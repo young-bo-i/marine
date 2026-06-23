@@ -21,8 +21,9 @@
 }
 
 * { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
 body {
-  width: 340px; margin: 0;
+  display: flex; flex-direction: column;
   font: 13px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
   background: var(--bg); color: var(--ink);
 }
@@ -50,7 +51,7 @@ svg { display: block; }
 }
 
 /* Body */
-.body { padding: 14px; background: var(--bg); }
+.body { padding: 14px; background: var(--bg); flex: 1; }
 .pane { display: none; }
 .pane.active { display: block; }
 

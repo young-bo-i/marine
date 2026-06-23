@@ -3,12 +3,17 @@
   "name": "Marine 字幕 & 文本提取器",
   "version": "0.1.0",
   "description": "提取 YouTube / Bilibili / Netflix 等主流视频平台字幕，以及任意网页的结构化文本。",
-  "minimum_chrome_version": "111",
-  "permissions": ["storage", "downloads"],
+  "minimum_chrome_version": "114",
+  "permissions": ["storage", "downloads", "sidePanel"],
   "host_permissions": ["<all_urls>"],
   "action": {
-    "default_popup": "popup.html",
-    "default_title": "抓取字幕 / 评论 / 文本"
+    "default_title": "Marine — 抓取与话术（侧边栏）"
+  },
+  "side_panel": {
+    "default_path": "popup.html"
+  },
+  "background": {
+    "service_worker": "src/sw.js"
   },
   "content_scripts": [
     {

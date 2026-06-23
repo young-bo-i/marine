@@ -223,11 +223,19 @@ $('#btn-reload').addEventListener('click', async () => {
   catch (e) { setStatus('刷新失败：' + (e && e.message || e), 'error'); }
 });
 
-// ---- 初始化 ----
-(async function init() {
+// ---- 对准当前标签页（侧边栏常驻，切 tab / 刷新要重对准并重置）----
+let myWindowId = null;
+async function attach() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) return;
   activeTabId = tab.id;
+  lastGrab = null;
+  resetChips('pending');
+  $('#btn-copy').disabled = true;
+  $('#btn-codex').disabled = true;
+  $('#btn-more').classList.add('hidden');
+  showReloadHint(false);
+  setStatus('点「一键抓取」开始检测本页内容');
   try {
     const ping = await chrome.tabs.sendMessage(activeTabId, { type: 'PING' });
     $('#platform').textContent = ping.platformLabel || ping.platform;
@@ -235,6 +243,14 @@ $('#btn-reload').addEventListener('click', async () => {
     $('#platform').textContent = '未注入';
     setStatus('本页未注入脚本', 'error'); showReloadHint(true);
   }
+}
+chrome.tabs.onActivated.addListener(info => { if (info.windowId === myWindowId) attach(); });
+chrome.tabs.onUpdated.addListener((tabId, ci) => { if (tabId === activeTabId && ci.status === 'complete') attach(); });
+
+// ---- 初始化（一次性）----
+(async function init() {
+  try { const w = await chrome.windows.getCurrent(); myWindowId = w.id; } catch (e) {}
+  await attach();
 
   const dbg = $('#debug-toggle');
   try { const o = await chrome.storage.local.get('marineDebug'); dbg.checked = !(o.marineDebug && o.marineDebug.enabled === false); }
