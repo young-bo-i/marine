@@ -4,15 +4,34 @@
 //   time(ISO), ipLocation, replyCount, children[] }。本文件零依赖、函数全局可见。
 
 // ---- 工具：穿透 Shadow DOM 收集元素（B站新版评论区是 Web Component） ----
+function marineShadowRootOf(el) {
+  try {
+    if (!el) return null;
+    if (el.shadowRoot) return el.shadowRoot;
+    if (typeof chrome !== 'undefined' && chrome.dom && chrome.dom.openOrClosedShadowRoot) {
+      return chrome.dom.openOrClosedShadowRoot(el);
+    }
+  } catch (e) {}
+  return null;
+}
+
 function marineCollectShadow(root, acc, budget) {
   acc = acc || [];
   budget = budget || { n: 0, max: 12000 };
+  if (!root || budget.n > budget.max) return acc;
+  if (root.nodeType === 1) {
+    acc.push(root);
+    budget.n++;
+    const rootShadow = marineShadowRootOf(root);
+    if (rootShadow) marineCollectShadow(rootShadow, acc, budget);
+  }
   let nodes;
   try { nodes = root.querySelectorAll('*'); } catch (e) { return acc; }
   for (const el of nodes) {
     if (budget.n++ > budget.max) return acc;
     acc.push(el);
-    if (el.shadowRoot) marineCollectShadow(el.shadowRoot, acc, budget);
+    const shadow = marineShadowRootOf(el);
+    if (shadow) marineCollectShadow(shadow, acc, budget);
   }
   return acc;
 }
@@ -125,6 +144,52 @@ function marineBuildComments(platform, captures) {
   built.ok = built.stats.count > 0;
   if (!built.ok) built.error = '捕获到响应但未解析出评论（结构可能已变）。';
   return built;
+}
+
+function marineCommentSnippet(text, max) {
+  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, max || 60);
+}
+
+function marineFlattenComments(tree) {
+  const out = [];
+  (function walk(list, depth) {
+    for (const c of list || []) {
+      out.push({
+        id: c.id || '',
+        parentId: c.parentId || '',
+        rootId: c.rootId || '',
+        authorName: (c.author && c.author.name) || '',
+        authorId: (c.author && c.author.id) || '',
+        text: c.text || '',
+        snippet: marineCommentSnippet(c.text, 80),
+        depth,
+      });
+      if (c.children && c.children.length) walk(c.children, depth + 1);
+    }
+  })(tree || [], 0);
+  return out;
+}
+
+// 给本地智能体看的评论文本：保留页面可定位的 rpid，方便后续一键填入对应回复框。
+function marineCommentsForAgent(tree, limit) {
+  limit = limit || 100000;
+  const lines = [];
+  let n = 0;
+  (function walk(list, depth) {
+    for (const c of list || []) {
+      if (n >= limit) return;
+      n++;
+      const meta = [];
+      if (c.id) meta.push('id=' + c.id);
+      if (c.likeCount) meta.push(c.likeCount + '赞');
+      if (c.ipLocation) meta.push(c.ipLocation);
+      lines.push('  '.repeat(depth) + (depth ? '↳ ' : '· ') + '[' + meta.join(' ') + '] ' +
+        (c.author.name || '匿名') + '：' + (c.text || '').replace(/\s+/g, ' '));
+      if (c.children && c.children.length) walk(c.children, depth + 1);
+    }
+  })(tree || [], 0);
+  if (n >= limit) lines.push('… 仅预览前 ' + limit + ' 条');
+  return lines.join('\n');
 }
 
 // 缩进预览文本

@@ -51,7 +51,17 @@ svg { display: block; }
 }
 
 /* Body */
-.body { padding: 14px; background: var(--bg); flex: 1; }
+.body { padding: 14px; background: var(--bg); flex: 1; min-height: 0; overflow-y: auto; }
+
+/* 本地智能体推荐回复 */
+.replies { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+.reply-card { border: 1px solid var(--border); border-radius: 10px; padding: 10px 11px; background: var(--card); }
+.reply-head { font-size: 11px; color: var(--accent-deep); font-weight: 600; margin-bottom: 5px; }
+.reply-text { font-size: 13px; color: var(--ink); line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
+.reply-actions { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+.reply-copy { font-size: 11px; padding: 3px 11px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--accent-deep); cursor: pointer; }
+.reply-fill { background: var(--tint-cyan-bg); border-color: var(--accent); }
+.reply-copy:hover { border-color: var(--accent); }
 .pane { display: none; }
 .pane.active { display: block; }
 
@@ -77,7 +87,7 @@ svg { display: block; }
 button:disabled { opacity: .5; cursor: default; box-shadow: none; }
 
 /* Cards */
-.cards { margin: 14px 0 4px; display: flex; flex-direction: column; gap: 8px; }
+.cards { margin: 0 0 4px; display: flex; flex-direction: column; gap: 8px; }
 .card {
   display: flex; align-items: center; gap: 11px;
   padding: 11px 12px; background: var(--card);
@@ -138,6 +148,19 @@ button:disabled { opacity: .5; cursor: default; box-shadow: none; }
 .switch { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; font-size: 13px; }
 .brand-pill { display: inline-flex; align-items: center; gap: 7px; padding: 5px 12px; border-radius: 11px; background: var(--tint-cyan-bg); color: var(--tint-cyan-fg); font-weight: 600; }
 .brand-pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--has-fg); }
+
+/* 调试日志（侧边栏内） */
+#pane-debug.active { display: flex; flex-direction: column; height: 100%; }
+.dbg-bar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.dbg-title { font-size: 12px; font-weight: 600; color: var(--ink); }
+.dbg-log {
+  flex: 1; min-height: 0; overflow: auto;
+  background: #0d1117; border: 1px solid var(--border); border-radius: 8px; padding: 8px;
+  font: 11px/1.55 ui-monospace, "SF Mono", Menlo, Consolas, monospace; color: #9da7b3;
+}
+.dbg-line { padding: 1px 0; word-break: break-word; white-space: pre-wrap; }
+.dbg-net { color: #4ea1ff; } .dbg-ok { color: #3fb950; } .dbg-track { color: #37c2a8; }
+.dbg-warn { color: #e3b341; } .dbg-error { color: #ff6b6b; } .dbg-info { color: #9da7b3; }
 .cfg-gap { margin-top: 16px; }
 
 .upload {

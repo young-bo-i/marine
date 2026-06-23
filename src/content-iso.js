@@ -23,12 +23,18 @@
   // ---- 评论被动捕获（按响应累积，去重交给解析层） ----
   const commentCaptures = [];   // { url, body, ts }
   let lastGrabParts = null;     // 缓存上次抓取的字幕/正文，供「加载更多评论」重建 bundle
+  let commentNotifyTimer = null;
   function marineIngestComment(d) {
     commentCaptures.push({ url: d.url, body: d.body, ts: Date.now() });
     if (commentCaptures.length > 400) commentCaptures.shift();
     let n = 0;
     try { n = marineBuildBiliComments([{ url: d.url, body: d.body }]).stats.count; } catch (e) {}
     marineLog('net', 'iso', '评论响应 ' + shortUrl(d.url) + ' → +' + n + ' 条（累计响应 ' + commentCaptures.length + '）');
+    // 评论是页面异步加载的，可能晚于抓取 → 防抖通知面板刷新计数（不滚动页面）
+    if (commentNotifyTimer) clearTimeout(commentNotifyTimer);
+    commentNotifyTimer = setTimeout(function () {
+      try { chrome.runtime.sendMessage({ __marineCommentUpdate: true }, function () { void chrome.runtime.lastError; }); } catch (e) {}
+    }, 400);
   }
 
   function marineSleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
@@ -40,8 +46,20 @@
       platform: detectPlatform(),
       stats: built.stats,
       preview: marineCommentsPreview(built.comments, 100),
+      agentMd: marineCommentsForAgent(built.comments, 100000),
+      targets: marineFlattenComments(built.comments),
       json: JSON.stringify(built.comments, null, 2),
     };
+  }
+
+  function marineCommentsPanelPayload(built) {
+    return built.ok ? {
+      status: 'has',
+      count: built.stats.count,
+      md: marineCommentsPreview(built.comments, 100000),
+      agentMd: marineCommentsForAgent(built.comments, 100000),
+      targets: marineFlattenComments(built.comments),
+    } : { status: 'none', targets: [] };
   }
 
   // 自动滚动 + 展开，驱动页面自发请求（钩子续收），实现「尽量全量」
@@ -110,13 +128,9 @@
     const out = { platform, subtitle: { status: 'none' }, comments: { status: 'none' }, text: { status: 'none' } };
     marineLog('info', 'iso', '一次抓取：字幕 + 评论 + 正文 @ ' + platform);
 
-    // 评论：评论型平台每次抓取只加载一页（~20 条），重复点「抓取」累积更多
-    let commentsBuilt = null;
-    if (platform === 'bilibili' || platform === 'zhihu') {
-      try { await marineDriveOnce(); } catch (e) {}
-    }
-    commentsBuilt = marineBuildComments(platform, commentCaptures);
-    if (commentsBuilt.ok) out.comments = { status: 'has', count: commentsBuilt.stats.count, md: marineCommentsPreview(commentsBuilt.comments, 100000) };
+    // 评论：被动解析已捕获的（自动抓取不滚动页面；要更多评论点「加载更多」）
+    const commentsBuilt = marineBuildComments(platform, commentCaptures);
+    if (commentsBuilt.ok) out.comments = marineCommentsPanelPayload(commentsBuilt);
 
     // 字幕
     let subRes = null;
@@ -239,6 +253,195 @@
     return [];
   }
 
+  // ---- 把推荐回复填入目标评论的回复框（只填草稿，不点击发送）----
+  function marineCssEscape(s) {
+    try { return CSS.escape(String(s)); } catch (e) { return String(s).replace(/["\\]/g, '\\$&'); }
+  }
+  function marineTextOf(el) {
+    try { return (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim(); }
+    catch (e) { return ''; }
+  }
+  function marineVisible(el) {
+    try {
+      const r = el.getBoundingClientRect();
+      const cs = getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden';
+    } catch (e) { return false; }
+  }
+  function marineComposedParent(el) {
+    if (!el) return null;
+    const p = el.parentElement || el.parentNode;
+    if (p && p.nodeType === 11 && p.host) return p.host;
+    return p && p.nodeType === 1 ? p : null;
+  }
+  function marineAllElements(root) {
+    return marineCollectShadow(root || document, [], { n: 0, max: 60000 });
+  }
+  function marineCommentSearchRoot() {
+    return document.querySelector('bili-comments, #commentapp, .comment-container, .comment-list, .reply-warp') || document;
+  }
+  function marineParseReplyTarget(target) {
+    const s = String(target || '').replace(/^回复\s*@?\s*/, '').trim();
+    const author = ((s.match(/^@?([^（(「"“：:]+)/) || [])[1] || '').trim();
+    const quoted = (s.match(/[「"“](.+?)[」"”]/) || [])[1] || '';
+    return { author, snippet: quoted.replace(/\s+/g, ' ').trim() };
+  }
+  function marineContainsTarget(el, target) {
+    const txt = marineTextOf(el);
+    if (!txt || txt.length > 4000) return false;
+    if (target.authorName && txt.indexOf(target.authorName) < 0) return false;
+    const sn = marineCommentSnippet(target.text || target.snippet || '', 28);
+    if (sn && txt.indexOf(sn) < 0) return false;
+    return true;
+  }
+  function marineFindReplyButton(root) {
+    let cur = root;
+    for (let i = 0; cur && i < 8; i++, cur = marineComposedParent(cur)) {
+      const els = [cur].concat(marineAllElements(cur));
+      const btn = els.find(el => {
+        const txt = marineTextOf(el);
+        return el.matches && el.matches('button,a,[role="button"],.reply,.reply-btn,.sub-reply') &&
+          /^回复$|回复/.test(txt) && txt.length <= 12 && marineVisible(el);
+      });
+      if (btn) return btn;
+    }
+    return null;
+  }
+  function marineFindCommentElement(target) {
+    const root = marineCommentSearchRoot();
+    const all = marineAllElements(root);
+    const id = String(target.id || '').trim();
+    if (id) {
+      const sel = [
+        '[data-id="' + marineCssEscape(id) + '"]',
+        '[data-rpid="' + marineCssEscape(id) + '"]',
+        '[data-reply-id="' + marineCssEscape(id) + '"]',
+        '[reply-id="' + marineCssEscape(id) + '"]',
+        '[rpid="' + marineCssEscape(id) + '"]',
+      ].join(',');
+      try {
+        const direct = (root.querySelector && root.querySelector(sel)) || document.querySelector(sel);
+        if (direct) return direct;
+      } catch (e) {}
+      const byAttr = all.filter(el => {
+        try {
+          for (const a of Array.from(el.attributes || [])) {
+            const name = a.name.toLowerCase();
+            if (/(^|[-_:])(id|rpid|reply)([-_:]|$)/.test(name) && String(a.value) === id) return true;
+          }
+        } catch (e) {}
+        return false;
+      });
+      if (byAttr.length) return byAttr[0];
+    }
+    const parsed = marineParseReplyTarget(target.label || '');
+    const fallback = {
+      authorName: target.authorName || parsed.author,
+      text: target.text || parsed.snippet,
+      snippet: target.snippet || parsed.snippet,
+    };
+    const matches = all.filter(el => marineContainsTarget(el, fallback));
+    matches.sort((a, b) => marineTextOf(a).length - marineTextOf(b).length);
+    return matches[0] || null;
+  }
+  function marineIsEditor(el) {
+    if (!el || !marineVisible(el)) return false;
+    const tag = (el.tagName || '').toLowerCase();
+    if (tag === 'textarea') return !el.disabled && !el.readOnly;
+    if (tag === 'input') return /^(text|search)?$/.test(el.type || 'text') && !el.disabled && !el.readOnly;
+    return el.isContentEditable || el.getAttribute('contenteditable') === 'true' || el.getAttribute('contenteditable') === 'plaintext-only';
+  }
+  function marineDeepActiveElement(root) {
+    let a = (root || document).activeElement;
+    let shadow = a && marineShadowRootOf(a);
+    while (shadow && shadow.activeElement) {
+      a = shadow.activeElement;
+      shadow = marineShadowRootOf(a);
+    }
+    return a;
+  }
+  function marineSetEditorText(el, text) {
+    try { el.focus(); } catch (e) {}
+    const tag = (el.tagName || '').toLowerCase();
+    if (tag === 'textarea' || tag === 'input') {
+      const proto = tag === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+      if (desc && desc.set) desc.set.call(el, text); else el.value = text;
+    } else {
+      try {
+        document.execCommand('selectAll', false, null);
+        document.execCommand('insertText', false, text);
+      } catch (e) {}
+      if (marineTextOf(el).indexOf(marineCommentSnippet(text, 12)) < 0) el.textContent = text;
+    }
+    try { el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text })); } catch (e) { el.dispatchEvent(new Event('input', { bubbles: true })); }
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  function marineComposedContains(root, el) {
+    for (let cur = el; cur; cur = marineComposedParent(cur)) {
+      if (cur === root) return true;
+    }
+    return false;
+  }
+  function marineClickElement(el) {
+    try { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (e) {}
+    try { el.click(); return; } catch (e) {}
+    try { el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window })); } catch (e) {}
+  }
+  function marineFindEditor(commentEl) {
+    const scopes = [];
+    for (let cur = commentEl, i = 0; cur && i < 4; i++, cur = marineComposedParent(cur)) scopes.push(cur);
+    const active = marineDeepActiveElement(document);
+    if (marineIsEditor(active) && scopes.some(r => marineComposedContains(r, active))) return active;
+    for (const r of scopes) {
+      const found = marineAllElements(r).filter(marineIsEditor);
+      if (found.length) return found[found.length - 1];
+    }
+    let commentRect = null;
+    try { commentRect = commentEl && commentEl.getBoundingClientRect(); } catch (e) {}
+    const nearby = marineAllElements(document).filter(el => {
+      if (!marineIsEditor(el)) return false;
+      if (!commentRect) return true;
+      try {
+        const r = el.getBoundingClientRect();
+        return r.top >= commentRect.top - 12 && r.top <= commentRect.bottom + 320;
+      } catch (e) { return false; }
+    });
+    if (nearby.length) return nearby[nearby.length - 1];
+    return null;
+  }
+  async function marineInjectReplyDraft(opts) {
+    opts = opts || {};
+    const target = {
+      id: opts.targetId || (opts.target && opts.target.id) || '',
+      authorName: opts.target && opts.target.authorName,
+      text: opts.target && opts.target.text,
+      snippet: opts.target && opts.target.snippet,
+      label: opts.targetLabel || opts.targetRaw || '',
+    };
+    const replyText = String(opts.text || '').trim();
+    if (!replyText) return { ok: false, error: '回复内容为空' };
+
+    const commentEl = marineFindCommentElement(target);
+    if (!commentEl) return { ok: false, error: '找不到目标评论，请先加载/滚动到这条评论附近' };
+    try { commentEl.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (e) {}
+    await marineSleep(250);
+
+    const replyBtn = marineFindReplyButton(commentEl);
+    if (!replyBtn) return { ok: false, error: '找到了评论，但没找到“回复”按钮' };
+    marineClickElement(replyBtn);
+
+    let editor = null;
+    for (let i = 0; i < 12 && !editor; i++) {
+      await marineSleep(180);
+      editor = marineFindEditor(commentEl);
+    }
+    if (!editor) return { ok: false, error: '已点开回复，但没找到输入框' };
+    marineSetEditorText(editor, replyText);
+    marineLog('ok', 'iso', '已填入回复草稿：' + (target.id || target.authorName || '目标评论'));
+    return { ok: true };
+  }
+
   // ---- 通用提取：优先 TextTrack，其次被动捕获 ----
   function extractGeneric() {
     const trk = trackSources();
@@ -265,9 +468,8 @@
           case 'PING':
             sendResponse({ ok: true, platform: detectPlatform(), platformLabel: PLATFORM_LABEL[detectPlatform()], url: location.href, title: document.title });
             break;
-          case 'DEBUG_SET':
-            marineDebug.setEnabled(!!msg.enabled);
-            sendResponse({ ok: true });
+          case 'GET_LOGS':
+            sendResponse({ logs: marineDebug.buffer() });
             break;
           case 'LIST_SOURCES': {
             const plat = detectPlatform();
@@ -309,6 +511,23 @@
           case 'GRAB_ALL':
             sendResponse(await marineGrabAll(msg.opts || {}));
             break;
+          case 'RESET_COMMENTS':   // 页内导航（换视频）时清空旧评论缓冲
+            commentCaptures.length = 0;
+            lastGrabParts = null;
+            sendResponse({ ok: true });
+            break;
+          case 'REBUILD_COMMENTS': {   // 被动评论到了 → 不滚动、只重建并回传（含 bundle）
+            const built = marineBuildComments(detectPlatform(), commentCaptures);
+            const parts = lastGrabParts || { textMarkdown: '', cues: null };
+            const bundle = marineBuildBundle({
+              platform: detectPlatform(), url: location.href,
+              textMarkdown: parts.textMarkdown,
+              comments: built.ok ? built.comments : [],
+              cues: parts.cues,
+            });
+            sendResponse({ ok: true, comments: marineCommentsPanelPayload(built), bundle });
+            break;
+          }
           case 'LOAD_MORE_COMMENTS': {
             await marineDriveOnce();
             const built = marineBuildComments(detectPlatform(), commentCaptures);
@@ -320,9 +539,12 @@
               cues: parts.cues,
             });
             marineLog('ok', 'iso', '加载更多评论 → 累计 ' + (built.ok ? built.stats.count : 0) + ' 条');
-            sendResponse({ ok: true, comments: built.ok ? { status: 'has', count: built.stats.count, md: marineCommentsPreview(built.comments, 100000) } : { status: 'none' }, bundle });
+            sendResponse({ ok: true, comments: marineCommentsPanelPayload(built), bundle });
             break;
           }
+          case 'INJECT_REPLY_DRAFT':
+            sendResponse(await marineInjectReplyDraft(msg.opts || {}));
+            break;
           default:
             sendResponse({ ok: false, error: '未知指令' });
         }
@@ -339,17 +561,6 @@
       : { ok: false, error: '该来源暂无字幕内容。' };
   }
 
-  // ---- 初始化调试面板 ----
-  function bootDebug(saved) {
-    saved = saved || {};
-    marineDebug.init({ enabled: saved.enabled !== false, open: saved.open !== false });
-    const label = PLATFORM_LABEL[detectPlatform()];
-    marineDebug.setMeta({ platform: label, captured: captured.length, tracks: trackBuffers.length });
-    marineLog('info', 'iso', '已加载 · 平台=' + label + ' · ' + location.href);
-  }
-  try {
-    const p = chrome.storage.local.get('marineDebug');
-    if (p && p.then) p.then(o => bootDebug(o && o.marineDebug)).catch(() => bootDebug());
-    else bootDebug();
-  } catch (e) { bootDebug(); }
+  // 日志转发到侧边栏「调试」tab（GET_LOGS 取历史 + 实时 __marineLog 推送），无页面悬浮层
+  marineLog('info', 'iso', '已加载 · 平台=' + PLATFORM_LABEL[detectPlatform()] + ' · ' + location.href);
 })();
