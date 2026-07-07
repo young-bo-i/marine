@@ -30,6 +30,11 @@ import type { SyncSettings } from "@/types";
 
 const DEVICE_LINK_URL = "https://donutbrowser.com/auth/link";
 
+// Marine self-hosted sync backend. Pre-filled so testers only need to paste
+// the shared sync token (never the URL). Users can overwrite it for their own
+// server. The token is intentionally NOT baked in — it's a shared secret.
+const DEFAULT_SELF_HOSTED_URL = "http://211.101.236.27:12342";
+
 interface SyncConfigDialogProps {
   isOpen: boolean;
   onClose: (loginOccurred?: boolean) => void;
@@ -97,7 +102,7 @@ export function SyncConfigDialog({
     setIsLoading(true);
     try {
       const settings = await invoke<SyncSettings>("get_sync_settings");
-      setServerUrl(settings.sync_server_url ?? "");
+      setServerUrl(settings.sync_server_url ?? DEFAULT_SELF_HOSTED_URL);
       setToken(settings.sync_token ?? "");
       if (settings.sync_server_url && settings.sync_token) {
         void testConnection(settings.sync_server_url);
@@ -126,12 +131,12 @@ export function SyncConfigDialog({
     if (isCloudLoading) return;
     if (isLoggedIn) {
       setActiveTab("cloud");
-    } else if (serverUrl && token) {
-      setActiveTab("self-hosted");
     } else {
-      setActiveTab("cloud");
+      // Marine uses self-hosted token sync as its primary (and only) backend,
+      // so land non-logged-in users straight on the self-hosted tab.
+      setActiveTab("self-hosted");
     }
-  }, [isCloudLoading, isLoggedIn, serverUrl, token]);
+  }, [isCloudLoading, isLoggedIn]);
 
   const handleTestConnection = useCallback(async () => {
     if (!serverUrl) {

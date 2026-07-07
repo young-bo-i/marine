@@ -444,7 +444,6 @@ async fn marine_generate_api(
   Ok(Json(out))
 }
 
-
 #[utoipa::path(
   get, path = "/v1/marine/provider-config",
   responses((status = 200, body = MarineProviderConfig)),

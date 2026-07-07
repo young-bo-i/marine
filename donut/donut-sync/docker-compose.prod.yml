@@ -1,0 +1,53 @@
+# Marine / donut-sync — self-hosted (token mode) production compose.
+#
+# Single host, HTTP. Host networking so the sync server reaches MinIO at the
+# SAME public endpoint it presigns for clients — no hairpin-NAT gamble.
+#
+# This file runs from an ASSEMBLED deploy dir laid out like:
+#   <deploydir>/
+#   ├── docker-compose.prod.yml   (this file)
+#   ├── .env                      (from .env.prod.example, with real secrets)
+#   └── donut-sync/               (the server source: Dockerfile, package.json, src/…)
+# because the Dockerfile does `COPY donut-sync/*`, the build context (".") must
+# CONTAIN a donut-sync/ subdir. Use ./deploy.sh to assemble this dir + upload it.
+#
+# Manual run (from the assembled dir):
+#   docker compose -f docker-compose.prod.yml up -d --build
+# Then open ports 12342 (sync) and 9000 (MinIO S3) in your cloud firewall.
+services:
+  minio:
+    image: minio/minio:latest
+    network_mode: host
+    command: server /data --address ":9000" --console-address "127.0.0.1:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    restart: unless-stopped
+
+  createbucket:
+    image: minio/mc:latest
+    network_mode: host
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set m http://127.0.0.1:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}; do echo 'waiting for minio...'; sleep 2; done;
+      mc mb -p m/${S3_BUCKET} || true;
+      echo 'bucket ready: ${S3_BUCKET}';
+      "
+    restart: "no"
+
+  sync:
+    build:
+      context: .
+      dockerfile: donut-sync/Dockerfile
+    network_mode: host
+    env_file: .env
+    depends_on:
+      - minio
+    restart: unless-stopped
+
+volumes:
+  minio_data:

@@ -34,8 +34,8 @@ fn source_dir(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
   // 3) Dev: walk up from the running exe to find `donut/marine-extension`
   //    (exe is at donut/src-tauri/target/debug/donutbrowser).
   if let Ok(exe) = std::env::current_exe() {
-    for anc in exe.ancestors() {
-      let pb = anc.join("marine-extension");
+    for ancestor in exe.ancestors() {
+      let pb = ancestor.join("marine-extension");
       if pb.join("manifest.json").exists() {
         return Some(pb);
       }

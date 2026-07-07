@@ -111,10 +111,7 @@ fn parse_output(raw: &str) -> Result<GenerationOutput, String> {
 /// Reusable generation core: pick the configured provider, build the prompt from
 /// the pre-built skill + grab payload, run it, and parse the structured output.
 /// Called by the REST API (`/v1/marine/generate`).
-pub async fn generate_output(
-  skill: &str,
-  payload: &Value,
-) -> Result<GenerationOutput, String> {
+pub async fn generate_output(skill: &str, payload: &Value) -> Result<GenerationOutput, String> {
   let settings = SettingsManager::instance()
     .load_settings()
     .map_err(|e| err_with("MARINE_GENERATE_FAILED", format!("settings: {e}")))?;
