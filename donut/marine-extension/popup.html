@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="color-scheme" content="dark light">
+  <title>Marine</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="hero">
+    <div class="brand">
+      <div class="logo">
+        <svg viewBox="98 96 316 316" fill="none" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M136 344V174C136 157 156 149 168 161L256 256L344 161C356 149 376 157 376 174V344" stroke="currentColor" stroke-width="40"></path>
+          <path d="M136 310C178 268 214 268 256 310C298 352 334 352 376 310" stroke="#3b82f6" stroke-width="36"></path>
+          <circle cx="256" cy="310" r="15" fill="#3b82f6"></circle>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <div class="brand-title">Marine</div>
+        <div class="brand-sub">字幕 · 评论 · 正文</div>
+      </div>
+    </div>
+    <div id="platform" class="badge">检测中…</div>
+  </header>
+
+  <main class="body">
+    <!-- 抓取 -->
+    <section id="pane-grab" class="pane active">
+      <div class="cards">
+        <div class="card">
+          <div class="ic ic-sub"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="M7 11h4M7 15h8M15 11h2"></path></svg></div>
+          <div class="card-main"><div class="card-t">字幕</div><div class="card-s">视频字幕轨</div></div>
+          <div id="st-sub" class="chip pending">待获取</div>
+        </div>
+
+        <div class="card">
+          <div class="ic ic-cmt"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 11.5a8 8 0 0 1-11.6 7.1L4 20l1.4-5A8 8 0 1 1 21 11.5z"></path></svg></div>
+          <div class="card-main">
+            <div class="card-t">评论 <button id="btn-more" class="more hidden">加载更多</button></div>
+            <div class="card-s">页面评论</div>
+          </div>
+          <div id="st-comment" class="chip pending">待获取</div>
+        </div>
+
+        <div class="card">
+          <div class="ic ic-txt"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6v20h12V8z"></path><path d="M14 2v6h6M9 13h6M9 17h6"></path></svg></div>
+          <div class="card-main"><div class="card-t">结构化文本</div><div class="card-s">正文 Markdown</div></div>
+          <div id="st-text" class="chip pending">待获取</div>
+        </div>
+      </div>
+
+      <div class="row">
+        <button id="btn-copy" class="icon-btn" disabled title="复制全部内容" aria-label="复制全部内容">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V5a2 2 0 0 1 2-2h10"></path></svg>
+        </button>
+        <button id="btn-codex" class="cta-2" disabled>
+          <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="8" width="16" height="11" rx="2.5"></rect><path d="M12 8V4.5M8.5 13h.01M15.5 13h.01"></path></svg>
+          生成话术
+        </button>
+      </div>
+      <span id="grab-status" class="status">正在自动检测当前页…</span>
+
+      <div id="replies" class="replies"></div>
+
+      <div id="reload-hint" class="hint hidden">
+        本页未注入脚本（扩展更新后已打开的页面需刷新一次）。<button id="btn-reload" class="link">刷新并重试</button>
+      </div>
+    </section>
+
+    <!-- 配置 -->
+    <section id="pane-config" class="pane">
+      <div id="cfg-status" class="status cfg-status"></div>
+
+      <!-- 连接状态（由 Donut 启动 profile 时自动配置；手填仅用于独立调试） -->
+      <div class="field-label">连接状态</div>
+      <div id="conn-status" class="conn-status"><span class="conn-dot"></span><span id="conn-status-text">检测中…</span></div>
+      <details class="conn-manual">
+        <summary>手动配置（调试用）</summary>
+        <label class="mini-label">apiBase</label>
+        <input id="cfg-apibase" class="cfg-input" placeholder="http://127.0.0.1:10108/v1/marine">
+        <label class="mini-label">token</label>
+        <input id="cfg-token" class="cfg-input" placeholder="Bearer token">
+        <button id="cfg-conn-save" class="cta-2 cfg-btn">保存连接并刷新</button>
+        <div id="cfg-conn-source" class="note"></div>
+        <div class="note">正常情况下从 Donut 启动此 profile 会自动写入 <code>marine-runtime-config.json</code>，无需手填。</div>
+      </details>
+
+      <!-- 话术方案：预制在扩展内，无需选择 -->
+      <div class="field-label cfg-gap">话术方案</div>
+      <div class="note" style="margin-top:0">已内置 <code>Scholay</code> 话术方案（人设 / 评论口径 / 风格参数），生成时自动使用，无需选择或配置。</div>
+
+      <!-- 引擎 / 本地智能体（自动识别 + 卡片选用） -->
+      <div class="field-label cfg-gap">引擎 / 本地智能体</div>
+      <div class="note" style="margin-top:0">自动识别本机 codex / claude CLI，点卡片选用；手动大模型端点为另一渠道。</div>
+      <div id="agent-grid" class="agent-grid">
+        <button type="button" class="agent-card" data-provider="codex" id="ac-codex">
+          <div class="agent-head"><span class="agent-name">OpenAI GPT Codex</span><span class="agent-dot"></span></div>
+          <span id="ac-codex-status" class="agent-status">检测中…</span>
+          <span class="agent-use">使用中</span>
+        </button>
+        <button type="button" class="agent-card" data-provider="claude" id="ac-claude">
+          <div class="agent-head"><span class="agent-name">Anthropic Claude Code</span><span class="agent-dot"></span></div>
+          <span id="ac-claude-status" class="agent-status">检测中…</span>
+          <span class="agent-use">使用中</span>
+        </button>
+        <button type="button" class="agent-card" data-provider="openai" id="ac-openai">
+          <div class="agent-head"><span class="agent-name">OpenAI 兼容 API</span><span class="agent-dot custom"></span></div>
+          <span class="agent-status custom">自定义端点 · 另一渠道</span>
+          <span class="agent-use">使用中</span>
+        </button>
+      </div>
+      <div id="cli-model-row" class="agent-cfg">
+        <label class="mini-label">CLI 模型（codex / claude，可选）</label>
+        <input id="pv-cli-model" class="cfg-input" placeholder="默认">
+      </div>
+      <div id="openai-row" class="agent-cfg hidden">
+        <label class="mini-label">OpenAI base_url</label>
+        <input id="pv-openai-base" class="cfg-input" placeholder="https://api.openai.com/v1">
+        <label class="mini-label">OpenAI model</label>
+        <input id="pv-openai-model" class="cfg-input" placeholder="gpt-4o">
+      </div>
+      <button id="pv-save" class="cta-2 cfg-btn">保存引擎配置</button>
+      <div class="note">codex / claude 用各自订阅登录（<code>~/.codex</code>、<code>~/.claude</code>）。OpenAI key 通过 Donut 的 <code>DONUT_MARINE_OPENAI_API_KEY</code> 环境变量设置。</div>
+    </section>
+
+    <!-- 调试 -->
+    <section id="pane-debug" class="pane">
+      <div class="dbg-bar"><span class="dbg-title">调试日志（当前页）</span><span class="dbg-actions"><button id="dbg-snapshot" class="link">导出快照</button><button id="dbg-clear" class="link">清空</button></span></div>
+      <div id="dbg-log" class="dbg-log"></div>
+      <div class="note" style="margin-top:8px">「导出快照」= 抓当前页的捕获 API 响应 + SSR 状态 + DOM 样本，复制到剪贴板。调平台解析时把它发给开发者。</div>
+    </section>
+  </main>
+
+  <nav class="tabbar">
+    <button class="tabbtn active" data-tab="grab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 11l5 4 5-4M5 21h14"></path></svg>抓取</button>
+    <button class="tabbtn" data-tab="config"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"></path><circle cx="9" cy="7" r="2" fill="var(--bg)"></circle><circle cx="15" cy="12" r="2" fill="var(--bg)"></circle><circle cx="8" cy="17" r="2" fill="var(--bg)"></circle></svg>配置</button>
+    <button class="tabbtn" data-tab="debug"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3 8 4-16 3 8h4"></path></svg>调试</button>
+  </nav>
+
+  <script src="popup.js"></script>
+</body>
+</html>

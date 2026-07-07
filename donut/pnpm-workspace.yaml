@@ -1,0 +1,39 @@
+packages:
+  - nodecar
+  - donut-sync
+
+onlyBuiltDependencies:
+  - '@biomejs/biome'
+  - '@nestjs/core'
+  - '@tailwindcss/oxide'
+  - better-sqlite3
+  - esbuild
+  - sharp
+  - sqlite3
+  - unrs-resolver
+
+# Husky and lint-staged shell out to pnpm without a TTY, so the interactive
+# "purge modules dir?" prompt errors out (ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY)
+# and aborts the commit. Skipping the prompt lets the hook proceed.
+confirmModulesPurge: false
+
+# Pinned for security. Moved from package.json#pnpm.overrides — pnpm 11
+# no longer reads that field; settings live here now.
+overrides:
+  picomatch@>=4.0.0 <4.0.4: '>=4.0.4'
+  path-to-regexp@>=8.0.0 <8.4.0: '>=8.4.0'
+  postcss@<8.5.10: '>=8.5.12'
+  fast-xml-parser@<5.7.0: '>=5.7.2'
+  fast-uri@<3.1.2: '>=3.1.2'
+  fast-xml-builder@<1.2.0: '>=1.2.0'
+  qs@>=6.11.1 <6.15.2: '>=6.15.2'
+  js-cookie@<3.0.7: '>=3.0.7'
+  multer@>=2.0.0 <2.2.0: '>=2.2.0'
+  form-data@>=4.0.0 <4.0.6: '>=4.0.6'
+  js-yaml@>=4.0.0 <4.2.0: '>=4.2.0 <5'
+  '@babel/core@<7.29.6': '>=7.29.6 <8'
+
+allowBuilds:
+  '@nestjs/core': true
+  sharp: true
+  unrs-resolver: true

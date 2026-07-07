@@ -1,0 +1,294 @@
+/* Marine side panel — restyled to Pencil's design language:
+   dark-first, monochrome zinc/shadcn, dense but softly rounded, flat with
+   whisper-soft shadows. Color is functional only: gray fills for primary
+   actions, one blue for active/selected, green for apply, red for danger. */
+
+:root {
+  --bg: #18181b;            /* app background (zinc-900) */
+  --panel: #18181b;
+  --surface: #27272a;       /* raised surface / input / control (zinc-800) */
+  --card: #1c1c1f;          /* card / list-row */
+  --border: #2a2a2e;        /* hairline divider */
+  --border-strong: #3f3f46; /* control border (zinc-700) */
+  --ink: #c8c8c8;           /* primary text (soft, not white) */
+  --muted: #a1a1aa;         /* secondary text (zinc-400) */
+  --faint: #71717a;         /* tertiary/labels (zinc-500) */
+  --action: #52525b;        /* primary/send fill (zinc-600) */
+  --action-hover: #3f3f46;  /* zinc-700 */
+  --accent: #3b82f6;        /* the one blue — active/selected only */
+  --ring: #52525b;          /* focus ring (zinc-600) */
+  --has-fg: #22c55e;        /* success text (green-500) */
+  --has-bg: rgba(34,197,94,.14);
+  --loading-fg: #a1a1aa; --loading-bg: #27272a;
+  --danger: #f87171;        /* red-400 */
+  --danger-bg: rgba(248,113,113,.12);
+  --radius: 10px;
+  --shadow-xs: 0 1px 2px 0 rgba(0,0,0,.30);
+  --shadow-sm: 0 1px 3px 0 rgba(0,0,0,.35), 0 1px 2px -1px rgba(0,0,0,.35);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #fafafa; --panel: #fafafa; --surface: #f4f4f5; --card: #ffffff;
+    --border: #e4e4e7; --border-strong: #d4d4d8; --ink: #18181b; --muted: #52525b;
+    --faint: #71717a; --action: #52525b; --action-hover: #3f3f46; --accent: #3b82f6;
+    --ring: #a1a1aa; --has-fg: #16a34a; --has-bg: rgba(22,163,74,.10);
+    --loading-fg: #71717a; --loading-bg: #f4f4f5; --danger: #dc2626; --danger-bg: rgba(220,38,38,.08);
+    --shadow-xs: 0 1px 2px 0 rgba(0,0,0,.05);
+    --shadow-sm: 0 1px 3px 0 rgba(0,0,0,.10), 0 1px 2px -1px rgba(0,0,0,.10);
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  font: 13px/1.5 ui-sans-serif, -apple-system, "system-ui", "Segoe UI",
+        "PingFang SC", "Microsoft YaHei", Helvetica, Arial, sans-serif;
+  background: var(--bg); color: var(--ink);
+}
+svg { display: block; }
+::selection { background: rgba(59,130,246,.30); }
+
+/* thin, unobtrusive scrollbars (Pencil "scrollbar-minimal") */
+* { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+/* Header — flat, monochrome, hairline underline (no gradient) */
+.hero {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 14px; background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.brand { display: flex; align-items: center; gap: 9px; }
+.logo {
+  width: 28px; height: 28px; border-radius: 8px;
+  background: var(--surface); color: var(--ink);
+  display: flex; align-items: center; justify-content: center;
+}
+.logo svg { width: 17px; height: 17px; }
+.brand-title { font-size: 14px; font-weight: 600; line-height: 1.1; color: var(--ink); }
+.brand-sub { font-size: 11px; color: var(--faint); }
+.badge {
+  font-size: 11px; font-weight: 500; padding: 2px 8px; border-radius: 6px;
+  background: transparent; color: var(--muted); border: 1px solid var(--border-strong);
+  white-space: nowrap;
+}
+.badge.active { background: var(--accent); color: #fff; border-color: transparent; }
+
+/* Body */
+.body { padding: 12px; background: var(--bg); flex: 1; min-height: 0; overflow-y: auto; }
+.pane { display: none; }
+.pane.active { display: block; }
+
+/* Status cards (subtitle / comment / text) — compact list rows */
+.cards { margin: 0 0 4px; display: flex; flex-direction: column; gap: 6px; }
+.card {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 10px; background: var(--card);
+  border: 1px solid var(--border); border-radius: var(--radius);
+}
+.ic { width: 30px; height: 30px; border-radius: 8px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; background: var(--surface); color: var(--muted); }
+.ic svg { width: 17px; height: 17px; }
+.ic-sub, .ic-cmt, .ic-txt { background: var(--surface); color: var(--muted); }
+.card-main { flex: 1; min-width: 0; }
+.card-t { font-size: 13px; font-weight: 500; color: var(--ink); display: flex; align-items: center; gap: 8px; }
+.card-s { font-size: 11px; color: var(--faint); }
+.more {
+  border: 1px solid var(--border-strong); background: transparent; color: var(--muted);
+  font-size: 10px; font-weight: 500; padding: 1px 7px; border-radius: 6px; cursor: pointer;
+}
+.more:hover { background: var(--surface); color: var(--ink); }
+
+/* Chips / status pills */
+.chip {
+  font-size: 11px; font-weight: 500; padding: 2px 8px; border-radius: 6px; white-space: nowrap;
+  background: transparent; color: var(--muted); border: 1px solid var(--border-strong);
+}
+.chip.loading { background: var(--loading-bg); color: var(--loading-fg); border-color: transparent; }
+.chip.has { background: var(--has-bg); color: var(--has-fg); border-color: transparent; }
+.chip.none { background: transparent; color: var(--faint); }
+
+/* Buttons */
+.cta, .cta-2 {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  cursor: pointer; border-radius: 8px; font-weight: 500; transition: background .15s, border-color .15s, color .15s;
+}
+.cta { width: 100%; padding: 10px; font-size: 14px; color: #fff; background: var(--action); border: none; box-shadow: var(--shadow-xs); }
+.cta:hover { background: var(--action-hover); }
+.cta .i { width: 16px; height: 16px; }
+.cta-2 { flex: 1; padding: 8px 12px; font-size: 13px; background: var(--surface); color: var(--ink); border: 1px solid var(--border-strong); box-shadow: var(--shadow-xs); }
+.cta-2 .i { width: 15px; height: 15px; }
+.cta-2:not(:disabled):hover { background: var(--action-hover); border-color: var(--ring); }
+/* the primary "generate / 本地智能体" action — Pencil's gray-600 send fill */
+#btn-codex { background: var(--action); color: #fff; border-color: transparent; }
+#btn-codex:not(:disabled):hover { background: var(--action-hover); }
+button:disabled { opacity: .5; cursor: default; box-shadow: none; }
+
+/* Row + icon button */
+.row { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+.icon-btn {
+  width: 34px; height: 34px; flex-shrink: 0; padding: 0; border-radius: 8px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--surface); color: var(--muted); border: 1px solid var(--border-strong); cursor: pointer;
+  box-shadow: var(--shadow-xs);
+}
+.icon-btn:not(:disabled):hover { background: var(--action-hover); color: var(--ink); border-color: var(--ring); }
+.status { display: block; margin-top: 9px; font-size: 12px; color: var(--muted); }
+.status.ok { color: var(--has-fg); }
+.status.error { color: var(--danger); }
+
+/* Generated 话术 draft cards — Pencil "assistant" cards */
+.replies { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+.reply-card {
+  border: 1px solid var(--border); border-radius: 14px; padding: 11px 12px;
+  background: var(--card); box-shadow: var(--shadow-sm);
+}
+.reply-head { font-size: 11px; color: var(--muted); font-weight: 500; margin-bottom: 6px; }
+.reply-text { font-size: 13px; color: var(--ink); line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+.reply-actions { margin-top: 9px; display: flex; flex-wrap: wrap; gap: 6px; }
+/* small pill buttons: gray by default, green for apply/fill/posted (Pencil approve=green) */
+.reply-copy {
+  font-size: 11px; font-weight: 500; padding: 3px 10px; border-radius: 8px;
+  border: 1px solid var(--border-strong); background: var(--surface); color: var(--muted); cursor: pointer;
+}
+.reply-copy:hover { background: var(--action-hover); color: var(--ink); }
+.reply-fill, .reply-post { background: rgba(34,197,94,.16); border-color: transparent; color: var(--has-fg); }
+.reply-fill:hover, .reply-post:hover { background: rgba(34,197,94,.26); color: var(--has-fg); }
+.reply-post.done { background: var(--has-bg); color: var(--has-fg); }
+
+.hint { margin-top: 11px; padding: 9px 11px; font-size: 12px; line-height: 1.6; background: var(--danger-bg); border-radius: 8px; color: var(--danger); }
+.link { border: none; background: none; padding: 0; color: var(--accent); cursor: pointer; font-size: 12px; text-decoration: underline; }
+.hidden { display: none !important; }
+
+/* Config pane */
+.field-label { font-size: 12px; font-weight: 600; color: var(--ink); margin-bottom: 7px; }
+.cfg-gap { margin-top: 18px; }
+.cfg-input {
+  width: 100%; padding: 8px 10px; border: 1px solid var(--border-strong); border-radius: 8px;
+  background: color-mix(in srgb, var(--surface) 40%, transparent); color: var(--ink); font-size: 13px;
+  box-shadow: var(--shadow-xs); transition: border-color .15s, box-shadow .15s;
+}
+.cfg-input::placeholder { color: var(--faint); }
+.cfg-input:focus { outline: none; border-color: var(--ring); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 45%, transparent); }
+.cfg-area { min-height: 54px; resize: vertical; font-family: inherit; line-height: 1.5; }
+.note { margin-top: 10px; font-size: 11px; line-height: 1.7; color: var(--muted); }
+.note code { background: var(--surface); padding: 1px 5px; border-radius: 4px; font-size: 10px; font-family: "Roboto Mono", ui-monospace, Menlo, monospace; }
+.mini-label { display: block; font-size: 11px; color: var(--faint); margin: 9px 0 4px; }
+.cfg-btn { width: 100%; margin-top: 10px; }
+
+/* Engine / local-agent cards (Pencil "connect your agent") */
+.agent-grid { display: flex; flex-direction: column; gap: 8px; margin: 8px 0 0; }
+.agent-card {
+  display: flex; flex-direction: column; gap: 7px; width: 100%; text-align: left; font: inherit;
+  padding: 11px 12px; background: var(--card); color: var(--ink);
+  border: 1px solid var(--border); border-radius: 12px; cursor: pointer; box-shadow: var(--shadow-xs);
+  transition: border-color .15s, background .15s, box-shadow .15s;
+}
+.agent-card:hover { border-color: var(--border-strong); background: var(--surface); }
+.agent-card.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.agent-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.agent-name { font-size: 13px; font-weight: 600; color: var(--ink); }
+.agent-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex-shrink: 0; }
+.agent-dot.ok { background: var(--has-fg); }
+.agent-dot.warn { background: #f59e0b; }
+.agent-dot.off { background: var(--faint); }
+.agent-dot.custom { background: var(--muted); }
+.agent-status {
+  display: inline-flex; align-items: center; align-self: flex-start;
+  font-size: 11px; font-weight: 500; padding: 2px 8px; border-radius: 6px;
+  color: var(--muted); border: 1px solid var(--border-strong); background: transparent;
+}
+.agent-status.ok { color: var(--has-fg); background: var(--has-bg); border-color: transparent; }
+.agent-status.warn { color: #f59e0b; border-color: color-mix(in srgb, #f59e0b 40%, transparent); }
+.agent-status.off { color: var(--faint); }
+.agent-status.custom { color: var(--muted); }
+.agent-use {
+  display: none; align-self: flex-start; font-size: 10px; font-weight: 500;
+  padding: 1px 8px; border-radius: 6px; background: var(--accent); color: #fff;
+}
+.agent-card.active .agent-use { display: inline-block; }
+.agent-cfg { margin-top: 10px; }
+
+/* Connection status + collapsible manual (debug) config */
+.conn-status {
+  display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+  background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+  font-size: 12px; font-weight: 500; color: var(--muted); box-shadow: var(--shadow-xs);
+}
+.conn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex-shrink: 0; }
+.conn-status.ok { color: var(--has-fg); }
+.conn-status.ok .conn-dot { background: var(--has-fg); }
+.conn-status.off { color: var(--faint); }
+.conn-status.off .conn-dot { background: var(--faint); }
+.conn-manual { margin-top: 10px; }
+.conn-manual > summary {
+  font-size: 11px; color: var(--faint); cursor: pointer; list-style: none;
+  user-select: none; padding: 2px 0; width: fit-content;
+}
+.conn-manual > summary::-webkit-details-marker { display: none; }
+.conn-manual > summary::before { content: "▸ "; }
+.conn-manual[open] > summary::before { content: "▾ "; }
+.conn-manual > summary:hover { color: var(--muted); }
+/* Config-pane feedback line (save success/error while on the 配置 tab) */
+.cfg-status { margin: 0 0 10px; }
+.cfg-status:empty { display: none; }
+
+/* Brand select row + editor */
+.brand-row { display: flex; align-items: center; gap: 8px; margin: 0 0 4px; }
+.brand-row-label { font-size: 12px; font-weight: 500; color: var(--ink); flex-shrink: 0; }
+.brand-select { flex: 1; min-width: 0; }
+.brand-mini-btn { flex: 0 0 auto; padding: 8px 12px; font-size: 12px; }
+.brand-mini-btn.danger { color: var(--danger); }
+.brand-mini-btn.danger:not(:disabled):hover { border-color: var(--danger); background: var(--danger-bg); }
+.brand-editor { margin-top: 4px; }
+
+/* Debug pane */
+#pane-debug.active { display: flex; flex-direction: column; height: 100%; }
+.dbg-bar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.dbg-actions { display: flex; align-items: center; gap: 12px; }
+.dbg-title { font-size: 12px; font-weight: 600; color: var(--ink); }
+.dbg-log {
+  flex: 1; min-height: 0; overflow: auto;
+  background: #0d0d0f; border: 1px solid var(--border); border-radius: 8px; padding: 8px;
+  font: 11px/1.55 "Roboto Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace; color: #a1a1aa;
+}
+.dbg-line { padding: 1px 0; word-break: break-word; white-space: pre-wrap; }
+.dbg-net { color: #60a5fa; } .dbg-ok { color: #4ade80; } .dbg-track { color: #2dd4bf; }
+.dbg-warn { color: #fbbf24; } .dbg-error { color: #f87171; } .dbg-info { color: #a1a1aa; }
+
+/* Bottom tab bar */
+.tabbar {
+  display: flex; border-top: 1px solid var(--border); background: var(--panel);
+  flex-shrink: 0;
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+.tabbtn {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px;
+  padding: 8px 0 9px; border: none; background: none; cursor: pointer;
+  color: var(--faint); font-size: 11px; font-weight: 500; transition: color .15s;
+}
+.tabbtn svg { width: 18px; height: 18px; stroke-width: 1.75; }
+.tabbtn:hover { color: var(--muted); }
+.tabbtn.active { color: var(--ink); }
+
+/* Leftover helpers (kept minimal in case referenced) */
+.switch { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; font-size: 13px; color: var(--ink); }
+.brand-pill { display: inline-flex; align-items: center; gap: 7px; padding: 4px 11px; border-radius: 8px; background: var(--surface); color: var(--ink); font-weight: 500; }
+.brand-pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--has-fg); }
+.upload { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 16px; border: 1.5px dashed var(--border-strong); border-radius: 10px; background: var(--surface); color: var(--muted); cursor: pointer; text-align: center; }
+.upload:hover { border-color: var(--ring); }
+.upload svg { width: 22px; height: 22px; }
+.upload-t { font-size: 13px; font-weight: 500; }
+.upload-sub { font-size: 11px; color: var(--faint); }
+.skill-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.skill-empty { font-size: 11px; color: var(--faint); padding: 4px 2px; }
+.skill-item { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); }
+.skill-item .sk-name { flex: 1; min-width: 0; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.skill-item .sk-size { font-size: 10px; color: var(--faint); }
+.skill-item .sk-del { border: none; background: none; color: var(--faint); cursor: pointer; font-size: 14px; padding: 0 2px; }
+.skill-item .sk-del:hover { color: var(--danger); }

@@ -1,0 +1,66 @@
+{
+  "manifest_version": 3,
+  "name": "Marine 字幕 & 文本提取器",
+  "version": "0.1.0",
+  "description": "提取 YouTube / Bilibili / Netflix 等主流视频平台字幕，以及任意网页的结构化文本。",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzPEPxV+qWzHG1AItK3YhlLmBUOQmq+LXVjhPI8x64h3v2+C8ONogkUaYKHlnDs7DvYF1CsStiE3Z7yuljh1mWxdL2/34clY5fZnBzTRhRnNgrnRIifEapsDp+8qSKCyJY+j7vrJhdyjjPvBSfaaQbUpjqqkgtxZoh91NU+OzdPkOcqiZ/wkNcyno34ZegKqc86pJtuKIXhcS3RMOxFLv3lJxywnsW5E/rDa9sk37JBABk3ECLMr28HG2f83uE4KpsKNyT//tjmXpDOMplIvUPR9LQyfpYn43pTJ7E3Tv+H7Zbl5KF3swZVsV4BhXEFTLn0yUohmj1XuUo1SwrwdzxwIDAQAB",
+  "minimum_chrome_version": "114",
+  "permissions": ["storage", "downloads", "sidePanel", "scripting", "dom"],
+  "host_permissions": ["<all_urls>"],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "Marine — 抓取与话术（侧边栏）",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "popup.html"
+  },
+  "background": {
+    "service_worker": "src/sw.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content-main.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": [
+        "src/debug-panel.js",
+        "src/format.js",
+        "src/extract-text.js",
+        "src/comments.js",
+        "src/platforms/youtube.js",
+        "src/platforms/bilibili.js",
+        "src/content-iso.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/panel-inject.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["popup.html", "popup.css", "popup.js", "skills/*"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

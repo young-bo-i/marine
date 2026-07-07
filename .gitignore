@@ -1,1 +1,10 @@
 .DS_Store
+
+# Local secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# Build outputs (bundles copied out for distribution)
+*.dmg
+*.app/
