@@ -419,24 +419,69 @@ async function fetchText(rel) {
 async function loadSkill() {
   if (skillCache) return skillCache;
   const base = 'skills/' + SKILL_BRAND + '/';
-  const [brandMd, voice, style] = await Promise.all([
+  const [brandMd, voice, style, sample] = await Promise.all([
     fetchText(base + '品牌.md'),
     fetchText(base + '评论口径.md'),
     fetchText(base + '风格参数.json'),
+    fetchText(base + '范文.md'),
   ]);
-  skillCache = [brandMd, '', '---', '', voice, '', '---', '', '# 风格参数', '```json', style, '```'].join('\n');
+  const parts = [brandMd, '', '---', '', voice, '', '---', '', '# 风格参数', '```json', style, '```'];
+  if (sample && sample.trim()) parts.push('', '---', '', sample);
+  // 用户导入的本地补充范文（.md，存 chrome.storage）—— 随内置范文一起带入。
+  try {
+    const o = await chrome.storage.local.get(['marineCustomSampleMd', 'marineCustomSampleName']);
+    if (o && o.marineCustomSampleMd && o.marineCustomSampleMd.trim()) {
+      parts.push('', '---', '', '# 导入范文（' + (o.marineCustomSampleName || 'custom') + '）——同样"学感觉、别照抄、卖点轮换"', '', o.marineCustomSampleMd.trim());
+    }
+  } catch (e) {}
+  skillCache = parts.join('\n');
   return skillCache;
 }
 
 // ---- 引擎 / 本地智能体（/provider-config + /agents）----
 let selectedProvider = 'codex';
 function selectProvider(p) {
-  selectedProvider = p || 'codex';
+  // 只支持 codex / claude；其它（含遗留的 openai）回退到 codex。
+  selectedProvider = (p === 'codex' || p === 'claude') ? p : 'codex';
   document.querySelectorAll('.agent-card').forEach((c) => c.classList.toggle('active', c.dataset.provider === selectedProvider));
-  if ($('#openai-row')) $('#openai-row').classList.toggle('hidden', selectedProvider !== 'openai');
-  if ($('#cli-model-row')) $('#cli-model-row').classList.toggle('hidden', selectedProvider === 'openai');
 }
 document.querySelectorAll('.agent-card').forEach((c) => c.addEventListener('click', () => selectProvider(c.dataset.provider)));
+
+// ---- 导入本地 .md 作为补充范文（存 chrome.storage，生成时并入 skill）----
+async function loadSampleStatus() {
+  const st = $('#sample-status'), clr = $('#sample-clear');
+  let o = {};
+  try { o = await chrome.storage.local.get(['marineCustomSampleName', 'marineCustomSampleMd']); } catch (e) {}
+  if (o && o.marineCustomSampleMd) {
+    const kb = (o.marineCustomSampleMd.length / 1024).toFixed(1);
+    if (st) st.textContent = '已导入范文：' + (o.marineCustomSampleName || 'custom.md') + '（' + kb + 'KB，随内置范文一起带入）';
+    if (clr) clr.classList.remove('hidden');
+  } else {
+    if (st) st.textContent = '未导入自定义范文（仅用内置范文）。';
+    if (clr) clr.classList.add('hidden');
+  }
+}
+if ($('#sample-import')) $('#sample-import').addEventListener('click', () => { const f = $('#sample-file'); if (f) f.click(); });
+if ($('#sample-file')) $('#sample-file').addEventListener('change', async (e) => {
+  const f = e.target.files && e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  if (!/\.md$/i.test(f.name)) { setStatus('只支持导入 .md 文档', 'error'); return; }
+  if (f.size > 200 * 1024) { setStatus('范文过大（>200KB），请精简后再导入', 'error'); return; }
+  try {
+    const text = await f.text();
+    await chrome.storage.local.set({ marineCustomSampleMd: text, marineCustomSampleName: f.name });
+    skillCache = null;   // 缓存失效 → 下次「生成话术」用上新范文
+    await loadSampleStatus();
+    setStatus('已导入范文：' + f.name, 'ok');
+  } catch (err) { setStatus('导入失败：' + ((err && err.message) || err), 'error'); }
+});
+if ($('#sample-clear')) $('#sample-clear').addEventListener('click', async () => {
+  try { await chrome.storage.local.remove(['marineCustomSampleMd', 'marineCustomSampleName']); } catch (e) {}
+  skillCache = null;
+  await loadSampleStatus();
+  setStatus('已移除导入范文（恢复仅用内置范文）', 'ok');
+});
 
 // 自动识别本机 codex / claude 的连接状态（Pencil 风格）
 // 把 codex/claude 两张卡统一置为某个状态（避免一直停在「检测中…」占位）。
@@ -475,18 +520,21 @@ async function loadProviderConfig() {
   try {
     const cfg = await apiFetch('/provider-config');
     if (!cfg) return;
-    selectProvider(cfg.provider || 'codex');
+    const prov = (cfg.provider === 'codex' || cfg.provider === 'claude') ? cfg.provider : 'codex';
+    selectProvider(prov);
     if ($('#pv-cli-model')) $('#pv-cli-model').value = cfg.cli_model || '';
-    if ($('#pv-openai-base')) $('#pv-openai-base').value = cfg.openai_base_url || '';
-    if ($('#pv-openai-model')) $('#pv-openai-model').value = cfg.openai_model || '';
+    // 自愈：遗留的 openai/未知 provider → 落盘 codex，避免后端仍走已停用的 openai
+    if (cfg.provider !== prov) {
+      try { await apiFetch('/provider-config', { method: 'PUT', body: JSON.stringify({ provider: prov, cli_model: cfg.cli_model || null, openai_base_url: null, openai_model: null }) }); } catch (e) {}
+    }
   } catch (e) { /* 未连接时静默 */ }
 }
 $('#pv-save').addEventListener('click', async () => {
   const body = {
-    provider: selectedProvider || null,
+    provider: selectedProvider || 'codex',
     cli_model: ($('#pv-cli-model').value || '').trim() || null,
-    openai_base_url: ($('#pv-openai-base').value || '').trim() || null,
-    openai_model: ($('#pv-openai-model').value || '').trim() || null,
+    openai_base_url: null,
+    openai_model: null,
   };
   try {
     await apiFetch('/provider-config', { method: 'PUT', body: JSON.stringify(body) });
@@ -719,6 +767,7 @@ chrome.tabs.onUpdated.addListener((tabId, ci) => {
   await attach();
 
   await loadConnFields();
+  try { await loadSampleStatus(); } catch (e) {}   // 本地导入范文状态（与 API 无关）
   try { await loadAgents(); } catch (e) {}   // 已处理未连接态（显示「未连接」）
   if (configReady()) {
     try { await loadProviderConfig(); } catch (e) {}

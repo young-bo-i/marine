@@ -86,13 +86,19 @@
         <div class="note">正常情况下从 Donut 启动此 profile 会自动写入 <code>marine-runtime-config.json</code>，无需手填。</div>
       </details>
 
-      <!-- 话术方案：预制在扩展内，无需选择 -->
+      <!-- 话术方案：预制在扩展内 + 可导入本地 .md 补充范文 -->
       <div class="field-label cfg-gap">话术方案</div>
-      <div class="note" style="margin-top:0">已内置 <code>Scholay</code> 话术方案（人设 / 评论口径 / 风格参数），生成时自动使用，无需选择或配置。</div>
+      <div class="note" style="margin-top:0">已内置 <code>Scholay</code> 话术方案（人设 / 评论口径 / 风格参数 / 范文），生成时自动带入。可再导入本地 <code>.md</code> 作为补充范文。</div>
+      <div class="brand-row" style="margin-top:8px">
+        <button id="sample-import" class="cta-2 brand-mini-btn">导入范文（.md）</button>
+        <button id="sample-clear" class="cta-2 brand-mini-btn danger hidden">移除</button>
+        <input id="sample-file" type="file" accept=".md,text/markdown" class="hidden">
+      </div>
+      <div id="sample-status" class="note" style="margin-top:6px">未导入自定义范文（仅用内置范文）。</div>
 
       <!-- 引擎 / 本地智能体（自动识别 + 卡片选用） -->
       <div class="field-label cfg-gap">引擎 / 本地智能体</div>
-      <div class="note" style="margin-top:0">自动识别本机 codex / claude CLI，点卡片选用；手动大模型端点为另一渠道。</div>
+      <div class="note" style="margin-top:0">自动识别本机 codex / claude CLI，点卡片选用。</div>
       <div id="agent-grid" class="agent-grid">
         <button type="button" class="agent-card" data-provider="codex" id="ac-codex">
           <div class="agent-head"><span class="agent-name">OpenAI GPT Codex</span><span class="agent-dot"></span></div>
@@ -104,24 +110,13 @@
           <span id="ac-claude-status" class="agent-status">检测中…</span>
           <span class="agent-use">使用中</span>
         </button>
-        <button type="button" class="agent-card" data-provider="openai" id="ac-openai">
-          <div class="agent-head"><span class="agent-name">OpenAI 兼容 API</span><span class="agent-dot custom"></span></div>
-          <span class="agent-status custom">自定义端点 · 另一渠道</span>
-          <span class="agent-use">使用中</span>
-        </button>
       </div>
       <div id="cli-model-row" class="agent-cfg">
         <label class="mini-label">CLI 模型（codex / claude，可选）</label>
         <input id="pv-cli-model" class="cfg-input" placeholder="默认">
       </div>
-      <div id="openai-row" class="agent-cfg hidden">
-        <label class="mini-label">OpenAI base_url</label>
-        <input id="pv-openai-base" class="cfg-input" placeholder="https://api.openai.com/v1">
-        <label class="mini-label">OpenAI model</label>
-        <input id="pv-openai-model" class="cfg-input" placeholder="gpt-4o">
-      </div>
       <button id="pv-save" class="cta-2 cfg-btn">保存引擎配置</button>
-      <div class="note">codex / claude 用各自订阅登录（<code>~/.codex</code>、<code>~/.claude</code>）。OpenAI key 通过 Donut 的 <code>DONUT_MARINE_OPENAI_API_KEY</code> 环境变量设置。</div>
+      <div class="note">codex / claude 用各自订阅登录（<code>~/.codex</code>、<code>~/.claude</code>），无需额外配置。</div>
     </section>
 
     <!-- 调试 -->
