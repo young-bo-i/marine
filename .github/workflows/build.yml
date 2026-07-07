@@ -39,7 +39,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22 # pnpm 11.2.2 requires Node >= 22.13
           cache: pnpm
           cache-dependency-path: donut/pnpm-lock.yaml
 
