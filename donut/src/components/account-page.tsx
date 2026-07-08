@@ -39,6 +39,11 @@ interface AccountPageProps {
 
 type ConnectionStatus = "unknown" | "testing" | "connected" | "error";
 
+// Marine self-hosted sync backend. Pre-filled so users only paste the shared
+// token (never the URL); overwrite it for a different server. The token is a
+// shared secret and is intentionally NOT baked in.
+const DEFAULT_SELF_HOSTED_URL = "http://211.101.236.27:12342";
+
 export function AccountPage({
   isOpen,
   onClose,
@@ -107,7 +112,8 @@ export function AccountPage({
   const loadSelfHostedSettings = useCallback(async () => {
     try {
       const settings = await invoke<SyncSettings>("get_sync_settings");
-      setServerUrl(settings.sync_server_url ?? "");
+      // `||` so a blank/absent saved value also falls back to the Marine default.
+      setServerUrl(settings.sync_server_url || DEFAULT_SELF_HOSTED_URL);
       setToken(settings.sync_token ?? "");
       setConnectionStatus(
         settings.sync_server_url && settings.sync_token ? "unknown" : "unknown",
@@ -131,9 +137,13 @@ export function AccountPage({
     setIsTestingConnection(true);
     setConnectionStatus("testing");
     try {
-      const healthUrl = `${serverUrl.replace(/\/$/, "")}/health`;
-      const response = await fetch(healthUrl);
-      if (response.ok) {
+      // Route through Rust (reqwest), not a webview fetch(): the secure tauri://
+      // origin blocks fetch() to an http:// server as mixed-content, so the test
+      // failed even when the server was reachable. Real sync uses reqwest too.
+      const ok = await invoke<boolean>("test_sync_connection", {
+        url: serverUrl,
+      });
+      if (ok) {
         setConnectionStatus("connected");
         showSuccessToast(t("sync.config.connectionSuccess"));
       } else {
