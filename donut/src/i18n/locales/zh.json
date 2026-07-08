@@ -332,6 +332,11 @@
       "nameDesc": "名称 (Z–A)",
       "newest": "最新优先",
       "oldest": "最早优先"
+    },
+    "sync": {
+      "pullNow": "拉取同步",
+      "pullDone": "已从服务器拉取最新同步",
+      "pullFailed": "拉取失败"
     }
   },
   "createProfile": {

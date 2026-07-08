@@ -1,11 +1,20 @@
 "use client";
 
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { GoPlus } from "react-icons/go";
-import { LuChevronLeft, LuChevronRight, LuSearch, LuX } from "react-icons/lu";
+import {
+  LuChevronLeft,
+  LuChevronRight,
+  LuRefreshCw,
+  LuSearch,
+  LuX,
+} from "react-icons/lu";
+import { translateBackendError } from "@/lib/backend-errors";
 import { getCurrentOS } from "@/lib/browser-utils";
+import { showErrorToast, showSuccessToast } from "@/lib/toast-utils";
 import { cn } from "@/lib/utils";
 import type { GroupWithCount } from "@/types";
 import { Button } from "./ui/button";
@@ -48,10 +57,29 @@ const HomeHeader = ({
 }: Props) => {
   const { t } = useTranslation();
   const [platform, setPlatform] = useState<string>("macos");
+  const [isSyncing, setIsSyncing] = useState(false);
 
   useEffect(() => {
     setPlatform(getCurrentOS());
   }, []);
+
+  // Manually pull remote-synced profiles/entities so items another machine
+  // synced to the server show up locally without restarting the app. The
+  // backend emits `profiles-changed` on completion, which the profile-events
+  // hook uses to reload the list.
+  const handleSyncNow = useCallback(async () => {
+    setIsSyncing(true);
+    try {
+      await invoke("sync_now");
+      showSuccessToast(t("profiles.sync.pullDone"));
+    } catch (error) {
+      showErrorToast(t("profiles.sync.pullFailed"), {
+        description: translateBackendError(t as never, error),
+      });
+    } finally {
+      setIsSyncing(false);
+    }
+  }, [t]);
 
   const isMacOS = platform === "macos";
   const showProfileToolbar = !pageTitle;
@@ -300,6 +328,30 @@ const HomeHeader = ({
       )}
 
       {!showProfileToolbar && <div className="flex-1" />}
+
+      {showProfileToolbar && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="shrink-0">
+              <Button
+                size="icon"
+                variant="outline"
+                className="size-7"
+                disabled={isSyncing}
+                onClick={() => {
+                  void handleSyncNow();
+                }}
+                aria-label={t("profiles.sync.pullNow")}
+              >
+                <LuRefreshCw
+                  className={cn("size-3.5", isSyncing && "animate-spin")}
+                />
+              </Button>
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>{t("profiles.sync.pullNow")}</TooltipContent>
+        </Tooltip>
+      )}
 
       {showProfileToolbar && (
         <div className="relative shrink-0">

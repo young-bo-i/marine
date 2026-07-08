@@ -3757,6 +3757,44 @@ pub async fn enable_sync_for_all_entities(app_handle: tauri::AppHandle) -> Resul
   Ok(())
 }
 
+/// Manually run a full sync pass on demand (triggered by the toolbar button).
+///
+/// Pulls remote-only profiles/entities that don't exist locally, then pushes
+/// all locally sync-enabled profiles. Individual pull failures are logged and
+/// ignored so one failing check doesn't abort the whole run. Finishes by
+/// emitting `profiles-changed` so the UI reloads its profile list even when
+/// nothing was downloaded.
+#[tauri::command]
+pub async fn sync_now(app_handle: tauri::AppHandle) -> Result<(), String> {
+  // Surfaces `SYNC_NOT_CONFIGURED` (JSON code) when there's no cloud login or
+  // self-hosted server URL + token — same pattern as the other sync commands.
+  ensure_sync_configured(&app_handle).await?;
+
+  let engine = SyncEngine::create_from_settings(&app_handle)
+    .await
+    .map_err(|e| {
+      serde_json::json!({ "code": "INTERNAL_ERROR", "params": { "detail": e } }).to_string()
+    })?;
+
+  // Pull: download remote-only profiles/entities missing locally.
+  if let Err(e) = engine.check_for_missing_synced_profiles(&app_handle).await {
+    log::warn!("sync_now: failed to check for missing profiles: {e}");
+  }
+  if let Err(e) = engine.check_for_missing_synced_entities(&app_handle).await {
+    log::warn!("sync_now: failed to check for missing entities: {e}");
+  }
+
+  // Push: queue all locally sync-enabled profiles for upload.
+  if let Some(scheduler) = super::get_global_scheduler() {
+    scheduler.sync_all_enabled_profiles(&app_handle).await;
+  }
+
+  // Ensure the profile list refreshes even if nothing new was pulled.
+  let _ = events::emit("profiles-changed", ());
+
+  Ok(())
+}
+
 #[tauri::command]
 pub async fn set_extension_sync_enabled(
   app_handle: tauri::AppHandle,

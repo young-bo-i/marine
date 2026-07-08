@@ -332,6 +332,11 @@
       "nameDesc": "이름 (Z→A)",
       "newest": "최신순",
       "oldest": "오래된순"
+    },
+    "sync": {
+      "pullNow": "서버에서 동기화",
+      "pullDone": "서버에서 최신 항목을 가져왔습니다",
+      "pullFailed": "동기화 가져오기 실패"
     }
   },
   "createProfile": {

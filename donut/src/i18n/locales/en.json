@@ -332,6 +332,11 @@
       "nameDesc": "Name (Z–A)",
       "newest": "Newest first",
       "oldest": "Oldest first"
+    },
+    "sync": {
+      "pullNow": "Sync from server",
+      "pullDone": "Pulled latest from server",
+      "pullFailed": "Sync pull failed"
     }
   },
   "createProfile": {

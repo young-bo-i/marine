@@ -18,7 +18,8 @@ pub use engine::{
   is_vpn_in_use_by_synced_profile, is_vpn_used_by_synced_profile, request_profile_sync,
   rollover_encryption_for_all_entities, set_extension_group_sync_enabled,
   set_extension_sync_enabled, set_group_sync_enabled, set_profile_sync_mode,
-  set_proxy_sync_enabled, set_vpn_sync_enabled, sync_profile, trigger_sync_for_profile, SyncEngine,
+  set_proxy_sync_enabled, set_vpn_sync_enabled, sync_now, sync_profile, trigger_sync_for_profile,
+  SyncEngine,
 };
 pub use manifest::{compute_diff, generate_manifest, HashCache, ManifestDiff, SyncManifest};
 pub use scheduler::{get_global_scheduler, set_global_scheduler, SyncScheduler};

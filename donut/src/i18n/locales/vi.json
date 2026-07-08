@@ -332,6 +332,11 @@
       "nameDesc": "Tên (Z–A)",
       "newest": "Mới nhất trước",
       "oldest": "Cũ nhất trước"
+    },
+    "sync": {
+      "pullNow": "Đồng bộ từ máy chủ",
+      "pullDone": "Đã lấy dữ liệu mới nhất từ máy chủ",
+      "pullFailed": "Không thể đồng bộ từ máy chủ"
     }
   },
   "createProfile": {

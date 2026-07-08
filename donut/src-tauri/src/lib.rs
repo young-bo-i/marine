@@ -110,7 +110,7 @@ use sync::{
   is_vpn_in_use_by_synced_profile, request_profile_sync, rollover_encryption_for_all_entities,
   set_e2e_password, set_extension_group_sync_enabled, set_extension_sync_enabled,
   set_group_sync_enabled, set_profile_sync_mode, set_proxy_sync_enabled, set_vpn_sync_enabled,
-  verify_e2e_password,
+  sync_now, verify_e2e_password,
 };
 
 use tag_manager::get_all_tags;
@@ -2388,6 +2388,7 @@ pub fn run() {
       set_profile_sync_mode,
       cancel_profile_sync,
       request_profile_sync,
+      sync_now,
       set_proxy_sync_enabled,
       set_group_sync_enabled,
       is_proxy_in_use_by_synced_profile,

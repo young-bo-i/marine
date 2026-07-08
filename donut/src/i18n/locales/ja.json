@@ -332,6 +332,11 @@
       "nameDesc": "名前 (Z→A)",
       "newest": "新しい順",
       "oldest": "古い順"
+    },
+    "sync": {
+      "pullNow": "サーバーから同期",
+      "pullDone": "サーバーから最新の同期を取得しました",
+      "pullFailed": "同期の取得に失敗しました"
     }
   },
   "createProfile": {
