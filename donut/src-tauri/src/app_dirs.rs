@@ -45,9 +45,9 @@ pub fn log_dir_override() -> Option<PathBuf> {
 
 pub fn app_name() -> &'static str {
   if cfg!(debug_assertions) {
-    "DonutBrowserDev"
+    "MarineDev"
   } else {
-    "DonutBrowser"
+    "Marine"
   }
 }
 
@@ -203,8 +203,8 @@ mod tests {
   fn test_app_name() {
     let name = app_name();
     assert!(
-      name == "DonutBrowser" || name == "DonutBrowserDev",
-      "app_name should be DonutBrowser or DonutBrowserDev, got: {name}"
+      name == "Marine" || name == "MarineDev",
+      "app_name should be Marine or MarineDev, got: {name}"
     );
   }
 

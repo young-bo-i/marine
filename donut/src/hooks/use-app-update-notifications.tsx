@@ -61,10 +61,19 @@ export function useAppUpdateNotifications() {
       // Always show manual check results, even if previously dismissed
       autoDownloadedVersion.current = null;
       setUpdateInfo(update);
+      // Give explicit feedback when already current — otherwise a manual check
+      // with no update available looks like nothing happened.
+      if (!update) {
+        showToast({
+          type: "success",
+          title: t("appUpdate.toast.upToDate"),
+          duration: 4000,
+        });
+      }
     } catch (error) {
       console.error("Failed to manually check for app updates:", error);
     }
-  }, [isClient]);
+  }, [isClient, t]);
 
   const handleAppUpdate = useCallback(
     async (appUpdateInfo: AppUpdateInfo) => {

@@ -86,6 +86,7 @@ interface SettingsDialogProps {
   isOpen: boolean;
   onClose: () => void;
   onIntegrationsOpen?: () => void;
+  onCheckForUpdates?: () => void;
   subPage?: boolean;
 }
 
@@ -93,6 +94,7 @@ export function SettingsDialog({
   isOpen,
   onClose,
   onIntegrationsOpen,
+  onCheckForUpdates,
   subPage,
 }: SettingsDialogProps) {
   const [settings, setSettings] = useState<AppSettings>({
@@ -949,9 +951,9 @@ export function SettingsDialog({
                 )}
 
                 <p className="text-xs text-muted-foreground">
-                  These permissions allow browsers launched from Donut Browser
-                  to access system resources. Each website will still ask for
-                  your permission individually.
+                  These permissions allow browsers launched from Marine to
+                  access system resources. Each website will still ask for your
+                  permission individually.
                 </p>
               </div>
             )}
@@ -1177,6 +1179,23 @@ export function SettingsDialog({
                 </div>
               )}
 
+              {onCheckForUpdates && (
+                <div className="flex items-center justify-between gap-x-3 rounded-lg border p-3">
+                  <Label className="text-sm font-medium">
+                    {t("settings.checkForUpdates")}
+                  </Label>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      onCheckForUpdates();
+                    }}
+                  >
+                    {t("settings.checkForUpdates")}
+                  </Button>
+                </div>
+              )}
+
               <div className="flex items-start gap-x-3 rounded-lg border p-3">
                 <Checkbox
                   id="keep-decrypted-profiles-in-ram"
@@ -1257,7 +1276,7 @@ export function SettingsDialog({
             {systemInfo && (
               <div className="border-t pt-2">
                 <p className="font-mono text-xs whitespace-pre-line text-muted-foreground select-all">
-                  {`Donut Browser ${systemInfo.app_version}\n${systemInfo.os} ${systemInfo.arch}${systemInfo.portable ? " (portable)" : ""}`}
+                  {`Marine ${systemInfo.app_version}\n${systemInfo.os} ${systemInfo.arch}${systemInfo.portable ? " (portable)" : ""}`}
                 </p>
               </div>
             )}

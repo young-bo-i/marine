@@ -3,21 +3,21 @@
 <plist version="1.0">
 <dict>
 	<key>NSCameraUsageDescription</key>
-	<string>Donut needs camera access to enable camera functionality in web browsers. Each website will still ask for your permission individually.</string>
+	<string>Marine needs camera access to enable camera functionality in web browsers. Each website will still ask for your permission individually.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Donut needs microphone access to enable microphone functionality in web browsers. Each website will still ask for your permission individually.</string>
+	<string>Marine needs microphone access to enable microphone functionality in web browsers. Each website will still ask for your permission individually.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Donut has proxy functionality that requires local network access. You can deny this functionality if you don't plan on setting proxies for browser profiles.</string>
+	<string>Marine has proxy functionality that requires local network access. You can deny this functionality if you don't plan on setting proxies for browser profiles.</string>
 	<key>CFBundleDisplayName</key>
-	<string>Donut</string>
+	<string>Marine</string>
 	<key>CFBundleName</key>
-	<string>Donut</string>
+	<string>Marine</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.donutbrowser</string>
+	<string>com.marine.app</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
     <key>CFBundleURLName</key>
-    <string>com.donutbrowser</string>
+    <string>com.marine.app</string>
 	<key>CFBundleExecutable</key>
 	<string>donutbrowser</string>
 	<key>CFBundleVersion</key>
@@ -27,7 +27,7 @@
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.productivity</string>
 	<key>NSHumanReadableCopyright</key>
-	<string>Copyright © 2025 Donut</string>
+	<string>© 2025 Marine · Based on Donut Browser (AGPL-3.0)</string>
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<dict>
@@ -57,4 +57,4 @@
 		</dict>
 	</array>
 </dict>
-</plist> 
+</plist>

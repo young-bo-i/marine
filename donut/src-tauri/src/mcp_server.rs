@@ -1584,7 +1584,7 @@ impl McpServer {
         "name": SERVER_NAME,
         "version": SERVER_VERSION,
       },
-      "instructions": "Donut Browser MCP server. Use tools/list to discover available browser automation tools."
+      "instructions": "Marine MCP server. Use tools/list to discover available browser automation tools."
     });
 
     log::info!("[mcp] New session initialized: {}", session_id);

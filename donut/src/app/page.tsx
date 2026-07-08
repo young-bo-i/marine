@@ -616,7 +616,7 @@ export default function Home() {
   const updateNotifications = useUpdateNotifications();
   const { checkForUpdates, isUpdating } = updateNotifications;
 
-  useAppUpdateNotifications();
+  const { checkForAppUpdatesManual } = useAppUpdateNotifications();
 
   // Check for startup URLs but only process them once
   const [hasCheckedStartupUrl, setHasCheckedStartupUrl] = useState(false);
@@ -1712,6 +1712,7 @@ export default function Home() {
                 setIntegrationsDialogOpen(true);
                 setCurrentPage("integrations");
               }}
+              onCheckForUpdates={checkForAppUpdatesManual}
               subPage={currentPage === "settings"}
             />
           )}

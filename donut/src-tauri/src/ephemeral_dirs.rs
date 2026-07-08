@@ -47,7 +47,7 @@ fn get_ephemeral_base_dir() -> Result<PathBuf, String> {
 
 #[cfg(target_os = "macos")]
 fn get_or_create_macos_ramdisk() -> Result<PathBuf, String> {
-  let mount_point = PathBuf::from("/Volumes/DonutEphemeral");
+  let mount_point = PathBuf::from("/Volumes/MarineEphemeral");
 
   // Reuse existing RAM disk from a previous session
   if mount_point.exists() && mount_point.is_dir() {
@@ -71,7 +71,7 @@ fn get_or_create_macos_ramdisk() -> Result<PathBuf, String> {
   let dev = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
   let fmt = std::process::Command::new("diskutil")
-    .args(["erasevolume", "HFS+", "DonutEphemeral", &dev])
+    .args(["erasevolume", "HFS+", "MarineEphemeral", &dev])
     .output()
     .map_err(|e| format!("diskutil erasevolume failed: {e}"))?;
 
@@ -93,7 +93,7 @@ fn get_or_create_macos_ramdisk() -> Result<PathBuf, String> {
 fn get_or_create_windows_ramdisk() -> Result<PathBuf, String> {
   // Check if a previous RAM disk with our directory already exists
   for letter in ['R', 'Q', 'P', 'O'] {
-    let base = PathBuf::from(format!("{}:\\DonutEphemeral", letter));
+    let base = PathBuf::from(format!("{}:\\MarineEphemeral", letter));
     if base.exists() && base.is_dir() {
       return Ok(base);
     }
@@ -112,7 +112,7 @@ fn get_or_create_windows_ramdisk() -> Result<PathBuf, String> {
 
     match output {
       Ok(out) if out.status.success() => {
-        let base = PathBuf::from(format!("{}\\DonutEphemeral", drive));
+        let base = PathBuf::from(format!("{}\\MarineEphemeral", drive));
         std::fs::create_dir_all(&base)
           .map_err(|e| format!("Failed to create dir on RAM disk: {e}"))?;
         log::info!("Created Windows RAM disk at {}", base.display());

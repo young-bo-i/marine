@@ -133,12 +133,12 @@
       "title": "Default Browser",
       "setAsDefault": "Set as Default Browser",
       "alreadyDefault": "Already Default Browser",
-      "description": "When set as default, Donut Browser will handle web links and allow you to choose which profile to use."
+      "description": "When set as default, Marine will handle web links and allow you to choose which profile to use."
     },
     "permissions": {
       "title": "System Permissions",
       "loading": "Loading permissions...",
-      "description": "These permissions allow browsers launched from Donut Browser to access system resources. Each website will still ask for your permission individually.",
+      "description": "These permissions allow browsers launched from Marine to access system resources. Each website will still ask for your permission individually.",
       "microphone": "Microphone",
       "microphoneDescription": "Access to microphone for browser applications",
       "camera": "Camera",
@@ -182,7 +182,7 @@
       "trialExpired": "Trial expired",
       "trialExpiredDescription": "Personal use remains free. Commercial use requires a license.",
       "subscriptionActive": "Subscribed — {{plan}} plan",
-      "subscriptionActiveDescription": "Your Donut Browser subscription is active. Commercial use is licensed for the duration of your plan."
+      "subscriptionActiveDescription": "Your Marine subscription is active. Commercial use is licensed for the duration of your plan."
     },
     "advanced": {
       "title": "Advanced",
@@ -195,9 +195,10 @@
       "copyLogsDescription": "Bundles the most recent log files (up to 5 MB) into your clipboard for sharing in bug reports."
     },
     "disableAutoUpdates": "Disable App Auto Updates",
-    "disableAutoUpdatesDescription": "Prevent the app from automatically checking and installing Donut Browser updates. Browser updates are not affected.",
+    "disableAutoUpdatesDescription": "Prevent the app from automatically checking and installing Marine updates. Browser updates are not affected.",
     "keepDecryptedProfilesInRam": "Keep Decrypted Profiles In RAM",
-    "keepDecryptedProfilesInRamDescription": "Preserve the decrypted in-RAM copy of password-protected profiles between launches for faster startup. The on-disk copy stays encrypted regardless."
+    "keepDecryptedProfilesInRamDescription": "Preserve the decrypted in-RAM copy of password-protected profiles between launches for faster startup. The on-disk copy stays encrypted regardless.",
+    "checkForUpdates": "Check for Updates"
   },
   "header": {
     "searchPlaceholder": "Search profiles...",
@@ -214,7 +215,7 @@
       "extensions": "Extensions"
     },
     "newProfile": "New",
-    "donutLogo": "Donut Browser logo",
+    "donutLogo": "Marine logo",
     "scrollGroupsLeft": "Scroll groups left",
     "scrollGroupsRight": "Scroll groups right"
   },
@@ -1186,7 +1187,7 @@
     "launchHook": {
       "title": "Launch Hook URL",
       "label": "Launch Hook URL",
-      "description": "Donut Browser will send a GET request to this URL whenever the profile is launched.",
+      "description": "Marine will send a GET request to this URL whenever the profile is launched.",
       "placeholder": "https://example.com/hooks/profile-launch",
       "invalidUrlHint": "Enter a valid http:// or https:// URL."
     },
@@ -1586,7 +1587,7 @@
   },
   "wayfernTerms": {
     "title": "Wayfern Terms and Conditions",
-    "description": "Before using Donut Browser, you must read and agree to Wayfern's Terms and Conditions.",
+    "description": "Before using Marine, you must read and agree to Wayfern's Terms and Conditions.",
     "reviewLabel": "Please review the Terms and Conditions at:",
     "agreeNotice": "By clicking \"I Accept\", you agree to be bound by these terms.",
     "acceptButton": "I Accept",
@@ -1597,7 +1598,7 @@
   "commercialTrial": {
     "title": "Commercial Trial Expired",
     "description": "Your 2-week commercial trial period has ended.",
-    "body": "If you are using Donut Browser for business purposes, you need to purchase a commercial license to continue. You can still use it for personal use for free.",
+    "body": "If you are using Marine for business purposes, you need to purchase a commercial license to continue. You can still use it for personal use for free.",
     "understandButton": "I Understand",
     "failed": "Failed to save acknowledgment",
     "tryAgain": "Please try again"
@@ -1605,10 +1606,10 @@
   "permissionDialog": {
     "titleMicrophone": "Microphone Access Required",
     "titleCamera": "Camera Access Required",
-    "descMicrophone": "Donut Browser needs access to your microphone to enable microphone functionality in web browsers. Each website that wants to use your microphone will still ask for your permission individually.",
-    "descCamera": "Donut Browser needs access to your camera to enable camera functionality in web browsers. Each website that wants to use your camera will still ask for your permission individually.",
-    "grantedMicrophone": "Permission granted! Browsers launched from Donut Browser can now access your microphone.",
-    "grantedCamera": "Permission granted! Browsers launched from Donut Browser can now access your camera.",
+    "descMicrophone": "Marine needs access to your microphone to enable microphone functionality in web browsers. Each website that wants to use your microphone will still ask for your permission individually.",
+    "descCamera": "Marine needs access to your camera to enable camera functionality in web browsers. Each website that wants to use your camera will still ask for your permission individually.",
+    "grantedMicrophone": "Permission granted! Browsers launched from Marine can now access your microphone.",
+    "grantedCamera": "Permission granted! Browsers launched from Marine can now access your camera.",
     "notGrantedMicrophone": "Permission not granted. Click the button below to request access to your microphone.",
     "notGrantedCamera": "Permission not granted. Click the button below to request access to your camera.",
     "doneButton": "Done",
@@ -1721,7 +1722,7 @@
   },
   "appUpdate": {
     "toast": {
-      "updateFailed": "Failed to update Donut Browser",
+      "updateFailed": "Failed to update Marine",
       "restartFailed": "Failed to restart",
       "updateReady": "Update ready, restart to apply",
       "manualDownloadRequired": "Manual download required",
@@ -1730,7 +1731,8 @@
       "later": "Later",
       "uploading": "Uploading",
       "downloading": "Downloading",
-      "startingUpdate": "Starting update..."
+      "startingUpdate": "Starting update...",
+      "upToDate": "You're on the latest version"
     }
   },
   "browserDownload": {
@@ -1814,7 +1816,7 @@
     },
     "warnings": {
       "forgetWarningTitle": "Important: this password is not recoverable",
-      "forgetWarningBody": "Donut Browser cannot reset, recover, or bypass this password. If you forget it, you will permanently lose access to this profile's data."
+      "forgetWarningBody": "Marine cannot reset, recover, or bypass this password. If you forget it, you will permanently lose access to this profile's data."
     },
     "modes": {
       "set": "Set",
@@ -1859,7 +1861,7 @@
     "invalidLaunchHookUrl": "Invalid launch hook URL. Use a full http:// or https:// URL.",
     "cookieDbLocked": "Could not read cookies — the database is locked. Close the browser and try again.",
     "cookieDbUnavailable": "Could not read cookies — the cookie store is unavailable.",
-    "selfHostedRequiresLogout": "Sign out of your Donut account before configuring a self-hosted server.",
+    "selfHostedRequiresLogout": "Sign out of your Marine account before configuring a self-hosted server.",
     "fingerprintRequiresPro": "Viewing or editing the fingerprint requires an active paid plan. Protection is included on all plans.",
     "proxyNotWorking": "The selected proxy isn't working, so the profile wasn't created.",
     "proxyPaymentRequired": "The selected proxy requires payment (402) — its subscription may have expired — so the profile wasn't created.",
@@ -1952,8 +1954,8 @@
     },
     "selfHosted": {
       "title": "Self-hosted sync server",
-      "description": "Point Donut at your own donut-sync server to sync profiles, proxies, groups, and extensions without using the hosted cloud.",
-      "disabledWhileLoggedIn": "Self-hosted sync is unavailable while you're signed into your Donut account. Sign out to use a custom server.",
+      "description": "Point Marine at your own donut-sync server to sync profiles, proxies, groups, and extensions without using the hosted cloud.",
+      "disabledWhileLoggedIn": "Self-hosted sync is unavailable while you're signed into your Marine account. Sign out to use a custom server.",
       "connectionStatus": "Connection:",
       "statusUnknown": "Untested",
       "testConnection": "Test connection",
@@ -1995,13 +1997,13 @@
     "goSettings": "Go to Settings"
   },
   "closeConfirm": {
-    "title": "Close Donut Browser?",
+    "title": "Close Marine?",
     "description": "Would you like to send the app to the system tray or quit?",
     "minimize": "Minimize to Tray",
     "quit": "Quit"
   },
   "tray": {
-    "show": "Show Donut Browser",
+    "show": "Show Marine",
     "quit": "Quit"
   },
   "browserSupport": {
@@ -2026,13 +2028,13 @@
       "finish": "Finish"
     },
     "thankYou": {
-      "title": "Thank you for choosing Donut Browser",
+      "title": "Thank you for choosing Marine",
       "body": "Hopefully it helps make your browsing more private — every identity kept its own, and nothing leaving your machine. Enjoy.",
       "cta": "Start browsing"
     }
   },
   "welcome": {
-    "title": "Welcome to Donut Browser",
+    "title": "Welcome to Marine",
     "tagline": "An open-source anti-detect browser for managing many identities at once.",
     "skip": "Skip",
     "next": "Next",
@@ -2076,7 +2078,7 @@
     },
     "license": {
       "title": "Licensing",
-      "body": "Donut Browser is open source and free to use.",
+      "body": "Marine is open source and free to use.",
       "agree": "I understand",
       "personalTitle": "Personal use",
       "personalDesc": "Free forever.",

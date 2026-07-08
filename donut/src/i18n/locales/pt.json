@@ -133,12 +133,12 @@
       "title": "Navegador Padrão",
       "setAsDefault": "Definir como Navegador Padrão",
       "alreadyDefault": "Já é o Navegador Padrão",
-      "description": "Quando definido como padrão, o Donut Browser lidará com links da web e permitirá que você escolha qual perfil usar."
+      "description": "Quando definido como padrão, o Marine lidará com links da web e permitirá que você escolha qual perfil usar."
     },
     "permissions": {
       "title": "Permissões do Sistema",
       "loading": "Carregando permissões...",
-      "description": "Essas permissões permitem que navegadores iniciados pelo Donut Browser acessem recursos do sistema. Cada site ainda pedirá sua permissão individualmente.",
+      "description": "Essas permissões permitem que navegadores iniciados pelo Marine acessem recursos do sistema. Cada site ainda pedirá sua permissão individualmente.",
       "microphone": "Microfone",
       "microphoneDescription": "Acesso ao microfone para aplicativos do navegador",
       "camera": "Câmera",
@@ -182,7 +182,7 @@
       "trialExpired": "Teste expirado",
       "trialExpiredDescription": "O uso pessoal continua gratuito. O uso comercial requer uma licença.",
       "subscriptionActive": "Assinado — plano {{plan}}",
-      "subscriptionActiveDescription": "Sua assinatura do Donut Browser está ativa. O uso comercial está licenciado enquanto seu plano estiver vigente."
+      "subscriptionActiveDescription": "Sua assinatura do Marine está ativa. O uso comercial está licenciado enquanto seu plano estiver vigente."
     },
     "advanced": {
       "title": "Avançado",
@@ -195,9 +195,10 @@
       "copyLogsDescription": "Junta os arquivos de log mais recentes (até 5 MB) na sua área de transferência para compartilhar em relatórios de bug."
     },
     "disableAutoUpdates": "Desativar Atualizações Automáticas do App",
-    "disableAutoUpdatesDescription": "Impede que o aplicativo verifique e instale atualizações do Donut Browser automaticamente. As atualizações de navegadores não são afetadas.",
+    "disableAutoUpdatesDescription": "Impede que o aplicativo verifique e instale atualizações do Marine automaticamente. As atualizações de navegadores não são afetadas.",
     "keepDecryptedProfilesInRam": "Manter Perfis Descriptografados na RAM",
-    "keepDecryptedProfilesInRamDescription": "Preserva a cópia descriptografada na RAM dos perfis protegidos por senha entre execuções para um início mais rápido. A cópia em disco permanece criptografada em qualquer caso."
+    "keepDecryptedProfilesInRamDescription": "Preserva a cópia descriptografada na RAM dos perfis protegidos por senha entre execuções para um início mais rápido. A cópia em disco permanece criptografada em qualquer caso.",
+    "checkForUpdates": "Verificar atualizações"
   },
   "header": {
     "searchPlaceholder": "Pesquisar perfis...",
@@ -214,7 +215,7 @@
       "extensions": "Extensões"
     },
     "newProfile": "Novo",
-    "donutLogo": "Logotipo do Donut Browser",
+    "donutLogo": "Logotipo do Marine",
     "scrollGroupsLeft": "Rolar grupos para a esquerda",
     "scrollGroupsRight": "Rolar grupos para a direita"
   },
@@ -1186,7 +1187,7 @@
     "launchHook": {
       "title": "URL do hook de inicialização",
       "label": "URL do hook de inicialização",
-      "description": "O Donut Browser enviará uma requisição GET para esta URL toda vez que o perfil for iniciado.",
+      "description": "O Marine enviará uma requisição GET para esta URL toda vez que o perfil for iniciado.",
       "placeholder": "https://example.com/hooks/profile-launch",
       "invalidUrlHint": "Insira uma URL válida http:// ou https://."
     },
@@ -1586,7 +1587,7 @@
   },
   "wayfernTerms": {
     "title": "Termos e condições da Wayfern",
-    "description": "Antes de usar o Donut Browser, você deve ler e concordar com os Termos e Condições da Wayfern.",
+    "description": "Antes de usar o Marine, você deve ler e concordar com os Termos e Condições da Wayfern.",
     "reviewLabel": "Por favor, revise os Termos e Condições em:",
     "agreeNotice": "Ao clicar em \"Aceito\", você concorda em ficar vinculado a esses termos.",
     "acceptButton": "Aceito",
@@ -1597,7 +1598,7 @@
   "commercialTrial": {
     "title": "Período de teste comercial expirado",
     "description": "Seu período de teste comercial de 2 semanas terminou.",
-    "body": "Se você está usando o Donut Browser para fins comerciais, precisa adquirir uma licença comercial para continuar. Você ainda pode usá-lo gratuitamente para uso pessoal.",
+    "body": "Se você está usando o Marine para fins comerciais, precisa adquirir uma licença comercial para continuar. Você ainda pode usá-lo gratuitamente para uso pessoal.",
     "understandButton": "Entendi",
     "failed": "Falha ao salvar a confirmação",
     "tryAgain": "Tente novamente"
@@ -1605,10 +1606,10 @@
   "permissionDialog": {
     "titleMicrophone": "Acesso ao microfone necessário",
     "titleCamera": "Acesso à câmera necessário",
-    "descMicrophone": "O Donut Browser precisa acessar seu microfone para habilitar a funcionalidade de microfone nos navegadores. Cada site que quiser usar seu microfone ainda pedirá sua permissão individualmente.",
-    "descCamera": "O Donut Browser precisa acessar sua câmera para habilitar a funcionalidade de câmera nos navegadores. Cada site que quiser usar sua câmera ainda pedirá sua permissão individualmente.",
-    "grantedMicrophone": "Permissão concedida! Os navegadores abertos pelo Donut Browser agora podem acessar seu microfone.",
-    "grantedCamera": "Permissão concedida! Os navegadores abertos pelo Donut Browser agora podem acessar sua câmera.",
+    "descMicrophone": "O Marine precisa acessar seu microfone para habilitar a funcionalidade de microfone nos navegadores. Cada site que quiser usar seu microfone ainda pedirá sua permissão individualmente.",
+    "descCamera": "O Marine precisa acessar sua câmera para habilitar a funcionalidade de câmera nos navegadores. Cada site que quiser usar sua câmera ainda pedirá sua permissão individualmente.",
+    "grantedMicrophone": "Permissão concedida! Os navegadores abertos pelo Marine agora podem acessar seu microfone.",
+    "grantedCamera": "Permissão concedida! Os navegadores abertos pelo Marine agora podem acessar sua câmera.",
     "notGrantedMicrophone": "Permissão não concedida. Clique no botão abaixo para solicitar acesso ao seu microfone.",
     "notGrantedCamera": "Permissão não concedida. Clique no botão abaixo para solicitar acesso à sua câmera.",
     "doneButton": "Concluído",
@@ -1721,7 +1722,7 @@
   },
   "appUpdate": {
     "toast": {
-      "updateFailed": "Falha ao atualizar o Donut Browser",
+      "updateFailed": "Falha ao atualizar o Marine",
       "restartFailed": "Falha ao reiniciar",
       "updateReady": "Atualização pronta, reinicie para aplicar",
       "manualDownloadRequired": "Download manual necessário",
@@ -1730,7 +1731,8 @@
       "later": "Mais tarde",
       "uploading": "Enviando",
       "downloading": "Baixando",
-      "startingUpdate": "Iniciando atualização..."
+      "startingUpdate": "Iniciando atualização...",
+      "upToDate": "Você está na versão mais recente"
     }
   },
   "browserDownload": {
@@ -1814,7 +1816,7 @@
     },
     "warnings": {
       "forgetWarningTitle": "Importante: esta senha não pode ser recuperada",
-      "forgetWarningBody": "O Donut Browser não pode redefinir, recuperar ou contornar esta senha. Se você esquecê-la, perderá permanentemente o acesso aos dados deste perfil."
+      "forgetWarningBody": "O Marine não pode redefinir, recuperar ou contornar esta senha. Se você esquecê-la, perderá permanentemente o acesso aos dados deste perfil."
     },
     "modes": {
       "set": "Definir",
@@ -1859,7 +1861,7 @@
     "invalidLaunchHookUrl": "URL do hook de inicialização inválida. Use uma URL completa http:// ou https://.",
     "cookieDbLocked": "Não foi possível ler os cookies — o banco de dados está bloqueado. Feche o navegador e tente novamente.",
     "cookieDbUnavailable": "Não foi possível ler os cookies — o repositório de cookies está indisponível.",
-    "selfHostedRequiresLogout": "Saia da sua conta Donut antes de configurar um servidor auto-hospedado.",
+    "selfHostedRequiresLogout": "Saia da sua conta Marine antes de configurar um servidor auto-hospedado.",
     "fingerprintRequiresPro": "Visualizar ou editar a impressão digital requer um plano pago ativo. A proteção está incluída em todos os planos.",
     "proxyNotWorking": "O proxy selecionado não está funcionando, então o perfil não foi criado.",
     "proxyPaymentRequired": "O proxy selecionado exige pagamento (402) — sua assinatura pode ter expirado — então o perfil não foi criado.",
@@ -1952,8 +1954,8 @@
     },
     "selfHosted": {
       "title": "Servidor de sincronização auto-hospedado",
-      "description": "Conecte o Donut ao seu próprio servidor donut-sync para sincronizar perfis, proxies, grupos e extensões sem usar a nuvem hospedada.",
-      "disabledWhileLoggedIn": "A sincronização auto-hospedada não está disponível enquanto você está conectado à sua conta Donut. Saia para usar um servidor personalizado.",
+      "description": "Conecte o Marine ao seu próprio servidor donut-sync para sincronizar perfis, proxies, grupos e extensões sem usar a nuvem hospedada.",
+      "disabledWhileLoggedIn": "A sincronização auto-hospedada não está disponível enquanto você está conectado à sua conta Marine. Saia para usar um servidor personalizado.",
       "connectionStatus": "Conexão:",
       "statusUnknown": "Não testado",
       "testConnection": "Testar conexão",
@@ -1995,13 +1997,13 @@
     "goSettings": "Ir para Configurações"
   },
   "closeConfirm": {
-    "title": "Fechar Donut Browser?",
+    "title": "Fechar Marine?",
     "description": "Você deseja enviar o aplicativo para a bandeja do sistema ou sair?",
     "minimize": "Minimizar para a bandeja",
     "quit": "Sair"
   },
   "tray": {
-    "show": "Mostrar Donut Browser",
+    "show": "Mostrar Marine",
     "quit": "Sair"
   },
   "browserSupport": {
@@ -2026,13 +2028,13 @@
       "finish": "Concluir"
     },
     "thankYou": {
-      "title": "Obrigado por escolher o Donut Browser",
+      "title": "Obrigado por escolher o Marine",
       "body": "Com sorte, deixará sua navegação mais privada: cada identidade separada e nada saindo do seu dispositivo. Boa navegação!",
       "cta": "Começar a navegar"
     }
   },
   "welcome": {
-    "title": "Boas-vindas ao Donut Browser",
+    "title": "Boas-vindas ao Marine",
     "tagline": "Um navegador anti-detecção de código aberto para gerenciar várias identidades ao mesmo tempo.",
     "skip": "Pular",
     "next": "Próximo",
@@ -2076,7 +2078,7 @@
     },
     "license": {
       "title": "Licenciamento",
-      "body": "O Donut Browser é de código aberto e gratuito.",
+      "body": "O Marine é de código aberto e gratuito.",
       "agree": "Entendi",
       "personalTitle": "Uso pessoal",
       "personalDesc": "Gratuito para sempre.",
