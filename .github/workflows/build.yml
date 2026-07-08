@@ -19,9 +19,11 @@ jobs:
           - os: macos-latest # Apple Silicon (arm64)
             artifact: macos-arm64
             bundles: app,dmg
+            shell: bash
           - os: windows-latest
             artifact: windows-x64
             bundles: nsis
+            shell: pwsh # PowerShell 7 — supports && (5.1 does not)
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -57,8 +59,21 @@ jobs:
       # tauri build 会自动：copy-proxy-binary（首缺时会 cargo build --bin donut-proxy）
       # + next build（beforeBuildCommand）。DONUT_BROWSER_VAULT_PASSWORD 有 build.rs 默认值，无需注入。
       # 未配 Apple/Windows 签名 → 产物为未签名/ad-hoc（内部测试可用，见下）。
+      #
+      # 用重试包裹：依赖 playwright-rust 的 build.rs 会从 playwright.azureedge.net
+      # （正被微软退役、偶发断流）下载 ~41MB 驱动，release 构建不走缓存、无重试，断流即
+      # panic（hyper IncompleteBody）——本次 macOS 就是这样挂的，Windows 只是运气好。
+      # cargo 会重跑“失败的 build script”，所以重试只重下驱动、复用已编译产物，代价很小。
+      # shell 按 OS 取：Windows PowerShell 5.1 不支持 && ，故显式用 pwsh(7)/bash。
       - name: Build Tauri app
-        run: pnpm tauri build --bundles ${{ matrix.bundles }}
+        uses: nick-fields/retry@v3
+        with:
+          max_attempts: 4
+          retry_wait_seconds: 30
+          retry_on: error
+          timeout_minutes: 90
+          shell: ${{ matrix.shell }}
+          command: cd donut && pnpm tauri build --bundles ${{ matrix.bundles }}
 
       - name: Collect artifacts
         uses: actions/upload-artifact@v4
