@@ -30,6 +30,14 @@ jobs:
     # tag via GITHUB_REF_NAME) instead of looking for nightly-* tags.
     env:
       STABLE_RELEASE: "1"
+      # sccache caches individual compilation units by content hash, so
+      # dependency object files are reused across builds even when our crate
+      # version changes every release (which busts the target-dir cache).
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      # sccache is a no-op with incremental compilation; make the release
+      # profile's (already-off) incremental setting explicit + future-proof.
+      CARGO_INCREMENTAL: "0"
     defaults:
       run:
         working-directory: donut
@@ -53,13 +61,28 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: donut/src-tauri -> target
 
+      - name: Cache Next.js build
+        uses: actions/cache@v4
+        with:
+          path: donut/.next/cache
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('donut/pnpm-lock.yaml') }}-${{ hashFiles('donut/src/**') }}
+          restore-keys: |
+            ${{ runner.os }}-nextjs-${{ hashFiles('donut/pnpm-lock.yaml') }}-
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # On a v* tag, force app version = tag so filename / About / updater agree.
+      - name: Sync version to tag
+        run: node scripts/ci-set-version.mjs
 
       # tauri build 会自动：copy-proxy-binary（首缺时会 cargo build --bin donut-proxy）
       # + next build（beforeBuildCommand）。DONUT_BROWSER_VAULT_PASSWORD 有 build.rs 默认值，无需注入。

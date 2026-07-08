@@ -1,6 +1,6 @@
 [package]
 name = "donutbrowser"
-version = "0.1.5"
+version = "0.1.7"
 description = "Simple Yet Powerful Anti-Detect Browser"
 authors = ["zhom@github"]
 edition = "2021"
@@ -169,10 +169,14 @@ opt-level = 0
 # Split debuginfo on macOS for faster linking (ignored on other platforms)
 split-debuginfo = "unpacked"
 
+# Tuned for FAST CI/tester builds, not a maximally-shrunk binary: lto=false drops
+# the serial (uncacheable) link-time pass, codegen-units=16 parallelizes codegen.
+# For a public "distribution" release, build with a stricter profile (lto=true,
+# codegen-units=1) — the runtime difference is negligible for a browser-launcher shell.
 [profile.release]
-codegen-units = 1
+codegen-units = 16
 opt-level = 3
-lto = "thin"
+lto = false
 # Split debuginfo on macOS for faster linking (ignored on other platforms)
 split-debuginfo = "unpacked"
 
