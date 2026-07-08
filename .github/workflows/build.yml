@@ -30,14 +30,6 @@ jobs:
     # tag via GITHUB_REF_NAME) instead of looking for nightly-* tags.
     env:
       STABLE_RELEASE: "1"
-      # sccache caches individual compilation units by content hash, so
-      # dependency object files are reused across builds even when our crate
-      # version changes every release (which busts the target-dir cache).
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
-      # sccache is a no-op with incremental compilation; make the release
-      # profile's (already-off) incremental setting explicit + future-proof.
-      CARGO_INCREMENTAL: "0"
     defaults:
       run:
         working-directory: donut
@@ -60,9 +52,6 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
