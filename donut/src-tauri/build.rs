@@ -35,6 +35,15 @@ fn main() {
     println!("cargo:rustc-env=BUILD_VERSION=dev-{version}");
   }
 
+  // BUILD_VERSION is derived from these env vars. Without rerun-if-env-changed the
+  // build script output (and thus BUILD_VERSION) is cached across builds by
+  // rust-cache — so a new tagged release could bake in the PREVIOUS version and the
+  // auto-updater would never see itself as up to date. Declare the deps explicitly.
+  println!("cargo:rerun-if-env-changed=BUILD_TAG");
+  println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
+  println!("cargo:rerun-if-env-changed=STABLE_RELEASE");
+  println!("cargo:rerun-if-env-changed=GITHUB_SHA");
+
   // Inject vault password at build time
   if let Ok(vault_password) = std::env::var("DONUT_BROWSER_VAULT_PASSWORD") {
     println!("cargo:rustc-env=DONUT_BROWSER_VAULT_PASSWORD={vault_password}");

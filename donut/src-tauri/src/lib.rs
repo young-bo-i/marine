@@ -101,7 +101,7 @@ use settings_manager::{
   complete_onboarding, dismiss_window_resize_warning, get_app_settings, get_onboarding_completed,
   get_sync_settings, get_system_info, get_system_language, get_table_sorting_settings,
   get_window_resize_warning_dismissed, open_log_directory, read_log_files, save_app_settings,
-  save_sync_settings, save_table_sorting_settings,
+  save_sync_settings, save_table_sorting_settings, test_sync_connection,
 };
 
 use sync::{
@@ -1864,14 +1864,15 @@ pub fn run() {
       });
 
       tauri::async_runtime::spawn(async move {
-        let updater = app_auto_updater::AppAutoUpdater::instance();
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3 * 60 * 60));
 
         loop {
           interval.tick().await;
 
           log::info!("Checking for app updates...");
-          match updater.check_for_updates().await {
+          // Go through the command fn (not the updater directly) so the 3h
+          // background check honors portable mode + the disable_auto_updates setting.
+          match app_auto_updater::check_for_app_updates().await {
             Ok(Some(update_info)) => {
               log::info!(
                 "App update available: {} -> {}",
@@ -2383,6 +2384,7 @@ pub fn run() {
       get_traffic_stats_for_period,
       get_sync_settings,
       save_sync_settings,
+      test_sync_connection,
       set_profile_sync_mode,
       cancel_profile_sync,
       request_profile_sync,

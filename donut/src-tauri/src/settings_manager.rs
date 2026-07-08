@@ -1021,6 +1021,30 @@ pub async fn save_sync_settings(
   })
 }
 
+/// Ping a self-hosted sync server's `/health` from Rust (reqwest), NOT the webview.
+/// The frontend can't `fetch()` an `http://` URL from the secure `tauri://` origin
+/// (blocked as insecure/mixed-content), so the in-webview test always failed even
+/// when the server was reachable. Real sync already goes through reqwest here, so
+/// routing the test through Rust makes it accurate and unblocks plain-HTTP servers.
+#[tauri::command]
+pub async fn test_sync_connection(url: String) -> Result<bool, String> {
+  let base = url.trim().trim_end_matches('/');
+  if base.is_empty() {
+    return Err("empty url".to_string());
+  }
+  let health = format!("{base}/health");
+  let client = reqwest::Client::builder()
+    .timeout(std::time::Duration::from_secs(10))
+    .build()
+    .map_err(|e| e.to_string())?;
+  let resp = client
+    .get(&health)
+    .send()
+    .await
+    .map_err(|e| e.to_string())?;
+  Ok(resp.status().is_success())
+}
+
 #[tauri::command]
 pub async fn dismiss_window_resize_warning() -> Result<(), String> {
   let manager = SettingsManager::instance();

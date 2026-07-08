@@ -25,6 +25,11 @@ jobs:
             bundles: nsis
             shell: pwsh # PowerShell 7 — supports && (5.1 does not)
     runs-on: ${{ matrix.os }}
+    # STABLE_RELEASE flips the app out of "nightly" update mode so the in-app
+    # auto-updater compares semver against our v* GitHub releases (built from the
+    # tag via GITHUB_REF_NAME) instead of looking for nightly-* tags.
+    env:
+      STABLE_RELEASE: "1"
     defaults:
       run:
         working-directory: donut

@@ -87,12 +87,15 @@ export function SyncConfigDialog({
   >("unknown");
   const hasConfig = Boolean(serverUrl && token);
 
+  // Route the health check through Rust (reqwest), not a webview fetch(): the
+  // secure tauri:// origin blocks fetch() to an http:// server as mixed-content,
+  // which made the test fail even when the server was reachable. Real sync uses
+  // the same reqwest transport, so this test now matches actual sync behavior.
   const testConnection = useCallback(async (url: string) => {
     setConnectionStatus("testing");
     try {
-      const healthUrl = `${url.replace(/\/$/, "")}/health`;
-      const response = await fetch(healthUrl);
-      setConnectionStatus(response.ok ? "connected" : "error");
+      const ok = await invoke<boolean>("test_sync_connection", { url });
+      setConnectionStatus(ok ? "connected" : "error");
     } catch {
       setConnectionStatus("error");
     }
@@ -102,7 +105,9 @@ export function SyncConfigDialog({
     setIsLoading(true);
     try {
       const settings = await invoke<SyncSettings>("get_sync_settings");
-      setServerUrl(settings.sync_server_url ?? DEFAULT_SELF_HOSTED_URL);
+      // `||` (not `??`) so an empty/blank saved value also falls back to the
+      // Marine default — a fresh install has no URL and should show it prefilled.
+      setServerUrl(settings.sync_server_url || DEFAULT_SELF_HOSTED_URL);
       setToken(settings.sync_token ?? "");
       if (settings.sync_server_url && settings.sync_token) {
         void testConnection(settings.sync_server_url);
@@ -147,9 +152,10 @@ export function SyncConfigDialog({
     setIsTesting(true);
     setConnectionStatus("testing");
     try {
-      const healthUrl = `${serverUrl.replace(/\/$/, "")}/health`;
-      const response = await fetch(healthUrl);
-      if (response.ok) {
+      const ok = await invoke<boolean>("test_sync_connection", {
+        url: serverUrl,
+      });
+      if (ok) {
         setConnectionStatus("connected");
         showSuccessToast(t("sync.config.connectionSuccess"));
       } else {

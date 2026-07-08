@@ -92,9 +92,16 @@ pub struct AppReleaseAsset {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppRelease {
   pub tag_name: String,
-  pub name: String,
-  pub body: String,
-  pub published_at: String,
+  // name/body/published_at are nullable in GitHub's Releases API (body is null
+  // for releases created without notes, published_at is null for drafts). They
+  // must be Option or serde_json fails to deserialize the whole array on `null`,
+  // which silently breaks every update check. #[serde(default)] also covers absent keys.
+  #[serde(default)]
+  pub name: Option<String>,
+  #[serde(default)]
+  pub body: Option<String>,
+  #[serde(default)]
+  pub published_at: Option<String>,
   pub prerelease: bool,
   pub assets: Vec<AppReleaseAsset>,
 }
@@ -182,7 +189,7 @@ impl AppAutoUpdater {
       // For stable builds, look for stable releases (semver format)
       let stable_releases: Vec<&AppRelease> = releases
         .iter()
-        .filter(|release| release.tag_name.starts_with('v'))
+        .filter(|release| release.tag_name.starts_with('v') && !release.prerelease)
         .collect();
       log::info!("Found {} stable releases", stable_releases.len());
       stable_releases
@@ -198,7 +205,7 @@ impl AppAutoUpdater {
     log::info!(
       "Latest release: {} ({})",
       latest_release.tag_name,
-      latest_release.name
+      latest_release.name.as_deref().unwrap_or("")
     );
 
     // Check if we need to update
@@ -207,7 +214,7 @@ impl AppAutoUpdater {
 
       // Build the release page URL
       let release_page_url = format!(
-        "https://github.com/zhom/donutbrowser/releases/tag/{}",
+        "https://github.com/young-bo-i/marine/releases/tag/{}",
         latest_release.tag_name
       );
 
@@ -223,10 +230,10 @@ impl AppAutoUpdater {
         let update_info = AppUpdateInfo {
           current_version,
           new_version: latest_release.tag_name.clone(),
-          release_notes: latest_release.body.clone(),
+          release_notes: latest_release.body.clone().unwrap_or_default(),
           download_url: download_url.unwrap_or_else(|| release_page_url.clone()),
           is_nightly,
-          published_at: latest_release.published_at.clone(),
+          published_at: latest_release.published_at.clone().unwrap_or_default(),
           manual_update_required,
           release_page_url: Some(release_page_url),
           repo_update,
@@ -248,10 +255,10 @@ impl AppAutoUpdater {
           let update_info = AppUpdateInfo {
             current_version,
             new_version: latest_release.tag_name.clone(),
-            release_notes: latest_release.body.clone(),
+            release_notes: latest_release.body.clone().unwrap_or_default(),
             download_url: url,
             is_nightly,
-            published_at: latest_release.published_at.clone(),
+            published_at: latest_release.published_at.clone().unwrap_or_default(),
             manual_update_required: false,
             release_page_url: Some(release_page_url),
             repo_update: false,
@@ -278,7 +285,7 @@ impl AppAutoUpdater {
   async fn fetch_app_releases(
     &self,
   ) -> Result<Vec<AppRelease>, Box<dyn std::error::Error + Send + Sync>> {
-    let url = "https://api.github.com/repos/zhom/donutbrowser/releases?per_page=100";
+    let url = "https://api.github.com/repos/young-bo-i/marine/releases?per_page=100";
     let response = self
       .client
       .get(url)
