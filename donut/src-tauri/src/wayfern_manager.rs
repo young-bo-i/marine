@@ -744,18 +744,28 @@ impl WayfernManager {
 
     if headless {
       args.push("--headless=new".to_string());
-    } else if let Some((w, h)) = config
-      .fingerprint
-      .as_deref()
-      .and_then(Self::window_size_from_fingerprint)
-    {
-      // Size the real OS window to match the fingerprint so the visible window
-      // agrees with the reported windowOuterWidth/screen dimensions. Anchor at
-      // 0,0 so the window also fits within the spoofed screen origin. Skipped in
-      // headless mode, where there is no on-screen window.
-      log::info!("Sizing Wayfern window to fingerprint dimensions: {w}x{h}");
-      args.push(format!("--window-size={w},{h}"));
-      args.push("--window-position=0,0".to_string());
+    } else {
+      // Reopen the previous session's tabs on every windowed launch so the
+      // user's open tabs persist across restarts on THIS device. Cross-device
+      // tab sync is intentionally deferred (Chromium's `Sessions/` dir is
+      // excluded from the file manifest), so this only restores locally.
+      // Windowed only — headless/MCP automation launches must start clean and
+      // never restore tabs.
+      args.push("--restore-last-session".to_string());
+
+      if let Some((w, h)) = config
+        .fingerprint
+        .as_deref()
+        .and_then(Self::window_size_from_fingerprint)
+      {
+        // Size the real OS window to match the fingerprint so the visible window
+        // agrees with the reported windowOuterWidth/screen dimensions. Anchor at
+        // 0,0 so the window also fits within the spoofed screen origin. Skipped in
+        // headless mode, where there is no on-screen window.
+        log::info!("Sizing Wayfern window to fingerprint dimensions: {w}x{h}");
+        args.push(format!("--window-size={w},{h}"));
+        args.push("--window-position=0,0".to_string());
+      }
     }
 
     #[cfg(target_os = "linux")]

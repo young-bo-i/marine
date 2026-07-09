@@ -8,6 +8,7 @@
 //! `automation` remain the shared browser-automation stack used by the MCP server.
 
 pub mod automation;
+pub mod bookmarks;
 pub mod cdp;
 pub mod extension;
 pub mod generate;

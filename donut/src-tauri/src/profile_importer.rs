@@ -332,6 +332,7 @@ impl ProfileImporter {
           password_protected: false,
           created_at: None,
           updated_at: None,
+          default_bookmarks_seeded: false,
         };
 
         match self
@@ -393,6 +394,7 @@ impl ProfileImporter {
           .unwrap_or(0),
       ),
       updated_at: Some(crate::proxy_manager::now_secs()),
+      default_bookmarks_seeded: false,
     };
 
     self.profile_manager.save_profile(&profile)?;

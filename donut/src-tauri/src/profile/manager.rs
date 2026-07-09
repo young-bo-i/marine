@@ -221,6 +221,7 @@ impl ProfileManager {
           password_protected: false,
           created_at: None,
           updated_at: None,
+          default_bookmarks_seeded: false,
         };
 
         match self
@@ -327,6 +328,7 @@ impl ProfileManager {
           password_protected: false,
           created_at: None,
           updated_at: None,
+          default_bookmarks_seeded: false,
         };
 
         match self
@@ -405,6 +407,7 @@ impl ProfileManager {
           .unwrap_or(0),
       ),
       updated_at: Some(crate::proxy_manager::now_secs()),
+      default_bookmarks_seeded: false,
     };
 
     // Save profile info
@@ -1108,6 +1111,7 @@ impl ProfileManager {
           .unwrap_or(0),
       ),
       updated_at: Some(crate::proxy_manager::now_secs()),
+      default_bookmarks_seeded: false,
     };
 
     // Donut: a clone must NOT be linkable to its source. The source

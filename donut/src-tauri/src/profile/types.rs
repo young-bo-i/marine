@@ -92,6 +92,14 @@ pub struct BrowserProfile {
   /// NOT bumped by browser-file changes, which sync via the file manifest.
   #[serde(default)]
   pub updated_at: Option<u64>,
+  /// Marine: set once the four default bookmarks (B站/小红书/知乎/抖音) have been
+  /// seeded into this Wayfern profile's bookmark bar. Historical profiles on
+  /// disk deserialize it as `false` and get seeded on their next launch; once
+  /// true it is never re-seeded, so a user who later deletes one of the four
+  /// keeps it deleted. Bookkeeping only — NOT a user edit, so flipping it must
+  /// not bump `updated_at`.
+  #[serde(default)]
+  pub default_bookmarks_seeded: bool,
 }
 
 pub fn default_release_type() -> String {

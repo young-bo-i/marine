@@ -284,6 +284,7 @@ mod tests {
       password_protected: false,
       created_at: None,
       updated_at: None,
+      default_bookmarks_seeded: false,
     }
   }
 

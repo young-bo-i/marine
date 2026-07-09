@@ -700,6 +700,36 @@ impl BrowserRunner {
         crate::ephemeral_dirs::get_effective_profile_path(&updated_profile, &profiles_dir);
       let profile_path_str = profile_data_path.to_string_lossy().to_string();
 
+      // Marine: seed the four default bookmarks (B站/小红书/知乎/抖音) into this
+      // profile's bookmark bar exactly once — new profiles on first launch,
+      // historical profiles on their next launch. We're already inside the
+      // `profile.browser == "wayfern"` branch, and `profile_data_path` is the
+      // same dir passed to Chromium as `--user-data-dir`, so Bookmarks lands in
+      // `<user-data-dir>/Default/Bookmarks`. The flag is bookkeeping: it is
+      // persisted here WITHOUT bumping updated_at (save_process_info ->
+      // save_profile never touches updated_at), and we set it before spawning so
+      // a later manual delete of one of the four is never re-added.
+      if !updated_profile.default_bookmarks_seeded {
+        match crate::marine::bookmarks::ensure_default_bookmarks(&profile_data_path) {
+          Ok(()) => {
+            updated_profile.default_bookmarks_seeded = true;
+            if let Err(e) = self.save_process_info(&updated_profile) {
+              log::warn!(
+                "Marine: failed to persist default_bookmarks_seeded for profile {}: {e}",
+                updated_profile.name
+              );
+            }
+          }
+          Err(e) => {
+            // Leave the flag false so the next launch retries; ensure_default_bookmarks is idempotent.
+            log::warn!(
+              "Marine: failed to seed default bookmarks for profile {}: {e}",
+              updated_profile.name
+            );
+          }
+        }
+      }
+
       // Install extensions if an extension group is assigned
       let mut extension_paths = Vec::new();
       if updated_profile.extension_group_id.is_some() {

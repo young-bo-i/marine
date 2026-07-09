@@ -8,7 +8,6 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use super::types::{SyncError, SyncResult};
-use crate::profile::types::BrowserProfile;
 
 /// Default exclude patterns for volatile browser profile files.
 /// Patterns use `**/` prefix to match at any directory depth, since the sync
@@ -39,6 +38,11 @@ pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
   "**/datareporting/**",
   "**/saved-telemetry-pings/**",
   "**/sessionstore-backups/**",
+  // Chromium's `Sessions/` dir (Session_*/Tabs_*) holds open-tab state. Syncing
+  // it across devices is DEFERRED pending the sync-frequency fix: those files
+  // rewrite constantly and inflated sync churn. Local tab restore still works
+  // via the `--restore-last-session` launch flag; only cross-device tab sync is
+  // on hold here.
   "**/sessions/**",
   "**/serviceworker.txt",
   "**/AlternateServices.bin",
@@ -61,6 +65,15 @@ pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
   "**/DawnWebGPUCache/**",
   "**/BrowserMetrics*",
   "**/.DS_Store",
+  // The profile-root `metadata.json` is the profile CONFIG. It is synced
+  // separately as the `profiles/<id>/metadata.json` config blob (see
+  // `upload_profile_metadata`), so including it in the file manifest is
+  // redundant. Worse, it carries `last_sync`, which is rewritten on every sync
+  // as bookkeeping — leaving it in the manifest made the file diff perpetually
+  // non-empty and drove an upload loop. Excluding it (glob has no `**`, so it
+  // matches only the top-level file, never a nested `profile/.../metadata.json`)
+  // decouples `last_sync` writes from the manifest entirely.
+  "metadata.json",
   ".donut-sync/**",
   // Orphaned local-only marker from earlier rollover-based fingerprint
   // regeneration. Keep excluding it so any markers left on disk from
@@ -224,39 +237,6 @@ fn hash_file(path: &Path) -> Result<Option<String>, SyncError> {
   Ok(Some(hasher.finalize().to_hex().to_string()))
 }
 
-/// Compute blake3 hash of metadata.json after sanitizing volatile fields.
-/// This prevents infinite sync loops where updating last_sync triggers a new sync.
-fn hash_sanitized_metadata(path: &Path) -> Result<Option<String>, SyncError> {
-  let content = match fs::read_to_string(path) {
-    Ok(c) => c,
-    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-    Err(e) => {
-      return Err(SyncError::IoError(format!(
-        "Failed to read metadata at {}: {e}",
-        path.display()
-      )));
-    }
-  };
-
-  let mut profile: BrowserProfile = serde_json::from_str(&content).map_err(|e| {
-    SyncError::SerializationError(format!("Failed to parse metadata for hashing: {e}"))
-  })?;
-
-  // Sanitize volatile fields that should not trigger a re-sync
-  profile.last_sync = None;
-  profile.process_id = None;
-  profile.last_launch = None;
-
-  let sanitized_json = serde_json::to_string(&profile).map_err(|e| {
-    SyncError::SerializationError(format!("Failed to serialize sanitized metadata: {e}"))
-  })?;
-
-  let mut hasher = blake3::Hasher::new();
-  hasher.update(sanitized_json.as_bytes());
-
-  Ok(Some(hasher.finalize().to_hex().to_string()))
-}
-
 /// Get mtime as unix timestamp
 /// Returns None if the file doesn't exist (was deleted)
 fn get_mtime(path: &Path) -> Result<Option<i64>, SyncError> {
@@ -372,19 +352,7 @@ pub fn generate_manifest(
         *max_mtime = (*max_mtime).max(mtime);
 
         // Check cache for existing hash
-        let hash = if relative_path == "metadata.json" {
-          // Special case: sanitize metadata.json before hashing to prevent sync loops
-          match hash_sanitized_metadata(&path)? {
-            Some(computed_hash) => computed_hash,
-            None => {
-              log::debug!(
-                "File disappeared during manifest generation, skipping: {}",
-                path.display()
-              );
-              continue;
-            }
-          }
-        } else if let Some(cached_hash) = cache.get(&relative_path, size, mtime) {
+        let hash = if let Some(cached_hash) = cache.get(&relative_path, size, mtime) {
           cached_hash.to_string()
         } else {
           match hash_file(&path)? {
@@ -546,6 +514,7 @@ pub fn get_cache_path(profile_dir: &Path) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::profile::types::BrowserProfile;
   use tempfile::TempDir;
 
   #[test]
@@ -664,8 +633,8 @@ mod tests {
 
     let paths: Vec<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
     assert!(
-      paths.contains(&"metadata.json"),
-      "metadata.json should be synced"
+      !paths.contains(&"metadata.json"),
+      "profile-root metadata.json is the config blob and must be excluded from the file manifest"
     );
     assert!(
       paths.contains(&"profile/Default/Cookies"),
@@ -867,14 +836,19 @@ mod tests {
   }
 
   #[test]
-  fn test_generate_manifest_sanitizes_metadata() {
+  fn test_generate_manifest_excludes_profile_root_metadata() {
+    // The profile-root metadata.json is the config blob (synced separately). It
+    // must never enter the file manifest — it carries `last_sync`, which is
+    // rewritten every sync, so including it would make the diff perpetually
+    // non-empty and drive an upload loop.
     let temp_dir = TempDir::new().unwrap();
     let profile_dir = temp_dir.path().join("profile");
     fs::create_dir_all(&profile_dir).unwrap();
 
     let profile_id = uuid::Uuid::new_v4();
-    let metadata_path = profile_dir.join("metadata.json");
 
+    // A top-level metadata.json (config) plus a real synced file and a nested
+    // metadata.json that should still be included.
     let profile = BrowserProfile {
       id: profile_id,
       name: "test-profile".to_string(),
@@ -882,68 +856,53 @@ mod tests {
       process_id: Some(1234),
       ..Default::default()
     };
-
-    fs::write(&metadata_path, serde_json::to_string(&profile).unwrap()).unwrap();
+    fs::write(
+      profile_dir.join("metadata.json"),
+      serde_json::to_string(&profile).unwrap(),
+    )
+    .unwrap();
+    fs::create_dir_all(profile_dir.join("profile/Default")).unwrap();
+    fs::write(profile_dir.join("profile/Default/Cookies"), "keep").unwrap();
+    // A nested file that happens to be named metadata.json must NOT be excluded:
+    // the exclusion targets only the top-level config blob.
+    fs::write(profile_dir.join("profile/Default/metadata.json"), "keep").unwrap();
 
     let mut cache = HashCache::default();
-    let manifest1 = generate_manifest(&profile_id.to_string(), &profile_dir, &mut cache).unwrap();
-    let hash1 = manifest1
-      .files
-      .iter()
-      .find(|f| f.path == "metadata.json")
-      .unwrap()
-      .hash
-      .clone();
+    let manifest = generate_manifest(&profile_id.to_string(), &profile_dir, &mut cache).unwrap();
+    let paths: Vec<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
 
-    // Update volatile fields
+    assert!(
+      !paths.contains(&"metadata.json"),
+      "top-level metadata.json must be excluded: {paths:?}"
+    );
+    assert!(
+      paths.contains(&"profile/Default/Cookies"),
+      "Cookies should be synced: {paths:?}"
+    );
+    assert!(
+      paths.contains(&"profile/Default/metadata.json"),
+      "nested metadata.json must still be synced: {paths:?}"
+    );
+
+    // Rewriting the top-level metadata.json with a new last_sync must leave the
+    // manifest byte-identical (it isn't part of the manifest at all).
+    let files_before = manifest.files.clone();
     let profile2 = BrowserProfile {
       id: profile_id,
       name: "test-profile".to_string(),
-      last_sync: Some(200),
+      last_sync: Some(999),
       process_id: Some(5678),
       ..Default::default()
     };
-
-    fs::write(&metadata_path, serde_json::to_string(&profile2).unwrap()).unwrap();
-
+    fs::write(
+      profile_dir.join("metadata.json"),
+      serde_json::to_string(&profile2).unwrap(),
+    )
+    .unwrap();
     let manifest2 = generate_manifest(&profile_id.to_string(), &profile_dir, &mut cache).unwrap();
-    let hash2 = manifest2
-      .files
-      .iter()
-      .find(|f| f.path == "metadata.json")
-      .unwrap()
-      .hash
-      .clone();
-
-    // Hash should be identical because volatile fields are sanitized
     assert_eq!(
-      hash1, hash2,
-      "Metadata hash should be stable across last_sync/process_id updates"
-    );
-
-    // Change a non-volatile field
-    let profile3 = BrowserProfile {
-      id: profile_id,
-      name: "changed-name".to_string(),
-      last_sync: Some(200),
-      ..Default::default()
-    };
-
-    fs::write(&metadata_path, serde_json::to_string(&profile3).unwrap()).unwrap();
-
-    let manifest3 = generate_manifest(&profile_id.to_string(), &profile_dir, &mut cache).unwrap();
-    let hash3 = manifest3
-      .files
-      .iter()
-      .find(|f| f.path == "metadata.json")
-      .unwrap()
-      .hash
-      .clone();
-
-    // Hash should be different because name changed
-    assert_ne!(
-      hash1, hash3,
-      "Metadata hash should change when non-volatile fields change"
+      files_before, manifest2.files,
+      "rewriting profile-root metadata.json must not change the manifest file set"
     );
   }
 }

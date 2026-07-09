@@ -572,138 +572,140 @@ impl SyncEngine {
     // Compute diff
     let diff = compute_diff(&local_manifest, remote_manifest.as_ref());
 
+    // Transfer browser files only when the manifest diff is non-empty. The
+    // config metadata reconcile below runs REGARDLESS — a config-only edit made
+    // while the browser is idle produces an empty file diff (metadata.json is
+    // excluded from the manifest) yet still must be pushed to remote.
     if diff.is_empty() {
-      log::info!("Profile {} is already in sync", profile_id);
+      log::info!("Profile {} file set already in sync", profile_id);
+    } else {
+      // Whether this sync will modify remote file OBJECTS. compute_diff is
+      // directional (either upload-side or download-side, never both), so this
+      // is true exactly when we are the newer side with real file changes. It
+      // gates the manifest.json re-upload: a download-only sync must not re-PUT
+      // the manifest (the remote manifest already matches, so it would only bump
+      // timestamps and echo back over SSE as a spurious change).
+      let has_upload_work =
+        !diff.files_to_upload.is_empty() || !diff.files_to_delete_remote.is_empty();
+
+      let upload_bytes: u64 = diff.files_to_upload.iter().map(|f| f.size).sum();
+      let download_bytes: u64 = diff.files_to_download.iter().map(|f| f.size).sum();
+      let total_files = diff.files_to_upload.len()
+        + diff.files_to_download.len()
+        + diff.files_to_delete_local.len()
+        + diff.files_to_delete_remote.len();
+
+      log::info!(
+        "Profile {} diff: {} to upload, {} to download, {} to delete local, {} to delete remote",
+        profile_id,
+        diff.files_to_upload.len(),
+        diff.files_to_download.len(),
+        diff.files_to_delete_local.len(),
+        diff.files_to_delete_remote.len()
+      );
+
       let _ = events::emit(
-        "profile-sync-status",
+        "profile-sync-progress",
         serde_json::json!({
           "profile_id": profile_id,
           "profile_name": profile.name,
-          "status": "synced"
+          "phase": "started",
+          "total_files": total_files,
+          "total_bytes": upload_bytes + download_bytes
         }),
       );
-      return Ok(());
-    }
 
-    let upload_bytes: u64 = diff.files_to_upload.iter().map(|f| f.size).sum();
-    let download_bytes: u64 = diff.files_to_download.iter().map(|f| f.size).sum();
-    let total_files = diff.files_to_upload.len()
-      + diff.files_to_download.len()
-      + diff.files_to_delete_local.len()
-      + diff.files_to_delete_remote.len();
-
-    log::info!(
-      "Profile {} diff: {} to upload, {} to download, {} to delete local, {} to delete remote",
-      profile_id,
-      diff.files_to_upload.len(),
-      diff.files_to_download.len(),
-      diff.files_to_delete_local.len(),
-      diff.files_to_delete_remote.len()
-    );
-
-    let _ = events::emit(
-      "profile-sync-progress",
-      serde_json::json!({
-        "profile_id": profile_id,
-        "profile_name": profile.name,
-        "phase": "started",
-        "total_files": total_files,
-        "total_bytes": upload_bytes + download_bytes
-      }),
-    );
-
-    // Perform uploads
-    if !diff.files_to_upload.is_empty() {
-      self
-        .upload_profile_files(
-          app_handle,
-          &profile_id,
-          &profile.name,
-          &profile_dir,
-          &diff.files_to_upload,
-          encryption_key.as_ref(),
-          &key_prefix,
-          &cancel_flag,
-        )
-        .await?;
-    }
-
-    if cancel_flag.load(Ordering::Relaxed) {
-      log::info!("Sync cancelled for profile {} after uploads", profile_id);
-      return Err(SyncError::Cancelled);
-    }
-
-    // Perform downloads
-    if !diff.files_to_download.is_empty() {
-      self
-        .download_profile_files(
-          app_handle,
-          &profile_id,
-          &profile.name,
-          &profile_dir,
-          &diff.files_to_download,
-          encryption_key.as_ref(),
-          &key_prefix,
-          &cancel_flag,
-        )
-        .await?;
-    }
-
-    if cancel_flag.load(Ordering::Relaxed) {
-      log::info!("Sync cancelled for profile {} after downloads", profile_id);
-      return Err(SyncError::Cancelled);
-    }
-
-    // Delete local files that don't exist remotely (when remote is newer)
-    for path in &diff.files_to_delete_local {
-      let file_path = profile_dir.join(path);
-      if file_path.exists() {
-        let _ = fs::remove_file(&file_path);
-        log::debug!("Deleted local file: {}", path);
+      // Perform uploads
+      if !diff.files_to_upload.is_empty() {
+        self
+          .upload_profile_files(
+            app_handle,
+            &profile_id,
+            &profile.name,
+            &profile_dir,
+            &diff.files_to_upload,
+            encryption_key.as_ref(),
+            &key_prefix,
+            &cancel_flag,
+          )
+          .await?;
       }
+
+      if cancel_flag.load(Ordering::Relaxed) {
+        log::info!("Sync cancelled for profile {} after uploads", profile_id);
+        return Err(SyncError::Cancelled);
+      }
+
+      // Perform downloads
+      if !diff.files_to_download.is_empty() {
+        self
+          .download_profile_files(
+            app_handle,
+            &profile_id,
+            &profile.name,
+            &profile_dir,
+            &diff.files_to_download,
+            encryption_key.as_ref(),
+            &key_prefix,
+            &cancel_flag,
+          )
+          .await?;
+      }
+
+      if cancel_flag.load(Ordering::Relaxed) {
+        log::info!("Sync cancelled for profile {} after downloads", profile_id);
+        return Err(SyncError::Cancelled);
+      }
+
+      // Delete local files that don't exist remotely (when remote is newer)
+      for path in &diff.files_to_delete_local {
+        let file_path = profile_dir.join(path);
+        if file_path.exists() {
+          let _ = fs::remove_file(&file_path);
+          log::debug!("Deleted local file: {}", path);
+        }
+      }
+
+      // Delete remote files that don't exist locally (when local is newer)
+      for path in &diff.files_to_delete_remote {
+        let remote_key = format!("{}profiles/{}/files/{}", key_prefix, profile_id, path);
+        let _ = self.client.delete(&remote_key, None).await;
+        log::debug!("Deleted remote file: {}", path);
+      }
+
+      // Upload manifest.json last for atomicity — but ONLY when we changed
+      // remote files (see has_upload_work above).
+      if has_upload_work {
+        let mut final_manifest = local_manifest;
+        final_manifest.encrypted = encryption_key.is_some();
+
+        self
+          .upload_manifest(
+            &profile_id,
+            &final_manifest,
+            encryption_key.as_ref(),
+            &key_prefix,
+          )
+          .await?;
+      }
+
+      // File transfer completed successfully — clean up resume state
+      SyncResumeState::delete(&profile_dir);
     }
 
-    // Delete remote files that don't exist locally (when local is newer)
-    for path in &diff.files_to_delete_remote {
-      let remote_key = format!("{}profiles/{}/files/{}", key_prefix, profile_id, path);
-      let _ = self.client.delete(&remote_key, None).await;
-      log::debug!("Deleted remote file: {}", path);
-    }
-
-    // Upload metadata.json (sanitized profile)
+    // Reconcile the profile CONFIG metadata.json on EVERY sync, independent of
+    // the file diff. metadata.json is excluded from the file manifest, so a
+    // config-only edit (rename / tags / note / proxy-vpn-group reassignment)
+    // done while the browser is idle produces an empty file diff — but the edit
+    // must still reach remote and be restorable on a fresh machine. This is
+    // idempotent (HEAD + updated_at compare, uploads on a missing remote), so an
+    // unchanged profile performs no PUT here.
     self
       .upload_profile_metadata(&profile_id, profile, &key_prefix)
       .await?;
 
-    // If we recovered from an empty local state (downloaded everything from remote),
-    // regenerate the manifest from the actual files now on disk so we don't
-    // overwrite the remote manifest with an empty one.
-    let final_manifest = if local_manifest.files.is_empty() && !diff.files_to_download.is_empty() {
-      let mut new_cache = HashCache::load(&cache_path);
-      let mut regenerated = generate_manifest(&profile_id, &profile_dir, &mut new_cache)?;
-      new_cache.save(&cache_path)?;
-      regenerated.encrypted = encryption_key.is_some();
-      regenerated
-    } else {
-      let mut m = local_manifest;
-      m.encrypted = encryption_key.is_some();
-      m
-    };
-
-    // Upload manifest.json last for atomicity
-    self
-      .upload_manifest(
-        &profile_id,
-        &final_manifest,
-        encryption_key.as_ref(),
-        &key_prefix,
-      )
-      .await?;
-
-    // Sync completed successfully — clean up resume state
-    SyncResumeState::delete(&profile_dir);
-
-    // Sync associated proxy, group, and VPN
+    // Sync associated proxy, group, and VPN. Each is idempotent (LWW via
+    // updated_at → no PUT when unchanged), so running them on every sync is safe.
     if let Some(proxy_id) = &profile.proxy_id {
       let _ = self.sync_proxy(proxy_id, Some(app_handle)).await;
     }
@@ -857,7 +859,7 @@ impl SyncEngine {
     let key_prefix = Self::get_team_key_prefix(profile).await;
     let profile_manager = ProfileManager::instance();
 
-    // Upload our metadata
+    // Upload our metadata (skipped when unchanged vs remote).
     self
       .upload_profile_metadata(&profile_id, profile, &key_prefix)
       .await?;
@@ -903,6 +905,13 @@ impl SyncEngine {
     Ok(())
   }
 
+  /// Reconcile the profile's config `metadata.json`, `updated_at` last-write-wins,
+  /// exactly like the other config entities. Idempotent: it PUTs only when the
+  /// remote is MISSING or older than the local edit, and skips the write when the
+  /// remote already reflects this (or a newer) edit — so a no-op sync writes
+  /// nothing (no write → no SSE echo → no loop). Routes through
+  /// `upload_config_json` so `updated_at` is written into the S3 object metadata
+  /// and future reconciles can HEAD without downloading the body.
   async fn upload_profile_metadata(
     &self,
     profile_id: &str,
@@ -912,23 +921,30 @@ impl SyncEngine {
     let mut sanitized = profile.clone();
     sanitized.process_id = None;
     sanitized.last_launch = None;
-    sanitized.last_sync = None; // Avoid triggering sync loop on timestamp change
+    sanitized.last_sync = None; // Bookkeeping only — never part of the synced state.
+
+    let local_updated = sanitized.updated_at.unwrap_or(0);
+    let remote_key = format!("{}profiles/{}/metadata.json", key_prefix, profile_id);
+
+    // Upload when the remote is missing (HEAD 404 → `stat.exists` false → new
+    // profile / fresh-machine restore) OR when our edit is newer. Skip only when
+    // the remote object exists and already reflects this (or a newer) edit.
+    let stat = self.client.stat(&remote_key).await?;
+    if stat.exists {
+      let remote_updated = self.remote_updated_at(&stat, &remote_key).await;
+      if remote_updated >= local_updated {
+        log::debug!(
+          "Profile {profile_id} metadata unchanged (remote updated_at {remote_updated} >= local {local_updated}) — skipping upload"
+        );
+        return Ok(());
+      }
+    }
 
     let json = serde_json::to_string_pretty(&sanitized)
       .map_err(|e| SyncError::SerializationError(format!("Failed to serialize profile: {e}")))?;
 
-    let (payload, content_type) = encryption::maybe_seal_for_upload(json.as_bytes())
-      .map_err(|e| SyncError::InvalidData(format!("Failed to seal profile metadata: {e}")))?;
-
-    let remote_key = format!("{}profiles/{}/metadata.json", key_prefix, profile_id);
-    let presign = self
-      .client
-      .presign_upload(&remote_key, Some(content_type))
-      .await?;
-
     self
-      .client
-      .upload_bytes(&presign.url, &payload, Some(content_type))
+      .upload_config_json(&remote_key, &json, local_updated)
       .await?;
 
     Ok(())
