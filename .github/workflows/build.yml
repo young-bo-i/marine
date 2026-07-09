@@ -30,6 +30,11 @@ jobs:
     # tag via GITHUB_REF_NAME) instead of looking for nightly-* tags.
     env:
       STABLE_RELEASE: "1"
+      # macOS code-signing identity (a stable self-signed cert). Tauri signs the
+      # .app with this so its TCC identity is stable across builds → the OS keeps
+      # granted camera/mic/etc. permissions after an auto-update instead of
+      # re-prompting. Empty when the secret isn't set → falls back to ad-hoc.
+      APPLE_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
     defaults:
       run:
         working-directory: donut
@@ -68,6 +73,36 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # Import the stable self-signed cert into a keychain so Tauri can sign the
+      # macOS .app with a build-invariant identity (→ TCC permissions survive
+      # auto-updates). No-op (ad-hoc build) when the secret isn't configured.
+      - name: Import macOS signing certificate
+        if: matrix.os == 'macos-latest'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          if [ -z "$MACOS_CERT_P12" ]; then
+            echo "MACOS_CERT_P12 not set — building ad-hoc (unsigned). Add the secret to enable stable signing."
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/marine-signing.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -hex 20)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
+          # Prepend our keychain to the user search list so codesign resolves the identity by name.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/["[:space:]]//g')
+          # Trust the cert for code signing so `security find-identity -v -p codesigning` treats it as valid.
+          openssl pkcs12 -in "$RUNNER_TEMP/cert.p12" -passin pass:"$MACOS_CERT_PASSWORD" -clcerts -nokeys -legacy -out "$RUNNER_TEMP/cert.pem" 2>/dev/null \
+            || openssl pkcs12 -in "$RUNNER_TEMP/cert.p12" -passin pass:"$MACOS_CERT_PASSWORD" -clcerts -nokeys -out "$RUNNER_TEMP/cert.pem"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/cert.pem" || echo "add-trusted-cert failed (codesign -s still works untrusted)"
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/cert.pem"
+          echo "Signing identities:"; security find-identity -v -p codesigning "$KEYCHAIN" || true
 
       # On a v* tag, force app version = tag so filename / About / updater agree.
       - name: Sync version to tag
