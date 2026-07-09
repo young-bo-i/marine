@@ -91,6 +91,33 @@ fn is_critical_file(path: &str) -> bool {
     .any(|pattern| path.contains(pattern))
 }
 
+/// Merge remote profile CONFIG metadata into the local profile using
+/// `updated_at` last-write-wins.
+///
+/// Remote config fields (name / tags / note / proxy / vpn / group) are applied
+/// ONLY when the remote edit is STRICTLY newer than the local one. When remote
+/// wins we also adopt its `updated_at` so both sides agree and the next sync
+/// doesn't re-merge (ping-pong). When the remote is older-or-equal we keep the
+/// local values untouched — the upload side (`upload_profile_metadata`, itself
+/// `updated_at`-gated) has already pushed our newer edit to remote, so a stale
+/// remote must never clobber a local rename. `last_sync` is bookkeeping and is
+/// handled by the caller, never here.
+fn merge_profile_metadata_lww(local: &BrowserProfile, remote: &BrowserProfile) -> BrowserProfile {
+  let mut merged = local.clone();
+  let local_ua = local.updated_at.unwrap_or(0);
+  let remote_ua = remote.updated_at.unwrap_or(0);
+  if remote_ua > local_ua {
+    merged.name = remote.name.clone();
+    merged.tags = remote.tags.clone();
+    merged.note = remote.note.clone();
+    merged.proxy_id = remote.proxy_id.clone();
+    merged.vpn_id = remote.vpn_id.clone();
+    merged.group_id = remote.group_id.clone();
+    merged.updated_at = remote.updated_at;
+  }
+  merged
+}
+
 /// Checkpoint all SQLite WAL files in a profile directory.
 ///
 /// When a browser crashes or is killed, SQLite WAL files may contain
@@ -716,35 +743,24 @@ impl SyncEngine {
       let _ = self.sync_vpn(vpn_id, Some(app_handle)).await;
     }
 
-    // Download remote metadata and merge changes (name, tags, notes, etc.)
+    // Download remote profile CONFIG metadata and merge with last-write-wins:
+    // remote name/tags/note/proxy/vpn/group are applied ONLY when the remote
+    // edit is strictly newer (updated_at). A stale remote must never clobber a
+    // local rename — the upload above has already pushed our newer edit. When
+    // the download fails we keep the local profile as-is. `last_sync` is
+    // bookkeeping and is always bumped.
     let remote_metadata_key = format!("{}profiles/{}/metadata.json", key_prefix, profile_id);
-    if let Ok(remote_meta) = self.download_profile_metadata(&remote_metadata_key).await {
-      let mut updated_profile = profile.clone();
-      // Merge fields that can be changed on other devices
-      updated_profile.name = remote_meta.name;
-      updated_profile.tags = remote_meta.tags;
-      updated_profile.note = remote_meta.note;
-      updated_profile.proxy_id = remote_meta.proxy_id;
-      updated_profile.vpn_id = remote_meta.vpn_id;
-      updated_profile.group_id = remote_meta.group_id;
-      updated_profile.last_sync = Some(
-        std::time::SystemTime::now()
-          .duration_since(std::time::UNIX_EPOCH)
-          .unwrap()
-          .as_secs(),
-      );
-      let _ = profile_manager.save_profile(&updated_profile);
-    } else {
-      // Fallback: just update last_sync
-      let mut updated_profile = profile.clone();
-      updated_profile.last_sync = Some(
-        std::time::SystemTime::now()
-          .duration_since(std::time::UNIX_EPOCH)
-          .unwrap()
-          .as_secs(),
-      );
-      let _ = profile_manager.save_profile(&updated_profile);
-    }
+    let mut updated_profile = match self.download_profile_metadata(&remote_metadata_key).await {
+      Ok(remote_meta) => merge_profile_metadata_lww(profile, &remote_meta),
+      Err(_) => profile.clone(),
+    };
+    updated_profile.last_sync = Some(
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs(),
+    );
+    let _ = profile_manager.save_profile(&updated_profile);
     let _ = events::emit("profiles-changed", ());
 
     let _ = events::emit(
@@ -864,16 +880,12 @@ impl SyncEngine {
       .upload_profile_metadata(&profile_id, profile, &key_prefix)
       .await?;
 
-    // Download remote metadata and merge if remote has changes
+    // Download remote metadata and merge with last-write-wins (same rule as
+    // sync_profile): remote config fields win only when strictly newer, so a
+    // stale remote never clobbers a local rename.
     let remote_metadata_key = format!("{}profiles/{}/metadata.json", key_prefix, profile_id);
     if let Ok(remote_meta) = self.download_profile_metadata(&remote_metadata_key).await {
-      let mut updated = profile.clone();
-      updated.name = remote_meta.name;
-      updated.tags = remote_meta.tags;
-      updated.note = remote_meta.note;
-      updated.proxy_id = remote_meta.proxy_id;
-      updated.vpn_id = remote_meta.vpn_id;
-      updated.group_id = remote_meta.group_id;
+      let mut updated = merge_profile_metadata_lww(profile, &remote_meta);
       updated.last_sync = Some(
         std::time::SystemTime::now()
           .duration_since(std::time::UNIX_EPOCH)
@@ -1250,6 +1262,32 @@ impl SyncEngine {
     if files.is_empty() {
       return Ok(());
     }
+
+    // The profile-root `metadata.json` is the profile CONFIG blob, synced
+    // separately as `profiles/<id>/metadata.json` (see manifest.rs) — it is no
+    // longer a manifest FILE. Legacy remote manifests (written before that
+    // split) may still list it; downloading `files/metadata.json` then 404s.
+    // Drop it here so a normal pull skips the expected-missing legacy entry at
+    // debug instead of retrying 3x and warning.
+    let files: Vec<super::manifest::ManifestFileEntry> = files
+      .iter()
+      .filter(|f| {
+        if f.path == "metadata.json" {
+          log::debug!(
+            "Skipping legacy profile-root metadata.json file entry for profile {} (config synced separately)",
+            profile_id
+          );
+          false
+        } else {
+          true
+        }
+      })
+      .cloned()
+      .collect();
+    if files.is_empty() {
+      return Ok(());
+    }
+    let files = files.as_slice();
 
     // Load resume state to skip already-downloaded files
     let mut resume_state = SyncResumeState::load(profile_dir)
@@ -2349,7 +2387,11 @@ impl SyncEngine {
     let metadata_stat = self.client.stat(&metadata_key).await?;
 
     if !metadata_stat.exists {
-      log::warn!(
+      // Benign during a normal pull: a profile whose remote metadata.json is
+      // absent (partial/legacy upload) is simply skipped, not surfaced as a
+      // user-facing error. The caller logs this at warn only if it returns Err;
+      // here we return Ok(false) so sync_now shows no error toast.
+      log::debug!(
         "Profile {} manifest exists but metadata.json missing, skipping",
         profile_id
       );
@@ -2579,6 +2621,13 @@ impl SyncEngine {
           .key
           .strip_prefix("profiles/")
           .and_then(|s| s.strip_suffix("/manifest.json"))
+          // Only `profiles/<id>/manifest.json` — a single path segment. Nested
+          // keys such as the Marine extension's own Chrome
+          // `profiles/<id>/files/profile/marine-ext/manifest.json` also end in
+          // `/manifest.json`; without this guard they were parsed as bogus
+          // profile ids like `<id>/files/profile/marine-ext` and spammed
+          // "Invalid profile ID format" warnings on every pull.
+          .filter(|id| !id.contains('/'))
         {
           profiles_to_check.insert(profile_id.to_string(), String::new());
         }
@@ -2597,6 +2646,9 @@ impl SyncEngine {
                 .key
                 .strip_prefix("profiles/")
                 .and_then(|s| s.strip_suffix("/manifest.json"))
+                // Single path segment only — ignore nested `.../manifest.json`
+                // keys (e.g. bundled extension manifests). See personal loop.
+                .filter(|id| !id.contains('/'))
               {
                 profiles_to_check.insert(profile_id.to_string(), team_prefix.clone());
               }
@@ -4213,5 +4265,75 @@ mod tests {
       .query_row("SELECT COUNT(*) FROM cookies", [], |row| row.get(0))
       .unwrap();
     assert_eq!(count, 1);
+  }
+
+  fn make_profile(name: &str, updated_at: Option<u64>) -> crate::profile::types::BrowserProfile {
+    crate::profile::types::BrowserProfile {
+      id: uuid::Uuid::new_v4(),
+      name: name.to_string(),
+      tags: vec![name.to_string()],
+      note: Some(name.to_string()),
+      proxy_id: Some(format!("{name}-proxy")),
+      updated_at,
+      ..Default::default()
+    }
+  }
+
+  #[test]
+  fn test_merge_metadata_lww_remote_newer_applied() {
+    // Remote edit is strictly newer → remote config fields win and its
+    // updated_at is adopted so both sides agree on the next sync.
+    let local = make_profile("local", Some(100));
+    let remote = make_profile("remote", Some(200));
+    let merged = merge_profile_metadata_lww(&local, &remote);
+    assert_eq!(merged.name, "remote");
+    assert_eq!(merged.tags, vec!["remote".to_string()]);
+    assert_eq!(merged.note.as_deref(), Some("remote"));
+    assert_eq!(merged.proxy_id.as_deref(), Some("remote-proxy"));
+    assert_eq!(merged.updated_at, Some(200));
+    // Identity preserved (merge is into the local profile).
+    assert_eq!(merged.id, local.id);
+  }
+
+  #[test]
+  fn test_merge_metadata_lww_remote_older_kept() {
+    // Stale remote (older updated_at) must never clobber the local edit —
+    // this is the data-loss bug the fix prevents (a local rename reverting).
+    let local = make_profile("local", Some(200));
+    let remote = make_profile("remote", Some(100));
+    let merged = merge_profile_metadata_lww(&local, &remote);
+    assert_eq!(merged.name, "local");
+    assert_eq!(merged.tags, vec!["local".to_string()]);
+    assert_eq!(merged.note.as_deref(), Some("local"));
+    assert_eq!(merged.proxy_id.as_deref(), Some("local-proxy"));
+    assert_eq!(merged.updated_at, Some(200));
+  }
+
+  #[test]
+  fn test_merge_metadata_lww_equal_keeps_local() {
+    // Equal timestamps → no change (local kept); prevents ping-pong.
+    let local = make_profile("local", Some(150));
+    let remote = make_profile("remote", Some(150));
+    let merged = merge_profile_metadata_lww(&local, &remote);
+    assert_eq!(merged.name, "local");
+    assert_eq!(merged.updated_at, Some(150));
+  }
+
+  #[test]
+  fn test_merge_metadata_lww_missing_timestamps() {
+    // Legacy profiles with no updated_at resolve to 0 on both sides → equal →
+    // local kept (no clobber from a timestamp-less remote).
+    let local = make_profile("local", None);
+    let remote = make_profile("remote", None);
+    let merged = merge_profile_metadata_lww(&local, &remote);
+    assert_eq!(merged.name, "local");
+    assert_eq!(merged.updated_at, None);
+
+    // A remote WITH a timestamp beats a legacy local (unknown = 0).
+    let local2 = make_profile("local", None);
+    let remote2 = make_profile("remote", Some(1));
+    let merged2 = merge_profile_metadata_lww(&local2, &remote2);
+    assert_eq!(merged2.name, "remote");
+    assert_eq!(merged2.updated_at, Some(1));
   }
 }

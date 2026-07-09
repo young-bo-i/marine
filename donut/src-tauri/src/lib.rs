@@ -1865,13 +1865,17 @@ pub fn run() {
       });
 
       tauri::async_runtime::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3 * 60 * 60));
+        // Check for app-version updates every 10 minutes so testers pick up a
+        // freshly-tagged release quickly. Each tick is one unauthenticated
+        // GitHub API call (~6/hr, well under the 60/hr limit); a download only
+        // happens when a newer release actually exists.
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10 * 60));
 
         loop {
           interval.tick().await;
 
           log::info!("Checking for app updates...");
-          // Go through the command fn (not the updater directly) so the 3h
+          // Go through the command fn (not the updater directly) so the
           // background check honors portable mode + the disable_auto_updates setting.
           match app_auto_updater::check_for_app_updates().await {
             Ok(Some(update_info)) => {
