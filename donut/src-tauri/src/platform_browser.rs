@@ -525,11 +525,13 @@ pub mod windows {
     // Fallback to Windows-specific process termination
     use std::process::Command;
 
-    // Try taskkill command as fallback
+    // Try taskkill command as fallback. `/T` kills the whole process tree
+    // (renderer/GPU/utility children), matching the tree-kill the macOS/Linux
+    // paths do, so no descendant browser process is left orphaned.
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     let output = Command::new("taskkill")
-      .args(["/F", "/PID", &pid.to_string()])
+      .args(["/F", "/T", "/PID", &pid.to_string()])
       .creation_flags(CREATE_NO_WINDOW)
       .output();
 

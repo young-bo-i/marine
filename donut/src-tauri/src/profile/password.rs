@@ -628,16 +628,23 @@ pub fn complete_after_quit_blocking(
     return None;
   }
 
-  // Snapshot is an optimization (skip re-encrypting unchanged files). When
-  // it's missing — e.g. natural-exit detection firing twice, or status
-  // checker firing for a profile whose snapshot was already consumed — we
-  // fall back to treating every ephemeral file as new. Empty `before`
-  // forces all files through encrypt, which is slower but correct.
-  let snapshot = LAUNCH_SNAPSHOTS
-    .lock()
-    .ok()
-    .and_then(|mut g| g.remove(&id))
-    .unwrap_or_default();
+  // The launch snapshot doubles as the idempotency key for completion. It is
+  // inserted exactly once per launch by `prepare_for_launch` and removed by the
+  // FIRST completion call. Its ABSENCE therefore means completion already ran
+  // for this launch, so a second call MUST be a safe no-op: this is exactly the
+  // reaper path, where `kill_browser_process` re-encrypts and returns, then the
+  // lib.rs status loop observes running→stopped and calls again. Re-encrypting
+  // a second time would run with an empty `before` snapshot — treating every
+  // kept-in-RAM file as changed — and could corrupt a keep-decrypted profile.
+  // Guard: no pending snapshot → nothing to do, return early WITHOUT
+  // re-encrypting. Every normal single-call path (app-stop via
+  // `kill_browser_process`, natural-quit via the lib.rs loop) always has a
+  // snapshot present from `prepare_for_launch`, so each still completes exactly
+  // once.
+  let Some(snapshot) = LAUNCH_SNAPSHOTS.lock().ok().and_then(|mut g| g.remove(&id)) else {
+    log::info!("complete_after_quit: no pending launch snapshot for profile {id}; already completed, skipping");
+    return None;
+  };
 
   let id_str = id.to_string();
   let ephemeral = crate::ephemeral_dirs::get_ephemeral_dir(&id_str)?;

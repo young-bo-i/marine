@@ -1,14 +1,25 @@
 use crate::browser_runner::BrowserRunner;
 use crate::camoufox::{CamoufoxConfigBuilder, GeoIPOption, ScreenConstraints};
 use crate::profile::BrowserProfile;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::AppHandle;
 use tokio::process::Command as TokioCommand;
 use tokio::sync::Mutex as AsyncMutex;
+
+/// Minimal view of a Firefox/Camoufox remote-debugging `/json` target — we only
+/// need its `type` to distinguish page targets (windows/tabs) from other
+/// targets. Firefox lists page targets the same way Chromium does.
+#[derive(Debug, Deserialize)]
+struct CamoufoxCdpTarget {
+  #[serde(rename = "type")]
+  target_type: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CamoufoxConfig {
@@ -65,6 +76,12 @@ struct CamoufoxInstance {
   profile_path: Option<String>,
   url: Option<String>,
   cdp_port: Option<u16>,
+  /// Whether this instance was launched with an on-screen window.
+  /// `Some(true)` = windowed (zero-window reaper may apply), `Some(false)` =
+  /// headless (never reap on zero page targets — headless automation
+  /// legitimately has none), `None` = unknown (a `recovered_<pid>` instance
+  /// discovered by system scan) — treated like headless for reaping.
+  windowed: Option<bool>,
 }
 
 struct CamoufoxManagerInner {
@@ -73,6 +90,7 @@ struct CamoufoxManagerInner {
 
 pub struct CamoufoxManager {
   inner: Arc<AsyncMutex<CamoufoxManagerInner>>,
+  http_client: Client,
 }
 
 impl CamoufoxManager {
@@ -81,6 +99,10 @@ impl CamoufoxManager {
       inner: Arc::new(AsyncMutex::new(CamoufoxManagerInner {
         instances: HashMap::new(),
       })),
+      http_client: Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("Failed to build reqwest client for camoufox_manager"),
     }
   }
 
@@ -109,6 +131,44 @@ impl CamoufoxManager {
           .unwrap_or_else(|_| std::path::Path::new(path).to_path_buf());
         if instance_path == target_path {
           return instance.cdp_port;
+        }
+      }
+    }
+    None
+  }
+
+  /// Count the DevTools targets of type `"page"` for this profile's instance —
+  /// how many Firefox windows/tabs currently exist. Resolves the CDP port via
+  /// the SAME in-memory instance lookup as `get_cdp_port`. Returns `None` when
+  /// the port is unknown (no tracked instance) OR the CDP `/json` request fails
+  /// (browser unreachable), so the caller can treat "cannot tell" as "assume
+  /// still open" and never falsely report a live browser as stopped. Only
+  /// `"page"` targets count.
+  pub async fn count_page_targets(&self, profile_path: &str) -> Option<usize> {
+    let port = self.get_cdp_port(profile_path).await?;
+    let url = format!("http://127.0.0.1:{port}/json");
+    let resp = self.http_client.get(&url).send().await.ok()?;
+    let targets: Vec<CamoufoxCdpTarget> = resp.json().await.ok()?;
+    Some(targets.iter().filter(|t| t.target_type == "page").count())
+  }
+
+  /// Whether the tracked instance for this profile was launched windowed.
+  /// `Some(true)` = known windowed (eligible for the zero-window reaper),
+  /// `Some(false)` = known headless, `None` = unknown (recovered instance) or
+  /// no tracked instance. Only `Some(true)` should enable reaping.
+  pub async fn is_instance_windowed(&self, profile_path: &str) -> Option<bool> {
+    let inner = self.inner.lock().await;
+    let target_path = std::path::Path::new(profile_path)
+      .canonicalize()
+      .unwrap_or_else(|_| std::path::Path::new(profile_path).to_path_buf());
+
+    for instance in inner.instances.values() {
+      if let Some(path) = &instance.profile_path {
+        let instance_path = std::path::Path::new(path)
+          .canonicalize()
+          .unwrap_or_else(|_| std::path::Path::new(path).to_path_buf());
+        if instance_path == target_path {
+          return instance.windowed;
         }
       }
     }
@@ -263,9 +323,13 @@ impl CamoufoxManager {
       args.push(url.to_string());
     }
 
-    // Add headless flag when requested via the API or via the CAMOUFOX_HEADLESS
-    // env var (used by integration tests)
-    if headless || std::env::var("CAMOUFOX_HEADLESS").is_ok() {
+    // Effective headless = requested via the API OR forced via the
+    // CAMOUFOX_HEADLESS env var (used by integration tests). This single value
+    // drives BOTH the `--headless` flag and the instance `windowed` label, so
+    // an env-forced-headless launch is never mislabeled as windowed (which
+    // would make the zero-window reaper eligible to kill a headless browser).
+    let effective_headless = headless || std::env::var("CAMOUFOX_HEADLESS").is_ok();
+    if effective_headless {
       args.push("--headless".to_string());
     }
 
@@ -362,6 +426,10 @@ impl CamoufoxManager {
       profile_path: Some(profile_path.to_string()),
       url: url.map(String::from),
       cdp_port: Some(cdp_port),
+      // Positively known windowed-ness from the EFFECTIVE headless decision
+      // (parameter OR CAMOUFOX_HEADLESS env), so the zero-window reaper only
+      // fires for GUI launches, never headless ones.
+      windowed: Some(!effective_headless),
     };
 
     let launch_result = CamoufoxLaunchResult {
@@ -374,6 +442,28 @@ impl CamoufoxManager {
 
     {
       let mut inner = self.inner.lock().await;
+      // A profile can only run one browser at a time, so any pre-existing entry
+      // for this same canonical profile_path is stale by definition (a crashed
+      // or system-recovered instance with a dead PID and `windowed: None`). Drop
+      // it BEFORE inserting the fresh one, using the same canonicalization the
+      // by-path lookups use, so `is_instance_windowed` / `get_cdp_port` /
+      // `count_page_targets` always resolve to exactly one entry and never pick
+      // a stale value in nondeterministic HashMap order.
+      let new_canonical = std::path::Path::new(profile_path)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::Path::new(profile_path).to_path_buf());
+      inner.instances.retain(|_, existing| {
+        existing
+          .profile_path
+          .as_deref()
+          .map(|p| {
+            std::path::Path::new(p)
+              .canonicalize()
+              .unwrap_or_else(|_| std::path::Path::new(p).to_path_buf())
+              != new_canonical
+          })
+          .unwrap_or(true)
+      });
       inner.instances.insert(instance_id, instance);
     }
 
@@ -517,6 +607,9 @@ impl CamoufoxManager {
           profile_path: Some(found_profile_path.clone()),
           url: None,
           cdp_port,
+          // Recovered by system scan after a GUI restart: windowed-ness is
+          // unknown, so never reap it on zero windows.
+          windowed: None,
         },
       );
 

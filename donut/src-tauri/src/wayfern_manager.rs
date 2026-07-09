@@ -71,6 +71,13 @@ struct WayfernInstance {
   profile_path: Option<String>,
   url: Option<String>,
   cdp_port: Option<u16>,
+  /// Whether this instance was launched with an on-screen window.
+  /// `Some(true)` = windowed (a Cmd+Q / last-window-close reaper may apply);
+  /// `Some(false)` = headless (never reap on zero windows — a headless
+  /// automation browser legitimately has zero page targets);
+  /// `None` = unknown (e.g. a `recovered_<pid>` instance discovered by system
+  /// scan after a GUI restart) — treated like headless for reaping (never reap).
+  windowed: Option<bool>,
 }
 
 struct WayfernManagerInner {
@@ -1008,9 +1015,34 @@ impl WayfernManager {
       profile_path: Some(profile_path.to_string()),
       url: url.map(|s| s.to_string()),
       cdp_port: Some(port),
+      // Positively known windowed-ness from the launch options, so the
+      // zero-window reaper only fires for GUI launches, never headless ones.
+      windowed: Some(!headless),
     };
 
     let mut inner = self.inner.lock().await;
+    // A profile can only run one browser at a time, so any pre-existing entry
+    // for this same canonical profile_path is stale by definition (a crashed
+    // or system-recovered instance with a dead PID and `windowed: None`). Drop
+    // it BEFORE inserting the fresh one, using the same canonicalization the
+    // by-path lookups use, so `is_instance_windowed` / `get_cdp_port` /
+    // `count_page_targets` always resolve to exactly one entry and never pick a
+    // stale value in nondeterministic HashMap order.
+    let new_canonical = std::path::Path::new(profile_path)
+      .canonicalize()
+      .unwrap_or_else(|_| std::path::Path::new(profile_path).to_path_buf());
+    inner.instances.retain(|_, existing| {
+      existing
+        .profile_path
+        .as_deref()
+        .map(|p| {
+          std::path::Path::new(p)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::Path::new(p).to_path_buf())
+            != new_canonical
+        })
+        .unwrap_or(true)
+    });
     inner.instances.insert(id.clone(), instance);
 
     Ok(WayfernLaunchResult {
@@ -1121,6 +1153,47 @@ impl WayfernManager {
     None
   }
 
+  /// Count the DevTools targets of type `"page"` for this profile's instance —
+  /// i.e. how many browser windows/tabs currently exist. On macOS, closing the
+  /// last window leaves Chromium resident with zero page targets, so a `Some(0)`
+  /// here means the user closed every window even though the process is alive.
+  ///
+  /// Resolves the CDP port via the SAME in-memory instance lookup as
+  /// `get_cdp_port` (only the instance-tracked port; never a fresh system
+  /// scan). Returns `None` when the port is unknown (no tracked instance) OR
+  /// the CDP `/json` request fails (browser unreachable) — the caller treats
+  /// `None` as "cannot tell, assume still open" so a genuinely open browser is
+  /// never falsely reported stopped. Only `"page"` targets count; service
+  /// workers / background pages / other target types are ignored.
+  pub async fn count_page_targets(&self, profile_path: &str) -> Option<usize> {
+    let port = self.get_cdp_port(profile_path).await?;
+    let targets = self.get_cdp_targets(port).await.ok()?;
+    Some(targets.iter().filter(|t| t.target_type == "page").count())
+  }
+
+  /// Whether the tracked instance for this profile was launched windowed.
+  /// `Some(true)` = known windowed (eligible for the zero-window reaper),
+  /// `Some(false)` = known headless, `None` = unknown (recovered instance) or
+  /// no tracked instance. Only `Some(true)` should enable reaping.
+  pub async fn is_instance_windowed(&self, profile_path: &str) -> Option<bool> {
+    let inner = self.inner.lock().await;
+    let target_path = std::path::Path::new(profile_path)
+      .canonicalize()
+      .unwrap_or_else(|_| std::path::Path::new(profile_path).to_path_buf());
+
+    for instance in inner.instances.values() {
+      if let Some(path) = &instance.profile_path {
+        let instance_path = std::path::Path::new(path)
+          .canonicalize()
+          .unwrap_or_else(|_| std::path::Path::new(path).to_path_buf());
+        if instance_path == target_path {
+          return instance.windowed;
+        }
+      }
+    }
+    None
+  }
+
   pub async fn find_wayfern_by_profile(&self, profile_path: &str) -> Option<WayfernLaunchResult> {
     use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 
@@ -1195,6 +1268,10 @@ impl WayfernManager {
           profile_path: Some(found_profile_path.clone()),
           url: None,
           cdp_port,
+          // Recovered by system scan after a GUI restart: we cannot know
+          // whether it was launched windowed or headless, so leave it unknown
+          // and never reap it on zero windows.
+          windowed: None,
         },
       );
 

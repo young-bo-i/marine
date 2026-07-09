@@ -18,7 +18,18 @@ pub struct BrowserRunner {
   auto_updater: &'static crate::auto_updater::AutoUpdater,
   camoufox_manager: &'static CamoufoxManager,
   wayfern_manager: &'static WayfernManager,
+  /// Per-profile consecutive "zero window" observations, keyed by profile id.
+  /// Debounces the zero-window reaper in `check_browser_status`: a windowed
+  /// Wayfern/Camoufox that reports zero CDP page targets must be seen empty
+  /// `ZERO_WINDOW_REAP_THRESHOLD` times in a row before we tear it down, so a
+  /// transient empty moment (e.g. between closing one window and opening the
+  /// next) never triggers a false stop.
+  zero_window_ticks: std::sync::Mutex<std::collections::HashMap<String, u8>>,
 }
+
+/// Consecutive zero-window observations required before the reaper tears down a
+/// windowed Wayfern/Camoufox instance whose process is alive but has no windows.
+const ZERO_WINDOW_REAP_THRESHOLD: u8 = 2;
 
 impl BrowserRunner {
   fn new() -> Self {
@@ -28,6 +39,7 @@ impl BrowserRunner {
       auto_updater: crate::auto_updater::AutoUpdater::instance(),
       camoufox_manager: CamoufoxManager::instance(),
       wayfern_manager: WayfernManager::instance(),
+      zero_window_ticks: std::sync::Mutex::new(std::collections::HashMap::new()),
     }
   }
 
@@ -1105,15 +1117,163 @@ impl BrowserRunner {
     })
   }
 
+  /// Liveness for the UI's "running" indicator.
+  ///
+  /// The base observation (`profile_manager.check_browser_status`) answers "is
+  /// the tracked PID alive?". That is not enough on macOS: closing the last
+  /// window of a Wayfern (Chromium) / Camoufox (Firefox) leaves the process
+  /// RESIDENT with zero windows (only Cmd+Q quits it), so a pure PID check
+  /// would report the profile "running" forever after the user closed it.
+  ///
+  /// For a positively-known WINDOWED Wayfern/Camoufox we therefore also ask
+  /// "does the browser still have a window?" via the CDP `/json` page-target
+  /// count. Zero page targets, observed `ZERO_WINDOW_REAP_THRESHOLD` times in a
+  /// row (debounced against transient empties), means the user closed every
+  /// window — we then run the EXISTING full teardown (`kill_browser_process`:
+  /// stop proxy, tree-kill the process + descendants, clear the PID, emit
+  /// events) and only then report stopped. Guarantees:
+  ///   (A) no fake close — a `None` (CDP unreachable) or `>0` count keeps the
+  ///       profile "running"; we only report stopped after a verified reap;
+  ///   (B) no orphan — teardown goes through `kill_browser_process`, which
+  ///       verifies the process is gone and stops the proxy worker;
+  ///   (C) never kill headless/automation — only `Some(true)` windowed
+  ///       instances are eligible; headless and unknown/recovered instances
+  ///       fall back to pure PID liveness.
   pub async fn check_browser_status(
     &self,
     app_handle: tauri::AppHandle,
     profile: &BrowserProfile,
   ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    self
+    let profile_id = profile.id.to_string();
+
+    // Base observation. Its `Ok(false)` path already cleared process_id and
+    // emitted events for a genuine crash/quit.
+    let proc_alive = self
       .profile_manager
-      .check_browser_status(app_handle, profile)
-      .await
+      .check_browser_status(app_handle.clone(), profile)
+      .await?;
+
+    if !proc_alive {
+      // Crash/quit path: forget any pending debounce and eagerly reap the
+      // proxy worker so it can't linger (requirement B on the crash path).
+      {
+        let mut ticks = self.zero_window_ticks.lock().unwrap();
+        ticks.remove(&profile_id);
+      }
+      let _ = crate::proxy_manager::PROXY_MANAGER
+        .stop_proxy_by_profile_id(app_handle.clone(), &profile_id)
+        .await;
+      return Ok(false);
+    }
+
+    // Only positively-known WINDOWED Wayfern/Camoufox instances get the
+    // zero-window reaper. Everything else (headless instances, unknown/
+    // recovered instances, and any other browser type) keeps today's pure
+    // PID-liveness behavior — return the base observation as-is.
+    let profiles_dir = self.profile_manager.get_profiles_dir();
+    let profile_path = crate::ephemeral_dirs::get_effective_profile_path(profile, &profiles_dir);
+    let profile_path_str = profile_path.to_string_lossy().to_string();
+
+    let page_targets = match profile.browser.as_str() {
+      "wayfern" => {
+        if self
+          .wayfern_manager
+          .is_instance_windowed(&profile_path_str)
+          .await
+          != Some(true)
+        {
+          return Ok(true);
+        }
+        self
+          .wayfern_manager
+          .count_page_targets(&profile_path_str)
+          .await
+      }
+      "camoufox" => {
+        if self
+          .camoufox_manager
+          .is_instance_windowed(&profile_path_str)
+          .await
+          != Some(true)
+        {
+          return Ok(true);
+        }
+        self
+          .camoufox_manager
+          .count_page_targets(&profile_path_str)
+          .await
+      }
+      _ => return Ok(true),
+    };
+
+    match page_targets {
+      // CDP unreachable: cannot tell. The process is alive, so err toward
+      // "open". Reset the debounce counter so only an UNINTERRUPTED run of
+      // `Some(0)` observations can reach the reap threshold — a `None` gap
+      // breaks the "consecutive" chain and must not let a stale earlier
+      // `Some(0)` combine with a later one to fake-close (requirement A).
+      None => {
+        let mut ticks = self.zero_window_ticks.lock().unwrap();
+        ticks.insert(profile_id, 0);
+        Ok(true)
+      }
+      // At least one window: definitely open. Reset the debounce counter.
+      Some(n) if n > 0 => {
+        let mut ticks = self.zero_window_ticks.lock().unwrap();
+        ticks.insert(profile_id, 0);
+        Ok(true)
+      }
+      // Zero windows: process alive but windowless (user closed the last
+      // window). Debounce, then reap on the threshold.
+      Some(_) => {
+        // Compute the decision under the lock, then DROP the guard before any
+        // await so the std Mutex is never held across `kill_browser_process`
+        // (which re-enters the manager locks).
+        let should_reap = {
+          let mut ticks = self.zero_window_ticks.lock().unwrap();
+          let counter = ticks.entry(profile_id.clone()).or_insert(0);
+          *counter = counter.saturating_add(1);
+          if *counter >= ZERO_WINDOW_REAP_THRESHOLD {
+            *counter = 0;
+            true
+          } else {
+            false
+          }
+        };
+
+        if !should_reap {
+          return Ok(true);
+        }
+
+        log::info!(
+          "Zero-window reaper firing for profile {} (ID: {}): process alive but no CDP page targets — tearing down",
+          profile.name,
+          profile.id
+        );
+        // Note: `kill_browser_process` stops the proxy worker BEFORE it verifies
+        // the force-kill, so on the rare force-kill failure it returns Err with
+        // the proxy already stopped while we keep reporting the profile
+        // "running" (retried on the next tick). Left as-is intentionally: on the
+        // reaper path the window is already closed (idle/windowless) so the
+        // real-world impact is minimal, and reordering the shared teardown is
+        // out of scope + higher risk.
+        match self.kill_browser_process(app_handle.clone(), profile).await {
+          Ok(()) => Ok(false),
+          Err(e) => {
+            // Teardown could not be verified — do NOT report stopped, so we
+            // never claim a close we didn't complete (requirements A + B).
+            // The counter was reset above, so it retries on the next zero
+            // windows.
+            log::warn!(
+              "Zero-window reaper failed to tear down profile {} (ID: {}): {e}; keeping it running and will retry",
+              profile.name,
+              profile.id
+            );
+            Ok(true)
+          }
+        }
+      }
+    }
   }
 
   pub async fn kill_browser_process(
