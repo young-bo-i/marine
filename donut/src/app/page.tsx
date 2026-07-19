@@ -12,6 +12,7 @@ import { CamoufoxDeprecationDialog } from "@/components/camoufox-deprecation-dia
 import { CloneProfileDialog } from "@/components/clone-profile-dialog";
 import { CloseConfirmDialog } from "@/components/close-confirm-dialog";
 import { CommandPalette } from "@/components/command-palette";
+import { CommentHistoryPage } from "@/components/comment-history-page";
 import { CookieCopyDialog } from "@/components/cookie-copy-dialog";
 import { CookieManagementDialog } from "@/components/cookie-management-dialog";
 import { CreateProfileDialog } from "@/components/create-profile-dialog";
@@ -383,6 +384,7 @@ export default function Home() {
         setAccountDialogOpen(true);
         break;
       case "shortcuts":
+      case "marine":
         // Plain page render — nothing else to open.
         break;
     }
@@ -1699,6 +1701,8 @@ export default function Home() {
           {currentPage === "shortcuts" && (
             <ShortcutsPage groupTargets={orderedGroupTargets} />
           )}
+
+          {currentPage === "marine" && <CommentHistoryPage />}
 
           {settingsDialogOpen && (
             <SettingsDialog

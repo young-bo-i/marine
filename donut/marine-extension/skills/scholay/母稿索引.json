@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "source": "母稿.md",
+  "maxExamples": 2,
+  "fallback": ["submission-review", "research-matrix"],
+  "routes": [
+    {
+      "id": "methodology-pre-review",
+      "paragraph": 1,
+      "label": "统计错误、方法学、撤稿与预审稿",
+      "keywords": ["统计", "统计学", "方法学", "数据错误", "数据分析", "撤稿", "预审稿", "科研诚信", "研究方法"]
+    },
+    {
+      "id": "research-matrix",
+      "paragraph": 2,
+      "label": "开题、选题价值、研究空白与矩阵分析",
+      "keywords": ["开题", "选题", "研究空白", "研究价值", "文献矩阵", "矩阵分析", "综述", "GEMINI", "多维表格"]
+    },
+    {
+      "id": "literature-workflow",
+      "paragraph": 3,
+      "label": "文献管理与一站式研究工作流",
+      "keywords": ["文献管理", "文件夹", "zotero", "endnote", "知识管理", "工具切换", "研究流程", "读文献"]
+    },
+    {
+      "id": "submission-review",
+      "paragraph": 4,
+      "label": "投稿、拒稿、返修与 AI 模拟评审",
+      "keywords": ["投稿", "审稿", "拒稿", "返修", "录用", "期刊", "frontiers", "审稿人", "模拟评审", "修改意见", "2区"]
+    },
+    {
+      "id": "citation-database",
+      "paragraph": 5,
+      "label": "AI 编文献、真实数据库与 MCP",
+      "keywords": ["编文献", "假文献", "参考文献", "引用", "数据库", "mcp", "检索", "幻觉", "文献真实性"]
+    },
+    {
+      "id": "academic-editor",
+      "paragraph": 6,
+      "label": "论文格式、LaTeX、排版与学术编辑器",
+      "keywords": ["格式", "排版", "latex", "overleaf", "prsim", "prism", "编辑器", "图表编号", "参考文献格式", "终稿"]
+    }
+  ]
+}

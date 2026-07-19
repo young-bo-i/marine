@@ -128,10 +128,9 @@ impl VersionComponent {
       (PreReleaseKind::Pre, Self::extract_number(stripped))
     } else if let Some(stripped) = pre_release.strip_prefix('a') {
       (PreReleaseKind::Alpha, Self::extract_number(stripped))
-    } else if let Some(stripped) = pre_release.strip_prefix('b') {
-      (PreReleaseKind::Beta, Self::extract_number(stripped))
     } else {
-      return None;
+      let stripped = pre_release.strip_prefix('b')?;
+      (PreReleaseKind::Beta, Self::extract_number(stripped))
     };
 
     Some(PreRelease { kind, number })

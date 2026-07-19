@@ -1900,7 +1900,7 @@
     "network": "Mạng",
     "integrations": "Tích hợp",
     "account": "Tài khoản",
-    "marine": "Marine"
+    "marine": "Nhật ký bình luận"
   },
   "pageTitle": {
     "proxies": "Mạng",
@@ -1912,7 +1912,7 @@
     "account": "Tài khoản",
     "import": "Nhập profile",
     "shortcuts": "Phím tắt",
-    "marine": "Marine"
+    "marine": "Nhật ký bình luận"
   },
   "encryption": {
     "required": {
@@ -2187,6 +2187,70 @@
       "baseUrl": "URL cơ sở",
       "keyHint": "Đặt khóa API qua biến môi trường DONUT_MARINE_OPENAI_API_KEY.",
       "saved": "Đã lưu"
+    },
+    "history": {
+      "title": "Nhật ký bình luận",
+      "description": "Bản ghi cục bộ có thể truy vết các bình luận đã đăng từ Marine. Xác nhận từ nền tảng dựa trên phản hồi thành công của trang web được hỗ trợ.",
+      "stats": {
+        "label": "Tóm tắt đăng bài",
+        "today": "Hôm nay",
+        "sevenDays": "7 ngày qua",
+        "all": "Toàn bộ thời gian"
+      },
+      "filters": {
+        "label": "Bộ lọc bình luận",
+        "search": "Tìm bình luận",
+        "searchPlaceholder": "Tìm bình luận, tiêu đề, URL hoặc tài khoản",
+        "identity": "Danh tính",
+        "platform": "Nền tảng",
+        "kind": "Loại bình luận",
+        "status": "Trạng thái xác nhận",
+        "time": "Khoảng thời gian",
+        "allIdentities": "Mọi danh tính",
+        "allPlatforms": "Mọi nền tảng",
+        "allKinds": "Mọi loại",
+        "allStatuses": "Mọi trạng thái",
+        "allTime": "Toàn bộ thời gian",
+        "today": "Hôm nay",
+        "sevenDays": "7 ngày qua",
+        "thirtyDays": "30 ngày qua",
+        "clear": "Xóa bộ lọc"
+      },
+      "columns": {
+        "time": "Đã đăng",
+        "identity": "Danh tính",
+        "page": "Trang",
+        "platform": "Nền tảng",
+        "kind": "Loại",
+        "comment": "Bình luận cuối",
+        "status": "Xác nhận"
+      },
+      "kind": {
+        "direct": "Bình luận trực tiếp",
+        "reply": "Trả lời"
+      },
+      "status": {
+        "automatic": "Nền tảng đã xác nhận",
+        "manual": "Xác nhận thủ công"
+      },
+      "untitled": "Trang không có tiêu đề",
+      "unknownIdentity": "Danh tính không xác định",
+      "unknownTime": "Thời gian không xác định",
+      "replyTo": "Trả lời {{name}}",
+      "showing": "Đang hiển thị {{shown}} trong {{total}} bản ghi",
+      "loading": "Đang tải nhật ký bình luận…",
+      "loadError": {
+        "title": "Không thể tải nhật ký",
+        "description": "Không thể đọc lịch sử cục bộ. Hãy thử lại sau giây lát."
+      },
+      "empty": {
+        "title": "Chưa có bình luận nào được ghi lại",
+        "description": "Bình luận đăng thành công và bình luận bạn xác nhận thủ công sẽ xuất hiện tại đây.",
+        "filteredTitle": "Không có bình luận phù hợp",
+        "filteredDescription": "Hãy thử thay đổi bộ lọc hoặc từ khóa tìm kiếm."
+      },
+      "unknownPlatform": "Nền tảng không xác định",
+      "profileId": "ID hồ sơ: {{id}}"
     }
   }
 }

@@ -1900,7 +1900,7 @@
     "network": "Network",
     "integrations": "Integrations",
     "account": "Account",
-    "marine": "Marine"
+    "marine": "Comment ledger"
   },
   "pageTitle": {
     "proxies": "Network",
@@ -1912,7 +1912,7 @@
     "account": "Account",
     "import": "Import profile",
     "shortcuts": "Keyboard shortcuts",
-    "marine": "Marine"
+    "marine": "Comment ledger"
   },
   "encryption": {
     "required": {
@@ -2187,6 +2187,70 @@
       "baseUrl": "Base URL",
       "keyHint": "Set the API key via the DONUT_MARINE_OPENAI_API_KEY environment variable.",
       "saved": "Saved"
+    },
+    "history": {
+      "title": "Comment ledger",
+      "description": "A local, traceable record of comments posted from Marine. Platform confirmation is based on a supported site's successful response.",
+      "stats": {
+        "label": "Posting summary",
+        "today": "Today",
+        "sevenDays": "Last 7 days",
+        "all": "All time"
+      },
+      "filters": {
+        "label": "Comment filters",
+        "search": "Search comments",
+        "searchPlaceholder": "Search comment, title, URL, or account",
+        "identity": "Identity",
+        "platform": "Platform",
+        "kind": "Comment type",
+        "status": "Confirmation status",
+        "time": "Time range",
+        "allIdentities": "All identities",
+        "allPlatforms": "All platforms",
+        "allKinds": "All types",
+        "allStatuses": "All confirmations",
+        "allTime": "All time",
+        "today": "Today",
+        "sevenDays": "Last 7 days",
+        "thirtyDays": "Last 30 days",
+        "clear": "Clear filters"
+      },
+      "columns": {
+        "time": "Published",
+        "identity": "Identity",
+        "page": "Page",
+        "platform": "Platform",
+        "kind": "Type",
+        "comment": "Final comment",
+        "status": "Confirmation"
+      },
+      "kind": {
+        "direct": "Direct",
+        "reply": "Reply"
+      },
+      "status": {
+        "automatic": "Platform confirmed",
+        "manual": "Manually confirmed"
+      },
+      "untitled": "Untitled page",
+      "unknownIdentity": "Unknown identity",
+      "unknownTime": "Unknown time",
+      "replyTo": "Reply to {{name}}",
+      "showing": "Showing {{shown}} of {{total}} records",
+      "loading": "Loading comment ledger…",
+      "loadError": {
+        "title": "Couldn't load the comment ledger",
+        "description": "The local history couldn't be read. Try again in a moment."
+      },
+      "empty": {
+        "title": "No comments recorded yet",
+        "description": "Successfully posted comments and comments you confirm manually will appear here.",
+        "filteredTitle": "No matching comments",
+        "filteredDescription": "Try changing the filters or search terms."
+      },
+      "unknownPlatform": "Unknown platform",
+      "profileId": "Profile ID: {{id}}"
     }
   }
 }

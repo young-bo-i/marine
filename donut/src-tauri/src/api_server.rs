@@ -6,8 +6,9 @@ use crate::profile::manager::ProfileManager;
 use crate::proxy_manager::PROXY_MANAGER;
 use crate::tag_manager::TAG_MANAGER;
 use axum::{
-  extract::{Path, State},
-  http::{HeaderMap, StatusCode},
+  body::{Body, Bytes},
+  extract::{Extension, Path, Query, State},
+  http::{header, HeaderMap, HeaderValue, StatusCode},
   middleware::{self, Next},
   response::{Json, Response},
   routing::get,
@@ -15,17 +16,32 @@ use axum::{
 };
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex};
+use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 // Marine (截流) types reused as the extension-facing REST surface.
 use crate::marine::generate::cli::{detect_agents, AgentStatus};
-use crate::marine::generate::{generate_output, GenDirect, GenReply, GenerationOutput};
-use crate::marine::history::{PostingRecord, HISTORY_MANAGER};
+use crate::marine::generate::{
+  generate_output, generate_output_stream, GenDirect, GenReply, GenerationOutput,
+  MAX_STREAMED_PROVIDER_BYTES,
+};
+use crate::marine::history::{HistoryError, PostingRecord, HISTORY_MANAGER};
+use crate::marine::rime::{
+  blocks_for_output, incremental_blocks_for_output, now_secs as rime_now_secs, RimeBlock,
+  RimeContext, RimeContextError, RimeContextMode, RimeContextStore, RimeInvokeRequest,
+  RimeInvokeResponse, RimeStatus, RimeStreamEncoder, RimeStreamEvent, RimeStreamGate,
+  RimeStreamGateError, RimeStreamIdentity, RimeStreamInvokeRequest, RimeTarget,
+  MAX_RIME_STREAM_ERROR_MESSAGE_BYTES, RIME_PLUGIN_ID,
+};
+
+const RIME_STREAM_FRAME_SEND_TIMEOUT_SECS: u64 = 5;
 
 // API Types
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
@@ -115,6 +131,12 @@ pub struct UpdateProfileRequest {
 #[derive(Clone)]
 struct ApiServerState {
   app_handle: tauri::AppHandle,
+  /// Per-process capability accepted only by the Rime consumer endpoints.
+  /// The browser extension continues to use the user's full API token for
+  /// publishing/clearing context.
+  rime_consumer_token: Arc<str>,
+  rime_runtime_instance_id: Arc<str>,
+  rime_stream_gate: RimeStreamGate,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -335,9 +357,16 @@ struct BatchStopResponse {
     marine_generate_api,
     marine_get_provider_config,
     marine_set_provider_config,
+    marine_get_identities,
     marine_get_history,
     marine_append_history,
+    marine_append_published_history,
     marine_get_agents,
+    marine_get_rime_status,
+    marine_put_rime_context,
+    marine_delete_rime_context,
+    marine_invoke_rime_action,
+    marine_invoke_rime_action_stream,
   ),
   components(schemas(
     ApiProfile,
@@ -372,11 +401,21 @@ struct BatchStopResponse {
     MarineGenerateRequest,
     MarineProviderConfig,
     AgentStatus,
+    MarineIdentity,
     MarineHistoryAppendRequest,
+    MarinePublishedHistoryRequest,
     GenerationOutput,
     GenDirect,
     GenReply,
     PostingRecord,
+    RimeBlock,
+    RimeContext,
+    RimeContextMode,
+    RimeInvokeRequest,
+    RimeInvokeResponse,
+    RimeStreamInvokeRequest,
+    RimeStatus,
+    RimeTarget,
   )),
   tags(
     (name = "profiles", description = "Profile management endpoints"),
@@ -423,10 +462,351 @@ struct MarineHistoryAppendRequest {
   profile_id: String,
   brand_id: String,
   target_url: String,
+  #[serde(default)]
+  page_title: String,
   platform: String,
   kind: String,
   angle: String,
   text: String,
+  #[serde(default)]
+  site_account_id: Option<String>,
+  #[serde(default)]
+  site_account_name: Option<String>,
+  #[serde(default)]
+  target_comment_id: Option<String>,
+  #[serde(default)]
+  target_author: Option<String>,
+  #[serde(default)]
+  parent_id: Option<String>,
+  #[serde(default)]
+  root_id: Option<String>,
+  #[serde(default)]
+  context_id: Option<String>,
+}
+
+fn default_marine_brand_id() -> String {
+  "scholay".to_string()
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct MarinePublishedHistoryRequest {
+  schema_version: u8,
+  #[serde(default)]
+  event_id: Option<String>,
+  profile_id: String,
+  #[serde(default = "default_marine_brand_id")]
+  brand_id: String,
+  target_url: String,
+  #[serde(default)]
+  page_title: String,
+  platform: String,
+  kind: String,
+  text_snapshot: String,
+  #[serde(default)]
+  site_account_id: Option<String>,
+  #[serde(default)]
+  site_account_name: Option<String>,
+  platform_comment_id: String,
+  #[serde(default)]
+  target_comment_id: Option<String>,
+  #[serde(default)]
+  target_author: Option<String>,
+  #[serde(default)]
+  parent_id: Option<String>,
+  #[serde(default)]
+  root_id: Option<String>,
+  #[serde(default)]
+  context_id: Option<String>,
+  /// Bilibili's `ctime` in Unix seconds. Observation time is used if absent.
+  #[serde(default, alias = "published_at")]
+  posted_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+struct MarineIdentity {
+  id: String,
+  name: String,
+}
+
+const HISTORY_MAX_URL_CHARS: usize = 4096;
+const HISTORY_MAX_TITLE_CHARS: usize = 512;
+const HISTORY_MAX_TEXT_CHARS: usize = 20_000;
+const HISTORY_MAX_SHORT_CHARS: usize = 256;
+const HISTORY_MAX_ID_CHARS: usize = 128;
+
+fn history_api_error(
+  status: StatusCode,
+  code: &str,
+  message: impl Into<String>,
+) -> (StatusCode, String) {
+  (status, crate::marine::err_with(code, message))
+}
+
+fn history_invalid(message: impl Into<String>) -> (StatusCode, String) {
+  history_api_error(StatusCode::BAD_REQUEST, "MARINE_HISTORY_INVALID", message)
+}
+
+fn history_storage_error(error: impl std::fmt::Display) -> (StatusCode, String) {
+  log::error!("Marine posting history storage failed: {error}");
+  history_api_error(
+    StatusCode::INTERNAL_SERVER_ERROR,
+    "MARINE_HISTORY_STORAGE_FAILED",
+    "posting history storage failed",
+  )
+}
+
+fn history_manager_error(error: HistoryError) -> (StatusCode, String) {
+  match error {
+    HistoryError::InvalidProfileId(_) => history_invalid("invalid profile_id"),
+    other => history_storage_error(other),
+  }
+}
+
+fn bounded_required(value: &str, field: &str, max_chars: usize) -> Result<String, String> {
+  let trimmed = value.trim();
+  if trimmed.is_empty() {
+    return Err(format!("{field} is required"));
+  }
+  if trimmed.chars().count() > max_chars {
+    return Err(format!("{field} exceeds {max_chars} characters"));
+  }
+  Ok(trimmed.to_string())
+}
+
+fn bounded_required_preserved(
+  value: &str,
+  field: &str,
+  max_chars: usize,
+) -> Result<String, String> {
+  if value.trim().is_empty() {
+    return Err(format!("{field} is required"));
+  }
+  if value.chars().count() > max_chars {
+    return Err(format!("{field} exceeds {max_chars} characters"));
+  }
+  Ok(value.to_string())
+}
+
+fn bounded_optional(
+  value: Option<String>,
+  field: &str,
+  max_chars: usize,
+) -> Result<Option<String>, String> {
+  let Some(value) = value else {
+    return Ok(None);
+  };
+  if value.trim().is_empty() {
+    return Ok(None);
+  }
+  bounded_required(&value, field, max_chars).map(Some)
+}
+
+fn validated_http_url(value: &str, require_bilibili: bool) -> Result<String, String> {
+  let value = bounded_required(value, "target_url", HISTORY_MAX_URL_CHARS)?;
+  let parsed = url::Url::parse(&value).map_err(|_| "target_url is not a valid URL".to_string())?;
+  if !matches!(parsed.scheme(), "http" | "https") {
+    return Err("target_url must use http or https".to_string());
+  }
+  if parsed.host_str().is_none() {
+    return Err("target_url must include a host".to_string());
+  }
+  if require_bilibili {
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    if host != "bilibili.com" && !host.ends_with(".bilibili.com") {
+      return Err("target_url must be a Bilibili page".to_string());
+    }
+  }
+  Ok(value)
+}
+
+fn normalized_platform_id(value: Option<String>, field: &str) -> Result<Option<String>, String> {
+  let Some(value) = bounded_optional(value, field, HISTORY_MAX_ID_CHARS)? else {
+    return Ok(None);
+  };
+  let number = value
+    .parse::<u64>()
+    .map_err(|_| format!("{field} must be a positive integer"))?;
+  if number == 0 {
+    return Ok(None);
+  }
+  Ok(Some(number.to_string()))
+}
+
+fn normalized_published_at(value: Option<u64>, observed_at: u64) -> Result<u64, String> {
+  let Some(value) = value else {
+    return Ok(observed_at);
+  };
+  let seconds = if value >= 100_000_000_000 {
+    value / 1_000
+  } else {
+    value
+  };
+  if seconds == 0 || seconds > observed_at.saturating_add(86_400) {
+    return Err("posted_at is not a plausible Unix timestamp".to_string());
+  }
+  Ok(seconds)
+}
+
+fn resolve_marine_identity(profile_id: &str) -> Result<MarineIdentity, (StatusCode, String)> {
+  let parsed_id =
+    uuid::Uuid::parse_str(profile_id).map_err(|_| history_invalid("profile_id must be a UUID"))?;
+  let profiles = ProfileManager::instance()
+    .list_profiles()
+    .map_err(history_storage_error)?;
+  profiles
+    .into_iter()
+    .find(|profile| profile.id == parsed_id)
+    .map(|profile| MarineIdentity {
+      id: profile.id.to_string(),
+      name: profile.name,
+    })
+    .ok_or_else(|| {
+      history_api_error(
+        StatusCode::NOT_FOUND,
+        "MARINE_HISTORY_PROFILE_NOT_FOUND",
+        "Marine identity not found",
+      )
+    })
+}
+
+fn manual_history_record(
+  request: MarineHistoryAppendRequest,
+  identity: &MarineIdentity,
+  observed_at: u64,
+) -> Result<PostingRecord, String> {
+  let platform = bounded_required(&request.platform, "platform", 64)?.to_ascii_lowercase();
+  let kind = bounded_required(&request.kind, "kind", 16)?.to_ascii_lowercase();
+  if !matches!(kind.as_str(), "direct" | "reply") {
+    return Err("kind must be direct or reply".to_string());
+  }
+  Ok(PostingRecord {
+    id: uuid::Uuid::new_v4().to_string(),
+    event_id: None,
+    profile_id: identity.id.clone(),
+    profile_name_snapshot: identity.name.clone(),
+    brand_id: bounded_required(&request.brand_id, "brand_id", 64)?,
+    target_url: validated_http_url(&request.target_url, false)?,
+    page_title: bounded_optional(
+      Some(request.page_title),
+      "page_title",
+      HISTORY_MAX_TITLE_CHARS,
+    )?
+    .unwrap_or_default(),
+    platform,
+    kind,
+    angle: bounded_optional(Some(request.angle), "angle", HISTORY_MAX_SHORT_CHARS)?
+      .unwrap_or_default(),
+    text_snapshot: bounded_required_preserved(&request.text, "text", HISTORY_MAX_TEXT_CHARS)?,
+    site_account_id: bounded_optional(
+      request.site_account_id,
+      "site_account_id",
+      HISTORY_MAX_ID_CHARS,
+    )?,
+    site_account_name: bounded_optional(
+      request.site_account_name,
+      "site_account_name",
+      HISTORY_MAX_SHORT_CHARS,
+    )?,
+    platform_comment_id: None,
+    target_comment_id: bounded_optional(
+      request.target_comment_id,
+      "target_comment_id",
+      HISTORY_MAX_ID_CHARS,
+    )?,
+    target_author: bounded_optional(
+      request.target_author,
+      "target_author",
+      HISTORY_MAX_SHORT_CHARS,
+    )?,
+    parent_id: bounded_optional(request.parent_id, "parent_id", HISTORY_MAX_ID_CHARS)?,
+    root_id: bounded_optional(request.root_id, "root_id", HISTORY_MAX_ID_CHARS)?,
+    context_id: bounded_optional(request.context_id, "context_id", HISTORY_MAX_ID_CHARS)?,
+    confirmation_source: "manual".into(),
+    status: "manual_confirmed".into(),
+    posted_at: observed_at,
+  })
+}
+
+fn published_history_record(
+  request: MarinePublishedHistoryRequest,
+  identity: &MarineIdentity,
+  observed_at: u64,
+) -> Result<PostingRecord, String> {
+  if request.schema_version != 1 {
+    return Err("schema_version must be 1".to_string());
+  }
+  if !request.platform.trim().eq_ignore_ascii_case("bilibili") {
+    return Err("platform must be bilibili".to_string());
+  }
+  let platform_comment_id =
+    normalized_platform_id(Some(request.platform_comment_id), "platform_comment_id")?
+      .ok_or_else(|| "platform_comment_id must be a positive integer".to_string())?;
+  let canonical_event_id = format!("bilibili:{platform_comment_id}");
+  if let Some(event_id) = request.event_id.as_deref() {
+    if event_id != canonical_event_id {
+      return Err("event_id does not match platform_comment_id".to_string());
+    }
+  }
+  let target_comment_id = normalized_platform_id(request.target_comment_id, "target_comment_id")?;
+  let parent_id = normalized_platform_id(request.parent_id, "parent_id")?;
+  let root_id = normalized_platform_id(request.root_id, "root_id")?;
+  let hierarchy_target_id = parent_id.clone().or_else(|| root_id.clone());
+  if target_comment_id != hierarchy_target_id {
+    return Err("target_comment_id does not match parent_id/root_id".to_string());
+  }
+  let inferred_kind = if hierarchy_target_id.is_some() {
+    "reply"
+  } else {
+    "direct"
+  };
+  if request.kind.trim().to_ascii_lowercase() != inferred_kind {
+    return Err("kind does not match the Bilibili reply hierarchy".to_string());
+  }
+  Ok(PostingRecord {
+    id: uuid::Uuid::new_v4().to_string(),
+    event_id: Some(canonical_event_id),
+    profile_id: identity.id.clone(),
+    profile_name_snapshot: identity.name.clone(),
+    brand_id: bounded_required(&request.brand_id, "brand_id", 64)?,
+    target_url: validated_http_url(&request.target_url, true)?,
+    page_title: bounded_optional(
+      Some(request.page_title),
+      "page_title",
+      HISTORY_MAX_TITLE_CHARS,
+    )?
+    .unwrap_or_default(),
+    platform: "bilibili".into(),
+    kind: inferred_kind.into(),
+    angle: String::new(),
+    text_snapshot: bounded_required_preserved(
+      &request.text_snapshot,
+      "text_snapshot",
+      HISTORY_MAX_TEXT_CHARS,
+    )?,
+    site_account_id: bounded_optional(
+      request.site_account_id,
+      "site_account_id",
+      HISTORY_MAX_ID_CHARS,
+    )?,
+    site_account_name: bounded_optional(
+      request.site_account_name,
+      "site_account_name",
+      HISTORY_MAX_SHORT_CHARS,
+    )?,
+    platform_comment_id: Some(platform_comment_id),
+    target_comment_id,
+    target_author: bounded_optional(
+      request.target_author,
+      "target_author",
+      HISTORY_MAX_SHORT_CHARS,
+    )?,
+    parent_id,
+    root_id,
+    context_id: bounded_optional(request.context_id, "context_id", HISTORY_MAX_ID_CHARS)?,
+    confirmation_source: "bilibili-api".into(),
+    status: "published".into(),
+    posted_at: normalized_published_at(request.posted_at, observed_at)?,
+  })
 }
 
 #[utoipa::path(
@@ -500,6 +880,27 @@ async fn marine_get_agents(
 }
 
 #[utoipa::path(
+  get, path = "/v1/marine/identities",
+  responses((status = 200, body = [MarineIdentity])),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_get_identities(
+  State(_state): State<ApiServerState>,
+) -> Result<Json<Vec<MarineIdentity>>, (StatusCode, String)> {
+  let mut identities: Vec<MarineIdentity> = ProfileManager::instance()
+    .list_profiles()
+    .map_err(history_storage_error)?
+    .into_iter()
+    .map(|profile| MarineIdentity {
+      id: profile.id.to_string(),
+      name: profile.name,
+    })
+    .collect();
+  identities.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+  Ok(Json(identities))
+}
+
+#[utoipa::path(
   get, path = "/v1/marine/history/{profile_id}",
   params(("profile_id" = String, Path, description = "Profile (persona) id")),
   responses((status = 200, body = [PostingRecord])),
@@ -509,10 +910,12 @@ async fn marine_get_history(
   Path(profile_id): Path<String>,
   State(_state): State<ApiServerState>,
 ) -> Result<Json<Vec<PostingRecord>>, (StatusCode, String)> {
+  let identity = resolve_marine_identity(&profile_id)?;
   let records = HISTORY_MANAGER
     .lock()
-    .unwrap()
-    .list_for_profile(&profile_id);
+    .map_err(|_| history_storage_error("history manager lock poisoned"))?
+    .list_for_profile(&identity.id)
+    .map_err(history_manager_error)?;
   Ok(Json(records))
 }
 
@@ -525,23 +928,601 @@ async fn marine_append_history(
   State(_state): State<ApiServerState>,
   Json(req): Json<MarineHistoryAppendRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-  let record = PostingRecord {
-    id: uuid::Uuid::new_v4().to_string(),
-    profile_id: req.profile_id,
-    brand_id: req.brand_id,
-    target_url: req.target_url,
-    platform: req.platform,
-    kind: req.kind,
-    angle: req.angle,
-    text_snapshot: req.text,
-    posted_at: crate::proxy_manager::now_secs(),
-  };
+  let identity = resolve_marine_identity(&req.profile_id)?;
+  let record = manual_history_record(req, &identity, crate::proxy_manager::now_secs())
+    .map_err(history_invalid)?;
   HISTORY_MANAGER
     .lock()
-    .unwrap()
+    .map_err(|_| history_storage_error("history manager lock poisoned"))?
     .append(record)
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(history_manager_error)?;
   Ok(StatusCode::OK)
+}
+
+#[utoipa::path(
+  post, path = "/v1/marine/history/published", request_body = MarinePublishedHistoryRequest,
+  responses((status = 200, description = "Recorded or already recorded", body = PostingRecord)),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_append_published_history(
+  State(_state): State<ApiServerState>,
+  Json(req): Json<MarinePublishedHistoryRequest>,
+) -> Result<Json<PostingRecord>, (StatusCode, String)> {
+  let identity = resolve_marine_identity(&req.profile_id)?;
+  let record = published_history_record(req, &identity, crate::proxy_manager::now_secs())
+    .map_err(history_invalid)?;
+  let outcome = HISTORY_MANAGER
+    .lock()
+    .map_err(|_| history_storage_error("history manager lock poisoned"))?
+    .append(record)
+    .map_err(history_manager_error)?;
+  Ok(Json(outcome.record().clone()))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RimeClearQuery {
+  context_id: Option<String>,
+}
+
+fn rime_context_error(error: RimeContextError) -> (StatusCode, String) {
+  let (status, message) = match error {
+    RimeContextError::Missing => (StatusCode::NOT_FOUND, "no active browser comment target"),
+    RimeContextError::Stale => (StatusCode::CONFLICT, "browser comment target is stale"),
+    RimeContextError::ContextMismatch => (StatusCode::CONFLICT, "browser comment target changed"),
+    RimeContextError::ActionMismatch => (
+      StatusCode::CONFLICT,
+      "action does not match the browser comment target",
+    ),
+    RimeContextError::Invalid(message) => (StatusCode::BAD_REQUEST, message),
+  };
+  (
+    status,
+    crate::marine::err_with("MARINE_RIME_CONTEXT_INVALID", message),
+  )
+}
+
+#[utoipa::path(
+  get, path = "/v1/marine/rime/status",
+  responses((status = 200, body = RimeStatus)),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_get_rime_status(Extension(store): Extension<RimeContextStore>) -> Json<RimeStatus> {
+  Json(store.status(rime_now_secs()))
+}
+
+#[utoipa::path(
+  put, path = "/v1/marine/rime/context", request_body = RimeContext,
+  responses((status = 200, body = RimeStatus), (status = 400, description = "Invalid or stale context")),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_put_rime_context(
+  Extension(store): Extension<RimeContextStore>,
+  Json(context): Json<RimeContext>,
+) -> Result<Json<RimeStatus>, (StatusCode, String)> {
+  store
+    .set(context, rime_now_secs())
+    .map(Json)
+    .map_err(rime_context_error)
+}
+
+#[utoipa::path(
+  delete, path = "/v1/marine/rime/context",
+  responses((status = 204, description = "Context cleared or already superseded")),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_delete_rime_context(
+  Extension(store): Extension<RimeContextStore>,
+  Query(query): Query<RimeClearQuery>,
+) -> StatusCode {
+  // A stale tab's blur event is intentionally idempotent: a mismatched
+  // contextId leaves the newer target untouched but still returns 204.
+  store.clear(query.context_id.as_deref());
+  StatusCode::NO_CONTENT
+}
+
+#[utoipa::path(
+  post, path = "/v1/marine/rime/invoke", request_body = RimeInvokeRequest,
+  responses(
+    (status = 200, body = RimeInvokeResponse),
+    (status = 404, description = "No active context"),
+    (status = 409, description = "Context changed or expired"),
+    (status = 500, description = "Generation failed")
+  ),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_invoke_rime_action(
+  Extension(store): Extension<RimeContextStore>,
+  Json(request): Json<RimeInvokeRequest>,
+) -> Result<Json<RimeInvokeResponse>, (StatusCode, String)> {
+  let context = store
+    .context_for_invoke(&request, rime_now_secs())
+    .map_err(rime_context_error)?;
+  let payload = context.generation_payload();
+  let output = generate_output(&context.skill, &payload)
+    .await
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+
+  // Generation can take long enough for focus to move to another profile or
+  // comment. Re-check the exact lease before returning any blocks so a result
+  // produced for a superseded target is discarded at the server boundary.
+  store
+    .context_for_invoke(&request, rime_now_secs())
+    .map_err(rime_context_error)?;
+
+  let blocks = blocks_for_output(&context, output);
+  if blocks.is_empty() {
+    return Err((
+      StatusCode::BAD_GATEWAY,
+      crate::marine::err_with(
+        "MARINE_GENERATE_FAILED",
+        "generation returned no candidate for the requested target",
+      ),
+    ));
+  }
+
+  Ok(Json(RimeInvokeResponse {
+    request_id: request.request_id,
+    action_id: request.action_id,
+    context_id: request.context_id,
+    blocks,
+    target_summary: Some(context.target_summary),
+  }))
+}
+
+#[utoipa::path(
+  post, path = "/v1/marine/rime/invoke-stream", request_body = RimeStreamInvokeRequest,
+  responses(
+    (status = 200, description = "Authenticated NDJSON generation stream", content_type = "application/x-ndjson"),
+    (status = 400, description = "Invalid stream binding"),
+    (status = 404, description = "No active context"),
+    (status = 409, description = "Context changed, duplicate request, or another stream is active")
+  ),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_invoke_rime_action_stream(
+  State(state): State<ApiServerState>,
+  Extension(store): Extension<RimeContextStore>,
+  Json(request): Json<RimeStreamInvokeRequest>,
+) -> Result<Response, (StatusCode, String)> {
+  request
+    .validate_binding(RIME_PLUGIN_ID, state.rime_runtime_instance_id.as_ref())
+    .map_err(rime_context_error)?;
+  let context = store
+    .context_for_invoke(&request.invoke, rime_now_secs())
+    .map_err(rime_context_error)?;
+  let permit = state
+    .rime_stream_gate
+    .acquire(&request.invoke.request_id)
+    .map_err(|error| match error {
+      RimeStreamGateError::Duplicate => (
+        StatusCode::CONFLICT,
+        crate::marine::err_with(
+          "MARINE_RIME_DUPLICATE_REQUEST",
+          "requestId has already been used by this Marine runtime",
+        ),
+      ),
+      RimeStreamGateError::Busy => (
+        StatusCode::CONFLICT,
+        crate::marine::err_with(
+          "MARINE_RIME_STREAM_BUSY",
+          "another Marine generation stream is already active",
+        ),
+      ),
+    })?;
+
+  let identity = RimeStreamIdentity::from_request(&request);
+  let (frames_tx, frames_rx) = mpsc::channel(32);
+  let cancellation = CancellationToken::new();
+  tokio::spawn(produce_rime_generation_stream(
+    store,
+    context,
+    request,
+    RimeStreamEncoder::new(identity),
+    frames_tx,
+    cancellation.clone(),
+    permit,
+  ));
+
+  let stream = futures_util::stream::unfold(
+    RimeResponseStreamState {
+      receiver: frames_rx,
+      cancellation,
+    },
+    |mut state| async move {
+      state
+        .receiver
+        .recv()
+        .await
+        .map(|bytes| (Ok::<Bytes, Infallible>(Bytes::from(bytes)), state))
+    },
+  );
+  let mut response = Response::new(Body::from_stream(stream));
+  response.headers_mut().insert(
+    header::CONTENT_TYPE,
+    HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
+  );
+  response
+    .headers_mut()
+    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+  response.headers_mut().insert(
+    header::X_CONTENT_TYPE_OPTIONS,
+    HeaderValue::from_static("nosniff"),
+  );
+  Ok(response)
+}
+
+struct RimeResponseStreamState {
+  receiver: mpsc::Receiver<Vec<u8>>,
+  cancellation: CancellationToken,
+}
+
+impl Drop for RimeResponseStreamState {
+  fn drop(&mut self) {
+    self.cancellation.cancel();
+  }
+}
+
+async fn produce_rime_generation_stream(
+  store: RimeContextStore,
+  context: RimeContext,
+  request: RimeStreamInvokeRequest,
+  mut encoder: RimeStreamEncoder,
+  frames: mpsc::Sender<Vec<u8>>,
+  cancellation: CancellationToken,
+  _permit: crate::marine::rime::RimeStreamPermit,
+) {
+  let mut context_changes = store.subscribe_changes();
+  if !stream_context_matches(&store, &request.invoke, &context) {
+    let _ = send_stream_error(
+      &mut encoder,
+      &frames,
+      &cancellation,
+      "MARINE_RIME_CONTEXT_INVALID",
+      Some("browser comment target changed before generation started"),
+    )
+    .await;
+    return;
+  }
+  let payload = context.generation_payload();
+  let skill = context.skill.clone();
+  let (provider_tx, mut provider_rx) = mpsc::channel(32);
+  let provider_cancellation = cancellation.child_token();
+  let provider_cancel_for_task = provider_cancellation.clone();
+  let mut generation = tokio::spawn(async move {
+    generate_output_stream(&skill, &payload, provider_tx, provider_cancel_for_task).await
+  });
+  let mut raw = String::new();
+  let mut snapshots: Vec<RimeBlock> = Vec::new();
+  let mut provider_open = true;
+  let mut heartbeat = tokio::time::interval(Duration::from_secs(8));
+  heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+  heartbeat.tick().await;
+
+  loop {
+    tokio::select! {
+      _ = cancellation.cancelled() => {
+        provider_cancellation.cancel();
+        finish_generation_task(&mut generation).await;
+        return;
+      }
+      changed = context_changes.changed() => {
+        if changed.is_err() || !stream_context_matches(&store, &request.invoke, &context) {
+          provider_cancellation.cancel();
+          let _ = send_stream_error(
+            &mut encoder,
+            &frames,
+            &cancellation,
+            "MARINE_RIME_CONTEXT_INVALID",
+            Some("browser comment target changed during generation"),
+          ).await;
+          finish_generation_task(&mut generation).await;
+          return;
+        }
+      }
+      _ = heartbeat.tick() => {
+        if !stream_context_matches(&store, &request.invoke, &context) {
+          provider_cancellation.cancel();
+          let _ = send_stream_error(
+            &mut encoder,
+            &frames,
+            &cancellation,
+            "MARINE_RIME_CONTEXT_INVALID",
+            Some("browser comment target changed during generation"),
+          ).await;
+          finish_generation_task(&mut generation).await;
+          return;
+        }
+        if send_stream_event_with_fallback(
+          &mut encoder,
+          &frames,
+          &cancellation,
+          RimeStreamEvent::Heartbeat,
+        ).await.is_err() {
+          provider_cancellation.cancel();
+          finish_generation_task(&mut generation).await;
+          return;
+        }
+      }
+      delta = provider_rx.recv(), if provider_open => {
+        let Some(delta) = delta else {
+          provider_open = false;
+          continue;
+        };
+        if raw.len().saturating_add(delta.len()) > MAX_STREAMED_PROVIDER_BYTES {
+          provider_cancellation.cancel();
+          let _ = send_stream_error(
+            &mut encoder,
+            &frames,
+            &cancellation,
+            "MARINE_GENERATE_FAILED",
+            Some("provider output exceeded the configured limit"),
+          ).await;
+          finish_generation_task(&mut generation).await;
+          return;
+        }
+        raw.push_str(&delta);
+        if !stream_context_matches(&store, &request.invoke, &context) {
+          provider_cancellation.cancel();
+          let _ = send_stream_error(
+            &mut encoder,
+            &frames,
+            &cancellation,
+            "MARINE_RIME_CONTEXT_INVALID",
+            Some("browser comment target changed during generation"),
+          ).await;
+          finish_generation_task(&mut generation).await;
+          return;
+        }
+        match incremental_blocks_for_output(&context, &raw) {
+          Ok(blocks) => {
+            for (index, block) in indexed_rime_blocks(blocks) {
+              if block.text.is_empty() || snapshots.get(index) == Some(&block) {
+                continue;
+              }
+              if snapshots.len() <= index {
+                snapshots.resize_with(index + 1, || RimeBlock {
+                  text: String::new(),
+                  title: None,
+                });
+              }
+              snapshots[index] = block.clone();
+              if send_stream_event_with_fallback(
+                &mut encoder,
+                &frames,
+                &cancellation,
+                RimeStreamEvent::Block {
+                  index,
+                  text: block.text,
+                  title: block.title,
+                },
+              ).await.is_err() {
+                provider_cancellation.cancel();
+                finish_generation_task(&mut generation).await;
+                return;
+              }
+            }
+          }
+          Err(error) => {
+            provider_cancellation.cancel();
+            let _ = send_stream_error(
+              &mut encoder,
+              &frames,
+              &cancellation,
+              "MARINE_GENERATE_FAILED",
+              Some(&error),
+            ).await;
+            finish_generation_task(&mut generation).await;
+            return;
+          }
+        }
+      }
+      result = &mut generation => {
+        let result = match result {
+          Ok(result) => result,
+          Err(error) => Err(crate::marine::err_with(
+            "MARINE_GENERATE_FAILED",
+            format!("generation task failed: {error}"),
+          )),
+        };
+        let output = match result {
+          Ok(output) => output,
+          Err(error) => {
+            let (code, message) = stream_error_parts(&error);
+            let _ = send_stream_error(
+              &mut encoder,
+              &frames,
+              &cancellation,
+              &code,
+              message.as_deref(),
+            ).await;
+            return;
+          }
+        };
+        if !stream_context_matches(&store, &request.invoke, &context) {
+          let _ = send_stream_error(
+            &mut encoder,
+            &frames,
+            &cancellation,
+            "MARINE_RIME_CONTEXT_INVALID",
+            Some("browser comment target changed before completion"),
+          ).await;
+          return;
+        }
+        let mut blocks = blocks_for_output(&context, output);
+        for block in &mut blocks {
+          block.title = block
+            .title
+            .as_deref()
+            .map(|title| truncate_utf8(title, 200));
+        }
+        if blocks.is_empty() {
+          let _ = send_stream_error(
+            &mut encoder,
+            &frames,
+            &cancellation,
+            "MARINE_GENERATE_FAILED",
+            Some("generation returned no candidate for the requested target"),
+          ).await;
+          return;
+        }
+        for (index, block) in blocks.iter().enumerate() {
+          if snapshots.get(index) != Some(block)
+            && send_stream_event_with_fallback(
+              &mut encoder,
+              &frames,
+              &cancellation,
+              RimeStreamEvent::Block {
+                index,
+                text: block.text.clone(),
+                title: block.title.clone(),
+              },
+            ).await.is_err() {
+              return;
+            }
+        }
+        let _ = send_stream_event_with_fallback(
+          &mut encoder,
+          &frames,
+          &cancellation,
+          RimeStreamEvent::Complete {
+            blocks,
+            target_summary: Some(truncate_utf8(&context.target_summary, 1000)),
+          },
+        ).await;
+        return;
+      }
+    }
+  }
+}
+
+fn indexed_rime_blocks(blocks: Vec<RimeBlock>) -> impl Iterator<Item = (usize, RimeBlock)> {
+  blocks.into_iter().enumerate()
+}
+
+fn stream_context_matches(
+  store: &RimeContextStore,
+  request: &RimeInvokeRequest,
+  captured: &RimeContext,
+) -> bool {
+  store
+    .context_for_invoke(request, rime_now_secs())
+    .is_ok_and(|current| stream_context_same_lease(&current, captured))
+}
+
+fn stream_context_same_lease(current: &RimeContext, captured: &RimeContext) -> bool {
+  // The extension periodically renews an otherwise identical focus lease by
+  // advancing only `updatedAt`. Keep that stream alive, while continuing to
+  // compare every semantic field through RimeContext's derived PartialEq.
+  // Normalizing one timestamp instead of listing fields also makes newly added
+  // context fields fail closed automatically.
+  let mut normalized_current = current.clone();
+  normalized_current.updated_at = captured.updated_at;
+  normalized_current == *captured
+}
+
+async fn send_stream_event(
+  encoder: &mut RimeStreamEncoder,
+  frames: &mpsc::Sender<Vec<u8>>,
+  cancellation: &CancellationToken,
+  event: RimeStreamEvent,
+) -> Result<(), String> {
+  let bytes = encoder.encode(event)?;
+  tokio::select! {
+    _ = cancellation.cancelled() => Err("stream receiver disconnected".to_string()),
+    result = tokio::time::timeout(
+      Duration::from_secs(RIME_STREAM_FRAME_SEND_TIMEOUT_SECS),
+      frames.send(bytes),
+    ) => result
+      .map_err(|_| "stream receiver stalled".to_string())?
+      .map_err(|_| "stream receiver disconnected".to_string()),
+  }
+}
+
+async fn send_stream_event_with_fallback(
+  encoder: &mut RimeStreamEncoder,
+  frames: &mpsc::Sender<Vec<u8>>,
+  cancellation: &CancellationToken,
+  event: RimeStreamEvent,
+) -> Result<(), String> {
+  match send_stream_event(encoder, frames, cancellation, event).await {
+    Ok(()) => Ok(()),
+    Err(error) if error.starts_with("stream receiver") => Err(error),
+    Err(error) => {
+      let _ = send_stream_error(
+        encoder,
+        frames,
+        cancellation,
+        "MARINE_RIME_STREAM_LIMIT",
+        Some(&error),
+      )
+      .await;
+      Err(error)
+    }
+  }
+}
+
+async fn send_stream_error(
+  encoder: &mut RimeStreamEncoder,
+  frames: &mpsc::Sender<Vec<u8>>,
+  cancellation: &CancellationToken,
+  code: &str,
+  message: Option<&str>,
+) -> Result<(), String> {
+  send_stream_event(
+    encoder,
+    frames,
+    cancellation,
+    RimeStreamEvent::Error {
+      code: truncate_utf8(code, 128),
+      message: message.map(|value| truncate_utf8(value, MAX_RIME_STREAM_ERROR_MESSAGE_BYTES)),
+    },
+  )
+  .await
+}
+
+fn truncate_utf8(value: &str, maximum_bytes: usize) -> String {
+  if value.len() <= maximum_bytes {
+    return value.to_string();
+  }
+  let mut boundary = maximum_bytes;
+  while boundary > 0 && !value.is_char_boundary(boundary) {
+    boundary -= 1;
+  }
+  value[..boundary].to_string()
+}
+
+fn stream_error_parts(error: &str) -> (String, Option<String>) {
+  let parsed = serde_json::from_str::<serde_json::Value>(error).ok();
+  let code = parsed
+    .as_ref()
+    .and_then(|value| value.get("code"))
+    .and_then(serde_json::Value::as_str)
+    .unwrap_or("MARINE_GENERATE_FAILED")
+    .chars()
+    .take(128)
+    .collect();
+  let message = parsed
+    .as_ref()
+    .and_then(|value| value.pointer("/params/message"))
+    .and_then(serde_json::Value::as_str)
+    .map(|value| value.chars().take(1000).collect());
+  (code, message)
+}
+
+async fn finish_generation_task(
+  task: &mut tokio::task::JoinHandle<Result<GenerationOutput, String>>,
+) {
+  // CLI providers perform bounded kill/reap and stdout/stderr joins after
+  // cancellation. Give that cleanup path time to finish before the last-resort
+  // task abort drops the child handle.
+  if tokio::time::timeout(Duration::from_secs(8), &mut *task)
+    .await
+    .is_err()
+  {
+    task.abort();
+    let _ = task.await;
+  }
 }
 // =================== end Marine endpoints ===================
 
@@ -567,6 +1548,7 @@ pub struct ApiServer {
   port: Option<u16>,
   shutdown_tx: Option<mpsc::Sender<()>>,
   task_handle: Option<tokio::task::JoinHandle<()>>,
+  rime_runtime_instance_id: Option<String>,
 }
 
 impl ApiServer {
@@ -575,6 +1557,7 @@ impl ApiServer {
       port: None,
       shutdown_tx: None,
       task_handle: None,
+      rime_runtime_instance_id: None,
     }
   }
 
@@ -591,8 +1574,13 @@ impl ApiServer {
     self.stop().await.ok();
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
+    let rime_consumer_token = crate::marine::rime::generate_runtime_token();
+    let rime_runtime_instance_id = uuid::Uuid::new_v4().to_string();
     let state = ApiServerState {
       app_handle: app_handle.clone(),
+      rime_consumer_token: Arc::from(rime_consumer_token.clone()),
+      rime_runtime_instance_id: Arc::from(rime_runtime_instance_id.clone()),
+      rime_stream_gate: RimeStreamGate::default(),
     };
 
     // Try preferred port first, then random port
@@ -651,14 +1639,22 @@ impl ApiServer {
         marine_get_provider_config,
         marine_set_provider_config
       ))
+      .routes(routes!(marine_get_identities))
       .routes(routes!(marine_get_history))
       .routes(routes!(marine_append_history))
+      .routes(routes!(marine_append_published_history))
       .routes(routes!(marine_get_agents))
+      .routes(routes!(marine_get_rime_status))
+      .routes(routes!(marine_put_rime_context))
+      .routes(routes!(marine_delete_rime_context))
+      .routes(routes!(marine_invoke_rime_action))
+      .routes(routes!(marine_invoke_rime_action_stream))
       .split_for_parts();
 
     let api = ApiDoc::openapi();
 
     let v1_routes = v1_routes
+      .layer(Extension(RimeContextStore::default()))
       // Inert chokepoint (innermost → runs after auth) for the future per-hour
       // automation request limit. See rate_limit_middleware.
       .layer(middleware::from_fn(rate_limit_middleware))
@@ -696,6 +1692,23 @@ impl ApiServer {
     self.shutdown_tx = Some(shutdown_tx);
     self.task_handle = Some(task_handle);
 
+    match crate::marine::rime::write_runtime_config(
+      actual_port,
+      &rime_consumer_token,
+      &rime_runtime_instance_id,
+    ) {
+      Ok(path) => {
+        self.rime_runtime_instance_id = Some(rime_runtime_instance_id);
+        log::info!(
+          "Marine: wrote scoped Rime plugin runtime config to {}",
+          path.display()
+        );
+      }
+      Err(error) => {
+        log::error!("Marine: failed to write Rime runtime config: {error}");
+      }
+    }
+
     Ok(actual_port)
   }
 
@@ -708,6 +1721,14 @@ impl ApiServer {
       handle.abort();
     }
 
+    if let Some(instance_id) = self.rime_runtime_instance_id.take() {
+      match crate::marine::rime::remove_runtime_config_if_owned(&instance_id) {
+        Ok(true) => log::info!("Marine: removed stopped Rime runtime lease"),
+        Ok(false) => {}
+        Err(error) => log::warn!("Marine: failed to remove Rime runtime lease: {error}"),
+      }
+    }
+
     self.port = None;
     Ok(())
   }
@@ -718,8 +1739,18 @@ async fn terms_check_middleware(
   request: axum::extract::Request,
   next: Next,
 ) -> Result<Response, StatusCode> {
-  // Check if Wayfern terms have been accepted
-  if !crate::wayfern_terms::WayfernTermsManager::instance().is_terms_accepted() {
+  let terms_accepted = crate::wayfern_terms::WayfernTermsManager::instance().is_terms_accepted();
+  terms_check_middleware_with_acceptance(request, next, terms_accepted).await
+}
+
+async fn terms_check_middleware_with_acceptance(
+  request: axum::extract::Request,
+  next: Next,
+  terms_accepted: bool,
+) -> Result<Response, StatusCode> {
+  // Rime's Chrome-first bridge does not launch or download Wayfern. Keep its
+  // local, authenticated endpoints independent from the browser license gate.
+  if !terms_accepted && !is_rime_api_path(request.uri().path()) {
     return Err(StatusCode::FORBIDDEN);
   }
 
@@ -749,6 +1780,16 @@ async fn auth_middleware(
     }
   };
 
+  // The runtime file consumed by Rime Buffer carries an ephemeral capability,
+  // not the long-lived full API bearer. It can read status and explicitly
+  // invoke an already-published action, but cannot publish context or access
+  // any account/profile API. A fresh capability is generated on every start.
+  if is_rime_consumer_path(&path)
+    && constant_time_token_matches(token, state.rime_consumer_token.as_ref())
+  {
+    return Ok(next.run(request).await);
+  }
+
   // Get the stored token
   let settings_manager = crate::settings_manager::SettingsManager::instance();
   let stored_token = match settings_manager.get_api_token(&state.app_handle).await {
@@ -768,17 +1809,37 @@ async fn auth_middleware(
   // Constant-time comparison so the auth check doesn't leak the shared-prefix
   // length via timing. `ConstantTimeEq` on equal-length byte slices; differing
   // lengths simply compare unequal.
-  use subtle::ConstantTimeEq;
-  let token_bytes = token.as_bytes();
-  let stored_bytes = stored_token.as_bytes();
-  let matches = token_bytes.len() == stored_bytes.len() && token_bytes.ct_eq(stored_bytes).into();
-  if !matches {
+  if !constant_time_token_matches(token, &stored_token) {
     log::warn!("[api] Rejected {path}: token mismatch");
     return Err(StatusCode::UNAUTHORIZED);
   }
 
   // Token is valid, continue with the request
   Ok(next.run(request).await)
+}
+
+fn is_rime_consumer_path(path: &str) -> bool {
+  matches!(
+    path,
+    "/v1/marine/rime/status" | "/v1/marine/rime/invoke" | "/v1/marine/rime/invoke-stream"
+  )
+}
+
+fn is_rime_api_path(path: &str) -> bool {
+  matches!(
+    path,
+    "/v1/marine/rime/status"
+      | "/v1/marine/rime/context"
+      | "/v1/marine/rime/invoke"
+      | "/v1/marine/rime/invoke-stream"
+  )
+}
+
+fn constant_time_token_matches(presented: &str, expected: &str) -> bool {
+  use subtle::ConstantTimeEq;
+  let presented = presented.as_bytes();
+  let expected = expected.as_bytes();
+  presented.len() == expected.len() && presented.ct_eq(expected).into()
 }
 
 /// Logs every request: method, path, query, response status, duration.
@@ -2600,6 +3661,147 @@ async fn refresh_wayfern_token(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use axum::body::Body;
+  use axum::http::{header, Request};
+  use http_body_util::BodyExt;
+  use tower::ServiceExt;
+
+  fn test_marine_identity() -> MarineIdentity {
+    MarineIdentity {
+      id: uuid::Uuid::new_v4().to_string(),
+      name: "Research identity".into(),
+    }
+  }
+
+  fn test_published_history_request() -> MarinePublishedHistoryRequest {
+    MarinePublishedHistoryRequest {
+      schema_version: 1,
+      event_id: Some("bilibili:9001".into()),
+      profile_id: uuid::Uuid::new_v4().to_string(),
+      brand_id: "scholay".into(),
+      target_url: "https://www.bilibili.com/video/BV1test".into(),
+      page_title: "A video".into(),
+      platform: "bilibili".into(),
+      kind: "direct".into(),
+      text_snapshot: " The final text returned by Bilibili\n".into(),
+      site_account_id: Some("42".into()),
+      site_account_name: Some("viewer".into()),
+      platform_comment_id: "9001".into(),
+      target_comment_id: None,
+      target_author: None,
+      parent_id: Some("0".into()),
+      root_id: Some("0".into()),
+      context_id: None,
+      posted_at: Some(1_700_000_000),
+    }
+  }
+
+  #[test]
+  fn marine_identity_response_exposes_only_id_and_name() {
+    let value = serde_json::to_value(test_marine_identity()).unwrap();
+    let object = value.as_object().unwrap();
+    assert_eq!(object.len(), 2);
+    assert!(object.contains_key("id"));
+    assert!(object.contains_key("name"));
+  }
+
+  #[test]
+  fn manual_history_request_remains_backward_compatible() {
+    let request: MarineHistoryAppendRequest = serde_json::from_value(serde_json::json!({
+      "profile_id": uuid::Uuid::new_v4().to_string(),
+      "brand_id": "scholay",
+      "target_url": "https://example.com/post",
+      "platform": "web",
+      "kind": "direct",
+      "angle": "",
+      "text": "manual comment"
+    }))
+    .unwrap();
+    let record = manual_history_record(request, &test_marine_identity(), 123).unwrap();
+    assert_eq!(record.status, "manual_confirmed");
+    assert_eq!(record.confirmation_source, "manual");
+    assert!(record.page_title.is_empty());
+    assert_eq!(record.posted_at, 123);
+  }
+
+  #[test]
+  fn published_history_uses_platform_receipt_fields() {
+    let record = published_history_record(
+      test_published_history_request(),
+      &test_marine_identity(),
+      1_800_000_000,
+    )
+    .unwrap();
+    assert_eq!(record.event_id.as_deref(), Some("bilibili:9001"));
+    assert_eq!(record.platform_comment_id.as_deref(), Some("9001"));
+    assert_eq!(
+      record.text_snapshot,
+      " The final text returned by Bilibili\n"
+    );
+    assert_eq!(record.kind, "direct");
+    assert_eq!(record.status, "published");
+    assert_eq!(record.confirmation_source, "bilibili-api");
+    assert_eq!(record.posted_at, 1_700_000_000);
+  }
+
+  #[test]
+  fn published_reply_uses_the_bilibili_parent_as_its_target() {
+    let mut request = test_published_history_request();
+    request.kind = "reply".into();
+    request.root_id = Some("12".into());
+    request.parent_id = Some("34".into());
+    request.target_comment_id = Some("34".into());
+    let record = published_history_record(request, &test_marine_identity(), 1_800_000_000).unwrap();
+    assert_eq!(record.kind, "reply");
+    assert_eq!(record.target_comment_id.as_deref(), Some("34"));
+  }
+
+  #[test]
+  fn published_history_rejects_non_bilibili_pages_and_mismatched_hierarchy() {
+    let identity = test_marine_identity();
+    let mut wrong_page = test_published_history_request();
+    wrong_page.target_url = "https://example.com/video/BV1test".into();
+    assert!(published_history_record(wrong_page, &identity, 1_800_000_000).is_err());
+
+    let mut wrong_kind = test_published_history_request();
+    wrong_kind.target_comment_id = Some("12".into());
+    assert!(published_history_record(wrong_kind, &identity, 1_800_000_000).is_err());
+  }
+
+  fn rime_test_context(context_id: &str) -> RimeContext {
+    RimeContext {
+      context_id: context_id.into(),
+      mode: RimeContextMode::Direct,
+      action_id: crate::marine::rime::DIRECT_ACTION_ID.into(),
+      label: "Marine · 直评".into(),
+      target_summary: "视频直评".into(),
+      platform: "bilibili".into(),
+      url: "https://www.bilibili.com/video/BV1".into(),
+      title: "Example".into(),
+      target: None,
+      skill: "be useful".into(),
+      payload: serde_json::json!({"article": {"markdown": "video"}}),
+      updated_at: rime_now_secs(),
+    }
+  }
+
+  fn rime_test_router(store: RimeContextStore) -> Router {
+    Router::new()
+      .route("/status", get(marine_get_rime_status))
+      .route(
+        "/context",
+        axum::routing::put(marine_put_rime_context).delete(marine_delete_rime_context),
+      )
+      .route("/invoke", axum::routing::post(marine_invoke_rime_action))
+      .layer(Extension(store))
+  }
+
+  async fn unaccepted_terms_test_middleware(
+    request: axum::extract::Request,
+    next: Next,
+  ) -> Result<Response, StatusCode> {
+    terms_check_middleware_with_acceptance(request, next, false).await
+  }
 
   // Removing `browser` from UpdateProfileRequest, and rejecting invalid
   // `browser` values on create, must NOT make the API reject requests that
@@ -2648,5 +3850,438 @@ mod tests {
     assert!(!is_valid("chromium"));
     assert!(!is_valid("firefox"));
     assert!(!is_valid(""));
+  }
+
+  #[test]
+  fn rime_runtime_capability_is_scoped_to_consumer_routes() {
+    assert!(is_rime_consumer_path("/v1/marine/rime/status"));
+    assert!(is_rime_consumer_path("/v1/marine/rime/invoke"));
+    assert!(is_rime_consumer_path("/v1/marine/rime/invoke-stream"));
+    assert!(!is_rime_consumer_path("/v1/marine/rime/context"));
+    assert!(!is_rime_consumer_path("/v1/profiles"));
+    assert!(constant_time_token_matches("capability", "capability"));
+    assert!(!constant_time_token_matches("capability", "capabilitx"));
+    assert!(!constant_time_token_matches("short", "longer"));
+  }
+
+  #[test]
+  fn rime_stream_route_is_documented_and_utf8_bounds_are_byte_based() {
+    let api = ApiDoc::openapi();
+    assert!(api
+      .paths
+      .paths
+      .contains_key("/v1/marine/rime/invoke-stream"));
+    let truncated = truncate_utf8("中中", 4);
+    assert_eq!(truncated, "中");
+    assert!(truncated.len() <= 4);
+  }
+
+  #[test]
+  fn rime_stream_lease_renewal_ignores_only_updated_at() {
+    let captured = rime_test_context("ctx-renewal");
+    let mut renewed = captured.clone();
+    renewed.updated_at = renewed.updated_at.saturating_add(1);
+
+    assert!(stream_context_same_lease(&renewed, &captured));
+    assert!(stream_context_same_lease(&captured, &renewed));
+  }
+
+  #[test]
+  fn rime_stream_lease_rejects_every_semantic_context_change() {
+    type ContextMutation = (&'static str, fn(&mut RimeContext));
+
+    let captured = rime_test_context("ctx-captured");
+    let changes: &[ContextMutation] = &[
+      ("contextId", |context| context.context_id.push_str("-other")),
+      ("mode", |context| context.mode = RimeContextMode::Reply),
+      ("actionId", |context| context.action_id.push_str("-other")),
+      ("label", |context| context.label.push_str(" other")),
+      ("targetSummary", |context| {
+        context.target_summary.push_str(" other")
+      }),
+      ("platform", |context| context.platform.push_str("-other")),
+      ("url", |context| context.url.push_str("?other=1")),
+      ("title", |context| context.title.push_str(" other")),
+      ("target", |context| {
+        context.target = Some(RimeTarget {
+          id: "target-other".into(),
+          author_name: "Other".into(),
+          text: "Other comment".into(),
+          parent_id: String::new(),
+          root_id: String::new(),
+        })
+      }),
+      ("skill", |context| context.skill.push_str(" other")),
+      ("payload", |context| {
+        context.payload = serde_json::json!({"article": {"markdown": "other"}})
+      }),
+    ];
+
+    for (field, mutate) in changes {
+      let mut changed = captured.clone();
+      mutate(&mut changed);
+      assert!(
+        !stream_context_same_lease(&changed, &captured),
+        "changing {field} must invalidate the stream lease"
+      );
+    }
+  }
+
+  #[test]
+  fn rime_stream_context_match_survives_store_renewal() {
+    let store = RimeContextStore::default();
+    let captured = rime_test_context("ctx-renewed-in-store");
+    let request = RimeInvokeRequest {
+      request_id: "request-renewal".into(),
+      action_id: captured.action_id.clone(),
+      context_id: captured.context_id.clone(),
+    };
+    store
+      .set(captured.clone(), rime_now_secs())
+      .expect("initial context should be accepted");
+
+    let mut renewed = captured.clone();
+    renewed.updated_at = renewed.updated_at.saturating_add(1);
+    store
+      .set(renewed, rime_now_secs())
+      .expect("fresh renewal should be accepted");
+
+    assert!(stream_context_matches(&store, &request, &captured));
+  }
+
+  #[test]
+  fn rime_stream_indexes_every_natural_block_and_complete_preserves_text() {
+    let context = rime_test_context("ctx-blocks");
+    let raw = r#"{"direct":[{"text":"第一句，第二句。第三句","angle":"结构"}],"replies":[]}"#;
+    let blocks = incremental_blocks_for_output(&context, raw).unwrap();
+    assert_eq!(blocks.len(), 3);
+    assert_eq!(
+      blocks
+        .iter()
+        .map(|block| block.text.as_str())
+        .collect::<String>(),
+      "第一句，第二句。第三句"
+    );
+
+    let identity = RimeStreamIdentity {
+      plugin_id: RIME_PLUGIN_ID.into(),
+      runtime_instance_id: "runtime-test".into(),
+      request_id: "request-test".into(),
+      action_id: crate::marine::rime::DIRECT_ACTION_ID.into(),
+      context_id: context.context_id.clone(),
+    };
+    let mut encoder = RimeStreamEncoder::new(identity);
+    let mut emitted_indices = Vec::new();
+    for (index, block) in indexed_rime_blocks(blocks.clone()) {
+      let frame: serde_json::Value = serde_json::from_slice(
+        &encoder
+          .encode(RimeStreamEvent::Block {
+            index,
+            text: block.text,
+            title: block.title,
+          })
+          .unwrap(),
+      )
+      .unwrap();
+      emitted_indices.push(frame["index"].as_u64().unwrap());
+    }
+    assert_eq!(emitted_indices, vec![0, 1, 2]);
+    let complete: serde_json::Value = serde_json::from_slice(
+      &encoder
+        .encode(RimeStreamEvent::Complete {
+          blocks,
+          target_summary: Some(context.target_summary),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let final_blocks: Vec<RimeBlock> = serde_json::from_value(complete["blocks"].clone()).unwrap();
+    assert_eq!(
+      final_blocks
+        .iter()
+        .map(|block| block.text.as_str())
+        .collect::<String>(),
+      "第一句，第二句。第三句"
+    );
+  }
+
+  #[test]
+  fn rime_stream_error_truncation_matches_encoder_utf8_limit() {
+    let message = "界".repeat(200);
+    let truncated = truncate_utf8(&message, MAX_RIME_STREAM_ERROR_MESSAGE_BYTES);
+    assert!(truncated.len() <= MAX_RIME_STREAM_ERROR_MESSAGE_BYTES);
+    assert!(truncated.is_char_boundary(truncated.len()));
+    let mut encoder = RimeStreamEncoder::new(RimeStreamIdentity {
+      plugin_id: RIME_PLUGIN_ID.into(),
+      runtime_instance_id: "runtime-test".into(),
+      request_id: "request-test".into(),
+      action_id: crate::marine::rime::DIRECT_ACTION_ID.into(),
+      context_id: "context-test".into(),
+    });
+    assert!(encoder
+      .encode(RimeStreamEvent::Error {
+        code: "MARINE_GENERATE_FAILED".into(),
+        message: Some(truncated),
+      })
+      .is_ok());
+  }
+
+  #[tokio::test]
+  async fn rime_routes_bypass_only_the_wayfern_terms_gate() {
+    async fn ok() -> StatusCode {
+      StatusCode::OK
+    }
+
+    let app = Router::new()
+      .route("/v1/marine/rime/status", get(ok))
+      .route("/v1/marine/rime/context", axum::routing::put(ok).delete(ok))
+      .route("/v1/marine/rime/invoke", axum::routing::post(ok))
+      .route("/v1/marine/rime/invoke-stream", axum::routing::post(ok))
+      .route("/v1/profiles", get(ok))
+      .layer(middleware::from_fn(unaccepted_terms_test_middleware));
+
+    for (method, path) in [
+      ("GET", "/v1/marine/rime/status"),
+      ("PUT", "/v1/marine/rime/context"),
+      ("DELETE", "/v1/marine/rime/context"),
+      ("POST", "/v1/marine/rime/invoke"),
+      ("POST", "/v1/marine/rime/invoke-stream"),
+    ] {
+      let request = Request::builder()
+        .method(method)
+        .uri(path)
+        .body(Body::empty())
+        .unwrap();
+      assert_eq!(
+        app.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::OK,
+        "{method} {path} should not require Wayfern terms"
+      );
+    }
+
+    let protected = Request::builder()
+      .uri("/v1/profiles")
+      .body(Body::empty())
+      .unwrap();
+    assert_eq!(
+      app.oneshot(protected).await.unwrap().status(),
+      StatusCode::FORBIDDEN
+    );
+  }
+
+  #[tokio::test]
+  async fn rime_context_routes_preserve_new_target_when_old_target_clears() {
+    let store = RimeContextStore::default();
+    let app = rime_test_router(store);
+    let now = rime_now_secs();
+
+    for (context_id, updated_at) in [("ctx-old", now - 2), ("ctx-new", now)] {
+      let mut context = rime_test_context(context_id);
+      context.updated_at = updated_at;
+      let request = Request::builder()
+        .method("PUT")
+        .uri("/context")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&context).unwrap()))
+        .unwrap();
+      assert_eq!(
+        app.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::OK
+      );
+    }
+
+    // The older profile's in-flight PUT may complete after the new target is
+    // already active. Its client timestamp makes the leases comparable, so it
+    // must not replace the newer target.
+    let mut delayed_old = rime_test_context("ctx-old");
+    delayed_old.updated_at = now - 2;
+    let delayed_put = Request::builder()
+      .method("PUT")
+      .uri("/context")
+      .header(header::CONTENT_TYPE, "application/json")
+      .body(Body::from(serde_json::to_vec(&delayed_old).unwrap()))
+      .unwrap();
+    assert_eq!(
+      app.clone().oneshot(delayed_put).await.unwrap().status(),
+      StatusCode::CONFLICT
+    );
+
+    let clear_old = Request::builder()
+      .method("DELETE")
+      .uri("/context?contextId=ctx-old")
+      .body(Body::empty())
+      .unwrap();
+    assert_eq!(
+      app.clone().oneshot(clear_old).await.unwrap().status(),
+      StatusCode::NO_CONTENT
+    );
+
+    let response = app
+      .oneshot(
+        Request::builder()
+          .uri("/status")
+          .body(Body::empty())
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let status: RimeStatus = serde_json::from_slice(&bytes).unwrap();
+    assert!(status.available);
+    assert_eq!(status.context_id.as_deref(), Some("ctx-new"));
+    assert_eq!(status.action_id, crate::marine::rime::DIRECT_ACTION_ID);
+  }
+
+  #[tokio::test]
+  async fn rime_deleting_active_context_does_not_fall_back() {
+    let store = RimeContextStore::default();
+    let app = rime_test_router(store);
+    let now = rime_now_secs();
+
+    for (context_id, updated_at) in [("ctx-profile-a", now - 2), ("ctx-profile-b", now)] {
+      let mut context = rime_test_context(context_id);
+      context.updated_at = updated_at;
+      let put = Request::builder()
+        .method("PUT")
+        .uri("/context")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&context).unwrap()))
+        .unwrap();
+      assert_eq!(
+        app.clone().oneshot(put).await.unwrap().status(),
+        StatusCode::OK
+      );
+    }
+
+    let delete_active = Request::builder()
+      .method("DELETE")
+      .uri("/context?contextId=ctx-profile-b")
+      .body(Body::empty())
+      .unwrap();
+    assert_eq!(
+      app.clone().oneshot(delete_active).await.unwrap().status(),
+      StatusCode::NO_CONTENT
+    );
+
+    let response = app
+      .oneshot(
+        Request::builder()
+          .uri("/status")
+          .body(Body::empty())
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let status: RimeStatus = serde_json::from_slice(&bytes).unwrap();
+    assert!(!status.available);
+    assert!(status.context_id.is_none());
+  }
+
+  #[tokio::test]
+  async fn rime_delete_arriving_before_put_revokes_only_that_lease() {
+    let store = RimeContextStore::default();
+    let app = rime_test_router(store);
+
+    let clear = Request::builder()
+      .method("DELETE")
+      .uri("/context?contextId=ctx-in-flight")
+      .body(Body::empty())
+      .unwrap();
+    assert_eq!(
+      app.clone().oneshot(clear).await.unwrap().status(),
+      StatusCode::NO_CONTENT
+    );
+
+    let delayed_put = Request::builder()
+      .method("PUT")
+      .uri("/context")
+      .header(header::CONTENT_TYPE, "application/json")
+      .body(Body::from(
+        serde_json::to_vec(&rime_test_context("ctx-in-flight")).unwrap(),
+      ))
+      .unwrap();
+    assert_eq!(
+      app.clone().oneshot(delayed_put).await.unwrap().status(),
+      StatusCode::CONFLICT
+    );
+
+    let current_put = Request::builder()
+      .method("PUT")
+      .uri("/context")
+      .header(header::CONTENT_TYPE, "application/json")
+      .body(Body::from(
+        serde_json::to_vec(&rime_test_context("ctx-current")).unwrap(),
+      ))
+      .unwrap();
+    assert_eq!(
+      app.clone().oneshot(current_put).await.unwrap().status(),
+      StatusCode::OK
+    );
+
+    let response = app
+      .oneshot(
+        Request::builder()
+          .uri("/status")
+          .body(Body::empty())
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let status: RimeStatus = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(status.context_id.as_deref(), Some("ctx-current"));
+  }
+
+  #[tokio::test]
+  async fn rime_invoke_route_rejects_context_mismatch_before_generation() {
+    let store = RimeContextStore::default();
+    store
+      .set(rime_test_context("ctx-current"), rime_now_secs())
+      .unwrap();
+    let app = rime_test_router(store);
+    let request = Request::builder()
+      .method("POST")
+      .uri("/invoke")
+      .header(header::CONTENT_TYPE, "application/json")
+      .body(Body::from(
+        serde_json::to_vec(&RimeInvokeRequest {
+          request_id: "req-1".into(),
+          action_id: crate::marine::rime::DIRECT_ACTION_ID.into(),
+          context_id: "ctx-stale".into(),
+        })
+        .unwrap(),
+      ))
+      .unwrap();
+    assert_eq!(
+      app.oneshot(request).await.unwrap().status(),
+      StatusCode::CONFLICT
+    );
+  }
+
+  #[tokio::test]
+  async fn rime_invoke_route_rejects_action_for_a_different_captured_mode() {
+    let store = RimeContextStore::default();
+    store
+      .set(rime_test_context("ctx-current"), rime_now_secs())
+      .unwrap();
+    let app = rime_test_router(store);
+    let request = Request::builder()
+      .method("POST")
+      .uri("/invoke")
+      .header(header::CONTENT_TYPE, "application/json")
+      .body(Body::from(
+        serde_json::to_vec(&RimeInvokeRequest {
+          request_id: "req-cross-mode".into(),
+          action_id: crate::marine::rime::REPLY_ACTION_ID.into(),
+          context_id: "ctx-current".into(),
+        })
+        .unwrap(),
+      ))
+      .unwrap();
+    assert_eq!(
+      app.oneshot(request).await.unwrap().status(),
+      StatusCode::CONFLICT
+    );
   }
 }

@@ -160,6 +160,7 @@ button:disabled { opacity: .5; cursor: default; box-shadow: none; }
 .reply-fill, .reply-post { background: rgba(34,197,94,.16); border-color: transparent; color: var(--has-fg); }
 .reply-fill:hover, .reply-post:hover { background: rgba(34,197,94,.26); color: var(--has-fg); }
 .reply-post.done { background: var(--has-bg); color: var(--has-fg); }
+.reply-auto-note { margin-left: auto; align-self: center; font-size: 10px; color: var(--has-fg); }
 
 .hint { margin-top: 11px; padding: 9px 11px; font-size: 12px; line-height: 1.6; background: var(--danger-bg); border-radius: 8px; color: var(--danger); }
 .link { border: none; background: none; padding: 0; color: var(--accent); cursor: pointer; font-size: 12px; text-decoration: underline; }

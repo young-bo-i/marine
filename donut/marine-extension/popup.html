@@ -72,7 +72,7 @@
     <section id="pane-config" class="pane">
       <div id="cfg-status" class="status cfg-status"></div>
 
-      <!-- 连接状态（由 Donut 启动 profile 时自动配置；手填仅用于独立调试） -->
+      <!-- 连接状态（生产由 Marine 自动配置；手填用于 Chrome 独立调试） -->
       <div class="field-label">连接状态</div>
       <div id="conn-status" class="conn-status"><span class="conn-dot"></span><span id="conn-status-text">检测中…</span></div>
       <details class="conn-manual">
@@ -80,21 +80,26 @@
         <label class="mini-label">apiBase</label>
         <input id="cfg-apibase" class="cfg-input" placeholder="http://127.0.0.1:10108/v1/marine">
         <label class="mini-label">token</label>
-        <input id="cfg-token" class="cfg-input" placeholder="Bearer token">
+        <input id="cfg-token" class="cfg-input" type="password" autocomplete="off" placeholder="已配置时留空可保持不变">
+        <label class="mini-label">Marine 身份</label>
+        <select id="cfg-profile" class="cfg-input" disabled>
+          <option value="">请先连接 Marine…</option>
+        </select>
+        <div id="cfg-profile-status" class="note">自动发布记录会归入这个浏览器身份。</div>
         <button id="cfg-conn-save" class="cta-2 cfg-btn">保存连接并刷新</button>
         <div id="cfg-conn-source" class="note"></div>
-        <div class="note">正常情况下从 Donut 启动此 profile 会自动写入 <code>marine-runtime-config.json</code>，无需手填。</div>
+        <div class="note">生产环境由 Marine 自动写入 <code>marine-runtime-config.json</code>。轻量开发桥可单独调试上下文；需要发布归档时，请连接真实 Marine 并选择一个身份。</div>
       </details>
 
-      <!-- 话术方案：预制在扩展内 + 可导入本地 .md 补充范文 -->
+      <!-- 话术方案：原版母稿按页面内容路由 + 可导入本地 .md 补充范文 -->
       <div class="field-label cfg-gap">话术方案</div>
-      <div class="note" style="margin-top:0">已内置 <code>Scholay</code> 话术方案（人设 / 评论口径 / 风格参数 / 范文），生成时自动带入。可再导入本地 <code>.md</code> 作为补充范文。</div>
+      <div class="note" style="margin-top:0">已内置 <code>Scholay</code> 原版母稿与场景路由，每次按页面背景选择最相关的一至两段。可再导入本地 <code>.md</code> 作为次级参考。</div>
       <div class="brand-row" style="margin-top:8px">
-        <button id="sample-import" class="cta-2 brand-mini-btn">导入范文（.md）</button>
+        <button id="sample-import" class="cta-2 brand-mini-btn">导入补充范文（.md）</button>
         <button id="sample-clear" class="cta-2 brand-mini-btn danger hidden">移除</button>
         <input id="sample-file" type="file" accept=".md,text/markdown" class="hidden">
       </div>
-      <div id="sample-status" class="note" style="margin-top:6px">未导入自定义范文（仅用内置范文）。</div>
+      <div id="sample-status" class="note" style="margin-top:6px">未导入补充范文（当前只用原版母稿）。</div>
 
       <!-- 引擎 / 本地智能体（自动识别 + 卡片选用） -->
       <div class="field-label cfg-gap">引擎 / 本地智能体</div>
@@ -121,9 +126,9 @@
 
     <!-- 调试 -->
     <section id="pane-debug" class="pane">
-      <div class="dbg-bar"><span class="dbg-title">调试日志（当前页）</span><span class="dbg-actions"><button id="dbg-snapshot" class="link">导出快照</button><button id="dbg-clear" class="link">清空</button></span></div>
+      <div class="dbg-bar"><span class="dbg-title">调试日志（当前页）</span><span class="dbg-actions"><button id="dbg-rime" class="link">复制 Rime 诊断</button><button id="dbg-snapshot" class="link">导出快照</button><button id="dbg-clear" class="link">清空</button></span></div>
       <div id="dbg-log" class="dbg-log"></div>
-      <div class="note" style="margin-top:8px">「导出快照」= 抓当前页的捕获 API 响应 + SSR 状态 + DOM 样本，复制到剪贴板。调平台解析时把它发给开发者。</div>
+      <div class="note" style="margin-top:8px">「复制 Rime 诊断」只导出脱敏的标签、类名、回复标签作者和候选计数；「导出快照」则包含页面捕获数据，仅用于平台解析联调。</div>
     </section>
   </main>
 
@@ -133,6 +138,8 @@
     <button class="tabbtn" data-tab="debug"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3 8 4-16 3 8h4"></path></svg>调试</button>
   </nav>
 
+  <script src="src/rime-context.js"></script>
+  <script src="src/scholay-skill.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

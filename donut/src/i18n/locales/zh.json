@@ -1900,7 +1900,7 @@
     "network": "网络",
     "integrations": "集成",
     "account": "账号",
-    "marine": "Marine"
+    "marine": "评论账本"
   },
   "pageTitle": {
     "proxies": "网络",
@@ -1912,7 +1912,7 @@
     "account": "账户",
     "import": "导入配置文件",
     "shortcuts": "键盘快捷键",
-    "marine": "Marine"
+    "marine": "评论账本"
   },
   "encryption": {
     "required": {
@@ -2187,6 +2187,70 @@
       "baseUrl": "Base URL",
       "keyHint": "通过环境变量 DONUT_MARINE_OPENAI_API_KEY 设置 API 密钥。",
       "saved": "已保存"
+    },
+    "history": {
+      "title": "评论账本",
+      "description": "在本地记录通过 Marine 发布的评论，便于回溯。平台确认以受支持站点返回发布成功为准。",
+      "stats": {
+        "label": "发布统计",
+        "today": "今天",
+        "sevenDays": "近 7 天",
+        "all": "全部"
+      },
+      "filters": {
+        "label": "评论筛选",
+        "search": "搜索评论",
+        "searchPlaceholder": "搜索评论、标题、网址或账号",
+        "identity": "身份",
+        "platform": "平台",
+        "kind": "评论类型",
+        "status": "确认状态",
+        "time": "时间范围",
+        "allIdentities": "全部身份",
+        "allPlatforms": "全部平台",
+        "allKinds": "全部类型",
+        "allStatuses": "全部确认状态",
+        "allTime": "全部时间",
+        "today": "今天",
+        "sevenDays": "近 7 天",
+        "thirtyDays": "近 30 天",
+        "clear": "清除筛选"
+      },
+      "columns": {
+        "time": "发布时间",
+        "identity": "身份",
+        "page": "页面",
+        "platform": "平台",
+        "kind": "类型",
+        "comment": "最终评论",
+        "status": "确认状态"
+      },
+      "kind": {
+        "direct": "直评",
+        "reply": "回复"
+      },
+      "status": {
+        "automatic": "平台确认",
+        "manual": "手动确认"
+      },
+      "untitled": "无标题页面",
+      "unknownIdentity": "未知身份",
+      "unknownTime": "未知时间",
+      "replyTo": "回复 {{name}}",
+      "showing": "显示 {{shown}} / {{total}} 条记录",
+      "loading": "正在加载评论账本…",
+      "loadError": {
+        "title": "无法加载评论账本",
+        "description": "暂时无法读取本地历史记录，请稍后重试。"
+      },
+      "empty": {
+        "title": "还没有评论记录",
+        "description": "发布成功的评论和你手动确认的评论会显示在这里。",
+        "filteredTitle": "没有匹配的评论",
+        "filteredDescription": "请尝试调整筛选条件或搜索词。"
+      },
+      "unknownPlatform": "未知平台",
+      "profileId": "配置身份 ID：{{id}}"
     }
   }
 }

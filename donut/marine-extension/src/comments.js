@@ -58,13 +58,26 @@ function marineClickExpanders(rootHint) {
 
 // ---- 哔哩哔哩归一化 ----
 // 注意：rpid / oid / root / parent 超 2^53，必须读 *_str 字段，否则 JSON.parse 丢精度。
+function marineBiliExactId(stringValue, numericValue, allowZero) {
+  if (typeof stringValue === 'string') {
+    const value = stringValue.trim();
+    if (/^\d+$/.test(value) && (allowZero || !/^0+$/.test(value))) return value;
+  }
+  if (typeof numericValue === 'number' && Number.isSafeInteger(numericValue) &&
+      numericValue >= (allowZero ? 0 : 1)) return String(numericValue);
+  return '';
+}
+
 function marineNormBili(r) {
   const m = r.member || {};
   const ctrl = r.reply_control || {};
+  const id = marineBiliExactId(r.rpid_str, r.rpid, false);
+  const parent = marineBiliExactId(r.parent_str, r.parent, true);
+  const root = marineBiliExactId(r.root_str, r.root, true);
   return {
-    id: String(r.rpid_str || r.rpid || ''),
-    parentId: (r.parent && String(r.parent) !== '0') ? String(r.parent_str || r.parent) : null,
-    rootId: (r.root && String(r.root) !== '0') ? String(r.root_str || r.root) : null,
+    id,
+    parentId: parent && !/^0+$/.test(parent) ? parent : null,
+    rootId: root && !/^0+$/.test(root) ? root : null,
     author: { name: m.uname || '', id: m.mid != null ? String(m.mid) : '' },
     text: ((r.content && r.content.message) || '').trim(),
     likeCount: r.like || 0,
@@ -90,7 +103,7 @@ function marineBuildBiliComments(captures) {
     else if (data.page && data.page.count != null && total == null) total = data.page.count;
 
     const isSubEndpoint = /\/reply\/reply(\?|$)/.test(cap.url);
-    const list = [].concat(data.top_replies || [], data.replies || []);
+    const list = [].concat(data.top_replies || [], data.replies || [], data.reply || []);
 
     for (const r of list) {
       const node = marineNormBili(r);

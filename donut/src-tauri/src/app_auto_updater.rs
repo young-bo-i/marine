@@ -72,6 +72,16 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+fn cleanup_rime_runtime_before_direct_exit() {
+  match crate::marine::rime::remove_runtime_config_for_current_process() {
+    Ok(true) => log::info!("Marine: removed Rime runtime lease before updater restart"),
+    Ok(false) => {}
+    Err(error) => {
+      log::warn!("Marine: failed to remove Rime runtime lease before updater restart: {error}")
+    }
+  }
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
 enum LinuxInstallationMethod {
@@ -1541,6 +1551,7 @@ rm "{}"
       tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
       // Exit the current process
+      cleanup_rime_runtime_before_direct_exit();
       std::process::exit(0);
     }
 
@@ -1661,6 +1672,7 @@ rm "{}"
       }
 
       tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+      cleanup_rime_runtime_before_direct_exit();
       std::process::exit(0);
     }
 
@@ -1717,6 +1729,7 @@ rm "{}"
       tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
       // Exit the current process
+      cleanup_rime_runtime_before_direct_exit();
       std::process::exit(0);
     }
 
@@ -1786,6 +1799,30 @@ pub async fn check_for_app_updates_manual() -> Result<Option<AppUpdateInfo>, Str
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn every_direct_updater_exit_cleans_the_rime_runtime_first() {
+    let source = include_str!("app_auto_updater.rs");
+    let exit_marker = ["std::process::", "exit(0);"].concat();
+    let cleanup_marker = "cleanup_rime_runtime_before_direct_exit();";
+    let exits: Vec<usize> = source
+      .match_indices(&exit_marker)
+      .map(|(index, _)| index)
+      .collect();
+
+    assert_eq!(
+      exits.len(),
+      3,
+      "new direct exits require the same cleanup guard"
+    );
+    for exit in exits {
+      let nearby = &source[exit.saturating_sub(160)..exit];
+      assert!(
+        nearby.contains(cleanup_marker),
+        "direct updater exit at byte {exit} bypasses Rime runtime cleanup"
+      );
+    }
+  }
 
   #[test]
   fn test_is_nightly_build() {

@@ -1900,7 +1900,7 @@
     "network": "Réseau",
     "integrations": "Intégrations",
     "account": "Compte",
-    "marine": "Marine"
+    "marine": "Registre des commentaires"
   },
   "pageTitle": {
     "proxies": "Réseau",
@@ -1912,7 +1912,7 @@
     "account": "Compte",
     "import": "Importer un profil",
     "shortcuts": "Raccourcis clavier",
-    "marine": "Marine"
+    "marine": "Registre des commentaires"
   },
   "encryption": {
     "required": {
@@ -2187,6 +2187,70 @@
       "baseUrl": "URL de base",
       "keyHint": "Définissez la clé API via la variable d'environnement DONUT_MARINE_OPENAI_API_KEY.",
       "saved": "Enregistré"
+    },
+    "history": {
+      "title": "Registre des commentaires",
+      "description": "Un historique local et traçable des commentaires publiés depuis Marine. La confirmation de la plateforme repose sur la réponse réussie d'un site compatible.",
+      "stats": {
+        "label": "Résumé des publications",
+        "today": "Aujourd'hui",
+        "sevenDays": "7 derniers jours",
+        "all": "Depuis le début"
+      },
+      "filters": {
+        "label": "Filtres des commentaires",
+        "search": "Rechercher des commentaires",
+        "searchPlaceholder": "Rechercher un commentaire, titre, URL ou compte",
+        "identity": "Identité",
+        "platform": "Plateforme",
+        "kind": "Type de commentaire",
+        "status": "État de confirmation",
+        "time": "Période",
+        "allIdentities": "Toutes les identités",
+        "allPlatforms": "Toutes les plateformes",
+        "allKinds": "Tous les types",
+        "allStatuses": "Toutes les confirmations",
+        "allTime": "Depuis le début",
+        "today": "Aujourd'hui",
+        "sevenDays": "7 derniers jours",
+        "thirtyDays": "30 derniers jours",
+        "clear": "Effacer les filtres"
+      },
+      "columns": {
+        "time": "Publié",
+        "identity": "Identité",
+        "page": "Page",
+        "platform": "Plateforme",
+        "kind": "Type",
+        "comment": "Commentaire final",
+        "status": "Confirmation"
+      },
+      "kind": {
+        "direct": "Direct",
+        "reply": "Réponse"
+      },
+      "status": {
+        "automatic": "Confirmé par la plateforme",
+        "manual": "Confirmation manuelle"
+      },
+      "untitled": "Page sans titre",
+      "unknownIdentity": "Identité inconnue",
+      "unknownTime": "Heure inconnue",
+      "replyTo": "Réponse à {{name}}",
+      "showing": "{{shown}} enregistrements sur {{total}} affichés",
+      "loading": "Chargement du registre des commentaires…",
+      "loadError": {
+        "title": "Impossible de charger le registre",
+        "description": "L'historique local n'a pas pu être lu. Réessayez dans un instant."
+      },
+      "empty": {
+        "title": "Aucun commentaire enregistré",
+        "description": "Les commentaires publiés avec succès et ceux que vous confirmez manuellement apparaîtront ici.",
+        "filteredTitle": "Aucun commentaire correspondant",
+        "filteredDescription": "Essayez de modifier les filtres ou les termes de recherche."
+      },
+      "unknownPlatform": "Plateforme inconnue",
+      "profileId": "ID du profil : {{id}}"
     }
   }
 }

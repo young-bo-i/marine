@@ -1900,7 +1900,7 @@
     "network": "네트워크",
     "integrations": "통합",
     "account": "계정",
-    "marine": "Marine"
+    "marine": "댓글 기록장"
   },
   "pageTitle": {
     "proxies": "네트워크",
@@ -1912,7 +1912,7 @@
     "account": "계정",
     "import": "프로필 가져오기",
     "shortcuts": "키보드 단축키",
-    "marine": "Marine"
+    "marine": "댓글 기록장"
   },
   "encryption": {
     "required": {
@@ -2187,6 +2187,70 @@
       "baseUrl": "기본 URL",
       "keyHint": "API 키는 DONUT_MARINE_OPENAI_API_KEY 환경 변수로 설정하세요.",
       "saved": "저장됨"
+    },
+    "history": {
+      "title": "댓글 기록장",
+      "description": "Marine에서 게시한 댓글을 로컬에 추적 가능한 형태로 기록합니다. 플랫폼 확인은 지원 사이트의 성공 응답을 기준으로 합니다.",
+      "stats": {
+        "label": "게시 요약",
+        "today": "오늘",
+        "sevenDays": "최근 7일",
+        "all": "전체 기간"
+      },
+      "filters": {
+        "label": "댓글 필터",
+        "search": "댓글 검색",
+        "searchPlaceholder": "댓글, 제목, URL 또는 계정 검색",
+        "identity": "신원",
+        "platform": "플랫폼",
+        "kind": "댓글 유형",
+        "status": "확인 상태",
+        "time": "기간",
+        "allIdentities": "모든 신원",
+        "allPlatforms": "모든 플랫폼",
+        "allKinds": "모든 유형",
+        "allStatuses": "모든 확인 상태",
+        "allTime": "전체 기간",
+        "today": "오늘",
+        "sevenDays": "최근 7일",
+        "thirtyDays": "최근 30일",
+        "clear": "필터 지우기"
+      },
+      "columns": {
+        "time": "게시 시간",
+        "identity": "신원",
+        "page": "페이지",
+        "platform": "플랫폼",
+        "kind": "유형",
+        "comment": "최종 댓글",
+        "status": "확인"
+      },
+      "kind": {
+        "direct": "직접 댓글",
+        "reply": "답글"
+      },
+      "status": {
+        "automatic": "플랫폼 확인",
+        "manual": "수동 확인"
+      },
+      "untitled": "제목 없는 페이지",
+      "unknownIdentity": "알 수 없는 신원",
+      "unknownTime": "알 수 없는 시간",
+      "replyTo": "{{name}}에게 답글",
+      "showing": "전체 {{total}}개 중 {{shown}}개 표시",
+      "loading": "댓글 기록장을 불러오는 중…",
+      "loadError": {
+        "title": "댓글 기록장을 불러올 수 없음",
+        "description": "로컬 기록을 읽을 수 없습니다. 잠시 후 다시 시도하세요."
+      },
+      "empty": {
+        "title": "아직 기록된 댓글이 없습니다",
+        "description": "게시에 성공한 댓글과 수동으로 확인한 댓글이 여기에 표시됩니다.",
+        "filteredTitle": "일치하는 댓글이 없습니다",
+        "filteredDescription": "필터 또는 검색어를 변경해 보세요."
+      },
+      "unknownPlatform": "알 수 없는 플랫폼",
+      "profileId": "프로필 ID: {{id}}"
     }
   }
 }

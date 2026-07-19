@@ -13,6 +13,8 @@ pub mod cdp;
 pub mod extension;
 pub mod generate;
 pub mod history;
+pub mod rime;
+pub mod rime_plugin;
 
 /// Build a `{ "code": ... }` error string (used by the generation engine).
 pub(crate) fn err(code: &str) -> String {

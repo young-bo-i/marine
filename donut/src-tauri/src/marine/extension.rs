@@ -15,6 +15,32 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::Manager;
 
+fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+  #[cfg(unix)]
+  {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = fs::OpenOptions::new()
+      .create(true)
+      .truncate(true)
+      .write(true)
+      .mode(0o600)
+      .open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    // `mode` only applies when a file is first created. The extension bundle
+    // already contains an empty runtime-config placeholder, so explicitly
+    // narrow permissions after truncating that copied file as well.
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+  }
+
+  #[cfg(not(unix))]
+  {
+    fs::write(path, contents)
+  }
+}
+
 /// Resolve the source of the bundled Marine extension.
 fn source_dir(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
   // 1) Explicit override (useful for dev / testing).
@@ -113,12 +139,32 @@ pub async fn ensure_for_profile(
     "token": token,
     "profileId": profile_id,
   });
-  if let Err(e) = fs::write(
-    dst.join("marine-runtime-config.json"),
-    serde_json::to_string_pretty(&cfg).unwrap_or_default(),
-  ) {
+  let config_json = serde_json::to_vec_pretty(&cfg).unwrap_or_default();
+  if let Err(e) = write_private_file(&dst.join("marine-runtime-config.json"), &config_json) {
     log::warn!("Marine: failed to stamp runtime config: {e}");
   }
 
   Some(dst)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+  use super::*;
+  use std::os::unix::fs::PermissionsExt;
+
+  #[test]
+  fn runtime_config_permissions_are_narrowed_even_for_existing_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("marine-runtime-config.json");
+    fs::write(&path, b"placeholder").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    write_private_file(&path, b"{\"token\":\"secret\"}").unwrap();
+
+    assert_eq!(
+      fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+      0o600
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"{\"token\":\"secret\"}");
+  }
 }

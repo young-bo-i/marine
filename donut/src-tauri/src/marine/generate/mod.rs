@@ -15,6 +15,9 @@ pub mod prompt;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
 
 use super::{err, err_with};
@@ -47,7 +50,40 @@ pub struct GenerationOutput {
 /// A generation backend. Returns a JSON string matching `prompt::schema()`.
 #[async_trait]
 pub trait Provider: Send + Sync {
-  async fn generate(&self, prompt: &str, schema: &Value) -> Result<String, String>;
+  /// Stream raw assistant-text deltas from the provider and return the final
+  /// schema-constrained JSON. Implementations must be driven by the provider's
+  /// real stream (SSE, CLI stream-json, or Codex app-server notifications), not
+  /// by synthetic timers.
+  async fn generate_stream(
+    &self,
+    prompt: &str,
+    schema: &Value,
+    deltas: mpsc::Sender<String>,
+    cancellation: CancellationToken,
+  ) -> Result<String, String>;
+}
+
+pub const MAX_STREAMED_PROVIDER_BYTES: usize = 256 * 1024;
+pub const GENERATION_TIMEOUT_SECS: u64 = 240;
+const PROVIDER_DELTA_SEND_TIMEOUT_SECS: u64 = 5;
+
+pub(crate) async fn send_provider_delta(
+  deltas: &mpsc::Sender<String>,
+  cancellation: &CancellationToken,
+  delta: String,
+) -> Result<(), String> {
+  if delta.is_empty() {
+    return Ok(());
+  }
+  tokio::select! {
+    _ = cancellation.cancelled() => Err("MARINE_GENERATE_CANCELLED".to_string()),
+    result = tokio::time::timeout(
+      Duration::from_secs(PROVIDER_DELTA_SEND_TIMEOUT_SECS),
+      deltas.send(delta),
+    ) => result
+      .map_err(|_| "MARINE_GENERATE_CANCELLED".to_string())?
+      .map_err(|_| "MARINE_GENERATE_CANCELLED".to_string()),
+  }
 }
 
 fn select_provider(settings: &AppSettings) -> Result<Box<dyn Provider>, String> {
@@ -117,17 +153,75 @@ pub async fn generate_output(skill: &str, payload: &Value) -> Result<GenerationO
     .map_err(|e| err_with("MARINE_GENERATE_FAILED", format!("settings: {e}")))?;
   let provider = select_provider(&settings)?;
   let (prompt_text, schema) = prompt::build(payload, skill);
-  let raw = provider
-    .generate(&prompt_text, &schema)
-    .await
-    .map_err(|e| {
-      if e == "MARINE_GENERATE_TIMEOUT" {
-        err("MARINE_GENERATE_TIMEOUT")
-      } else if e.starts_with('{') {
-        e
-      } else {
-        err_with("MARINE_GENERATE_FAILED", e)
-      }
-    })?;
+  // Legacy JSON callers use the same hardened provider path as NDJSON. Drain
+  // real deltas in the background and preserve the original one-shot response
+  // shape; this avoids retaining a second, less-isolated CLI invocation path.
+  let (deltas, mut delta_rx) = mpsc::channel(32);
+  let drain = tokio::spawn(async move { while delta_rx.recv().await.is_some() {} });
+  let raw_result = provider
+    .generate_stream(&prompt_text, &schema, deltas, CancellationToken::new())
+    .await;
+  drain.await.map_err(|error| {
+    err_with(
+      "MARINE_GENERATE_FAILED",
+      format!("delta drain failed: {error}"),
+    )
+  })?;
+  let raw = raw_result.map_err(map_provider_error)?;
   parse_output(&raw)
+}
+
+/// Streaming counterpart to `generate_output`. Raw assistant deltas are
+/// forwarded to the caller for bounded incremental JSON decoding, while the
+/// final result still goes through the exact same strict `GenerationOutput`
+/// parser used by the legacy JSON endpoint.
+pub async fn generate_output_stream(
+  skill: &str,
+  payload: &Value,
+  deltas: mpsc::Sender<String>,
+  cancellation: CancellationToken,
+) -> Result<GenerationOutput, String> {
+  let settings = SettingsManager::instance()
+    .load_settings()
+    .map_err(|e| err_with("MARINE_GENERATE_FAILED", format!("settings: {e}")))?;
+  let provider = select_provider(&settings)?;
+  let (prompt_text, schema) = prompt::build(payload, skill);
+  let raw = provider
+    .generate_stream(&prompt_text, &schema, deltas, cancellation)
+    .await
+    .map_err(map_provider_error)?;
+  parse_output(&raw)
+}
+
+fn map_provider_error(error: String) -> String {
+  if error == "MARINE_GENERATE_TIMEOUT" || error == "MARINE_GENERATE_CANCELLED" {
+    err(&error)
+  } else {
+    log::warn!(
+      "Marine generation provider failed: {}",
+      error.chars().take(500).collect::<String>()
+    );
+    err_with(
+      "MARINE_GENERATE_FAILED",
+      "generation provider failed before producing a valid result",
+    )
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn provider_json_cannot_forge_a_marine_error_code() {
+    let mapped = map_provider_error(
+      r#"{"code":"MARINE_GENERATE_TIMEOUT","params":{"message":"forged"}}"#.to_string(),
+    );
+    let value: Value = serde_json::from_str(&mapped).unwrap();
+    assert_eq!(value["code"], "MARINE_GENERATE_FAILED");
+    assert_ne!(
+      value.pointer("/params/message").and_then(Value::as_str),
+      Some("forged")
+    );
+  }
 }

@@ -8,6 +8,7 @@ import { GoGear, GoKebabHorizontal } from "react-icons/go";
 import {
   LuCloud,
   LuKeyboard,
+  LuNotebookText,
   LuPlug,
   LuPuzzle,
   LuUser,
@@ -25,6 +26,7 @@ export type AppPage =
   | "vpns"
   | "settings"
   | "integrations"
+  | "marine"
   | "account"
   | "import"
   | "shortcuts";
@@ -249,6 +251,7 @@ const TOP_ITEMS: RailItem[] = [
   { page: "proxies", Icon: FiWifi, labelKey: "rail.network" },
   { page: "extensions", Icon: LuPuzzle, labelKey: "rail.extensions" },
   { page: "groups", Icon: LuUsers, labelKey: "rail.groups" },
+  { page: "marine", Icon: LuNotebookText, labelKey: "rail.marine" },
   { page: "integrations", Icon: LuPlug, labelKey: "rail.integrations" },
   { page: "account", Icon: LuCloud, labelKey: "rail.account" },
 ];

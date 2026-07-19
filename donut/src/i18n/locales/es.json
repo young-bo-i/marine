@@ -1900,7 +1900,7 @@
     "network": "Red",
     "integrations": "Integraciones",
     "account": "Cuenta",
-    "marine": "Marine"
+    "marine": "Registro de comentarios"
   },
   "pageTitle": {
     "proxies": "Red",
@@ -1912,7 +1912,7 @@
     "account": "Cuenta",
     "import": "Importar perfil",
     "shortcuts": "Atajos de teclado",
-    "marine": "Marine"
+    "marine": "Registro de comentarios"
   },
   "encryption": {
     "required": {
@@ -2187,6 +2187,70 @@
       "baseUrl": "URL base",
       "keyHint": "Configura la clave API con la variable de entorno DONUT_MARINE_OPENAI_API_KEY.",
       "saved": "Guardado"
+    },
+    "history": {
+      "title": "Registro de comentarios",
+      "description": "Un registro local y rastreable de los comentarios publicados desde Marine. La confirmación de la plataforma se basa en la respuesta correcta de un sitio compatible.",
+      "stats": {
+        "label": "Resumen de publicaciones",
+        "today": "Hoy",
+        "sevenDays": "Últimos 7 días",
+        "all": "Todo el tiempo"
+      },
+      "filters": {
+        "label": "Filtros de comentarios",
+        "search": "Buscar comentarios",
+        "searchPlaceholder": "Buscar comentario, título, URL o cuenta",
+        "identity": "Identidad",
+        "platform": "Plataforma",
+        "kind": "Tipo de comentario",
+        "status": "Estado de confirmación",
+        "time": "Periodo",
+        "allIdentities": "Todas las identidades",
+        "allPlatforms": "Todas las plataformas",
+        "allKinds": "Todos los tipos",
+        "allStatuses": "Todas las confirmaciones",
+        "allTime": "Todo el tiempo",
+        "today": "Hoy",
+        "sevenDays": "Últimos 7 días",
+        "thirtyDays": "Últimos 30 días",
+        "clear": "Borrar filtros"
+      },
+      "columns": {
+        "time": "Publicado",
+        "identity": "Identidad",
+        "page": "Página",
+        "platform": "Plataforma",
+        "kind": "Tipo",
+        "comment": "Comentario final",
+        "status": "Confirmación"
+      },
+      "kind": {
+        "direct": "Directo",
+        "reply": "Respuesta"
+      },
+      "status": {
+        "automatic": "Confirmado por la plataforma",
+        "manual": "Confirmación manual"
+      },
+      "untitled": "Página sin título",
+      "unknownIdentity": "Identidad desconocida",
+      "unknownTime": "Hora desconocida",
+      "replyTo": "Respuesta a {{name}}",
+      "showing": "Se muestran {{shown}} de {{total}} registros",
+      "loading": "Cargando el registro de comentarios…",
+      "loadError": {
+        "title": "No se pudo cargar el registro",
+        "description": "No se pudo leer el historial local. Inténtalo de nuevo en un momento."
+      },
+      "empty": {
+        "title": "Aún no hay comentarios registrados",
+        "description": "Los comentarios publicados correctamente y los que confirmes manualmente aparecerán aquí.",
+        "filteredTitle": "No hay comentarios coincidentes",
+        "filteredDescription": "Prueba a cambiar los filtros o los términos de búsqueda."
+      },
+      "unknownPlatform": "Plataforma desconocida",
+      "profileId": "ID del perfil: {{id}}"
     }
   }
 }

@@ -1900,7 +1900,7 @@
     "network": "ネットワーク",
     "integrations": "連携",
     "account": "アカウント",
-    "marine": "Marine"
+    "marine": "コメント台帳"
   },
   "pageTitle": {
     "proxies": "ネットワーク",
@@ -1912,7 +1912,7 @@
     "account": "アカウント",
     "import": "プロファイルをインポート",
     "shortcuts": "キーボードショートカット",
-    "marine": "Marine"
+    "marine": "コメント台帳"
   },
   "encryption": {
     "required": {
@@ -2187,6 +2187,70 @@
       "baseUrl": "ベース URL",
       "keyHint": "API キーは環境変数 DONUT_MARINE_OPENAI_API_KEY で設定します。",
       "saved": "保存しました"
+    },
+    "history": {
+      "title": "コメント台帳",
+      "description": "Marine から投稿したコメントをローカルに記録し、後から確認できます。プラットフォーム確認は対応サイトの成功応答に基づきます。",
+      "stats": {
+        "label": "投稿概要",
+        "today": "今日",
+        "sevenDays": "過去 7 日間",
+        "all": "全期間"
+      },
+      "filters": {
+        "label": "コメントフィルター",
+        "search": "コメントを検索",
+        "searchPlaceholder": "コメント、タイトル、URL、アカウントを検索",
+        "identity": "ID",
+        "platform": "プラットフォーム",
+        "kind": "コメント種別",
+        "status": "確認状態",
+        "time": "期間",
+        "allIdentities": "すべての ID",
+        "allPlatforms": "すべてのプラットフォーム",
+        "allKinds": "すべての種別",
+        "allStatuses": "すべての確認状態",
+        "allTime": "全期間",
+        "today": "今日",
+        "sevenDays": "過去 7 日間",
+        "thirtyDays": "過去 30 日間",
+        "clear": "フィルターをクリア"
+      },
+      "columns": {
+        "time": "投稿日時",
+        "identity": "ID",
+        "page": "ページ",
+        "platform": "プラットフォーム",
+        "kind": "種別",
+        "comment": "最終コメント",
+        "status": "確認"
+      },
+      "kind": {
+        "direct": "直接コメント",
+        "reply": "返信"
+      },
+      "status": {
+        "automatic": "プラットフォーム確認済み",
+        "manual": "手動確認"
+      },
+      "untitled": "無題のページ",
+      "unknownIdentity": "不明な ID",
+      "unknownTime": "時刻不明",
+      "replyTo": "{{name}} への返信",
+      "showing": "{{total}} 件中 {{shown}} 件を表示",
+      "loading": "コメント台帳を読み込み中…",
+      "loadError": {
+        "title": "コメント台帳を読み込めません",
+        "description": "ローカル履歴を読み込めませんでした。しばらくしてからもう一度お試しください。"
+      },
+      "empty": {
+        "title": "コメント記録はまだありません",
+        "description": "投稿に成功したコメントと手動で確認したコメントがここに表示されます。",
+        "filteredTitle": "一致するコメントはありません",
+        "filteredDescription": "フィルターまたは検索語を変更してみてください。"
+      },
+      "unknownPlatform": "不明なプラットフォーム",
+      "profileId": "プロファイル ID: {{id}}"
     }
   }
 }

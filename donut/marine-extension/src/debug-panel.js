@@ -30,6 +30,7 @@ var marineDebug = (function () {
   return {
     log: log,
     buffer: function () { return buffer.slice(); },
+    clear: function () { buffer.length = 0; },
     // 旧 API 保留为 no-op，避免改动各处调用
     init: function () {}, setMeta: function () {}, setEnabled: function () {},
   };

@@ -1305,6 +1305,21 @@ fn show_main_window(app_handle: &tauri::AppHandle) {
   }
 }
 
+#[tauri::command]
+fn marine_list_posting_history() -> Result<Vec<marine::history::PostingRecord>, String> {
+  marine::history::HISTORY_MANAGER
+    .lock()
+    .map_err(|_| {
+      log::error!("Marine posting history manager lock poisoned");
+      marine::err("INTERNAL_ERROR")
+    })?
+    .list_all()
+    .map_err(|error| {
+      log::error!("Failed to list Marine posting history: {error}");
+      marine::err("INTERNAL_ERROR")
+    })
+}
+
 /// Update the tray menu labels with localized strings pushed from the frontend
 /// (which owns the active language). The item ids are unchanged so the existing
 /// menu-event handler keeps matching.
@@ -1488,6 +1503,25 @@ pub fn run() {
         .build(),
     )
     .setup(|app| {
+      // The plugin manifest is durable installation metadata. Keep it across
+      // Marine exits; only the short-lived runtime credential lease is removed
+      // in `RunEvent::Exit` below.
+      #[cfg(target_os = "macos")]
+      match crate::marine::rime_plugin::sync_bundled_manifest(app.handle()) {
+        Ok(crate::marine::rime_plugin::ManifestSyncOutcome::Installed) => {
+          log::info!("Installed Marine plugin manifest for RimeBuffer")
+        }
+        Ok(crate::marine::rime_plugin::ManifestSyncOutcome::Updated) => {
+          log::info!("Updated Marine plugin manifest for RimeBuffer")
+        }
+        Ok(crate::marine::rime_plugin::ManifestSyncOutcome::Unchanged) => {
+          log::debug!("Marine plugin manifest for RimeBuffer is current")
+        }
+        Err(error) => {
+          log::warn!("Could not synchronize Marine plugin manifest for RimeBuffer: {error}")
+        }
+      }
+
       // Recover ephemeral dir mappings from RAM-backed storage (tmpfs/ramdisk)
       ephemeral_dirs::recover_ephemeral_dirs();
 
@@ -2383,6 +2417,7 @@ pub fn run() {
       start_api_server,
       stop_api_server,
       get_api_server_status,
+      marine_list_posting_history,
       get_all_traffic_snapshots,
       get_profile_traffic_snapshot,
       clear_all_traffic_stats,
@@ -2484,8 +2519,14 @@ pub fn run() {
         }
         // Final event before the process exits — fires on every graceful exit
         // path (quit dialog, tray, Cmd+Q, all-windows-closed). Synchronously
-        // reap the browsers Donut launched so they don't outlive it.
+        // revoke the Rime runtime lease and reap browsers Donut launched so
+        // neither credentials nor browser children outlive this process.
         tauri::RunEvent::Exit => {
+          match crate::marine::rime::remove_runtime_config_for_current_process() {
+            Ok(true) => log::info!("Quit cleanup: removed Rime runtime lease"),
+            Ok(false) => {}
+            Err(error) => log::warn!("Quit cleanup: failed to remove Rime runtime lease: {error}"),
+          }
           reap_all_browsers_sync();
         }
         _ => {}

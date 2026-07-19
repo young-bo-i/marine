@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "id": "marine",
+  "name": "Marine",
+  "version": "0.3.0",
+  "runtimeConfigPaths": [
+    "~/Library/Application Support/MarineDev/etinput-runtime.json",
+    "~/Library/Application Support/Marine/etinput-runtime.json"
+  ],
+  "actions": [
+    {
+      "id": "marine.generate-direct",
+      "title": "生成直评",
+      "symbol": "bubble.left.and.text.bubble.right",
+      "statusPath": "/rime/status",
+      "invokePath": "/rime/invoke",
+      "streamPath": "/rime/invoke-stream",
+      "modes": ["direct"],
+      "presentationId": "marine.generate-comment",
+      "presentationTitle": "生成评论"
+    },
+    {
+      "id": "marine.generate-reply",
+      "title": "生成回复",
+      "symbol": "arrowshape.turn.up.left",
+      "statusPath": "/rime/status",
+      "invokePath": "/rime/invoke",
+      "streamPath": "/rime/invoke-stream",
+      "modes": ["reply"],
+      "presentationId": "marine.generate-comment",
+      "presentationTitle": "生成评论"
+    }
+  ]
+}
