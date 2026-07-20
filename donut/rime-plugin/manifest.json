@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "marine",
   "name": "Marine",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "runtimeConfigPaths": [
     "~/Library/Application Support/MarineDev/etinput-runtime.json",
     "~/Library/Application Support/Marine/etinput-runtime.json"
@@ -13,8 +13,9 @@
       "title": "生成直评",
       "symbol": "bubble.left.and.text.bubble.right",
       "statusPath": "/rime/status",
+      "preparePath": "/rime/prepare",
       "invokePath": "/rime/invoke",
-      "streamPath": "/rime/invoke-stream",
+      "requiresFocus": false,
       "modes": ["direct"],
       "presentationId": "marine.generate-comment",
       "presentationTitle": "生成评论"
@@ -24,8 +25,9 @@
       "title": "生成回复",
       "symbol": "arrowshape.turn.up.left",
       "statusPath": "/rime/status",
+      "preparePath": "/rime/prepare",
       "invokePath": "/rime/invoke",
-      "streamPath": "/rime/invoke-stream",
+      "requiresFocus": false,
       "modes": ["reply"],
       "presentationId": "marine.generate-comment",
       "presentationTitle": "生成评论"

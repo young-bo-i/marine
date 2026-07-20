@@ -125,8 +125,8 @@ svg { display: block; }
 .cta-2 .i { width: 15px; height: 15px; }
 .cta-2:not(:disabled):hover { background: var(--action-hover); border-color: var(--ring); }
 /* the primary "generate / 本地智能体" action — Pencil's gray-600 send fill */
-#btn-codex { background: var(--action); color: #fff; border-color: transparent; }
-#btn-codex:not(:disabled):hover { background: var(--action-hover); }
+#btn-record { background: var(--action); color: #fff; border-color: transparent; }
+#btn-record:not(:disabled):hover { background: var(--action-hover); }
 button:disabled { opacity: .5; cursor: default; box-shadow: none; }
 
 /* Row + icon button */

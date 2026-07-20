@@ -2,22 +2,19 @@
 //!
 //! The browser extension publishes the editor/comment target that currently
 //! owns focus. Rime Buffer can then discover that target through the local
-//! Marine API and explicitly request a direct-comment or reply candidate.
+//! Marine API and request a target-bound prompt for its selected AI connector.
 //! Context is intentionally memory-only: when Marine is not running there is
 //! no plugin runtime, and restarting Marine never revives a stale page target.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::watch;
 use utoipa::ToSchema;
-
-use super::generate::GenerationOutput;
 
 pub const DIRECT_ACTION_ID: &str = "marine.generate-direct";
 pub const REPLY_ACTION_ID: &str = "marine.generate-reply";
@@ -37,6 +34,7 @@ const RIME_SOURCE_SUBTITLE: &str = "subtitle";
 const RIME_SOURCE_COMMENTS: &str = "comments";
 const RIME_SOURCE_ARTICLE: &str = "article";
 const RIME_SOURCE_NONE: &str = "none";
+const MAX_RIME_TARGET_SUMMARY_BYTES: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -93,7 +91,7 @@ pub struct RimeContext {
   pub target: Option<RimeTarget>,
   #[serde(default)]
   pub skill: String,
-  /// Normalized Marine generation payload:
+  /// Normalized Marine prompt payload:
   /// `article.markdown`, `comments.agentMd`, and `subtitle.text`.
   #[serde(default)]
   #[schema(value_type = Object)]
@@ -114,6 +112,13 @@ impl RimeContext {
     if !self.payload.is_object() {
       return Err(RimeContextError::Invalid("payload must be an object"));
     }
+    if self.target_summary.len() > MAX_RIME_TARGET_SUMMARY_BYTES
+      || self.target_summary.contains('\0')
+    {
+      return Err(RimeContextError::Invalid(
+        "targetSummary must be at most 1000 UTF-8 bytes without NUL",
+      ));
+    }
     if self.mode == RimeContextMode::Reply
       && !self
         .target
@@ -130,9 +135,8 @@ impl RimeContext {
     Ok(())
   }
 
-  /// Add an internal, explicit generation intent while preserving the public
-  /// `/v1/marine/generate` payload contract for existing extension callers.
-  pub fn generation_payload(&self) -> Value {
+  /// Add Marine's trusted action and target binding before prompt assembly.
+  pub fn prompt_payload(&self) -> Value {
     let mut payload = self.payload.clone();
     let selected_source = rime_payload_source(&payload);
     let Some(object) = payload.as_object_mut() else {
@@ -229,52 +233,20 @@ pub struct RimeInvokeRequest {
   pub context_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct RimeBlock {
-  pub text: String,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub title: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct RimeInvokeResponse {
-  pub request_id: String,
-  pub action_id: String,
-  pub context_id: String,
-  pub blocks: Vec<RimeBlock>,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub target_summary: Option<String>,
-}
-
-pub const RIME_STREAM_PROTOCOL_VERSION: u8 = 1;
-pub const MAX_RIME_STREAM_BLOCKS: usize = 20;
-// Protocol v1 wire limits are intentionally identical to the RimeBuffer
-// parser. Keep these byte-based: Swift `Character` counts are not a portable
-// wire-size contract for multi-byte UTF-8 text.
-pub const MAX_RIME_STREAM_TEXT_BYTES: usize = 20_000;
-pub const MAX_RIME_CANDIDATE_BYTES: usize = super::generate::MAX_STREAMED_PROVIDER_BYTES;
-// Complete is one NDJSON frame, so reserve room for escaped metadata,
-// identities, targetSummary, and frame keys below the 512 KiB wire ceiling.
-const MAX_RIME_COMPLETE_BLOCKS_JSON_BYTES: usize = 480 * 1024;
-pub const MAX_RIME_STREAM_FRAME_BYTES: usize = 512 * 1024;
-pub const MAX_RIME_STREAM_TOTAL_BYTES: usize = 1024 * 1024;
-pub const MAX_RIME_STREAM_EVENTS: usize = 2048;
-const MAX_RIME_STREAM_ID_BYTES: usize = 128;
-pub const MAX_RIME_STREAM_ERROR_MESSAGE_BYTES: usize = 500;
-const MAX_RECENT_STREAM_REQUESTS: usize = 256;
+pub const RIME_PREPARE_PROTOCOL_VERSION: u8 = 1;
+pub const RIME_PREPARE_RESULT_FORMAT: &str = "blocks-v1";
+const MAX_RIME_REQUEST_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct RimeStreamInvokeRequest {
+pub struct RimePrepareRequest {
   pub plugin_id: String,
   pub runtime_instance_id: String,
   #[serde(flatten)]
   pub invoke: RimeInvokeRequest,
 }
 
-impl RimeStreamInvokeRequest {
+impl RimePrepareRequest {
   pub fn validate_binding(
     &self,
     expected_plugin_id: &str,
@@ -288,11 +260,11 @@ impl RimeStreamInvokeRequest {
       self.invoke.context_id.as_str(),
     ] {
       if value.is_empty()
-        || value.len() > MAX_RIME_STREAM_ID_BYTES
+        || value.len() > MAX_RIME_REQUEST_ID_BYTES
         || !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
       {
         return Err(RimeContextError::Invalid(
-          "stream identity fields must be 1-128 bytes of printable ASCII",
+          "request identity fields must be 1-128 bytes of printable ASCII",
         ));
       }
     }
@@ -312,241 +284,30 @@ impl RimeStreamInvokeRequest {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct RimeStreamIdentity {
+pub struct RimePrepareResponse {
+  pub protocol_version: u8,
+  pub result_format: String,
   pub plugin_id: String,
   pub runtime_instance_id: String,
   pub request_id: String,
   pub action_id: String,
   pub context_id: String,
+  pub prompt: String,
+  pub target_summary: String,
 }
 
-impl RimeStreamIdentity {
-  pub fn from_request(request: &RimeStreamInvokeRequest) -> Self {
+impl RimePrepareResponse {
+  pub fn new(request: &RimePrepareRequest, prompt: String, target_summary: String) -> Self {
     Self {
+      protocol_version: RIME_PREPARE_PROTOCOL_VERSION,
+      result_format: RIME_PREPARE_RESULT_FORMAT.to_string(),
       plugin_id: request.plugin_id.clone(),
       runtime_instance_id: request.runtime_instance_id.clone(),
       request_id: request.invoke.request_id.clone(),
       action_id: request.invoke.action_id.clone(),
       context_id: request.invoke.context_id.clone(),
-    }
-  }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
-#[serde(tag = "type")]
-pub enum RimeStreamEvent {
-  #[serde(rename = "heartbeat")]
-  Heartbeat,
-  #[serde(rename = "block")]
-  Block {
-    index: usize,
-    text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    title: Option<String>,
-  },
-  #[serde(rename = "complete")]
-  Complete {
-    blocks: Vec<RimeBlock>,
-    #[serde(rename = "targetSummary", skip_serializing_if = "Option::is_none")]
-    target_summary: Option<String>,
-  },
-  #[serde(rename = "error")]
-  Error {
-    code: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
-  },
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct RimeStreamFrame {
-  pub protocol_version: u8,
-  pub seq: u64,
-  #[serde(flatten)]
-  pub identity: RimeStreamIdentity,
-  #[serde(flatten)]
-  pub event: RimeStreamEvent,
-}
-
-pub struct RimeStreamEncoder {
-  identity: RimeStreamIdentity,
-  next_seq: u64,
-  event_count: usize,
-  total_bytes: usize,
-  terminal_emitted: bool,
-}
-
-impl RimeStreamEncoder {
-  pub fn new(identity: RimeStreamIdentity) -> Self {
-    Self {
-      identity,
-      next_seq: 1,
-      event_count: 0,
-      total_bytes: 0,
-      terminal_emitted: false,
-    }
-  }
-
-  pub fn encode(&mut self, event: RimeStreamEvent) -> Result<Vec<u8>, String> {
-    if self.terminal_emitted {
-      return Err("Rime stream already emitted a terminal event".to_string());
-    }
-    validate_stream_event(&event)?;
-    let terminal = matches!(
-      &event,
-      RimeStreamEvent::Complete { .. } | RimeStreamEvent::Error { .. }
-    );
-    let event_limit = if terminal {
-      MAX_RIME_STREAM_EVENTS
-    } else {
-      MAX_RIME_STREAM_EVENTS.saturating_sub(1)
-    };
-    if self.event_count >= event_limit {
-      return Err("Rime stream exceeded the event limit".to_string());
-    }
-    let frame = RimeStreamFrame {
-      protocol_version: RIME_STREAM_PROTOCOL_VERSION,
-      seq: self.next_seq,
-      identity: self.identity.clone(),
-      event,
-    };
-    let mut bytes = serde_json::to_vec(&frame)
-      .map_err(|error| format!("serialize Rime stream frame: {error}"))?;
-    bytes.push(b'\n');
-    if bytes.len() > MAX_RIME_STREAM_FRAME_BYTES {
-      return Err("Rime stream frame exceeded the size limit".to_string());
-    }
-    let total_limit = if terminal {
-      MAX_RIME_STREAM_TOTAL_BYTES
-    } else {
-      MAX_RIME_STREAM_TOTAL_BYTES.saturating_sub(MAX_RIME_STREAM_FRAME_BYTES)
-    };
-    if self.total_bytes.saturating_add(bytes.len()) > total_limit {
-      return Err("Rime stream exceeded the total size limit".to_string());
-    }
-    self.next_seq = self.next_seq.saturating_add(1);
-    self.event_count = self.event_count.saturating_add(1);
-    self.total_bytes = self.total_bytes.saturating_add(bytes.len());
-    self.terminal_emitted = terminal;
-    Ok(bytes)
-  }
-}
-
-fn validate_stream_event(event: &RimeStreamEvent) -> Result<(), String> {
-  match event {
-    RimeStreamEvent::Heartbeat => Ok(()),
-    RimeStreamEvent::Block { index, text, title } => {
-      if *index >= MAX_RIME_STREAM_BLOCKS {
-        return Err("Rime stream block index exceeded the limit".to_string());
-      }
-      if text.is_empty() || text.len() > MAX_RIME_STREAM_TEXT_BYTES {
-        return Err("Rime stream block text exceeded the limit".to_string());
-      }
-      if title.as_ref().is_some_and(|value| value.len() > 200) {
-        return Err("Rime stream block title exceeded the limit".to_string());
-      }
-      Ok(())
-    }
-    RimeStreamEvent::Complete {
-      blocks,
+      prompt,
       target_summary,
-    } => {
-      if blocks.is_empty() || blocks.len() > MAX_RIME_STREAM_BLOCKS {
-        return Err("Rime stream final block count is invalid".to_string());
-      }
-      for block in blocks {
-        if block.text.is_empty() || block.text.len() > MAX_RIME_STREAM_TEXT_BYTES {
-          return Err("Rime stream final block text exceeded the limit".to_string());
-        }
-        if block.title.as_ref().is_some_and(|value| value.len() > 200) {
-          return Err("Rime stream final block title exceeded the limit".to_string());
-        }
-      }
-      if target_summary
-        .as_ref()
-        .is_some_and(|value| value.len() > 1000)
-      {
-        return Err("Rime stream target summary exceeded the limit".to_string());
-      }
-      Ok(())
-    }
-    RimeStreamEvent::Error { code, message } => {
-      if code.is_empty() || code.len() > 128 {
-        return Err("Rime stream error code is invalid".to_string());
-      }
-      if message
-        .as_ref()
-        .is_some_and(|value| value.len() > MAX_RIME_STREAM_ERROR_MESSAGE_BYTES)
-      {
-        return Err("Rime stream error message exceeded the limit".to_string());
-      }
-      Ok(())
-    }
-  }
-}
-
-#[derive(Clone, Default)]
-pub struct RimeStreamGate {
-  inner: Arc<std::sync::Mutex<RimeStreamGateState>>,
-}
-
-#[derive(Default)]
-struct RimeStreamGateState {
-  active: Option<(uuid::Uuid, String)>,
-  recent: VecDeque<String>,
-  seen: HashSet<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RimeStreamGateError {
-  Busy,
-  Duplicate,
-}
-
-pub struct RimeStreamPermit {
-  gate: RimeStreamGate,
-  lease_id: uuid::Uuid,
-}
-
-impl RimeStreamGate {
-  pub fn acquire(&self, request_id: &str) -> Result<RimeStreamPermit, RimeStreamGateError> {
-    let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-    if state.seen.contains(request_id) {
-      return Err(RimeStreamGateError::Duplicate);
-    }
-    if state.active.is_some() {
-      return Err(RimeStreamGateError::Busy);
-    }
-    while state.recent.len() >= MAX_RECENT_STREAM_REQUESTS {
-      if let Some(expired) = state.recent.pop_front() {
-        state.seen.remove(&expired);
-      }
-    }
-    let lease_id = uuid::Uuid::new_v4();
-    state.active = Some((lease_id, request_id.to_string()));
-    state.recent.push_back(request_id.to_string());
-    state.seen.insert(request_id.to_string());
-    Ok(RimeStreamPermit {
-      gate: self.clone(),
-      lease_id,
-    })
-  }
-}
-
-impl Drop for RimeStreamPermit {
-  fn drop(&mut self) {
-    let mut state = self
-      .gate
-      .inner
-      .lock()
-      .unwrap_or_else(|error| error.into_inner());
-    if state
-      .active
-      .as_ref()
-      .is_some_and(|(lease_id, _)| *lease_id == self.lease_id)
-    {
-      state.active = None;
     }
   }
 }
@@ -619,33 +380,12 @@ impl RimeContextState {
   }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct RimeContextStore {
   inner: Arc<RwLock<RimeContextState>>,
-  changes: watch::Sender<u64>,
-}
-
-impl Default for RimeContextStore {
-  fn default() -> Self {
-    let (changes, _) = watch::channel(0);
-    Self {
-      inner: Arc::new(RwLock::new(RimeContextState::default())),
-      changes,
-    }
-  }
 }
 
 impl RimeContextStore {
-  pub fn subscribe_changes(&self) -> watch::Receiver<u64> {
-    self.changes.subscribe()
-  }
-
-  fn notify_change(&self) {
-    self
-      .changes
-      .send_modify(|version| *version = version.saturating_add(1));
-  }
-
   pub fn set(&self, context: RimeContext, now_secs: u64) -> Result<RimeStatus, RimeContextError> {
     context.validate(now_secs)?;
     let updated_at_millis = normalize_timestamp_millis(context.updated_at);
@@ -664,8 +404,6 @@ impl RimeContextStore {
         || updated_at_millis <= state.high_watermark_millis
       {
         let status = status_from_state(&state, now_secs);
-        drop(state);
-        self.notify_change();
         return Ok(status);
       }
 
@@ -687,8 +425,6 @@ impl RimeContextStore {
       );
       state.prune(now_secs);
       let status = status_from_state(&state, now_secs);
-      drop(state);
-      self.notify_change();
       return Ok(status);
     } else if updated_at_millis <= state.high_watermark_millis {
       // A superseded profile must not regain ownership merely because its PUT
@@ -696,8 +432,6 @@ impl RimeContextStore {
       state.revoke(&context_id, now_secs);
       state.prune(now_secs);
       let status = status_from_state(&state, now_secs);
-      drop(state);
-      self.notify_change();
       return Ok(status);
     }
 
@@ -740,8 +474,6 @@ impl RimeContextStore {
     }
     state.prune(now_secs);
     let status = status_from_state(&state, now_secs);
-    drop(state);
-    self.notify_change();
     Ok(status)
   }
 
@@ -762,8 +494,6 @@ impl RimeContextStore {
     // already in flight when DELETE arrived cannot revive that target.
     let removed = state.revoke(expected, now_secs);
     state.prune(now_secs);
-    drop(state);
-    self.notify_change();
     removed
   }
 
@@ -824,444 +554,6 @@ fn status_from_state(state: &RimeContextState, now_secs: u64) -> RimeStatus {
     target_summary: Some(context.target_summary.clone()),
     updated_at: context.updated_at,
   }
-}
-
-pub fn blocks_for_output(context: &RimeContext, output: GenerationOutput) -> Vec<RimeBlock> {
-  match context.mode {
-    RimeContextMode::Direct => output
-      .direct
-      .into_iter()
-      .find_map(|candidate| {
-        let text = candidate.text.trim();
-        (!text.is_empty()).then(|| blocks_for_candidate(text, bounded_title(&candidate.angle)))
-      })
-      .unwrap_or_default(),
-    RimeContextMode::Reply => {
-      let target_id = context
-        .target
-        .as_ref()
-        .map(|target| target.id.as_str())
-        .unwrap_or_default();
-      output
-        .replies
-        .into_iter()
-        .filter(|candidate| !target_id.is_empty() && candidate.target_id == target_id)
-        .find_map(|candidate| {
-          let text = candidate.text.trim();
-          (!text.is_empty())
-            .then(|| blocks_for_candidate(text, bounded_title(&context.target_summary)))
-        })
-        .unwrap_or_default()
-    }
-  }
-}
-
-fn bounded_title(value: &str) -> Option<String> {
-  let value = value.trim();
-  if value.is_empty() {
-    return None;
-  }
-  Some(truncate_utf8_bytes(value, 200))
-}
-
-fn blocks_for_candidate(text: &str, first_title: Option<String>) -> Vec<RimeBlock> {
-  let blocks: Vec<RimeBlock> = split_rime_text(text)
-    .into_iter()
-    .enumerate()
-    .map(|(index, text)| RimeBlock {
-      text,
-      title: (index == 0).then(|| first_title.clone()).flatten(),
-    })
-    .collect();
-  if serde_json::to_vec(&blocks)
-    .is_ok_and(|encoded| encoded.len() <= MAX_RIME_COMPLETE_BLOCKS_JSON_BYTES)
-  {
-    blocks
-  } else {
-    Vec::new()
-  }
-}
-
-/// Split one sendable candidate into ordered, concatenable blocks. Natural
-/// punctuation stays attached to the preceding block. This is deliberately an
-/// online splitter: extending `text` can only grow the current last block or
-/// append a new one, so an index already emitted by the stream never moves. If
-/// a pathological tail exhausts all 20 slots and then exceeds the per-block
-/// limit, fail closed instead of rewriting earlier boundaries.
-fn split_rime_text(text: &str) -> Vec<String> {
-  let text = text.trim();
-  if text.is_empty() || text.len() > MAX_RIME_CANDIDATE_BYTES {
-    return Vec::new();
-  }
-
-  let mut blocks = Vec::new();
-  let mut start = 0usize;
-  let mut characters = text.char_indices().peekable();
-  while let Some((index, character)) = characters.next() {
-    let end = index + character.len_utf8();
-    if end.saturating_sub(start) > MAX_RIME_STREAM_TEXT_BYTES {
-      if blocks.len() >= MAX_RIME_STREAM_BLOCKS - 1 || index == start {
-        return Vec::new();
-      }
-      blocks.push(text[start..index].to_string());
-      start = index;
-    }
-    let delimiter_run_ends = is_rime_block_delimiter(character)
-      && !characters
-        .peek()
-        .is_some_and(|(_, next)| is_rime_block_delimiter(*next));
-    let slots_after_boundary = MAX_RIME_STREAM_BLOCKS.saturating_sub(blocks.len() + 1);
-    let maximum_future_bytes = MAX_RIME_CANDIDATE_BYTES.saturating_sub(end);
-    if delimiter_run_ends
-      && slots_after_boundary.saturating_mul(MAX_RIME_STREAM_TEXT_BYTES) >= maximum_future_bytes
-    {
-      blocks.push(text[start..end].to_string());
-      start = end;
-    }
-  }
-  if start < text.len() {
-    if text.len().saturating_sub(start) > MAX_RIME_STREAM_TEXT_BYTES {
-      return Vec::new();
-    }
-    blocks.push(text[start..].to_string());
-  }
-  blocks
-}
-
-fn is_rime_block_delimiter(character: char) -> bool {
-  matches!(
-    character,
-    '，' | '。' | '！' | '？' | '；' | ',' | '.' | '!' | '?' | ';' | '\n'
-  )
-}
-
-fn utf8_boundary_at_or_before(value: &str, maximum: usize) -> usize {
-  let mut boundary = maximum.min(value.len());
-  while boundary > 0 && !value.is_char_boundary(boundary) {
-    boundary -= 1;
-  }
-  boundary
-}
-
-fn truncate_utf8_bytes(value: &str, maximum: usize) -> String {
-  value[..utf8_boundary_at_or_before(value, maximum)].to_string()
-}
-
-/// Decode the first candidate that is valid for the captured action from a
-/// partial schema-constrained GenerationOutput JSON document, then apply the
-/// exact same block splitter used by the authoritative final result. Direct
-/// streams never expose reply text; reply streams wait for an exact, complete
-/// targetId match before exposing text. JSON strings may end mid-UTF-8 escape.
-pub fn incremental_blocks_for_output(
-  context: &RimeContext,
-  input: &str,
-) -> Result<Vec<RimeBlock>, String> {
-  if input.len() > super::generate::MAX_STREAMED_PROVIDER_BYTES {
-    return Err("partial generation JSON exceeded the configured limit".to_string());
-  }
-  let bytes = input.as_bytes();
-  match context.mode {
-    RimeContextMode::Direct => {
-      let Some(objects) = incremental_array_objects(bytes, "direct")? else {
-        return Ok(Vec::new());
-      };
-      for object in objects {
-        let text = object_string_field(object.bytes, "text")?;
-        if let Some(text) = text.filter(|value| !value.value.trim().is_empty()) {
-          let angle = object_string_field(object.bytes, "angle")?
-            .filter(|value| value.closed)
-            .and_then(|value| bounded_title(&value.value));
-          return Ok(blocks_for_candidate(text.value.trim(), angle));
-        }
-        if !object.complete {
-          break;
-        }
-      }
-    }
-    RimeContextMode::Reply => {
-      let target_id = context
-        .target
-        .as_ref()
-        .map(|target| target.id.as_str())
-        .unwrap_or_default();
-      if target_id.is_empty() {
-        return Ok(Vec::new());
-      }
-      let Some(objects) = incremental_array_objects(bytes, "replies")? else {
-        return Ok(Vec::new());
-      };
-      for object in objects {
-        let candidate_target = object_string_field(object.bytes, "targetId")?;
-        let target_matches = candidate_target
-          .as_ref()
-          .is_some_and(|value| value.closed && value.value == target_id);
-        if target_matches {
-          let text = object_string_field(object.bytes, "text")?;
-          if let Some(text) = text.filter(|value| !value.value.trim().is_empty()) {
-            return Ok(blocks_for_candidate(
-              text.value.trim(),
-              bounded_title(&context.target_summary),
-            ));
-          }
-        }
-        if !object.complete && !candidate_target.as_ref().is_some_and(|value| value.closed) {
-          break;
-        }
-      }
-    }
-  }
-  Ok(Vec::new())
-}
-
-struct IncrementalObject<'a> {
-  bytes: &'a [u8],
-  complete: bool,
-}
-
-struct IncrementalString {
-  value: String,
-  closed: bool,
-}
-
-fn incremental_array_objects<'a>(
-  bytes: &'a [u8],
-  key: &str,
-) -> Result<Option<Vec<IncrementalObject<'a>>>, String> {
-  let Some(array_start) = find_top_level_array(bytes, key)? else {
-    return Ok(None);
-  };
-  let mut objects = Vec::new();
-  let mut cursor = array_start + 1;
-  loop {
-    cursor = skip_json_whitespace(bytes, cursor);
-    while bytes.get(cursor) == Some(&b',') {
-      cursor = skip_json_whitespace(bytes, cursor + 1);
-    }
-    match bytes.get(cursor) {
-      None | Some(b']') => break,
-      Some(b'{') => {
-        let (end, complete) = scan_json_object(bytes, cursor);
-        objects.push(IncrementalObject {
-          bytes: &bytes[cursor..end],
-          complete,
-        });
-        cursor = end;
-        if !complete {
-          break;
-        }
-      }
-      _ => return Err("generation JSON array contained a non-object candidate".to_string()),
-    }
-  }
-  Ok(Some(objects))
-}
-
-fn find_top_level_array(bytes: &[u8], wanted_key: &str) -> Result<Option<usize>, String> {
-  let mut cursor = 0usize;
-  let mut object_depth = 0usize;
-  let mut array_depth = 0usize;
-  while cursor < bytes.len() {
-    match bytes[cursor] {
-      b'"' => {
-        let string = scan_json_string(bytes, cursor);
-        if !string.closed {
-          return Ok(None);
-        }
-        if object_depth == 1 && array_depth == 0 {
-          let key = decode_json_string(&bytes[string.content_start..string.content_end], true)?;
-          let mut value_start = skip_json_whitespace(bytes, string.next_index);
-          if bytes.get(value_start) == Some(&b':') {
-            value_start = skip_json_whitespace(bytes, value_start + 1);
-            if key == wanted_key {
-              return Ok((bytes.get(value_start) == Some(&b'[')).then_some(value_start));
-            }
-          }
-        }
-        cursor = string.next_index;
-      }
-      b'{' => {
-        object_depth = object_depth.saturating_add(1);
-        cursor += 1;
-      }
-      b'}' => {
-        object_depth = object_depth.saturating_sub(1);
-        cursor += 1;
-      }
-      b'[' => {
-        array_depth = array_depth.saturating_add(1);
-        cursor += 1;
-      }
-      b']' => {
-        array_depth = array_depth.saturating_sub(1);
-        cursor += 1;
-      }
-      _ => cursor += 1,
-    }
-  }
-  Ok(None)
-}
-
-fn scan_json_object(bytes: &[u8], start: usize) -> (usize, bool) {
-  let mut cursor = start;
-  let mut object_depth = 0usize;
-  let mut array_depth = 0usize;
-  while cursor < bytes.len() {
-    match bytes[cursor] {
-      b'"' => {
-        let string = scan_json_string(bytes, cursor);
-        if !string.closed {
-          return (bytes.len(), false);
-        }
-        cursor = string.next_index;
-      }
-      b'{' => {
-        object_depth += 1;
-        cursor += 1;
-      }
-      b'}' => {
-        object_depth = object_depth.saturating_sub(1);
-        cursor += 1;
-        if object_depth == 0 && array_depth == 0 {
-          return (cursor, true);
-        }
-      }
-      b'[' => {
-        array_depth += 1;
-        cursor += 1;
-      }
-      b']' => {
-        array_depth = array_depth.saturating_sub(1);
-        cursor += 1;
-      }
-      _ => cursor += 1,
-    }
-  }
-  (bytes.len(), false)
-}
-
-fn object_string_field(
-  bytes: &[u8],
-  wanted_key: &str,
-) -> Result<Option<IncrementalString>, String> {
-  let mut cursor = 1usize;
-  let mut object_depth = 1usize;
-  let mut array_depth = 0usize;
-  while cursor < bytes.len() {
-    match bytes[cursor] {
-      b'"' => {
-        let key = scan_json_string(bytes, cursor);
-        if !key.closed {
-          return Ok(None);
-        }
-        if object_depth == 1 && array_depth == 0 {
-          let key_text = decode_json_string(&bytes[key.content_start..key.content_end], true)?;
-          let mut value_start = skip_json_whitespace(bytes, key.next_index);
-          if bytes.get(value_start) == Some(&b':') {
-            value_start = skip_json_whitespace(bytes, value_start + 1);
-            if key_text == wanted_key {
-              if bytes.get(value_start) != Some(&b'"') {
-                return Ok(None);
-              }
-              let value = scan_json_string(bytes, value_start);
-              return Ok(Some(IncrementalString {
-                value: decode_json_string(
-                  &bytes[value.content_start..value.content_end],
-                  value.closed,
-                )?,
-                closed: value.closed,
-              }));
-            }
-          }
-        }
-        cursor = key.next_index;
-      }
-      b'{' => {
-        object_depth += 1;
-        cursor += 1;
-      }
-      b'}' => {
-        object_depth = object_depth.saturating_sub(1);
-        cursor += 1;
-      }
-      b'[' => {
-        array_depth += 1;
-        cursor += 1;
-      }
-      b']' => {
-        array_depth = array_depth.saturating_sub(1);
-        cursor += 1;
-      }
-      _ => cursor += 1,
-    }
-  }
-  Ok(None)
-}
-
-struct ScannedJsonString {
-  content_start: usize,
-  content_end: usize,
-  next_index: usize,
-  closed: bool,
-}
-
-fn scan_json_string(bytes: &[u8], quote_index: usize) -> ScannedJsonString {
-  let mut cursor = quote_index.saturating_add(1);
-  let content_start = cursor;
-  let mut escaped = false;
-  while cursor < bytes.len() {
-    let byte = bytes[cursor];
-    if escaped {
-      escaped = false;
-    } else if byte == b'\\' {
-      escaped = true;
-    } else if byte == b'"' {
-      return ScannedJsonString {
-        content_start,
-        content_end: cursor,
-        next_index: cursor + 1,
-        closed: true,
-      };
-    }
-    cursor += 1;
-  }
-  ScannedJsonString {
-    content_start,
-    content_end: bytes.len(),
-    next_index: bytes.len(),
-    closed: false,
-  }
-}
-
-fn skip_json_whitespace(bytes: &[u8], mut index: usize) -> usize {
-  while bytes
-    .get(index)
-    .is_some_and(|byte| matches!(*byte, b' ' | b'\n' | b'\r' | b'\t'))
-  {
-    index += 1;
-  }
-  index
-}
-
-fn decode_json_string(content: &[u8], complete: bool) -> Result<String, String> {
-  let content = std::str::from_utf8(content)
-    .map_err(|_| "partial generation JSON contained invalid UTF-8".to_string())?;
-  if complete {
-    return decode_json_string_prefix(content)
-      .ok_or_else(|| "generation JSON contained an invalid string escape".to_string());
-  }
-  let mut boundaries: Vec<usize> = content.char_indices().map(|(index, _)| index).collect();
-  boundaries.push(content.len());
-  for end in boundaries.into_iter().rev() {
-    if let Some(decoded) = decode_json_string_prefix(&content[..end]) {
-      return Ok(decoded);
-    }
-  }
-  Ok(String::new())
-}
-
-fn decode_json_string_prefix(content: &str) -> Option<String> {
-  let encoded = format!("\"{content}\"");
-  serde_json::from_str(&encoded).ok()
 }
 
 pub fn now_secs() -> u64 {
@@ -1515,7 +807,6 @@ fn restore_claimed_runtime_config(claimed_path: &Path, path: &Path) -> Result<()
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::marine::generate::{GenDirect, GenReply};
 
   fn direct_context(updated_at: u64) -> RimeContext {
     RimeContext {
@@ -1549,6 +840,32 @@ mod tests {
       }),
       ..direct_context(updated_at)
     }
+  }
+
+  #[test]
+  fn target_summary_matches_the_rime_prepare_byte_contract() {
+    let now = 1_000_000;
+    let mut context = direct_context(now);
+    context.target_summary = "界".repeat(333);
+    assert_eq!(context.target_summary.len(), 999);
+    assert!(context.validate(now).is_ok());
+
+    context.target_summary.push('界');
+    assert_eq!(context.target_summary.len(), 1_002);
+    assert_eq!(
+      context.validate(now),
+      Err(RimeContextError::Invalid(
+        "targetSummary must be at most 1000 UTF-8 bytes without NUL"
+      ))
+    );
+
+    context.target_summary = "bad\0summary".into();
+    assert_eq!(
+      context.validate(now),
+      Err(RimeContextError::Invalid(
+        "targetSummary must be at most 1000 UTF-8 bytes without NUL"
+      ))
+    );
   }
 
   #[test]
@@ -1607,20 +924,6 @@ mod tests {
         "actionId does not match the context mode"
       ))
     );
-  }
-
-  #[test]
-  fn context_store_notifies_streams_on_set_and_clear() {
-    let now = 1_000_000;
-    let store = RimeContextStore::default();
-    let mut changes = store.subscribe_changes();
-    assert!(!changes.has_changed().unwrap());
-
-    store.set(direct_context(now), now).unwrap();
-    assert!(changes.has_changed().unwrap());
-    let _ = changes.borrow_and_update();
-    assert!(store.clear_at(Some("ctx-direct"), now));
-    assert!(changes.has_changed().unwrap());
   }
 
   #[test]
@@ -1856,72 +1159,6 @@ mod tests {
   }
 
   #[test]
-  fn mode_selects_only_the_matching_generation_candidates() {
-    let output = GenerationOutput {
-      direct: vec![GenDirect {
-        text: " direct ".into(),
-        angle: "angle".into(),
-      }],
-      replies: vec![GenReply {
-        target_id: "42".into(),
-        target: "@Alice".into(),
-        text: " reply ".into(),
-      }],
-    };
-    assert_eq!(
-      blocks_for_output(&direct_context(1), output.clone()),
-      vec![RimeBlock {
-        text: "direct".into(),
-        title: Some("angle".into())
-      }]
-    );
-    assert_eq!(
-      blocks_for_output(&reply_context(1), output),
-      vec![RimeBlock {
-        text: "reply".into(),
-        title: Some("回复 @Alice".into())
-      }]
-    );
-  }
-
-  #[test]
-  fn reply_with_an_id_discards_candidates_for_other_comments() {
-    let context = reply_context(1);
-    let output = GenerationOutput {
-      direct: Vec::new(),
-      replies: vec![
-        GenReply {
-          target_id: "another-comment".into(),
-          target: "@Mallory".into(),
-          text: "wrong target".into(),
-        },
-        GenReply {
-          target_id: " 42 ".into(),
-          target: "@Mallory".into(),
-          text: "whitespace-normalized ids must not match".into(),
-        },
-        GenReply {
-          target_id: "42".into(),
-          target: "@Alice".into(),
-          text: "right target".into(),
-        },
-        GenReply {
-          target_id: "42".into(),
-          target: "@Alice".into(),
-          text: "alternative must not be appended".into(),
-        },
-      ],
-    };
-    assert_eq!(
-      blocks_for_output(&context, output),
-      vec![RimeBlock {
-        text: "right target".into(),
-        title: Some("回复 @Alice".into()),
-      }]
-    );
-  }
-
-  #[test]
   fn reply_context_requires_exact_id_author_and_text() {
     let now = 1_000_000;
     for target in [
@@ -1957,139 +1194,11 @@ mod tests {
       );
     }
 
-    let mut context = reply_context(now);
-    context.target = None;
-    assert!(blocks_for_output(
-      &context,
-      GenerationOutput {
-        direct: Vec::new(),
-        replies: vec![GenReply {
-          target_id: "anything".into(),
-          target: "@Alice".into(),
-          text: "must not be accepted".into(),
-        }],
-      }
-    )
-    .is_empty());
+    assert!(reply_context(now).validate(now).is_ok());
   }
 
   #[test]
-  fn action_invocation_uses_only_one_candidate() {
-    let output = GenerationOutput {
-      direct: vec![
-        GenDirect {
-          text: "best".into(),
-          angle: "first".into(),
-        },
-        GenDirect {
-          text: "second".into(),
-          angle: "second".into(),
-        },
-      ],
-      replies: Vec::new(),
-    };
-    assert_eq!(
-      blocks_for_output(&direct_context(1), output),
-      vec![RimeBlock {
-        text: "best".into(),
-        title: Some("first".into()),
-      }]
-    );
-  }
-
-  #[test]
-  fn one_candidate_splits_into_ordered_sendable_blocks() {
-    let text = " 先说重点，接着解释。Really? Yes!\n最后一句； ";
-    let blocks = blocks_for_output(
-      &direct_context(1),
-      GenerationOutput {
-        direct: vec![GenDirect {
-          text: text.into(),
-          angle: "层次".into(),
-        }],
-        replies: Vec::new(),
-      },
-    );
-    assert_eq!(
-      blocks,
-      vec![
-        RimeBlock {
-          text: "先说重点，".into(),
-          title: Some("层次".into()),
-        },
-        RimeBlock {
-          text: "接着解释。".into(),
-          title: None,
-        },
-        RimeBlock {
-          text: "Really?".into(),
-          title: None,
-        },
-        RimeBlock {
-          text: " Yes!\n".into(),
-          title: None,
-        },
-        RimeBlock {
-          text: "最后一句；".into(),
-          title: None,
-        },
-      ]
-    );
-    assert_eq!(
-      blocks
-        .iter()
-        .map(|block| block.text.as_str())
-        .collect::<String>(),
-      text.trim()
-    );
-  }
-
-  #[test]
-  fn splitter_hard_splits_utf8_without_losing_text() {
-    let text = "界".repeat(8_000);
-    let blocks = split_rime_text(&text);
-    assert_eq!(blocks.len(), 2);
-    assert!(blocks
-      .iter()
-      .all(|block| block.len() <= MAX_RIME_STREAM_TEXT_BYTES));
-    assert!(blocks
-      .iter()
-      .all(|block| block.is_char_boundary(block.len())));
-    assert_eq!(blocks.concat(), text);
-  }
-
-  #[test]
-  fn splitter_caps_natural_boundaries_at_twenty_blocks() {
-    let text = (0..25)
-      .map(|index| format!("第{index}句，"))
-      .collect::<String>();
-    let blocks = split_rime_text(&text);
-    assert!(blocks.len() <= MAX_RIME_STREAM_BLOCKS);
-    assert_eq!(blocks.concat(), text);
-    assert!(blocks
-      .iter()
-      .all(|block| block.len() <= MAX_RIME_STREAM_TEXT_BYTES));
-    assert!(blocks.last().unwrap().contains("第24句，"));
-  }
-
-  #[test]
-  fn splitter_reserves_tail_capacity_without_rewriting_streamed_indices() {
-    let prefix = format!("{}{}", "a,".repeat(19), "x".repeat(20_000));
-    let extended = format!("{prefix}y");
-    let before = split_rime_text(&prefix);
-    let after = split_rime_text(&extended);
-    assert!(!before.is_empty());
-    assert_eq!(before.len(), after.len());
-    assert!(after.len() <= MAX_RIME_STREAM_BLOCKS);
-    for (index, snapshot) in before.iter().enumerate() {
-      assert!(after[index].starts_with(snapshot), "block {index} moved");
-    }
-    assert_eq!(before.concat(), prefix);
-    assert_eq!(after.concat(), extended);
-  }
-
-  #[test]
-  fn generation_payload_overrides_forged_intent_with_captured_reply_target() {
+  fn prompt_payload_overrides_forged_intent_with_captured_reply_target() {
     let mut context = reply_context(1);
     context.target.as_mut().unwrap().parent_id = "parent-9".into();
     context.target.as_mut().unwrap().root_id = "root-7".into();
@@ -2114,7 +1223,7 @@ mod tests {
         "target": {"id": "attacker", "authorName": "Mallory", "text": "wrong thread"}
       }
     });
-    let payload = context.generation_payload();
+    let payload = context.prompt_payload();
     let intent = &payload["__marineIntent"];
     let envelope = &payload["__marineContext"];
     assert_eq!(intent["mode"], "reply");
@@ -2140,10 +1249,10 @@ mod tests {
   }
 
   #[test]
-  fn generation_payload_infers_source_for_legacy_mutually_exclusive_payloads() {
+  fn prompt_payload_infers_source_for_legacy_mutually_exclusive_payloads() {
     let mut context = direct_context(1);
     assert_eq!(
-      context.generation_payload()["__marineContext"]["source"],
+      context.prompt_payload()["__marineContext"]["source"],
       RIME_SOURCE_ARTICLE
     );
 
@@ -2153,13 +1262,13 @@ mod tests {
       "subtitle": {"text": "\n\t"}
     });
     assert_eq!(
-      context.generation_payload()["__marineContext"]["source"],
+      context.prompt_payload()["__marineContext"]["source"],
       RIME_SOURCE_COMMENTS
     );
 
     context.payload = serde_json::json!({});
     assert_eq!(
-      context.generation_payload()["__marineContext"]["source"],
+      context.prompt_payload()["__marineContext"]["source"],
       RIME_SOURCE_NONE
     );
   }
@@ -2230,102 +1339,8 @@ mod tests {
   }
 
   #[test]
-  fn incremental_json_scanner_emits_first_character_and_handles_split_escapes() {
-    let context = direct_context(1);
-    assert_eq!(
-      incremental_blocks_for_output(&context, r#"{"direct":[{"text":"你"#).unwrap(),
-      vec![RimeBlock {
-        text: "你".into(),
-        title: None,
-      }]
-    );
-    assert_eq!(
-      incremental_blocks_for_output(&context, r#"{"direct":[{"text":"a，\u4F"#).unwrap(),
-      vec![RimeBlock {
-        text: "a，".into(),
-        title: None,
-      }]
-    );
-    assert_eq!(
-      incremental_blocks_for_output(
-        &context,
-        r#"{"direct":[{"text":"a\n\u4E2D\uD83D\uDE00\"尾","angle":"x"}],"replies":[]}"#
-      )
-      .unwrap(),
-      vec![
-        RimeBlock {
-          text: "a\n".into(),
-          title: Some("x".into()),
-        },
-        RimeBlock {
-          text: "中😀\"尾".into(),
-          title: None,
-        },
-      ]
-    );
-  }
-
-  #[test]
-  fn incremental_json_scanner_keeps_action_and_reply_target_isolated() {
-    let raw = r#"{"direct":[{"text":"直评，继续","angle":"a"}],"replies":[{"targetId":"other","target":"@B","text":"错的"},{"targetId":" 42 ","target":"@B","text":"空白归一化也不能串楼"},{"targetId":"42","target":"@A","text":"正确，回复"}]}"#;
-    assert_eq!(
-      incremental_blocks_for_output(&direct_context(1), raw).unwrap(),
-      vec![
-        RimeBlock {
-          text: "直评，".into(),
-          title: Some("a".into()),
-        },
-        RimeBlock {
-          text: "继续".into(),
-          title: None,
-        },
-      ]
-    );
-    assert_eq!(
-      incremental_blocks_for_output(&reply_context(1), raw).unwrap(),
-      vec![
-        RimeBlock {
-          text: "正确，".into(),
-          title: Some("回复 @Alice".into()),
-        },
-        RimeBlock {
-          text: "回复".into(),
-          title: None,
-        },
-      ]
-    );
-    assert!(
-      incremental_blocks_for_output(&direct_context(1), r#"{"direct":[{"text":"bad\q"}] }"#)
-        .is_err()
-    );
-  }
-
-  #[test]
-  fn incremental_and_final_blocks_keep_the_same_indices() {
-    let context = direct_context(1);
-    let partial =
-      incremental_blocks_for_output(&context, r#"{"direct":[{"text":"第一句，第二"#).unwrap();
-    let raw = r#"{"direct":[{"text":"第一句，第二句。第三句","angle":"角度"}],"replies":[]}"#;
-    let streamed_final = incremental_blocks_for_output(&context, raw).unwrap();
-    let authoritative = blocks_for_output(
-      &context,
-      serde_json::from_str::<GenerationOutput>(raw).unwrap(),
-    );
-    assert_eq!(partial[0].text, streamed_final[0].text);
-    assert!(streamed_final[1].text.starts_with(&partial[1].text));
-    assert_eq!(streamed_final, authoritative);
-    assert_eq!(
-      authoritative
-        .iter()
-        .map(|block| block.text.as_str())
-        .collect::<String>(),
-      "第一句，第二句。第三句"
-    );
-  }
-
-  #[test]
-  fn stream_frames_repeat_exact_identity_with_contiguous_sequence_numbers() {
-    let request = RimeStreamInvokeRequest {
+  fn prepare_identity_and_response_enforce_the_blocks_v1_contract() {
+    let request = RimePrepareRequest {
       plugin_id: RIME_PLUGIN_ID.into(),
       runtime_instance_id: "runtime-1".into(),
       invoke: RimeInvokeRequest {
@@ -2337,155 +1352,30 @@ mod tests {
     request
       .validate_binding(RIME_PLUGIN_ID, "runtime-1")
       .unwrap();
-    let mut encoder = RimeStreamEncoder::new(RimeStreamIdentity::from_request(&request));
-    let heartbeat: Value = serde_json::from_slice(
-      encoder
-        .encode(RimeStreamEvent::Heartbeat)
-        .unwrap()
-        .as_slice(),
-    )
-    .unwrap();
-    let block: Value = serde_json::from_slice(
-      encoder
-        .encode(RimeStreamEvent::Block {
-          index: 0,
-          text: "首字".into(),
-          title: None,
-        })
-        .unwrap()
-        .as_slice(),
-    )
-    .unwrap();
-    for (frame, seq, kind) in [(&heartbeat, 1, "heartbeat"), (&block, 2, "block")] {
-      assert_eq!(frame["protocolVersion"], RIME_STREAM_PROTOCOL_VERSION);
-      assert_eq!(frame["seq"], seq);
-      assert_eq!(frame["type"], kind);
-      assert_eq!(frame["pluginId"], RIME_PLUGIN_ID);
-      assert_eq!(frame["runtimeInstanceId"], "runtime-1");
-      assert_eq!(frame["requestId"], "request-1");
-      assert_eq!(frame["actionId"], DIRECT_ACTION_ID);
-      assert_eq!(frame["contextId"], "context-1");
-    }
-    encoder
-      .encode(RimeStreamEvent::Complete {
-        blocks: vec![RimeBlock {
-          text: "完成".into(),
-          title: None,
-        }],
-        target_summary: None,
-      })
-      .unwrap();
-    assert!(encoder.encode(RimeStreamEvent::Heartbeat).is_err());
-  }
-
-  #[test]
-  fn stream_encoder_and_binding_enforce_bounds_and_runtime_identity() {
-    let request = RimeStreamInvokeRequest {
-      plugin_id: RIME_PLUGIN_ID.into(),
-      runtime_instance_id: "runtime-1".into(),
-      invoke: RimeInvokeRequest {
-        request_id: "request-1".into(),
-        action_id: DIRECT_ACTION_ID.into(),
-        context_id: "context-1".into(),
-      },
-    };
     assert!(request
       .validate_binding(RIME_PLUGIN_ID, "runtime-other")
       .is_err());
-    let mut invalid_identity = request.clone();
-    invalid_identity.invoke.request_id = "请求-1".into();
-    assert!(invalid_identity
-      .validate_binding(RIME_PLUGIN_ID, "runtime-1")
-      .is_err());
-    invalid_identity.invoke.request_id = "\u{7f}".into();
-    assert!(invalid_identity
-      .validate_binding(RIME_PLUGIN_ID, "runtime-1")
-      .is_err());
-    invalid_identity.invoke.request_id = "x".repeat(MAX_RIME_STREAM_ID_BYTES + 1);
-    assert!(invalid_identity
-      .validate_binding(RIME_PLUGIN_ID, "runtime-1")
-      .is_err());
-    let mut encoder = RimeStreamEncoder::new(RimeStreamIdentity::from_request(&request));
-    let utf8_at_limit = "界".repeat(MAX_RIME_STREAM_TEXT_BYTES / "界".len());
-    assert!(utf8_at_limit.len() <= MAX_RIME_STREAM_TEXT_BYTES);
-    encoder
-      .encode(RimeStreamEvent::Block {
-        index: 0,
-        text: utf8_at_limit.clone(),
-        title: None,
-      })
-      .unwrap();
-    assert!(encoder
-      .encode(RimeStreamEvent::Block {
-        index: 0,
-        text: format!("{utf8_at_limit}界"),
-        title: None,
-      })
-      .is_err());
-    assert!(encoder
-      .encode(RimeStreamEvent::Block {
-        index: MAX_RIME_STREAM_BLOCKS,
-        text: "x".into(),
-        title: None,
-      })
-      .is_err());
-    assert!(encoder
-      .encode(RimeStreamEvent::Block {
-        index: 0,
-        text: "x".repeat(MAX_RIME_STREAM_TEXT_BYTES + 1),
-        title: None,
-      })
-      .is_err());
-  }
 
-  #[test]
-  fn stream_encoder_accepts_twenty_maximum_plaintext_blocks_in_complete() {
-    let identity = RimeStreamIdentity {
-      plugin_id: RIME_PLUGIN_ID.into(),
-      runtime_instance_id: "runtime-1".into(),
-      request_id: "request-aggregate".into(),
-      action_id: DIRECT_ACTION_ID.into(),
-      context_id: "context-aggregate".into(),
-    };
-    let blocks = (0..MAX_RIME_STREAM_BLOCKS)
-      .map(|_| RimeBlock {
-        text: "x".repeat(MAX_RIME_STREAM_TEXT_BYTES),
-        title: None,
-      })
-      .collect::<Vec<_>>();
-    let mut encoder = RimeStreamEncoder::new(identity);
-    let encoded = encoder
-      .encode(RimeStreamEvent::Complete {
-        blocks,
-        target_summary: None,
-      })
-      .unwrap();
-    assert!(encoded.len() <= MAX_RIME_STREAM_FRAME_BYTES);
-    let frame: RimeStreamFrame = serde_json::from_slice(&encoded).unwrap();
-    let RimeStreamEvent::Complete { blocks, .. } = frame.event else {
-      panic!("expected complete event");
-    };
-    assert_eq!(blocks.len(), MAX_RIME_STREAM_BLOCKS);
-  }
+    let mut invalid = request.clone();
+    invalid.invoke.request_id = "请求-1".into();
+    assert!(invalid
+      .validate_binding(RIME_PLUGIN_ID, "runtime-1")
+      .is_err());
+    invalid.invoke.request_id = "x".repeat(MAX_RIME_REQUEST_ID_BYTES + 1);
+    assert!(invalid
+      .validate_binding(RIME_PLUGIN_ID, "runtime-1")
+      .is_err());
 
-  #[test]
-  fn stream_gate_is_single_concurrency_and_rejects_request_replay() {
-    let gate = RimeStreamGate::default();
-    let first = gate.acquire("request-1").unwrap();
-    assert_eq!(
-      gate.acquire("request-1").err(),
-      Some(RimeStreamGateError::Duplicate)
-    );
-    assert_eq!(
-      gate.acquire("request-2").err(),
-      Some(RimeStreamGateError::Busy)
-    );
-    drop(first);
-    let second = gate.acquire("request-2").unwrap();
-    drop(second);
-    assert_eq!(
-      gate.acquire("request-1").err(),
-      Some(RimeStreamGateError::Duplicate)
-    );
+    let response = RimePrepareResponse::new(&request, "connector prompt".into(), "视频直评".into());
+    let value = serde_json::to_value(response).unwrap();
+    assert_eq!(value["protocolVersion"], RIME_PREPARE_PROTOCOL_VERSION);
+    assert_eq!(value["resultFormat"], RIME_PREPARE_RESULT_FORMAT);
+    assert_eq!(value["pluginId"], RIME_PLUGIN_ID);
+    assert_eq!(value["runtimeInstanceId"], "runtime-1");
+    assert_eq!(value["requestId"], "request-1");
+    assert_eq!(value["actionId"], DIRECT_ACTION_ID);
+    assert_eq!(value["contextId"], "context-1");
+    assert_eq!(value["prompt"], "connector prompt");
+    assert_eq!(value["targetSummary"], "视频直评");
   }
 }

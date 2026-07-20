@@ -1,4 +1,4 @@
-// comments.js — 评论抽取（Phase 0：哔哩哔哩）
+// comments.js — Bilibili / 知乎 / 小红书评论抽取与统一归一化。
 // 思路：被动捕获页面自己发出的（已签名的）评论 API 响应，只解析已解密 JSON，零签名负担。
 // 规范化结构 NormalizedComment：{ id, parentId, rootId, author{name,id}, text, likeCount,
 //   time(ISO), ipLocation, replyCount, children[] }。本文件零依赖、函数全局可见。
@@ -187,9 +187,13 @@ function marineZhihuIp(c) {
 function marineNormZhihuComment(c) {
   if (!c) return null;
   const author = c.author || {};
+  const rootId = c.root_comment_id || c.root_id || c.rootCommentId || '';
+  const parentId = c.parent_comment_id || c.parent_id || c.parentCommentId ||
+    (c.reply_to_comment && c.reply_to_comment.id) || '';
   return {
     id: String(c.id || ''),
-    parentId: null, rootId: null,
+    parentId: parentId ? String(parentId) : null,
+    rootId: rootId ? String(rootId) : null,
     author: { name: marineZhihuName(author), id: author.id != null ? String(author.id) : '' },
     text: marineZhihuStrip(c.content || ''),
     likeCount: c.like_count != null ? c.like_count : (c.likeCount || 0),
@@ -201,8 +205,45 @@ function marineNormZhihuComment(c) {
 }
 function marineBuildZhihuComments(captures) {
   const answers = new Map();   // 回答/文章 id -> 根节点
-  const seen = new Set();
-  const looseComments = [];    // 未能归到某个已捕获回答的评论，兜底当独立根
+  const seenAnswers = new Set();
+  const comments = new Map();  // comment id -> 合并后的节点（暂不建树）
+  const commentHosts = new Map(); // root comment id -> answer/article id
+
+  const rememberComment = function (node, hostId) {
+    if (!node || !node.id) return null;
+    const previous = comments.get(node.id);
+    if (previous) {
+      if (!previous.author.name && node.author.name) previous.author = node.author;
+      if (!previous.text && node.text) previous.text = node.text;
+      if (!previous.parentId && node.parentId) previous.parentId = node.parentId;
+      if (!previous.rootId && node.rootId) previous.rootId = node.rootId;
+      if (!previous.time && node.time) previous.time = node.time;
+      if (!previous.ipLocation && node.ipLocation) previous.ipLocation = node.ipLocation;
+      previous.likeCount = Math.max(previous.likeCount || 0, node.likeCount || 0);
+      previous.replyCount = Math.max(previous.replyCount || 0, node.replyCount || 0);
+      node = previous;
+    } else {
+      node.children = [];
+      comments.set(node.id, node);
+    }
+    const rootKey = node.rootId && node.rootId !== node.id ? node.rootId : node.id;
+    if (hostId && rootKey && !commentHosts.has(rootKey)) commentHosts.set(rootKey, String(hostId));
+    return node;
+  };
+
+  const ingestComment = function (raw, hostId, parentNode, endpointRootId) {
+    const node = marineNormZhihuComment(raw);
+    if (!node || !node.id) return;
+    if (endpointRootId && endpointRootId !== node.id && !node.rootId) node.rootId = endpointRootId;
+    if (parentNode) {
+      if (!node.rootId) node.rootId = parentNode.rootId || parentNode.id;
+      if (!node.parentId) node.parentId = parentNode.id;
+    }
+    const remembered = rememberComment(node, hostId);
+    for (const child of (raw.child_comments || raw.childComments || [])) {
+      ingestComment(child, hostId, remembered, endpointRootId || remembered.rootId || remembered.id);
+    }
+  };
 
   // 1) SSR 初始回答/文章（js-initialData，最稳，含首屏内容）
   try {
@@ -214,7 +255,7 @@ function marineBuildZhihuComments(captures) {
       const amap = ents.answers;
       if (amap) for (const k in amap) {
         const n = marineNormZhihuAnswer(amap[k]);
-        if (n && n.id && !seen.has('a' + n.id)) { seen.add('a' + n.id); answers.set(n.id, n); }
+        if (n && n.id && !seenAnswers.has(n.id)) { seenAnswers.add(n.id); answers.set(n.id, n); }
       }
     }
   } catch (e) {}
@@ -230,32 +271,67 @@ function marineBuildZhihuComments(captures) {
     if (/comment/i.test(url)) {
       const m = url.match(/\/(answers|articles|questions|pins)\/(\d+)\//) || url.match(/resource_id=(\d+)/);
       const hostId = m ? String(m[2] || m[1]) : null;
+      const childEndpoint = url.match(/\/comment\/([^/?]+)\/child_comment(?:[/?]|$)/i);
+      const endpointRootId = childEndpoint ? String(childEndpoint[1]) : '';
       for (const c of data) {
-        const n = marineNormZhihuComment(c);
-        if (!n || !n.id || seen.has('c' + n.id)) continue;
-        seen.add('c' + n.id);
-        for (const k of (c.child_comments || c.childComments || [])) {
-          const kn = marineNormZhihuComment(k);
-          if (kn && kn.id && !seen.has('c' + kn.id)) { seen.add('c' + kn.id); n.children.push(kn); }
-        }
-        if (hostId && answers.has(hostId)) answers.get(hostId).children.push(n);
-        else looseComments.push(n);
+        ingestComment(c, hostId, null, endpointRootId);
       }
     } else {
       for (const item of data) {
         const n = marineNormZhihuAnswer(item.target || item);
-        if (n && n.id && !seen.has('a' + n.id)) { seen.add('a' + n.id); answers.set(n.id, n); }
+        if (n && n.id && !seenAnswers.has(n.id)) { seenAnswers.add(n.id); answers.set(n.id, n); }
       }
     }
   }
 
+  // Child-comment pages do not carry the answer id and can arrive before the
+  // root-comment page. Create missing roots, then build the hierarchy in a
+  // second pass so response order cannot change the resulting tree.
+  for (const node of Array.from(comments.values())) {
+    if (!node.rootId || node.rootId === node.id || comments.has(node.rootId)) continue;
+    comments.set(node.rootId, {
+      id: node.rootId,
+      parentId: null,
+      rootId: null,
+      author: { name: '', id: '' },
+      text: '（根评论未捕获）',
+      likeCount: 0,
+      replyCount: 0,
+      children: [],
+    });
+  }
+  for (const node of comments.values()) node.children = [];
+
+  const topComments = [];
+  for (const node of comments.values()) {
+    let parent = null;
+    if (node.parentId && node.parentId !== node.id) parent = comments.get(node.parentId) || null;
+    if (!parent && node.rootId && node.rootId !== node.id) parent = comments.get(node.rootId) || null;
+    if (parent && parent !== node) parent.children.push(node);
+    else topComments.push(node);
+  }
+
+  const looseComments = [];
+  for (const node of topComments) {
+    const hostId = commentHosts.get(node.id);
+    if (hostId && answers.has(hostId)) answers.get(hostId).children.push(node);
+    else looseComments.push(node);
+  }
+
   const tree = Array.from(answers.values()).concat(looseComments);
   tree.sort((a, b) => (b.likeCount || 0) - (a.likeCount || 0));
-  let subs = 0;
-  for (const r of tree) subs += r.children.length;
+  let count = 0, subs = 0, maxDepth = 0;
+  (function countTree(list, depth) {
+    for (const node of list || []) {
+      count++;
+      if (depth > 1) subs++;
+      maxDepth = Math.max(maxDepth, depth);
+      countTree(node.children, depth + 1);
+    }
+  })(tree, 1);
   return {
     comments: tree,
-    stats: { count: tree.length + subs, roots: tree.length, subs, maxDepth: subs ? 2 : (tree.length ? 1 : 0) },
+    stats: { count, roots: tree.length, subs, maxDepth },
   };
 }
 
@@ -264,9 +340,13 @@ function marineXhsName(u) { const x = u || {}; return x.nickname || x.name || ''
 function marineNormXhs(c) {
   if (!c) return null;
   const u = c.user_info || c.user || {};
+  const rootId = c.root_comment_id || c.root_id || '';
+  const parentId = c.parent_comment_id || c.parent_id || c.target_comment_id ||
+    (c.target_comment && (c.target_comment.id || c.target_comment.comment_id)) || '';
   return {
     id: String(c.id || c.comment_id || ''),
-    parentId: null, rootId: null,
+    parentId: parentId ? String(parentId) : null,
+    rootId: rootId ? String(rootId) : null,
     author: { name: marineXhsName(u), id: u.user_id != null ? String(u.user_id) : '' },
     text: String(c.content || '').trim(),
     likeCount: c.like_count != null ? (Number(c.like_count) || 0) : 0,
@@ -298,13 +378,19 @@ function marineBuildXhsComments(captures) {
       if (!node || !node.id || seen.has(node.id)) continue;
       seen.add(node.id);
       if (isSub) {
-        node.rootId = subRootId || (c.target_comment && String(c.target_comment.id)) || null;
+        node.rootId = node.rootId || subRootId || null;
+        if (!node.parentId) node.parentId = node.rootId;
         orphanSubs.push(node);
       } else {
         roots.set(node.id, node);
         for (const sc of (c.sub_comments || [])) {
           const sn = marineNormXhs(sc);
-          if (sn && sn.id && !seen.has(sn.id)) { seen.add(sn.id); sn.rootId = node.id; node.children.push(sn); }
+          if (sn && sn.id && !seen.has(sn.id)) {
+            seen.add(sn.id);
+            if (!sn.rootId) sn.rootId = node.id;
+            if (!sn.parentId) sn.parentId = node.id;
+            node.children.push(sn);
+          }
         }
       }
     }
@@ -332,15 +418,31 @@ function marineBuildXhsComments(captures) {
 
 // 正文提取：知乎/小红书的「内容」在结构化数据里（feed 响应 / js-initialData），
 // 比通用 DOM 提取干净准确。返回 Markdown 字符串（拿不到则空串，交给通用提取兜底）。
-function marineExtractNoteText(platform, captures) {
+function marineExtractNoteText(platform, captures, opts) {
+  opts = opts || {};
+  const directScope = opts.directScope || {};
   try {
     if (platform === 'xiaohongshu') {
+      const pathMatch = location.pathname.match(/\/explore\/([0-9a-f]+)/i);
+      const wantedNoteId = String(directScope.id || (pathMatch && pathMatch[1]) || '');
       for (const cap of (captures || [])) {
         if (!/\/feed(\b|\?)/.test(cap.url || '')) continue;
         let j;
         try { j = JSON.parse(cap.body); } catch (e) { continue; }
-        for (const it of ((j.data && j.data.items) || [])) {
+        const items = (j.data && j.data.items) || [];
+        const ordered = wantedNoteId
+          ? items.slice().sort(function (a, b) {
+            const aCard = a && a.note_card || {};
+            const bCard = b && b.note_card || {};
+            const aId = String(a && (a.id || a.note_id) || aCard.note_id || aCard.id || '');
+            const bId = String(b && (b.id || b.note_id) || bCard.note_id || bCard.id || '');
+            return Number(bId === wantedNoteId) - Number(aId === wantedNoteId);
+          })
+          : items;
+        for (const it of ordered) {
           const nc = it && it.note_card;
+          const noteId = String(it && (it.id || it.note_id) || nc && (nc.note_id || nc.id) || '');
+          if (wantedNoteId && noteId !== wantedNoteId) continue;
           if (nc && (nc.title || nc.desc)) {
             const parts = [];
             if (nc.title) parts.push('# ' + nc.title);
@@ -351,10 +453,67 @@ function marineExtractNoteText(platform, captures) {
           }
         }
       }
+      const noteRoot = document.querySelector('#noteContainer, .note-container');
+      if (noteRoot) {
+        const titleEl = noteRoot.querySelector('.note-content .title, .note-content .note-title');
+        const descEl = noteRoot.querySelector('.note-content .desc');
+        const authorEl = noteRoot.querySelector(
+          '.author-container .username, .author-container .name, .note-author .name',
+        );
+        const title = String(titleEl && (titleEl.innerText || titleEl.textContent) || '').trim();
+        const desc = String(descEl && (descEl.innerText || descEl.textContent) || '').trim();
+        const author = String(authorEl && (authorEl.innerText || authorEl.textContent) || '').trim();
+        if (title || desc) {
+          const parts = [];
+          if (title) parts.push('# ' + title);
+          if (author) parts.push('> 作者：' + author);
+          if (desc) parts.push('\n' + desc);
+          return parts.join('\n');
+        }
+      }
     } else if (platform === 'zhihu') {
       const el = document.getElementById('js-initialData');
-      if (!el) return '';
-      const ents = (JSON.parse(el.textContent || '{}').initialState || {}).entities || {};
+      let ents = {};
+      if (el) {
+        try { ents = (JSON.parse(el.textContent || '{}').initialState || {}).entities || {}; }
+        catch (e) {}
+      }
+      const pathAnswer = location.pathname.match(/\/answer\/(\d+)/);
+      const wantedAnswerId = String(directScope.id || (pathAnswer && pathAnswer[1]) || '');
+      if (wantedAnswerId && ents.answers && ents.answers[wantedAnswerId]) {
+        const answer = ents.answers[wantedAnswerId];
+        const questionRef = answer.question;
+        const questionId = answer.question_id || answer.questionId ||
+          (questionRef && typeof questionRef === 'object' ? questionRef.id : questionRef);
+        const question = questionRef && typeof questionRef === 'object'
+          ? questionRef
+          : (ents.questions && ents.questions[String(questionId || '')]) || {};
+        const parts = [];
+        const title = directScope.title || question.title || document.title || '';
+        if (title) parts.push('# ' + String(title).trim());
+        const authorName = directScope.authorName || marineZhihuName(answer.author);
+        if (authorName) parts.push('> 回答者：' + authorName);
+        const content = marineZhihuStrip(answer.content || answer.excerpt || answer.excerpt_new || '');
+        if (content) parts.push('\n' + content);
+        if (parts.length) return parts.join('\n');
+      }
+      if (wantedAnswerId) {
+        for (const item of Array.from(document.querySelectorAll('.AnswerItem[data-zop]'))) {
+          let zop;
+          try { zop = JSON.parse(item.getAttribute('data-zop') || '{}'); } catch (e) { continue; }
+          if (String(zop.itemId || '') !== wantedAnswerId) continue;
+          const contentEl = item.querySelector('.RichContent-inner, .RichContent, [itemprop="text"]');
+          const content = String(contentEl && (contentEl.innerText || contentEl.textContent) || '')
+            .replace(/\s+/g, ' ').trim();
+          const parts = [];
+          const title = directScope.title || zop.title || document.title || '';
+          if (title) parts.push('# ' + String(title).trim());
+          const authorName = directScope.authorName || zop.authorName || '';
+          if (authorName) parts.push('> 回答者：' + authorName);
+          if (content) parts.push('\n' + content);
+          if (parts.length) return parts.join('\n');
+        }
+      }
       for (const k in (ents.articles || {})) {
         const a = ents.articles[k];
         if (a && (a.title || a.content)) return '# ' + (a.title || '') + '\n\n' + marineZhihuStrip(a.content || a.excerpt || '');

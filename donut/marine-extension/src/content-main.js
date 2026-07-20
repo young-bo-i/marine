@@ -264,8 +264,23 @@
   // 小红书：评论 comment/page + comment/sub/page；笔记详情 feed。
   const XHS_RE = /\/api\/sns\/web\/v\d+\/(comment\/(sub\/)?page|feed)/i;
 
+  function hostnameOf(value) {
+    try {
+      const parsed = nativeConstruct(NativeURL, [string(value || ''), ORIGIN]);
+      return urlHostnameGet ? string(call(urlHostnameGet, parsed)) : '';
+    } catch (e) { return ''; }
+  }
+
+  const PAGE_HOSTNAME = hostnameOf(ORIGIN);
+
   function matchKind(url) {
-    if (test(COMMENT_RE, url) || test(ZHIHU_RE, url) || test(XHS_RE, url)) return 'comment';
+    const responseHostname = hostnameOf(url);
+    if (test(/(^|\.)bilibili\.com$/i, PAGE_HOSTNAME) &&
+        test(/(^|\.)bilibili\.com$/i, responseHostname) && test(COMMENT_RE, url)) return 'comment';
+    if (test(/(^|\.)zhihu\.com$/i, PAGE_HOSTNAME) &&
+        test(/(^|\.)zhihu\.com$/i, responseHostname) && test(ZHIHU_RE, url)) return 'comment';
+    if (test(/(^|\.)xiaohongshu\.com$/i, PAGE_HOSTNAME) &&
+        test(/(^|\.)xiaohongshu\.com$/i, responseHostname) && test(XHS_RE, url)) return 'comment';
     if (test(SUB_RE, url)) return 'subtitle';
     return null;
   }

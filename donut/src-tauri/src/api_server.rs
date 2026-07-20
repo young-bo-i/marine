@@ -6,9 +6,8 @@ use crate::profile::manager::ProfileManager;
 use crate::proxy_manager::PROXY_MANAGER;
 use crate::tag_manager::TAG_MANAGER;
 use axum::{
-  body::{Body, Bytes},
   extract::{Extension, Path, Query, State},
-  http::{header, HeaderMap, HeaderValue, StatusCode},
+  http::{HeaderMap, StatusCode},
   middleware::{self, Next},
   response::{Json, Response},
   routing::get,
@@ -16,32 +15,19 @@ use axum::{
 };
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
-use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex};
-use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-// Marine (截流) types reused as the extension-facing REST surface.
-use crate::marine::generate::cli::{detect_agents, AgentStatus};
-use crate::marine::generate::{
-  generate_output, generate_output_stream, GenDirect, GenReply, GenerationOutput,
-  MAX_STREAMED_PROVIDER_BYTES,
-};
 use crate::marine::history::{HistoryError, PostingRecord, HISTORY_MANAGER};
 use crate::marine::rime::{
-  blocks_for_output, incremental_blocks_for_output, now_secs as rime_now_secs, RimeBlock,
-  RimeContext, RimeContextError, RimeContextMode, RimeContextStore, RimeInvokeRequest,
-  RimeInvokeResponse, RimeStatus, RimeStreamEncoder, RimeStreamEvent, RimeStreamGate,
-  RimeStreamGateError, RimeStreamIdentity, RimeStreamInvokeRequest, RimeTarget,
-  MAX_RIME_STREAM_ERROR_MESSAGE_BYTES, RIME_PLUGIN_ID,
+  now_secs as rime_now_secs, RimeContext, RimeContextError, RimeContextMode, RimeContextStore,
+  RimeInvokeRequest, RimePrepareRequest, RimePrepareResponse, RimeStatus, RimeTarget,
+  RIME_PLUGIN_ID,
 };
-
-const RIME_STREAM_FRAME_SEND_TIMEOUT_SECS: u64 = 5;
 
 // API Types
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
@@ -136,7 +122,6 @@ struct ApiServerState {
   /// publishing/clearing context.
   rime_consumer_token: Arc<str>,
   rime_runtime_instance_id: Arc<str>,
-  rime_stream_gate: RimeStreamGate,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -365,6 +350,7 @@ struct BatchStopResponse {
     marine_get_rime_status,
     marine_put_rime_context,
     marine_delete_rime_context,
+    marine_prepare_rime_action,
     marine_invoke_rime_action,
     marine_invoke_rime_action_stream,
   ),
@@ -400,20 +386,15 @@ struct BatchStopResponse {
     ProxySettings,
     MarineGenerateRequest,
     MarineProviderConfig,
-    AgentStatus,
     MarineIdentity,
     MarineHistoryAppendRequest,
     MarinePublishedHistoryRequest,
-    GenerationOutput,
-    GenDirect,
-    GenReply,
     PostingRecord,
-    RimeBlock,
     RimeContext,
     RimeContextMode,
     RimeInvokeRequest,
-    RimeInvokeResponse,
-    RimeStreamInvokeRequest,
+    RimePrepareRequest,
+    RimePrepareResponse,
     RimeStatus,
     RimeTarget,
   )),
@@ -432,12 +413,9 @@ struct BatchStopResponse {
 struct ApiDoc;
 
 // ===================== Marine (截流) endpoints =====================
-// The in-browser Marine extension calls these over localhost for the "heavy"
-// work it can't do in-page: generation (local codex/claude CLI or an
-// OpenAI-compatible endpoint), provider config, and posting history. The
-// persona/话术 ("skill") is pre-built inside the extension and sent with each
-// generate call. Page-context work (grab/comment-extraction/reply-fill) stays
-// in the extension itself.
+// The in-browser Marine extension publishes the frozen page target, 话术, and
+// posting history. Rime-side connectors own model authorization and execution;
+// Marine only prepares the prompt bound to an authenticated context lease.
 
 #[derive(Debug, Deserialize, ToSchema)]
 struct MarineGenerateRequest {
@@ -809,74 +787,61 @@ fn published_history_record(
   })
 }
 
+fn marine_ai_execution_moved() -> (StatusCode, String) {
+  (
+    StatusCode::GONE,
+    crate::marine::err_with(
+      "MARINE_AI_MOVED_TO_RIME",
+      "AI execution moved to the Rime connector selected by the user",
+    ),
+  )
+}
+
 #[utoipa::path(
   post, path = "/v1/marine/generate", request_body = MarineGenerateRequest,
-  responses((status = 200, body = GenerationOutput), (status = 404, description = "Brand not found"), (status = 500, description = "Generation failed")),
+  responses((status = 410, description = "AI execution moved to Rime connectors")),
   security(("bearer_auth" = [])), tag = "marine"
 )]
 async fn marine_generate_api(
-  State(_state): State<ApiServerState>,
-  Json(req): Json<MarineGenerateRequest>,
-) -> Result<Json<GenerationOutput>, (StatusCode, String)> {
-  let out = generate_output(&req.skill, &req.payload)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-  Ok(Json(out))
+  Json(request): Json<MarineGenerateRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+  let _retired_payload = (request.skill, request.payload);
+  Err(marine_ai_execution_moved())
 }
 
 #[utoipa::path(
   get, path = "/v1/marine/provider-config",
-  responses((status = 200, body = MarineProviderConfig)),
+  responses((status = 410, description = "AI authorization moved to Rime connectors")),
   security(("bearer_auth" = [])), tag = "marine"
 )]
-async fn marine_get_provider_config(
-  State(_state): State<ApiServerState>,
-) -> Result<Json<MarineProviderConfig>, (StatusCode, String)> {
-  let s = crate::settings_manager::SettingsManager::instance()
-    .load_settings()
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-  Ok(Json(MarineProviderConfig {
-    provider: s.marine_provider,
-    cli_model: s.marine_cli_model,
-    openai_base_url: s.marine_openai_base_url,
-    openai_model: s.marine_openai_model,
-  }))
+async fn marine_get_provider_config() -> Result<StatusCode, (StatusCode, String)> {
+  Err(marine_ai_execution_moved())
 }
 
 #[utoipa::path(
   put, path = "/v1/marine/provider-config", request_body = MarineProviderConfig,
-  responses((status = 200, body = MarineProviderConfig)),
+  responses((status = 410, description = "AI authorization moved to Rime connectors")),
   security(("bearer_auth" = [])), tag = "marine"
 )]
 async fn marine_set_provider_config(
-  State(_state): State<ApiServerState>,
-  Json(cfg): Json<MarineProviderConfig>,
-) -> Result<Json<MarineProviderConfig>, (StatusCode, String)> {
-  let manager = crate::settings_manager::SettingsManager::instance();
-  let mut s = manager
-    .load_settings()
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-  s.marine_provider = cfg.provider.clone();
-  s.marine_cli_model = cfg.cli_model.clone();
-  s.marine_openai_base_url = cfg.openai_base_url.clone();
-  s.marine_openai_model = cfg.openai_model.clone();
-  manager
-    .save_settings(&s)
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-  Ok(Json(cfg))
+  Json(config): Json<MarineProviderConfig>,
+) -> Result<StatusCode, (StatusCode, String)> {
+  let _retired_config = (
+    config.provider,
+    config.cli_model,
+    config.openai_base_url,
+    config.openai_model,
+  );
+  Err(marine_ai_execution_moved())
 }
 
-/// Auto-detected local agents (codex / claude) with connection status, so the
-/// extension can show Pencil-style "connect your agent" cards.
 #[utoipa::path(
   get, path = "/v1/marine/agents",
-  responses((status = 200, description = "Local agent connection status", body = [AgentStatus])),
+  responses((status = 410, description = "AI authorization moved to Rime connectors")),
   security(("bearer_auth" = [])), tag = "marine"
 )]
-async fn marine_get_agents(
-  State(_state): State<ApiServerState>,
-) -> Result<Json<Vec<AgentStatus>>, (StatusCode, String)> {
-  Ok(Json(detect_agents()))
+async fn marine_get_agents() -> Result<StatusCode, (StatusCode, String)> {
+  Err(marine_ai_execution_moved())
 }
 
 #[utoipa::path(
@@ -1021,509 +986,90 @@ async fn marine_delete_rime_context(
   StatusCode::NO_CONTENT
 }
 
-#[utoipa::path(
-  post, path = "/v1/marine/rime/invoke", request_body = RimeInvokeRequest,
-  responses(
-    (status = 200, body = RimeInvokeResponse),
-    (status = 404, description = "No active context"),
-    (status = 409, description = "Context changed or expired"),
-    (status = 500, description = "Generation failed")
-  ),
-  security(("bearer_auth" = [])), tag = "marine"
-)]
-async fn marine_invoke_rime_action(
-  Extension(store): Extension<RimeContextStore>,
-  Json(request): Json<RimeInvokeRequest>,
-) -> Result<Json<RimeInvokeResponse>, (StatusCode, String)> {
-  let context = store
-    .context_for_invoke(&request, rime_now_secs())
-    .map_err(rime_context_error)?;
-  let payload = context.generation_payload();
-  let output = generate_output(&context.skill, &payload)
-    .await
-    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
-
-  // Generation can take long enough for focus to move to another profile or
-  // comment. Re-check the exact lease before returning any blocks so a result
-  // produced for a superseded target is discarded at the server boundary.
-  store
-    .context_for_invoke(&request, rime_now_secs())
-    .map_err(rime_context_error)?;
-
-  let blocks = blocks_for_output(&context, output);
-  if blocks.is_empty() {
-    return Err((
-      StatusCode::BAD_GATEWAY,
-      crate::marine::err_with(
-        "MARINE_GENERATE_FAILED",
-        "generation returned no candidate for the requested target",
-      ),
-    ));
-  }
-
-  Ok(Json(RimeInvokeResponse {
-    request_id: request.request_id,
-    action_id: request.action_id,
-    context_id: request.context_id,
-    blocks,
-    target_summary: Some(context.target_summary),
-  }))
-}
-
-#[utoipa::path(
-  post, path = "/v1/marine/rime/invoke-stream", request_body = RimeStreamInvokeRequest,
-  responses(
-    (status = 200, description = "Authenticated NDJSON generation stream", content_type = "application/x-ndjson"),
-    (status = 400, description = "Invalid stream binding"),
-    (status = 404, description = "No active context"),
-    (status = 409, description = "Context changed, duplicate request, or another stream is active")
-  ),
-  security(("bearer_auth" = [])), tag = "marine"
-)]
-async fn marine_invoke_rime_action_stream(
-  State(state): State<ApiServerState>,
-  Extension(store): Extension<RimeContextStore>,
-  Json(request): Json<RimeStreamInvokeRequest>,
-) -> Result<Response, (StatusCode, String)> {
-  request
-    .validate_binding(RIME_PLUGIN_ID, state.rime_runtime_instance_id.as_ref())
-    .map_err(rime_context_error)?;
-  let context = store
-    .context_for_invoke(&request.invoke, rime_now_secs())
-    .map_err(rime_context_error)?;
-  let permit = state
-    .rime_stream_gate
-    .acquire(&request.invoke.request_id)
-    .map_err(|error| match error {
-      RimeStreamGateError::Duplicate => (
-        StatusCode::CONFLICT,
-        crate::marine::err_with(
-          "MARINE_RIME_DUPLICATE_REQUEST",
-          "requestId has already been used by this Marine runtime",
-        ),
-      ),
-      RimeStreamGateError::Busy => (
-        StatusCode::CONFLICT,
-        crate::marine::err_with(
-          "MARINE_RIME_STREAM_BUSY",
-          "another Marine generation stream is already active",
-        ),
-      ),
-    })?;
-
-  let identity = RimeStreamIdentity::from_request(&request);
-  let (frames_tx, frames_rx) = mpsc::channel(32);
-  let cancellation = CancellationToken::new();
-  tokio::spawn(produce_rime_generation_stream(
-    store,
-    context,
-    request,
-    RimeStreamEncoder::new(identity),
-    frames_tx,
-    cancellation.clone(),
-    permit,
-  ));
-
-  let stream = futures_util::stream::unfold(
-    RimeResponseStreamState {
-      receiver: frames_rx,
-      cancellation,
-    },
-    |mut state| async move {
-      state
-        .receiver
-        .recv()
-        .await
-        .map(|bytes| (Ok::<Bytes, Infallible>(Bytes::from(bytes)), state))
-    },
-  );
-  let mut response = Response::new(Body::from_stream(stream));
-  response.headers_mut().insert(
-    header::CONTENT_TYPE,
-    HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
-  );
-  response
-    .headers_mut()
-    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-  response.headers_mut().insert(
-    header::X_CONTENT_TYPE_OPTIONS,
-    HeaderValue::from_static("nosniff"),
-  );
-  Ok(response)
-}
-
-struct RimeResponseStreamState {
-  receiver: mpsc::Receiver<Vec<u8>>,
-  cancellation: CancellationToken,
-}
-
-impl Drop for RimeResponseStreamState {
-  fn drop(&mut self) {
-    self.cancellation.cancel();
-  }
-}
-
-async fn produce_rime_generation_stream(
-  store: RimeContextStore,
-  context: RimeContext,
-  request: RimeStreamInvokeRequest,
-  mut encoder: RimeStreamEncoder,
-  frames: mpsc::Sender<Vec<u8>>,
-  cancellation: CancellationToken,
-  _permit: crate::marine::rime::RimeStreamPermit,
-) {
-  let mut context_changes = store.subscribe_changes();
-  if !stream_context_matches(&store, &request.invoke, &context) {
-    let _ = send_stream_error(
-      &mut encoder,
-      &frames,
-      &cancellation,
-      "MARINE_RIME_CONTEXT_INVALID",
-      Some("browser comment target changed before generation started"),
-    )
-    .await;
-    return;
-  }
-  let payload = context.generation_payload();
-  let skill = context.skill.clone();
-  let (provider_tx, mut provider_rx) = mpsc::channel(32);
-  let provider_cancellation = cancellation.child_token();
-  let provider_cancel_for_task = provider_cancellation.clone();
-  let mut generation = tokio::spawn(async move {
-    generate_output_stream(&skill, &payload, provider_tx, provider_cancel_for_task).await
-  });
-  let mut raw = String::new();
-  let mut snapshots: Vec<RimeBlock> = Vec::new();
-  let mut provider_open = true;
-  let mut heartbeat = tokio::time::interval(Duration::from_secs(8));
-  heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-  heartbeat.tick().await;
-
-  loop {
-    tokio::select! {
-      _ = cancellation.cancelled() => {
-        provider_cancellation.cancel();
-        finish_generation_task(&mut generation).await;
-        return;
-      }
-      changed = context_changes.changed() => {
-        if changed.is_err() || !stream_context_matches(&store, &request.invoke, &context) {
-          provider_cancellation.cancel();
-          let _ = send_stream_error(
-            &mut encoder,
-            &frames,
-            &cancellation,
-            "MARINE_RIME_CONTEXT_INVALID",
-            Some("browser comment target changed during generation"),
-          ).await;
-          finish_generation_task(&mut generation).await;
-          return;
-        }
-      }
-      _ = heartbeat.tick() => {
-        if !stream_context_matches(&store, &request.invoke, &context) {
-          provider_cancellation.cancel();
-          let _ = send_stream_error(
-            &mut encoder,
-            &frames,
-            &cancellation,
-            "MARINE_RIME_CONTEXT_INVALID",
-            Some("browser comment target changed during generation"),
-          ).await;
-          finish_generation_task(&mut generation).await;
-          return;
-        }
-        if send_stream_event_with_fallback(
-          &mut encoder,
-          &frames,
-          &cancellation,
-          RimeStreamEvent::Heartbeat,
-        ).await.is_err() {
-          provider_cancellation.cancel();
-          finish_generation_task(&mut generation).await;
-          return;
-        }
-      }
-      delta = provider_rx.recv(), if provider_open => {
-        let Some(delta) = delta else {
-          provider_open = false;
-          continue;
-        };
-        if raw.len().saturating_add(delta.len()) > MAX_STREAMED_PROVIDER_BYTES {
-          provider_cancellation.cancel();
-          let _ = send_stream_error(
-            &mut encoder,
-            &frames,
-            &cancellation,
-            "MARINE_GENERATE_FAILED",
-            Some("provider output exceeded the configured limit"),
-          ).await;
-          finish_generation_task(&mut generation).await;
-          return;
-        }
-        raw.push_str(&delta);
-        if !stream_context_matches(&store, &request.invoke, &context) {
-          provider_cancellation.cancel();
-          let _ = send_stream_error(
-            &mut encoder,
-            &frames,
-            &cancellation,
-            "MARINE_RIME_CONTEXT_INVALID",
-            Some("browser comment target changed during generation"),
-          ).await;
-          finish_generation_task(&mut generation).await;
-          return;
-        }
-        match incremental_blocks_for_output(&context, &raw) {
-          Ok(blocks) => {
-            for (index, block) in indexed_rime_blocks(blocks) {
-              if block.text.is_empty() || snapshots.get(index) == Some(&block) {
-                continue;
-              }
-              if snapshots.len() <= index {
-                snapshots.resize_with(index + 1, || RimeBlock {
-                  text: String::new(),
-                  title: None,
-                });
-              }
-              snapshots[index] = block.clone();
-              if send_stream_event_with_fallback(
-                &mut encoder,
-                &frames,
-                &cancellation,
-                RimeStreamEvent::Block {
-                  index,
-                  text: block.text,
-                  title: block.title,
-                },
-              ).await.is_err() {
-                provider_cancellation.cancel();
-                finish_generation_task(&mut generation).await;
-                return;
-              }
-            }
-          }
-          Err(error) => {
-            provider_cancellation.cancel();
-            let _ = send_stream_error(
-              &mut encoder,
-              &frames,
-              &cancellation,
-              "MARINE_GENERATE_FAILED",
-              Some(&error),
-            ).await;
-            finish_generation_task(&mut generation).await;
-            return;
-          }
-        }
-      }
-      result = &mut generation => {
-        let result = match result {
-          Ok(result) => result,
-          Err(error) => Err(crate::marine::err_with(
-            "MARINE_GENERATE_FAILED",
-            format!("generation task failed: {error}"),
-          )),
-        };
-        let output = match result {
-          Ok(output) => output,
-          Err(error) => {
-            let (code, message) = stream_error_parts(&error);
-            let _ = send_stream_error(
-              &mut encoder,
-              &frames,
-              &cancellation,
-              &code,
-              message.as_deref(),
-            ).await;
-            return;
-          }
-        };
-        if !stream_context_matches(&store, &request.invoke, &context) {
-          let _ = send_stream_error(
-            &mut encoder,
-            &frames,
-            &cancellation,
-            "MARINE_RIME_CONTEXT_INVALID",
-            Some("browser comment target changed before completion"),
-          ).await;
-          return;
-        }
-        let mut blocks = blocks_for_output(&context, output);
-        for block in &mut blocks {
-          block.title = block
-            .title
-            .as_deref()
-            .map(|title| truncate_utf8(title, 200));
-        }
-        if blocks.is_empty() {
-          let _ = send_stream_error(
-            &mut encoder,
-            &frames,
-            &cancellation,
-            "MARINE_GENERATE_FAILED",
-            Some("generation returned no candidate for the requested target"),
-          ).await;
-          return;
-        }
-        for (index, block) in blocks.iter().enumerate() {
-          if snapshots.get(index) != Some(block)
-            && send_stream_event_with_fallback(
-              &mut encoder,
-              &frames,
-              &cancellation,
-              RimeStreamEvent::Block {
-                index,
-                text: block.text.clone(),
-                title: block.title.clone(),
-              },
-            ).await.is_err() {
-              return;
-            }
-        }
-        let _ = send_stream_event_with_fallback(
-          &mut encoder,
-          &frames,
-          &cancellation,
-          RimeStreamEvent::Complete {
-            blocks,
-            target_summary: Some(truncate_utf8(&context.target_summary, 1000)),
-          },
-        ).await;
-        return;
-      }
-    }
-  }
-}
-
-fn indexed_rime_blocks(blocks: Vec<RimeBlock>) -> impl Iterator<Item = (usize, RimeBlock)> {
-  blocks.into_iter().enumerate()
-}
-
-fn stream_context_matches(
-  store: &RimeContextStore,
-  request: &RimeInvokeRequest,
-  captured: &RimeContext,
-) -> bool {
-  store
-    .context_for_invoke(request, rime_now_secs())
-    .is_ok_and(|current| stream_context_same_lease(&current, captured))
-}
-
-fn stream_context_same_lease(current: &RimeContext, captured: &RimeContext) -> bool {
-  // The extension periodically renews an otherwise identical focus lease by
-  // advancing only `updatedAt`. Keep that stream alive, while continuing to
-  // compare every semantic field through RimeContext's derived PartialEq.
-  // Normalizing one timestamp instead of listing fields also makes newly added
-  // context fields fail closed automatically.
+fn rime_context_same_lease(current: &RimeContext, captured: &RimeContext) -> bool {
+  // Periodic focus renewal advances only updatedAt. Every semantic field stays
+  // frozen so prepare can never return a prompt for a superseded target.
   let mut normalized_current = current.clone();
   normalized_current.updated_at = captured.updated_at;
   normalized_current == *captured
 }
 
-async fn send_stream_event(
-  encoder: &mut RimeStreamEncoder,
-  frames: &mpsc::Sender<Vec<u8>>,
-  cancellation: &CancellationToken,
-  event: RimeStreamEvent,
-) -> Result<(), String> {
-  let bytes = encoder.encode(event)?;
-  tokio::select! {
-    _ = cancellation.cancelled() => Err("stream receiver disconnected".to_string()),
-    result = tokio::time::timeout(
-      Duration::from_secs(RIME_STREAM_FRAME_SEND_TIMEOUT_SECS),
-      frames.send(bytes),
-    ) => result
-      .map_err(|_| "stream receiver stalled".to_string())?
-      .map_err(|_| "stream receiver disconnected".to_string()),
-  }
-}
-
-async fn send_stream_event_with_fallback(
-  encoder: &mut RimeStreamEncoder,
-  frames: &mpsc::Sender<Vec<u8>>,
-  cancellation: &CancellationToken,
-  event: RimeStreamEvent,
-) -> Result<(), String> {
-  match send_stream_event(encoder, frames, cancellation, event).await {
-    Ok(()) => Ok(()),
-    Err(error) if error.starts_with("stream receiver") => Err(error),
-    Err(error) => {
-      let _ = send_stream_error(
-        encoder,
-        frames,
-        cancellation,
-        "MARINE_RIME_STREAM_LIMIT",
-        Some(&error),
+fn prepare_rime_response(
+  store: &RimeContextStore,
+  expected_runtime_instance_id: &str,
+  request: RimePrepareRequest,
+) -> Result<RimePrepareResponse, (StatusCode, String)> {
+  request
+    .validate_binding(RIME_PLUGIN_ID, expected_runtime_instance_id)
+    .map_err(rime_context_error)?;
+  let context = store
+    .context_for_invoke(&request.invoke, rime_now_secs())
+    .map_err(rime_context_error)?;
+  let payload = context.prompt_payload();
+  let prompt = crate::marine::generate::prompt::build_blocks_v1(&payload, &context.skill).map_err(
+    |message| {
+      (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        crate::marine::err_with("MARINE_RIME_PROMPT_TOO_LARGE", message),
       )
-      .await;
-      Err(error)
-    }
-  }
-}
-
-async fn send_stream_error(
-  encoder: &mut RimeStreamEncoder,
-  frames: &mpsc::Sender<Vec<u8>>,
-  cancellation: &CancellationToken,
-  code: &str,
-  message: Option<&str>,
-) -> Result<(), String> {
-  send_stream_event(
-    encoder,
-    frames,
-    cancellation,
-    RimeStreamEvent::Error {
-      code: truncate_utf8(code, 128),
-      message: message.map(|value| truncate_utf8(value, MAX_RIME_STREAM_ERROR_MESSAGE_BYTES)),
     },
-  )
-  .await
+  )?;
+
+  let current = store
+    .context_for_invoke(&request.invoke, rime_now_secs())
+    .map_err(rime_context_error)?;
+  if !rime_context_same_lease(&current, &context) {
+    return Err(rime_context_error(RimeContextError::ContextMismatch));
+  }
+
+  Ok(RimePrepareResponse::new(
+    &request,
+    prompt,
+    context.target_summary,
+  ))
 }
 
-fn truncate_utf8(value: &str, maximum_bytes: usize) -> String {
-  if value.len() <= maximum_bytes {
-    return value.to_string();
-  }
-  let mut boundary = maximum_bytes;
-  while boundary > 0 && !value.is_char_boundary(boundary) {
-    boundary -= 1;
-  }
-  value[..boundary].to_string()
+#[utoipa::path(
+  post, path = "/v1/marine/rime/prepare", request_body = RimePrepareRequest,
+  responses(
+    (status = 200, body = RimePrepareResponse),
+    (status = 400, description = "Invalid runtime or request identity"),
+    (status = 413, description = "Fixed prompt content exceeds the connector limit"),
+    (status = 404, description = "No active context"),
+    (status = 409, description = "Context changed or expired")
+  ),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_prepare_rime_action(
+  State(state): State<ApiServerState>,
+  Extension(store): Extension<RimeContextStore>,
+  Json(request): Json<RimePrepareRequest>,
+) -> Result<Json<RimePrepareResponse>, (StatusCode, String)> {
+  prepare_rime_response(&store, state.rime_runtime_instance_id.as_ref(), request).map(Json)
 }
 
-fn stream_error_parts(error: &str) -> (String, Option<String>) {
-  let parsed = serde_json::from_str::<serde_json::Value>(error).ok();
-  let code = parsed
-    .as_ref()
-    .and_then(|value| value.get("code"))
-    .and_then(serde_json::Value::as_str)
-    .unwrap_or("MARINE_GENERATE_FAILED")
-    .chars()
-    .take(128)
-    .collect();
-  let message = parsed
-    .as_ref()
-    .and_then(|value| value.pointer("/params/message"))
-    .and_then(serde_json::Value::as_str)
-    .map(|value| value.chars().take(1000).collect());
-  (code, message)
+#[utoipa::path(
+  post, path = "/v1/marine/rime/invoke", request_body = RimeInvokeRequest,
+  responses((status = 410, description = "AI execution moved to Rime connectors")),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_invoke_rime_action(
+  Json(_request): Json<RimeInvokeRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+  Err(marine_ai_execution_moved())
 }
 
-async fn finish_generation_task(
-  task: &mut tokio::task::JoinHandle<Result<GenerationOutput, String>>,
-) {
-  // CLI providers perform bounded kill/reap and stdout/stderr joins after
-  // cancellation. Give that cleanup path time to finish before the last-resort
-  // task abort drops the child handle.
-  if tokio::time::timeout(Duration::from_secs(8), &mut *task)
-    .await
-    .is_err()
-  {
-    task.abort();
-    let _ = task.await;
-  }
+#[utoipa::path(
+  post, path = "/v1/marine/rime/invoke-stream", request_body = RimePrepareRequest,
+  responses((status = 410, description = "AI execution moved to Rime connectors")),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_invoke_rime_action_stream(
+  Json(_request): Json<RimePrepareRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+  Err(marine_ai_execution_moved())
 }
+
 // =================== end Marine endpoints ===================
 
 struct SecurityAddon;
@@ -1580,7 +1126,6 @@ impl ApiServer {
       app_handle: app_handle.clone(),
       rime_consumer_token: Arc::from(rime_consumer_token.clone()),
       rime_runtime_instance_id: Arc::from(rime_runtime_instance_id.clone()),
-      rime_stream_gate: RimeStreamGate::default(),
     };
 
     // Try preferred port first, then random port
@@ -1647,6 +1192,7 @@ impl ApiServer {
       .routes(routes!(marine_get_rime_status))
       .routes(routes!(marine_put_rime_context))
       .routes(routes!(marine_delete_rime_context))
+      .routes(routes!(marine_prepare_rime_action))
       .routes(routes!(marine_invoke_rime_action))
       .routes(routes!(marine_invoke_rime_action_stream))
       .split_for_parts();
@@ -1821,7 +1367,10 @@ async fn auth_middleware(
 fn is_rime_consumer_path(path: &str) -> bool {
   matches!(
     path,
-    "/v1/marine/rime/status" | "/v1/marine/rime/invoke" | "/v1/marine/rime/invoke-stream"
+    "/v1/marine/rime/status"
+      | "/v1/marine/rime/prepare"
+      | "/v1/marine/rime/invoke"
+      | "/v1/marine/rime/invoke-stream"
   )
 }
 
@@ -1830,6 +1379,7 @@ fn is_rime_api_path(path: &str) -> bool {
     path,
     "/v1/marine/rime/status"
       | "/v1/marine/rime/context"
+      | "/v1/marine/rime/prepare"
       | "/v1/marine/rime/invoke"
       | "/v1/marine/rime/invoke-stream"
   )
@@ -3855,6 +3405,7 @@ mod tests {
   #[test]
   fn rime_runtime_capability_is_scoped_to_consumer_routes() {
     assert!(is_rime_consumer_path("/v1/marine/rime/status"));
+    assert!(is_rime_consumer_path("/v1/marine/rime/prepare"));
     assert!(is_rime_consumer_path("/v1/marine/rime/invoke"));
     assert!(is_rime_consumer_path("/v1/marine/rime/invoke-stream"));
     assert!(!is_rime_consumer_path("/v1/marine/rime/context"));
@@ -3865,29 +3416,189 @@ mod tests {
   }
 
   #[test]
-  fn rime_stream_route_is_documented_and_utf8_bounds_are_byte_based() {
+  fn rime_prepare_route_and_response_are_documented() {
     let api = ApiDoc::openapi();
+    assert!(api.paths.paths.contains_key("/v1/marine/rime/prepare"));
     assert!(api
-      .paths
-      .paths
-      .contains_key("/v1/marine/rime/invoke-stream"));
-    let truncated = truncate_utf8("中中", 4);
-    assert_eq!(truncated, "中");
-    assert!(truncated.len() <= 4);
+      .components
+      .as_ref()
+      .unwrap()
+      .schemas
+      .contains_key("RimePrepareResponse"));
   }
 
   #[test]
-  fn rime_stream_lease_renewal_ignores_only_updated_at() {
+  fn rime_prepare_echoes_identity_and_builds_only_a_blocks_v1_prompt() {
+    let store = RimeContextStore::default();
+    let context = rime_test_context("ctx-prepare");
+    let now = rime_now_secs();
+    store
+      .set(context.clone(), now)
+      .expect("test context should be accepted");
+    let request = RimePrepareRequest {
+      plugin_id: RIME_PLUGIN_ID.into(),
+      runtime_instance_id: "runtime-test".into(),
+      invoke: RimeInvokeRequest {
+        request_id: "request-test".into(),
+        action_id: context.action_id.clone(),
+        context_id: context.context_id.clone(),
+      },
+    };
+
+    let response = prepare_rime_response(&store, "runtime-test", request).unwrap();
+    assert_eq!(response.protocol_version, 1);
+    assert_eq!(response.result_format, "blocks-v1");
+    assert_eq!(response.plugin_id, RIME_PLUGIN_ID);
+    assert_eq!(response.runtime_instance_id, "runtime-test");
+    assert_eq!(response.request_id, "request-test");
+    assert_eq!(response.action_id, context.action_id);
+    assert_eq!(response.context_id, context.context_id);
+    assert_eq!(response.target_summary, context.target_summary);
+    assert!(response.prompt.contains("blocks 必须恰好包含 1 项"));
+    assert!(response.prompt.contains("video"));
+    assert!(!response.prompt.contains("replies 必须"));
+
+    let json = serde_json::to_value(response).unwrap();
+    assert_eq!(json["protocolVersion"], 1);
+    assert_eq!(json["resultFormat"], "blocks-v1");
+    assert_eq!(json["pluginId"], RIME_PLUGIN_ID);
+    assert_eq!(json["runtimeInstanceId"], "runtime-test");
+  }
+
+  #[test]
+  fn rime_prepare_rejects_a_mismatched_runtime_before_building() {
+    let store = RimeContextStore::default();
+    let context = rime_test_context("ctx-wrong-runtime");
+    let now = rime_now_secs();
+    store.set(context.clone(), now).unwrap();
+    let request = RimePrepareRequest {
+      plugin_id: RIME_PLUGIN_ID.into(),
+      runtime_instance_id: "runtime-other".into(),
+      invoke: RimeInvokeRequest {
+        request_id: "request-wrong-runtime".into(),
+        action_id: context.action_id,
+        context_id: context.context_id,
+      },
+    };
+
+    let error = prepare_rime_response(&store, "runtime-test", request).unwrap_err();
+    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+  }
+
+  #[test]
+  fn rime_prepare_rejects_fixed_prompt_content_above_the_connector_limit() {
+    let store = RimeContextStore::default();
+    let mut context = rime_test_context("ctx-oversized-prompt");
+    context.skill = "S".repeat(crate::marine::generate::prompt::MAX_BLOCKS_V1_PROMPT_BYTES + 1);
+    store.set(context.clone(), rime_now_secs()).unwrap();
+    let request = RimePrepareRequest {
+      plugin_id: RIME_PLUGIN_ID.into(),
+      runtime_instance_id: "runtime-test".into(),
+      invoke: RimeInvokeRequest {
+        request_id: "request-oversized-prompt".into(),
+        action_id: context.action_id,
+        context_id: context.context_id,
+      },
+    };
+
+    let error = prepare_rime_response(&store, "runtime-test", request).unwrap_err();
+    assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+    let body: serde_json::Value = serde_json::from_str(&error.1).unwrap();
+    assert_eq!(body["code"], "MARINE_RIME_PROMPT_TOO_LARGE");
+  }
+
+  #[tokio::test]
+  async fn legacy_rime_generation_routes_are_gone() {
+    let app = Router::new()
+      .route("/invoke", axum::routing::post(marine_invoke_rime_action))
+      .route(
+        "/invoke-stream",
+        axum::routing::post(marine_invoke_rime_action_stream),
+      );
+    let identity = serde_json::json!({
+      "requestId": "request-gone",
+      "actionId": crate::marine::rime::DIRECT_ACTION_ID,
+      "contextId": "context-gone"
+    });
+    let stream_identity = serde_json::json!({
+      "pluginId": RIME_PLUGIN_ID,
+      "runtimeInstanceId": "runtime-gone",
+      "requestId": "request-gone",
+      "actionId": crate::marine::rime::DIRECT_ACTION_ID,
+      "contextId": "context-gone"
+    });
+
+    for (path, body) in [("/invoke", identity), ("/invoke-stream", stream_identity)] {
+      let response = app
+        .clone()
+        .oneshot(
+          Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+      assert_eq!(response.status(), StatusCode::GONE, "{path}");
+      let bytes = response.into_body().collect().await.unwrap().to_bytes();
+      let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+      assert_eq!(body["code"], "MARINE_AI_MOVED_TO_RIME");
+    }
+  }
+
+  #[tokio::test]
+  async fn legacy_marine_ai_routes_are_gone() {
+    let app = Router::new()
+      .route("/generate", axum::routing::post(marine_generate_api))
+      .route(
+        "/provider-config",
+        get(marine_get_provider_config).put(marine_set_provider_config),
+      )
+      .route("/agents", get(marine_get_agents));
+
+    for (method, path, body) in [
+      (
+        "POST",
+        "/generate",
+        serde_json::json!({"skill": "legacy", "payload": {}}),
+      ),
+      ("GET", "/provider-config", serde_json::Value::Null),
+      ("PUT", "/provider-config", serde_json::json!({})),
+      ("GET", "/agents", serde_json::Value::Null),
+    ] {
+      let mut request = Request::builder().method(method).uri(path);
+      let body = if body.is_null() {
+        Body::empty()
+      } else {
+        request = request.header(header::CONTENT_TYPE, "application/json");
+        Body::from(serde_json::to_vec(&body).unwrap())
+      };
+      let response = app
+        .clone()
+        .oneshot(request.body(body).unwrap())
+        .await
+        .unwrap();
+      assert_eq!(response.status(), StatusCode::GONE, "{method} {path}");
+      let bytes = response.into_body().collect().await.unwrap().to_bytes();
+      let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+      assert_eq!(body["code"], "MARINE_AI_MOVED_TO_RIME");
+    }
+  }
+
+  #[test]
+  fn rime_prepare_lease_renewal_ignores_only_updated_at() {
     let captured = rime_test_context("ctx-renewal");
     let mut renewed = captured.clone();
     renewed.updated_at = renewed.updated_at.saturating_add(1);
 
-    assert!(stream_context_same_lease(&renewed, &captured));
-    assert!(stream_context_same_lease(&captured, &renewed));
+    assert!(rime_context_same_lease(&renewed, &captured));
+    assert!(rime_context_same_lease(&captured, &renewed));
   }
 
   #[test]
-  fn rime_stream_lease_rejects_every_semantic_context_change() {
+  fn rime_prepare_lease_rejects_every_semantic_context_change() {
     type ContextMutation = (&'static str, fn(&mut RimeContext));
 
     let captured = rime_test_context("ctx-captured");
@@ -3921,14 +3632,14 @@ mod tests {
       let mut changed = captured.clone();
       mutate(&mut changed);
       assert!(
-        !stream_context_same_lease(&changed, &captured),
-        "changing {field} must invalidate the stream lease"
+        !rime_context_same_lease(&changed, &captured),
+        "changing {field} must invalidate the prepare lease"
       );
     }
   }
 
   #[test]
-  fn rime_stream_context_match_survives_store_renewal() {
+  fn rime_prepare_context_match_survives_store_renewal() {
     let store = RimeContextStore::default();
     let captured = rime_test_context("ctx-renewed-in-store");
     let request = RimeInvokeRequest {
@@ -3946,84 +3657,10 @@ mod tests {
       .set(renewed, rime_now_secs())
       .expect("fresh renewal should be accepted");
 
-    assert!(stream_context_matches(&store, &request, &captured));
-  }
-
-  #[test]
-  fn rime_stream_indexes_every_natural_block_and_complete_preserves_text() {
-    let context = rime_test_context("ctx-blocks");
-    let raw = r#"{"direct":[{"text":"第一句，第二句。第三句","angle":"结构"}],"replies":[]}"#;
-    let blocks = incremental_blocks_for_output(&context, raw).unwrap();
-    assert_eq!(blocks.len(), 3);
-    assert_eq!(
-      blocks
-        .iter()
-        .map(|block| block.text.as_str())
-        .collect::<String>(),
-      "第一句，第二句。第三句"
-    );
-
-    let identity = RimeStreamIdentity {
-      plugin_id: RIME_PLUGIN_ID.into(),
-      runtime_instance_id: "runtime-test".into(),
-      request_id: "request-test".into(),
-      action_id: crate::marine::rime::DIRECT_ACTION_ID.into(),
-      context_id: context.context_id.clone(),
-    };
-    let mut encoder = RimeStreamEncoder::new(identity);
-    let mut emitted_indices = Vec::new();
-    for (index, block) in indexed_rime_blocks(blocks.clone()) {
-      let frame: serde_json::Value = serde_json::from_slice(
-        &encoder
-          .encode(RimeStreamEvent::Block {
-            index,
-            text: block.text,
-            title: block.title,
-          })
-          .unwrap(),
-      )
-      .unwrap();
-      emitted_indices.push(frame["index"].as_u64().unwrap());
-    }
-    assert_eq!(emitted_indices, vec![0, 1, 2]);
-    let complete: serde_json::Value = serde_json::from_slice(
-      &encoder
-        .encode(RimeStreamEvent::Complete {
-          blocks,
-          target_summary: Some(context.target_summary),
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    let final_blocks: Vec<RimeBlock> = serde_json::from_value(complete["blocks"].clone()).unwrap();
-    assert_eq!(
-      final_blocks
-        .iter()
-        .map(|block| block.text.as_str())
-        .collect::<String>(),
-      "第一句，第二句。第三句"
-    );
-  }
-
-  #[test]
-  fn rime_stream_error_truncation_matches_encoder_utf8_limit() {
-    let message = "界".repeat(200);
-    let truncated = truncate_utf8(&message, MAX_RIME_STREAM_ERROR_MESSAGE_BYTES);
-    assert!(truncated.len() <= MAX_RIME_STREAM_ERROR_MESSAGE_BYTES);
-    assert!(truncated.is_char_boundary(truncated.len()));
-    let mut encoder = RimeStreamEncoder::new(RimeStreamIdentity {
-      plugin_id: RIME_PLUGIN_ID.into(),
-      runtime_instance_id: "runtime-test".into(),
-      request_id: "request-test".into(),
-      action_id: crate::marine::rime::DIRECT_ACTION_ID.into(),
-      context_id: "context-test".into(),
-    });
-    assert!(encoder
-      .encode(RimeStreamEvent::Error {
-        code: "MARINE_GENERATE_FAILED".into(),
-        message: Some(truncated),
-      })
-      .is_ok());
+    let current = store
+      .context_for_invoke(&request, rime_now_secs())
+      .expect("renewed lease should still resolve");
+    assert!(rime_context_same_lease(&current, &captured));
   }
 
   #[tokio::test]
@@ -4035,6 +3672,7 @@ mod tests {
     let app = Router::new()
       .route("/v1/marine/rime/status", get(ok))
       .route("/v1/marine/rime/context", axum::routing::put(ok).delete(ok))
+      .route("/v1/marine/rime/prepare", axum::routing::post(ok))
       .route("/v1/marine/rime/invoke", axum::routing::post(ok))
       .route("/v1/marine/rime/invoke-stream", axum::routing::post(ok))
       .route("/v1/profiles", get(ok))
@@ -4044,6 +3682,7 @@ mod tests {
       ("GET", "/v1/marine/rime/status"),
       ("PUT", "/v1/marine/rime/context"),
       ("DELETE", "/v1/marine/rime/context"),
+      ("POST", "/v1/marine/rime/prepare"),
       ("POST", "/v1/marine/rime/invoke"),
       ("POST", "/v1/marine/rime/invoke-stream"),
     ] {
@@ -4233,55 +3872,41 @@ mod tests {
     assert_eq!(status.context_id.as_deref(), Some("ctx-current"));
   }
 
-  #[tokio::test]
-  async fn rime_invoke_route_rejects_context_mismatch_before_generation() {
+  #[test]
+  fn rime_prepare_rejects_a_context_mismatch() {
     let store = RimeContextStore::default();
     store
       .set(rime_test_context("ctx-current"), rime_now_secs())
       .unwrap();
-    let app = rime_test_router(store);
-    let request = Request::builder()
-      .method("POST")
-      .uri("/invoke")
-      .header(header::CONTENT_TYPE, "application/json")
-      .body(Body::from(
-        serde_json::to_vec(&RimeInvokeRequest {
-          request_id: "req-1".into(),
-          action_id: crate::marine::rime::DIRECT_ACTION_ID.into(),
-          context_id: "ctx-stale".into(),
-        })
-        .unwrap(),
-      ))
-      .unwrap();
-    assert_eq!(
-      app.oneshot(request).await.unwrap().status(),
-      StatusCode::CONFLICT
-    );
+    let request = RimePrepareRequest {
+      plugin_id: RIME_PLUGIN_ID.into(),
+      runtime_instance_id: "runtime-test".into(),
+      invoke: RimeInvokeRequest {
+        request_id: "req-1".into(),
+        action_id: crate::marine::rime::DIRECT_ACTION_ID.into(),
+        context_id: "ctx-stale".into(),
+      },
+    };
+    let error = prepare_rime_response(&store, "runtime-test", request).unwrap_err();
+    assert_eq!(error.0, StatusCode::CONFLICT);
   }
 
-  #[tokio::test]
-  async fn rime_invoke_route_rejects_action_for_a_different_captured_mode() {
+  #[test]
+  fn rime_prepare_rejects_action_for_a_different_captured_mode() {
     let store = RimeContextStore::default();
     store
       .set(rime_test_context("ctx-current"), rime_now_secs())
       .unwrap();
-    let app = rime_test_router(store);
-    let request = Request::builder()
-      .method("POST")
-      .uri("/invoke")
-      .header(header::CONTENT_TYPE, "application/json")
-      .body(Body::from(
-        serde_json::to_vec(&RimeInvokeRequest {
-          request_id: "req-cross-mode".into(),
-          action_id: crate::marine::rime::REPLY_ACTION_ID.into(),
-          context_id: "ctx-current".into(),
-        })
-        .unwrap(),
-      ))
-      .unwrap();
-    assert_eq!(
-      app.oneshot(request).await.unwrap().status(),
-      StatusCode::CONFLICT
-    );
+    let request = RimePrepareRequest {
+      plugin_id: RIME_PLUGIN_ID.into(),
+      runtime_instance_id: "runtime-test".into(),
+      invoke: RimeInvokeRequest {
+        request_id: "req-cross-mode".into(),
+        action_id: crate::marine::rime::REPLY_ACTION_ID.into(),
+        context_id: "ctx-current".into(),
+      },
+    };
+    let error = prepare_rime_response(&store, "runtime-test", request).unwrap_err();
+    assert_eq!(error.0, StatusCode::CONFLICT);
   }
 }

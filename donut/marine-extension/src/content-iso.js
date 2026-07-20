@@ -77,17 +77,48 @@
     } : { status: 'none', targets: [] };
   }
 
+  function marineCommentDriveRootHint() {
+    const platform = detectPlatform();
+    if (platform === 'bilibili') return 'bili-comments';
+    if (platform === 'zhihu') return '.Modal-content, .Comments-container, .CommentListV2';
+    if (platform === 'xiaohongshu') return '.note-scroller, .comments-container';
+    return null;
+  }
+
+  function marineCommentScrollSurface() {
+    let root = marineCommentSearchRoot();
+    for (let current = root, depth = 0; current && current !== document && depth < 8;
+      current = marineComposedParent(current), depth++) {
+      try {
+        const style = getComputedStyle(current);
+        if (current.scrollHeight > current.clientHeight + 24 &&
+            /(auto|scroll)/.test(style.overflowY || style.overflow)) return current;
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  function marineScrollCommentsToEnd() {
+    const surface = marineCommentScrollSurface();
+    if (surface) {
+      try { surface.scrollTo(0, surface.scrollHeight); }
+      catch (e) { try { surface.scrollTop = surface.scrollHeight; } catch (ignore) {} }
+      return;
+    }
+    try { window.scrollTo(0, document.documentElement.scrollHeight); } catch (e) {}
+  }
+
   // 自动滚动 + 展开，驱动页面自发请求（钩子续收），实现「尽量全量」
   async function marineDriveComments(opts) {
     opts = opts || {};
     const budget = Math.min(opts.budgetMs || 20000, 60000);
     const t0 = Date.now();
-    const rootHint = detectPlatform() === 'bilibili' ? 'bili-comments' : null;
+    const rootHint = marineCommentDriveRootHint();
     let last = -1, stable = 0, rounds = 0;
     marineLog('info', 'iso', '开始自动滚动加载评论（预算 ' + Math.round(budget / 1000) + 's）…');
     while (Date.now() - t0 < budget && stable < 3) {
       rounds++;
-      try { window.scrollTo(0, document.documentElement.scrollHeight); } catch (e) {}
+      marineScrollCommentsToEnd();
       let clicked = 0;
       try { clicked = marineClickExpanders(rootHint); } catch (e) {}
       await marineSleep(1100);
@@ -102,11 +133,11 @@
 
   // 单步加载：滚一屏 + 展开，约触发一页（~20 条）。重复调用即可加载更多。
   async function marineDriveOnce() {
-    const rootHint = detectPlatform() === 'bilibili' ? 'bili-comments' : null;
+    const rootHint = marineCommentDriveRootHint();
     try {
       const el = rootHint && document.querySelector(rootHint);
       if (el && el.scrollIntoView) el.scrollIntoView({ block: 'end' });
-      window.scrollTo(0, document.documentElement.scrollHeight);
+      marineScrollCommentsToEnd();
     } catch (e) {}
     let clicked = 0;
     try { clicked = marineClickExpanders(rootHint); } catch (e) {}
@@ -120,7 +151,7 @@
     return n;
   }
 
-  // 把字幕 + 评论 + 正文打成一份可复制的 Markdown（喂 Codex 用）
+  // 把字幕 + 评论 + 正文打成一份可复制的 Markdown（供当前 AI 连接器使用）
   function marineBuildBundle(d) {
     const parts = [];
     parts.push('平台：' + (PLATFORM_LABEL[d.platform] || d.platform) + '　来源：' + d.url);
@@ -159,7 +190,7 @@
     // 结构化文本：知乎/小红书优先从结构化数据取干净正文，其它站点用通用提取兜底
     let textRes = null;
     try {
-      const noteMd = marineExtractNoteText(platform, commentCaptures);
+      const noteMd = marineExtractNoteText(platform, commentCaptures, opts);
       if (noteMd && noteMd.trim()) textRes = { ok: true, chars: noteMd.length, markdown: noteMd };
       else textRes = marineExtractStructuredText();
     } catch (e) { textRes = null; }
@@ -305,6 +336,13 @@
     return marineCollectShadow(root || document, [], { n: 0, max: 60000 });
   }
   function marineCommentSearchRoot() {
+    const adapter = marineRimeSiteAdapter();
+    if (adapter && typeof adapter.commentSearchRoot === 'function') {
+      try {
+        const root = adapter.commentSearchRoot(document);
+        if (root) return root;
+      } catch (e) {}
+    }
     return document.querySelector('bili-comments, #commentapp, .comment-container, .comment-list, .reply-warp, .Comments-container, .CommentListV2, .Question-main, .ListShortcut, .comments-el, .comments-container, .note-scroller') || document;
   }
   function marineParseReplyTarget(target) {
@@ -471,6 +509,59 @@
 
   // ---- Rime 动作插件：当前评论投放目标 ----
   // 目标由用户对编辑器/“回复”按钮的交互驱动；不扫描轮询 DOM，也不点击发布。
+  function marineRimeSiteAdapter(platform) {
+    const registry = globalThis.MarineCommentTargetAdapters;
+    if (!registry || typeof registry.get !== 'function') return null;
+    try { return registry.get(platform || detectPlatform()) || null; }
+    catch (e) { return null; }
+  }
+
+  function marineRimeAdapterSupportsPage(adapter) {
+    if (!adapter || typeof adapter.supportsPage !== 'function') {
+      return detectPlatform() === 'bilibili' && /\/video\//.test(location.pathname);
+    }
+    try { return adapter.supportsPage(location) === true; }
+    catch (e) { return false; }
+  }
+
+  function marineRimePublicDirectScope(scope) {
+    if (!scope || !String(scope.id || '').trim() || !String(scope.kind || '').trim()) return null;
+    return {
+      id: String(scope.id).trim(),
+      kind: String(scope.kind).trim(),
+      title: String(scope.title || '').replace(/\s+/g, ' ').trim().slice(0, 240),
+      authorName: String(scope.authorName || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+    };
+  }
+
+  function marineRimeDirectScopeForEditor(editor) {
+    const adapter = marineRimeSiteAdapter();
+    if (!adapter || typeof adapter.directScopeForEditor !== 'function') return null;
+    try {
+      const resolved = adapter.directScopeForEditor(
+        editor,
+        marineRimeTarget.directScope,
+        location,
+        document,
+      );
+      if (!marineRimePublicDirectScope(resolved)) return null;
+      return resolved;
+    } catch (e) { return null; }
+  }
+
+  function marineRimeTheme() {
+    const adapter = marineRimeSiteAdapter();
+    const value = adapter && adapter.theme || {};
+    return {
+      accent: value.accent || 'rgb(0, 174, 236)',
+      soft: value.soft || 'rgba(0, 174, 236, .055)',
+      ring: value.ring || 'rgba(0, 174, 236, .18)',
+      badge: value.badge || 'rgb(0, 132, 180)',
+      directLabel: value.directLabel || 'Marine \u00b7 \u76f4\u8bc4',
+      replyLabel: value.replyLabel || 'Marine \u00b7 \u56de\u590d',
+    };
+  }
+
   function marineRimeNewSourceId() {
     try { return crypto.randomUUID(); }
     catch (e) { return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2); }
@@ -481,6 +572,7 @@
     revision: 0,
     activationSerial: 0,
     sourceId: marineRimeNewSourceId(),
+    directScope: null,
     pendingReply: null,
     pendingReplyTimer: null,
     replyBindings: new WeakMap(),
@@ -492,9 +584,105 @@
     pageUrl: location.href,
     navigationRearmRequired: false,
     navigationEventCutoff: 0,
+    lifecycleObserver: null,
+    lifecycleTimer: null,
     diagnosticSequence: 0,
     diagnosticLastAt: new Map(),
   };
+  let marineRimeSendQueue = Promise.resolve();
+
+  function marineRimeReleaseDirectScope(reason, clearActive) {
+    const scope = marineRimeTarget.directScope;
+    if (scope) {
+      scope.invalidated = true;
+      try { if (scope.modalObserver) scope.modalObserver.disconnect(); } catch (e) {}
+    }
+    marineRimeTarget.directScope = null;
+    marineRimeTarget.grabCache = null;
+    if (clearActive) marineRimeClear(reason || 'direct-scope-released');
+  }
+
+  // BEGIN marine-rime-reliable-transport
+  const MARINE_RIME_SEND_ATTEMPTS = 3;
+  const MARINE_RIME_SEND_ACK_TIMEOUT_MS = 1500;
+  const MARINE_RIME_SEND_RETRY_DELAYS_MS = [60, 180];
+
+  function marineRimeDelay(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function marineRimeOperationIsCurrent(operation) {
+    const active = marineRimeTarget.active;
+    if (operation.op === 'put') {
+      const revisionMatches = operation.leaseRenewal === true
+        ? Number(active && active.publishedRevision) === operation.revision
+        : marineRimeTarget.revision === operation.revision;
+      return marineRimeTarget.sourceId === operation.sourceId &&
+        revisionMatches &&
+        !!active && active.contextId === operation.contextId;
+    }
+    // Context IDs are unique per focus lease. A delayed DELETE may still
+    // safely revoke its own old lease, but must never delete a context that
+    // has somehow become active again.
+    return !active || active.contextId !== operation.contextId;
+  }
+
+  async function marineRimeSendOnce(message) {
+    let timeout;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(function () { return chrome.runtime.sendMessage(message); }),
+        new Promise(function (_, reject) {
+          timeout = setTimeout(function () {
+            reject(new Error('Marine Rime ACK timed out'));
+          }, MARINE_RIME_SEND_ACK_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+
+  async function marineRimeDeliver(operation) {
+    const message = {
+      __marineRimeContext: true,
+      op: operation.op,
+      contextId: operation.contextId,
+      context: operation.context,
+      revision: operation.revision,
+      sourceId: operation.sourceId,
+      retainWhenUnfocused: operation.retainWhenUnfocused === true,
+      leaseRenewal: operation.leaseRenewal === true,
+    };
+    let lastError = null;
+    for (let attempt = 0; attempt < MARINE_RIME_SEND_ATTEMPTS; attempt++) {
+      if (!marineRimeOperationIsCurrent(operation)) {
+        return { ok: true, applied: false, stale: true };
+      }
+      try {
+        const response = await marineRimeSendOnce(message);
+        if (!marineRimeOperationIsCurrent(operation)) {
+          return { ok: true, applied: false, stale: true };
+        }
+        if (response && response.ok === true) {
+          if (!response.skipped) return { ok: true, applied: true, response };
+          if (!response.deferred) return { ok: true, applied: false, skipped: true, response };
+          lastError = new Error('Marine Rime context deferred');
+        } else {
+          lastError = new Error(response && response.error || 'Marine Rime 未收到有效 ACK');
+        }
+      } catch (error) {
+        lastError = error;
+      }
+      if (attempt + 1 < MARINE_RIME_SEND_ATTEMPTS) {
+        await marineRimeDelay(MARINE_RIME_SEND_RETRY_DELAYS_MS[attempt]);
+      }
+    }
+    const detail = String(lastError && lastError.message || lastError || '未知错误');
+    marineLog('warn', 'rime-target', operation.op + ' 失败：' + detail);
+    return { ok: false, applied: false, error: detail };
+  }
+  // END marine-rime-reliable-transport
 
   function marineRimeHash(value) {
     let h = 2166136261;
@@ -521,10 +709,11 @@
     return parts.join('/');
   }
 
-  function marineRimeSemanticKey(mode, target, editor) {
+  function marineRimeSemanticKey(mode, target, editor, directScope) {
     const targetText = [(target && target.authorName) || '', (target && target.snippet) || ''].filter(Boolean).join('|');
+    const scope = marineRimePublicDirectScope(directScope);
     const targetKey = mode === 'direct'
-      ? 'direct'
+      ? ('direct|' + (scope ? scope.kind + '|' + scope.id : marineRimeElementKey(editor)))
       : ((target && target.id) || targetText || marineRimeElementKey(editor));
     return marineRimePageKey() + '|' + mode + '|' + targetKey;
   }
@@ -609,6 +798,11 @@
 
   function marineRimeIsCommentBoundary(el) {
     if (!el || !el.tagName) return false;
+    const adapter = marineRimeSiteAdapter();
+    if (adapter && typeof adapter.isCommentBoundary === 'function') {
+      try { if (adapter.isCommentBoundary(el)) return true; }
+      catch (e) {}
+    }
     const tag = el.tagName.toLowerCase();
     if (/^bili-comment-(?:reply-)?renderer$/.test(tag) || tag === 'bili-comment-card') return true;
     const cls = String(el.className && typeof el.className === 'string' ? el.className : '');
@@ -643,6 +837,13 @@
 
   function marineRimeCommentId(commentEl) {
     if (!commentEl) return '';
+    const adapter = marineRimeSiteAdapter();
+    if (adapter && typeof adapter.commentId === 'function') {
+      try {
+        const siteId = String(adapter.commentId(commentEl) || '').trim();
+        if (siteId) return siteId;
+      } catch (e) {}
+    }
     const values = new Set();
     const addValue = function (value) {
       if (typeof value === 'number') {
@@ -790,6 +991,21 @@
 
   function marineRimeDomIdentity(commentEl) {
     if (!commentEl) return { authorName: '', text: '', confidentText: false };
+    const adapter = marineRimeSiteAdapter();
+    if (adapter && typeof adapter.domIdentity === 'function') {
+      try {
+        const siteIdentity = adapter.domIdentity(commentEl);
+        if (siteIdentity && (siteIdentity.authorName || siteIdentity.text || siteIdentity.wholeText)) {
+          const siteText = marineRimeNormalizeCommentIdentity(siteIdentity.text);
+          return {
+            authorName: marineRimeNormalizeCommentIdentity(siteIdentity.authorName),
+            text: siteText,
+            wholeText: marineRimeNormalizeCommentIdentity(siteIdentity.wholeText || siteText),
+            confidentText: siteIdentity.confidentText !== false && !!siteText,
+          };
+        }
+      } catch (e) {}
+    }
     const directWholeText = marineTextOf(commentEl);
     const composedWholeText = marineRimeComposedEvidenceText(commentEl, commentEl);
     const wholeText = composedWholeText.length > directWholeText.length ? composedWholeText : directWholeText;
@@ -1008,6 +1224,22 @@
   // different comment box cannot bleed in from the whole comment list.
   function marineRimeEditorContextLabel(editor) {
     const attributed = marineRimeEditorPlaceholder(editor);
+    const adapter = marineRimeSiteAdapter();
+    let siteLabel = '';
+    if (adapter && typeof adapter.editorContextLabel === 'function') {
+      try { siteLabel = String(adapter.editorContextLabel(editor) || '').trim(); }
+      catch (e) {}
+    }
+    if (marineRimeIsReplyEditorPlaceholder(siteLabel)) {
+      const siteAuthor = marineRimeReplyPlaceholderAuthor(siteLabel);
+      marineRimeDiagnostic('editor-label', {
+        source: 'site-adapter',
+        labelAuthor: marineRimeDiagnosticAuthor(siteAuthor),
+        editor: marineRimeDiagnosticShape(editor),
+        chain: marineRimeDiagnosticChain(editor, 7),
+      }, 'site|' + siteAuthor + '|' + marineRimeDiagnosticShape(editor).tag);
+      return siteLabel;
+    }
     if (marineRimeIsReplyEditorPlaceholder(attributed)) {
       const attributedAuthor = marineRimeReplyPlaceholderAuthor(attributed);
       marineRimeDiagnostic('editor-label', {
@@ -1059,7 +1291,7 @@
       }
       if (scope === commentRoot) break;
     }
-    return attributed;
+    return siteLabel || attributed;
   }
 
   function marineRimeIsReplyEditorPlaceholder(value) {
@@ -1148,6 +1380,11 @@
 
   function marineRimeIsReplyThread(el) {
     if (!el || !el.tagName) return false;
+    const adapter = marineRimeSiteAdapter();
+    if (adapter && typeof adapter.isReplyThread === 'function') {
+      try { if (adapter.isReplyThread(el)) return true; }
+      catch (e) {}
+    }
     const tag = el.tagName.toLowerCase();
     if (tag === 'bili-comment-thread-renderer' || tag === 'bili-comment-card') return true;
     const cls = String(el.className && typeof el.className === 'string' ? el.className : '');
@@ -1214,7 +1451,15 @@
   }
 
   function marineRimeIsCommentEditor(editor) {
-    if (!editor || detectPlatform() !== 'bilibili' || !/\/video\//.test(location.pathname)) return false;
+    if (!editor) return false;
+    const platform = detectPlatform();
+    const adapter = marineRimeSiteAdapter(platform);
+    if (!marineRimeAdapterSupportsPage(adapter)) return false;
+    if (adapter && typeof adapter.isCommentEditor === 'function') {
+      try { if (adapter.isCommentEditor(editor)) return true; }
+      catch (e) {}
+    }
+    if (platform !== 'bilibili' || !/\/video\//.test(location.pathname)) return false;
     const root = marineCommentSearchRoot();
     if (root !== document && marineComposedContains(root, editor)) return true;
     if (marineRimeCommentContainer(editor)) return true;
@@ -1223,6 +1468,7 @@
 
   function marineRimeClassify(editor) {
     if (!marineRimeIsCommentEditor(editor)) return null;
+    const directScope = marineRimeDirectScopeForEditor(editor);
     const now = Date.now();
     let pending = marineRimeTarget.pendingReply;
     if (pending && !marineRimeReplyLeaseIsFresh(
@@ -1282,7 +1528,12 @@
       }
     }
     const reply = !!(commentEl || marineRimeIsReplyEditorPlaceholder(placeholder) || matchedPending);
-    if (!reply) return { mode: 'direct', editor, commentEl: null, target: null };
+    if (!reply) {
+      // 一个知乎页面可以同时有多条回答。没有回答 scope 时宁可不启用，
+      // 也不能把话术投到另一条回答的评论框。
+      if (detectPlatform() === 'zhihu' && !marineRimePublicDirectScope(directScope)) return null;
+      return { mode: 'direct', editor, commentEl: null, target: null, directScope };
+    }
     if (!target && matchedPending && pending) { commentEl = pending.commentEl; target = pending.target; }
     target = target || { id: '', authorName: '', text: '', snippet: '', parentId: '', rootId: '' };
     if (!target.authorName) target.authorName = marineRimeReplyPlaceholderAuthor(placeholder);
@@ -1303,11 +1554,12 @@
       });
       if (marineRimeTarget.pendingReply === pending) marineRimeClearPendingReply('handoff-complete');
     }
-    return { mode: 'reply', editor, commentEl, target };
+    return { mode: 'reply', editor, commentEl, target, directScope };
   }
 
   function marineRimeEnsureOverlay() {
     if (marineRimeTarget.overlay) return marineRimeTarget.overlay;
+    const theme = marineRimeTheme();
     const make = function (kind) {
       const el = document.createElement('div');
       el.setAttribute('data-marine-rime-target', kind);
@@ -1320,13 +1572,13 @@
       return el;
     };
     const comment = make('comment');
-    Object.assign(comment.style, { border: '2px solid rgba(0, 174, 236, .92)', background: 'rgba(0, 174, 236, .055)', boxShadow: '0 0 0 3px rgba(0, 174, 236, .12)' });
+    Object.assign(comment.style, { border: '2px solid ' + theme.accent, background: theme.soft, boxShadow: '0 0 0 3px ' + theme.ring });
     const editor = make('editor');
-    Object.assign(editor.style, { border: '2px solid rgb(0, 174, 236)', background: 'rgba(0, 174, 236, .035)', boxShadow: '0 0 0 3px rgba(0, 174, 236, .18)' });
+    Object.assign(editor.style, { border: '2px solid ' + theme.accent, background: theme.soft, boxShadow: '0 0 0 3px ' + theme.ring });
     const badge = make('badge');
     Object.assign(badge.style, {
       height: '24px', width: 'auto', padding: '3px 9px', borderRadius: '999px',
-      color: '#fff', background: 'rgb(0, 132, 180)', font: '600 12px/18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+      color: '#fff', background: theme.badge, font: '600 12px/18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
       letterSpacing: '.1px', whiteSpace: 'nowrap', boxShadow: '0 3px 10px rgba(0, 0, 0, .18)',
     });
     marineRimeTarget.overlay = { comment, editor, badge };
@@ -1351,6 +1603,7 @@
 
   function marineRimeRender() {
     const overlay = marineRimeEnsureOverlay();
+    const theme = marineRimeTheme();
     const active = marineRimeTarget.active;
     if (!active) {
       overlay.comment.style.display = 'none';
@@ -1363,7 +1616,9 @@
     else overlay.comment.style.display = 'none';
     if (!editorRect || overlay.editor.style.display === 'none') { overlay.badge.style.display = 'none'; return; }
     const author = active.target && active.target.authorName;
-    overlay.badge.textContent = active.mode === 'reply' ? ('Marine \u00b7 \u56de\u590d @' + (author || '\u4f5c\u8005')) : 'Marine \u00b7 \u76f4\u8bc4';
+    overlay.badge.textContent = active.mode === 'reply'
+      ? (theme.replyLabel + ' @' + (author || '\u4f5c\u8005'))
+      : theme.directLabel;
     overlay.badge.style.display = 'block';
     const badgeWidth = overlay.badge.getBoundingClientRect().width || 120;
     const top = editorRect.top >= 31 ? editorRect.top - 29 : Math.min(innerHeight - 26, editorRect.bottom + 5);
@@ -1379,29 +1634,33 @@
     });
   }
 
-  function marineRimeSend(op, contextId, context, revision) {
-    try {
-      chrome.runtime.sendMessage({
-        __marineRimeContext: true,
-        op,
-        contextId,
-        context,
-        revision,
-        sourceId: marineRimeTarget.sourceId,
-      }, function (response) {
-        const err = chrome.runtime.lastError;
-        if (err) { marineLog('warn', 'rime-target', op + ' 失败：' + err.message); return; }
-        if (response && !response.ok) marineLog('warn', 'rime-target', op + ' 失败：' + (response.error || '未知错误'));
-      });
-    } catch (e) { marineLog('warn', 'rime-target', op + ' 失败：' + String(e && e.message || e)); }
+  function marineRimeSend(op, contextId, context, revision, options) {
+    const active = marineRimeTarget.active;
+    const operation = {
+      op,
+      contextId,
+      context,
+      revision,
+      sourceId: marineRimeTarget.sourceId,
+      retainWhenUnfocused: op === 'put' && !!active && active.contextId === contextId &&
+        marineRimePersistentTargetIsOpen(active),
+      leaseRenewal: op === 'put' && !!options && options.leaseRenewal === true,
+    };
+    const result = marineRimeSendQueue.catch(function () {}).then(function () {
+      return marineRimeDeliver(operation);
+    });
+    marineRimeSendQueue = result.catch(function () {});
+    return result;
   }
 
-  async function marineRimeGrabContext() {
-    const key = marineRimePageKey() + '|' + commentCaptures.length;
+  async function marineRimeGrabContext(info) {
+    const directScope = marineRimePublicDirectScope(info && info.directScope);
+    const key = marineRimePageKey() + '|' + commentCaptures.length + '|' +
+      (directScope ? directScope.kind + ':' + directScope.id : 'page');
     const cached = marineRimeTarget.grabCache;
     if (cached && cached.key === key && Date.now() - cached.at < 30000) return cached.value;
     const value = await Promise.race([
-      marineGrabAll({}),
+      marineGrabAll({ directScope }),
       new Promise(function (_, reject) {
         setTimeout(function () { reject(new Error('抓取上下文超时')); }, 8000);
       }),
@@ -1411,16 +1670,28 @@
   }
 
   function marineRimeTargetSummary(info) {
-    if (info.mode === 'direct') return '直评 \u00b7 ' + (document.title || location.href);
-    const target = info.target || {};
-    const author = target.authorName || '作者';
-    const snippet = marineCommentSnippet(target.text || target.snippet, 80);
-    return '@' + author + (snippet ? '：「' + snippet + '」' : '');
+    let summary;
+    if (info.mode === 'direct') {
+      const scope = marineRimePublicDirectScope(info.directScope);
+      if (scope && scope.kind === 'answer') {
+        summary = '直评回答' + (scope.authorName ? ' @' + scope.authorName : '') +
+          ' \u00b7 ' + (scope.title || scope.id);
+      } else if (scope && scope.kind === 'note') {
+        summary = '直评笔记 \u00b7 ' + (scope.title || scope.id);
+      } else summary = '直评 \u00b7 ' + (document.title || location.href);
+    }
+    else {
+      const target = info.target || {};
+      const author = target.authorName || '作者';
+      const snippet = marineCommentSnippet(target.text || target.snippet, 80);
+      summary = '@' + author + (snippet ? '：「' + snippet + '」' : '');
+    }
+    return marineRimeTruncateUtf8(summary, MARINE_RIME_TARGET_SUMMARY_MAX_BYTES);
   }
 
   async function marineRimePublish(info, revision) {
     let grab;
-    try { grab = await marineRimeGrabContext(); }
+    try { grab = await marineRimeGrabContext(info); }
     catch (e) {
       marineLog('warn', 'rime-target', '抓取上下文失败，使用当前页基本信息：' + String(e && e.message || e));
       grab = { platform: detectPlatform(), url: location.href, title: document.title, bundle: '', text: { status: 'none' }, comments: { status: 'none' }, subtitle: { status: 'none' } };
@@ -1430,11 +1701,14 @@
     const actionId = info.mode === 'reply' ? 'marine.generate-reply' : 'marine.generate-direct';
     const targetSummary = marineRimeTargetSummary(info);
     const target = info.mode === 'reply' ? marineRimeBuildReplyTarget(info.target) : null;
+    const theme = marineRimeTheme();
     const context = {
       contextId: info.contextId,
       mode: info.mode,
       actionId,
-      label: info.mode === 'reply' ? ('Marine \u00b7 \u56de\u590d @' + ((info.target && info.target.authorName) || '作者')) : 'Marine \u00b7 \u76f4\u8bc4',
+      label: info.mode === 'reply'
+        ? (theme.replyLabel + ' @' + ((info.target && info.target.authorName) || '作者'))
+        : theme.directLabel,
       targetSummary,
       platform: grab.platform || detectPlatform(),
       url: location.href,
@@ -1453,9 +1727,13 @@
       marineLog('warn', 'rime-target', '投放上下文超过安全传输上限，未建立目标');
       return;
     }
-    active.publishedContext = context;
-    active.publishedAt = Date.now();
-    marineRimeSend('put', info.contextId, context, revision);
+    const delivered = await marineRimeSend('put', info.contextId, context, revision);
+    const published = marineRimeTarget.active;
+    if (!delivered.applied || !published || published.contextId !== info.contextId ||
+        marineRimeTarget.revision !== revision) return;
+    published.publishedContext = context;
+    published.publishedRevision = revision;
+    published.publishedAt = Date.now();
     marineLog('ok', 'rime-target', '已锁定 ' + context.label + '：' + context.targetSummary);
   }
 
@@ -1476,13 +1754,17 @@
   function marineRimeActivate(editor) {
     const info = marineRimeClassify(editor);
     if (!info) { marineRimeClear('not-comment-editor'); return; }
-    info.semanticKey = marineRimeSemanticKey(info.mode, info.target, info.editor);
+    info.semanticKey = marineRimeSemanticKey(info.mode, info.target, info.editor, info.directScope);
     const current = marineRimeTarget.active;
     if (current && current.semanticKey === info.semanticKey && current.editor === info.editor) {
       current.commentEl = info.commentEl;
       current.target = info.target;
+      current.directScope = info.directScope;
       marineRimeSchedulePosition();
-      if (!current.publishedAt || Date.now() - current.publishedAt > 30000) marineRimeRenew();
+      if (!current.publishedAt) {
+        const revision = ++marineRimeTarget.revision;
+        void marineRimePublish(current, revision);
+      } else if (Date.now() - current.publishedAt > 30000) void marineRimeRenew();
       return;
     }
     if (current) {
@@ -1500,18 +1782,28 @@
     void marineRimePublish(info, revision);
   }
 
-  function marineRimeRenew() {
+  async function marineRimeRenew() {
     const active = marineRimeTarget.active;
     if (!active || !active.publishedContext || document.hidden) return;
     const focused = marineDeepActiveElement(document);
     if (focused !== active.editor) return;
-    const revision = ++marineRimeTarget.revision;
+    // A lease renewal is not a new target/content generation. Reuse the exact
+    // revision that the worker last acknowledged so WINDOW_ID_NONE can refresh
+    // only the already-tracked retained reply, never grant a newer/stale PUT.
+    const revision = Number(active.publishedRevision) || 0;
+    if (revision <= 0) return;
     const context = Object.assign({}, active.publishedContext, {
       updatedAt: Date.now(),
     });
-    active.publishedContext = context;
-    active.publishedAt = Date.now();
-    marineRimeSend('put', active.contextId, context, revision);
+    const delivered = await marineRimeSend(
+      'put', active.contextId, context, revision, { leaseRenewal: true },
+    );
+    const published = marineRimeTarget.active;
+    if (!delivered.applied || !published || published.contextId !== active.contextId ||
+        Number(published.publishedRevision) !== revision) return;
+    published.publishedContext = context;
+    published.publishedRevision = revision;
+    published.publishedAt = Date.now();
   }
 
   function marineRimeClear(reason) {
@@ -1522,6 +1814,45 @@
     marineRimeRender();
     marineRimeSend('delete', previous.contextId, null, revision);
     marineLog('info', 'rime-target', '已清理投放目标：' + reason);
+  }
+
+  function marineRimePersistentTargetIsOpen(info) {
+    const adapter = marineRimeSiteAdapter();
+    if (!info || !adapter || typeof adapter.persistentTargetIsOpen !== 'function') return false;
+    try { return adapter.persistentTargetIsOpen(info, document, location) === true; }
+    catch (e) { return false; }
+  }
+
+  function marineRimeRetainOrClear(reason) {
+    const active = marineRimeTarget.active;
+    marineRimeClearPendingReply(reason);
+    if (active && marineRimePersistentTargetIsOpen(active)) {
+      marineRimeSchedulePosition();
+      return true;
+    }
+    marineRimeClear(reason);
+    return false;
+  }
+
+  function marineRimeCheckPersistentTarget() {
+    marineRimeTarget.lifecycleTimer = null;
+    const active = marineRimeTarget.active;
+    if (!active || active.mode !== 'reply' || !active.publishedContext) return;
+    const adapter = marineRimeSiteAdapter();
+    if (!adapter || typeof adapter.persistentTargetIsOpen !== 'function') return;
+    if (marineRimePersistentTargetIsOpen(active)) return;
+    marineRimeReleaseDirectScope('target-closed-scope', false);
+    marineRimeClearPendingReply('target-closed');
+    marineRimeClear('target-closed');
+  }
+
+  function marineRimeScheduleLifecycleCheck() {
+    const active = marineRimeTarget.active;
+    if (!active || active.mode !== 'reply' || !active.publishedContext) return;
+    const adapter = marineRimeSiteAdapter();
+    if (!adapter || typeof adapter.persistentTargetIsOpen !== 'function') return;
+    if (marineRimeTarget.lifecycleTimer) clearTimeout(marineRimeTarget.lifecycleTimer);
+    marineRimeTarget.lifecycleTimer = setTimeout(marineRimeCheckPersistentTarget, 50);
   }
 
   function marineRimeTryPendingReply() {
@@ -1555,6 +1886,59 @@
   }
 
   function marineRimeHandleClick(event) {
+    const adapter = marineRimeSiteAdapter();
+    if (adapter && typeof adapter.shouldClearTargetFromEventPath === 'function') {
+      let shouldClear = false;
+      try { shouldClear = adapter.shouldClearTargetFromEventPath(
+        marineRimeEventPath(event), marineRimeTarget.active,
+      ); }
+      catch (e) {}
+      if (shouldClear) {
+        marineRimeReleaseDirectScope('explicit-cancel', false);
+        marineRimeClearPendingReply('explicit-cancel');
+        marineRimeClear('explicit-cancel');
+        return;
+      }
+    }
+    if (adapter && typeof adapter.shouldClearDirectScopeFromEventPath === 'function') {
+      let shouldClear = false;
+      try { shouldClear = adapter.shouldClearDirectScopeFromEventPath(marineRimeEventPath(event)); }
+      catch (e) {}
+      if (shouldClear) {
+        marineRimeReleaseDirectScope('direct-scope-closed', true);
+        marineRimeClearPendingReply('direct-scope-closed');
+        return;
+      }
+    }
+    if (adapter && typeof adapter.directScopeFromEventPath === 'function') {
+      let directScope = null;
+      try { directScope = adapter.directScopeFromEventPath(marineRimeEventPath(event)); }
+      catch (e) {}
+      const publicScope = marineRimePublicDirectScope(directScope);
+      if (publicScope) {
+        const previousRaw = marineRimeTarget.directScope;
+        const previous = marineRimePublicDirectScope(marineRimeTarget.directScope);
+        const replaced = !!previousRaw && previousRaw !== directScope;
+        if (replaced) marineRimeReleaseDirectScope('direct-scope-replaced', true);
+        marineRimeTarget.directScope = directScope;
+        marineRimeClearPendingReply('direct-scope');
+        if (!previous || replaced || previous.kind !== publicScope.kind || previous.id !== publicScope.id) {
+          marineRimeClear('direct-scope-change');
+          marineRimeTarget.grabCache = null;
+        }
+        marineRimeDiagnostic('direct-scope', {
+          platform: detectPlatform(),
+          kind: publicScope.kind,
+          hasId: !!publicScope.id,
+          hasTitle: !!publicScope.title,
+          hasAuthor: !!publicScope.authorName,
+        }, detectPlatform() + '|' + publicScope.kind + '|' + publicScope.id);
+        for (const delay of [0, 80, 200, 500]) {
+          setTimeout(function () { marineRimeRefreshFromEvent(null); }, delay);
+        }
+        return;
+      }
+    }
     const reply = marineRimeReplyControl(event);
     if (reply) {
       const commentEl = marineRimeCommentContainer(reply.path);
@@ -1617,8 +2001,7 @@
         // this bounded hand-off, which an outside click/window blur can cancel.
         return;
       } else {
-        marineRimeClearPendingReply('editor-blur');
-        marineRimeClear('editor-blur');
+        marineRimeRetainOrClear('editor-blur');
       }
     }, 100);
   }
@@ -1629,6 +2012,7 @@
     marineRimeTarget.navigationRearmRequired = true;
     marineRimeTarget.navigationEventCutoff = performance.now();
     marineRimeClearPendingReply('navigation');
+    marineRimeReleaseDirectScope('navigation-scope', false);
     marineRimeTarget.grabCache = null;
     if (marineRimeTarget.refreshTimer) { clearTimeout(marineRimeTarget.refreshTimer); marineRimeTarget.refreshTimer = null; }
     commentCaptures.length = 0;
@@ -1643,7 +2027,8 @@
   }
 
   function marineRimeStartTargetTracking() {
-    if (detectPlatform() !== 'bilibili') return;
+    const adapter = marineRimeSiteAdapter();
+    if (!marineRimeAdapterSupportsPage(adapter)) return;
     document.addEventListener('click', marineRimeHandleClick, true);
     document.addEventListener('focusin', function (event) {
       const editor = marineRimeEditorFromEvent(event);
@@ -1656,11 +2041,16 @@
       }
     }, true);
     document.addEventListener('focusout', marineRimeHandleFocusOut, true);
+    document.addEventListener('keydown', function (event) {
+      if (event && event.key === 'Escape') {
+        marineRimeReleaseDirectScope('escape', true);
+        marineRimeClearPendingReply('escape');
+      }
+    }, true);
     window.addEventListener('scroll', marineRimeSchedulePosition, true);
     window.addEventListener('resize', marineRimeSchedulePosition, false);
     window.addEventListener('blur', function () {
-      marineRimeClearPendingReply('window-blur');
-      marineRimeClear('window-blur');
+      marineRimeRetainOrClear('window-blur');
     });
     window.addEventListener('focus', function () { setTimeout(function () { marineRimeRefreshFromEvent(null); }, 0); });
     document.addEventListener('visibilitychange', function () {
@@ -1699,6 +2089,21 @@
       setTimeout(function () { marineRimeRefreshFromEvent(null); }, 0);
     });
     setInterval(marineRimeRenew, 60000);
+    if (typeof MutationObserver === 'function' && document.documentElement) {
+      marineRimeTarget.lifecycleObserver = new MutationObserver(marineRimeScheduleLifecycleCheck);
+      try {
+        marineRimeTarget.lifecycleObserver.observe(document.documentElement, {
+          subtree: true,
+          childList: true,
+          characterData: true,
+          attributes: true,
+          attributeFilter: ['class', 'hidden', 'aria-hidden', 'style'],
+        });
+      } catch (e) {
+        try { marineRimeTarget.lifecycleObserver.disconnect(); } catch (ignore) {}
+        marineRimeTarget.lifecycleObserver = null;
+      }
+    }
     // Readiness marker for unpacked-extension development and E2E fixtures.
     // It carries no context or credentials and is never trusted as input.
     if (document.documentElement) document.documentElement.setAttribute('data-marine-rime-ready', '1');

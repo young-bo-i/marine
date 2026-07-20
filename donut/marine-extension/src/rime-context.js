@@ -6,6 +6,7 @@ const MARINE_RIME_CONTEXT_MAX_BYTES = 1_500_000;
 const MARINE_RIME_ARTICLE_MAX_BYTES = 180_000;
 const MARINE_RIME_COMMENTS_MAX_BYTES = 700_000;
 const MARINE_RIME_SUBTITLE_MAX_BYTES = 300_000;
+const MARINE_RIME_TARGET_SUMMARY_MAX_BYTES = 1_000;
 const MARINE_RIME_REPLY_HANDOFF_MS = 4_000;
 
 function marineRimeUtf8Bytes(value) {
@@ -41,7 +42,10 @@ function marineRimeBuildContextEnvelope(grab, envelope, source) {
     url: marineRimeContextString(page.url || captured.url),
     title: marineRimeContextString(page.title || captured.title),
     mode: page.mode === 'reply' ? 'reply' : 'direct',
-    targetSummary: marineRimeContextString(page.targetSummary),
+    targetSummary: marineRimeTruncateUtf8(
+      marineRimeContextString(page.targetSummary),
+      MARINE_RIME_TARGET_SUMMARY_MAX_BYTES,
+    ),
     source,
   };
 }
@@ -50,6 +54,9 @@ function marineRimeBuildContextEnvelope(grab, envelope, source) {
 // alongside it so the agent still knows the page and exact action location.
 // Empty/whitespace-only captures are not usable sources and fall through.
 function marineRimeBuildPayload(grab, envelope) {
+  const platform = marineRimeContextString(
+    envelope && envelope.platform || grab && grab.platform,
+  );
   const articleText = grab && grab.text && grab.text.md;
   const agentComments = grab && grab.comments && grab.comments.agentMd;
   const markdownComments = grab && grab.comments && grab.comments.md;
@@ -58,7 +65,11 @@ function marineRimeBuildPayload(grab, envelope) {
     : markdownComments;
   const subtitleText = grab && grab.subtitle && grab.subtitle.text;
   let source = 'none';
-  if (marineRimeContextString(subtitleText)) source = 'subtitle';
+  // 知乎回答和小红书笔记的正文，等价于 B 站视频的字幕：它才是直评/回复
+  // 的主背景。评论列表不能盖掉正文；精确回复楼层会通过可信 target 单独携带。
+  if ((platform === 'zhihu' || platform === 'xiaohongshu') && marineRimeContextString(articleText)) {
+    source = 'article';
+  } else if (marineRimeContextString(subtitleText)) source = 'subtitle';
   else if (marineRimeContextString(commentsText)) source = 'comments';
   else if (marineRimeContextString(articleText)) source = 'article';
 
@@ -176,7 +187,7 @@ function marineRimeStableDomTargetId(pageKey, identity, elementKey) {
 }
 
 function marineRimeReplyPlaceholderAuthor(value) {
-  const match = String(value || '').match(/^\s*回复\s*@?\s*([^\s：:]+)\s*[：:]?/);
+  const match = String(value || '').match(/^\s*回复\s*@?\s*(.+?)\s*(?:[：:]\s*)?$/);
   return match ? marineRimeNormalizeCommentIdentity(match[1]) : '';
 }
 

@@ -167,13 +167,31 @@ function sendContext(tabId, message, tab = {}) {
   });
 }
 
-function putMessage(contextId, revision, sourceId = "document-a") {
+function putMessage(
+  contextId,
+  revision,
+  sourceId = "document-a",
+  retainWhenUnfocused = false,
+  leaseRenewal = false,
+) {
   return {
     op: "put",
     contextId,
     revision,
     sourceId,
+    retainWhenUnfocused,
+    leaseRenewal,
     context: { contextId },
+  };
+}
+
+function deleteMessage(contextId, revision, sourceId) {
+  return {
+    op: "delete",
+    contextId,
+    revision,
+    sourceId,
+    context: null,
   };
 }
 
@@ -475,5 +493,153 @@ assert.deepEqual(
   [{ method: "PUT", contextId: "query-failure-recovery" }],
   "a verified sender must recover after a transient active-tab query failure",
 );
+
+// XHS uses one shared reply editor. The selected reply remains semantically
+// open while focus moves to Rime/Codex, so Chrome losing focus must park that
+// lease instead of deleting it. Returning to the same tab restores ownership;
+// switching to another tab still revokes it deterministically.
+const retainedContextId = "xhs-reply-retained-across-window-blur";
+assert.equal(
+  (await sendContext(
+    10,
+    putMessage(retainedContextId, 2, "document-query-recovery", true),
+    { active: true, windowId: 80 },
+  )).ok,
+  true,
+);
+const callsBeforeRetainedBlur = apiCalls.length;
+focusWindow(chrome.windows.WINDOW_ID_NONE);
+await flushTasks();
+assert.equal(
+  apiCalls.slice(callsBeforeRetainedBlur).some(
+    (call) => call.method === "DELETE" && call.contextId === retainedContextId,
+  ),
+  false,
+  "a retained XHS reply must survive Chrome WINDOW_ID_NONE",
+);
+await new Promise((resolve) => setTimeout(resolve, 30));
+assert.equal(
+  sessionState.marineRimeLeaseStateV1.suspendedRetainedTabId,
+  10,
+  "the retained tab must be persisted while Chrome focus is outside the browser",
+);
+assert.equal(
+  sessionState.marineRimeLeaseStateV1.tabs["10"].retainWhenUnfocused,
+  true,
+  "the persisted context must retain its explicit unfocused-lifetime capability",
+);
+
+// A pure timestamp renewal reuses the exact acknowledged revision. Repeating
+// it models the minute timer running beyond the server's five-minute TTL: every
+// tick must reach localhost without re-granting ownership to any other sender.
+const callsBeforeRetainedRenewals = apiCalls.length;
+for (let minute = 1; minute <= 6; minute++) {
+  const renewal = putMessage(
+    retainedContextId,
+    2,
+    "document-query-recovery",
+    true,
+    true,
+  );
+  renewal.context.updatedAt = 1_000_000 + minute * 60_000;
+  const result = await sendContext(10, renewal, { active: true, windowId: 80 });
+  assert.equal(result.ok, true);
+  assert.equal(result.skipped, undefined);
+}
+assert.equal(
+  apiCalls.slice(callsBeforeRetainedRenewals).filter(
+    (call) => call.method === "PUT" && call.contextId === retainedContextId,
+  ).length,
+  6,
+  "the exact suspended lease must remain renewable for longer than five minutes",
+);
+
+const callsBeforeRejectedRenewals = apiCalls.length;
+const rejectedRenewals = [
+  sendContext(11, putMessage(
+    retainedContextId, 2, "document-query-recovery", true, true,
+  ), { active: true, windowId: 80 }),
+  sendContext(10, putMessage(
+    retainedContextId, 2, "document-other", true, true,
+  ), { active: true, windowId: 80 }),
+  sendContext(10, putMessage(
+    retainedContextId, 3, "document-query-recovery", true, true,
+  ), { active: true, windowId: 80 }),
+  sendContext(10, putMessage(
+    "different-context", 2, "document-query-recovery", true, true,
+  ), { active: true, windowId: 80 }),
+  sendContext(10, putMessage(
+    retainedContextId, 2, "document-query-recovery", true, false,
+  ), { active: true, windowId: 80 }),
+  sendContext(10, putMessage(
+    retainedContextId, 2, "document-query-recovery", false, true,
+  ), { active: true, windowId: 80 }),
+];
+for (const result of await Promise.all(rejectedRenewals)) {
+  assert.equal(result.skipped, true);
+  assert.equal(result.deferred, undefined);
+}
+assert.equal(
+  apiCalls.length,
+  callsBeforeRejectedRenewals,
+  "another tab/source/revision/context or a non-retained PUT must not renew the suspended lease",
+);
+assert.equal(
+  sessionState.marineRimeLeaseStateV1.tabs["10"].contextId,
+  retainedContextId,
+  "rejected renewals must not mutate the tracked retained context",
+);
+
+focusWindow(80);
+await flushTasks();
+assert.equal(
+  apiCalls.slice(callsBeforeRetainedBlur).some(
+    (call) => call.method === "DELETE" && call.contextId === retainedContextId,
+  ),
+  false,
+  "returning to the same Chrome tab must restore the parked XHS reply",
+);
+
+activeTabByWindow.set(80, 11);
+tabActivated.emit({ tabId: 11, windowId: 80 });
+await flushTasks();
+assert.equal(
+  apiCalls.slice(callsBeforeRetainedBlur).some(
+    (call) => call.method === "DELETE" && call.contextId === retainedContextId,
+  ),
+  true,
+  "switching away from the XHS page must revoke the retained reply context",
+);
+
+// Closing the actual retained target while Chrome is unfocused is different
+// from a renewal: the same source may advance its revision and DELETE must hit
+// localhost immediately instead of waiting for browser focus to return.
+const closeWhileUnfocusedId = "xhs-reply-closed-while-unfocused";
+assert.equal(
+  (await sendContext(
+    11,
+    putMessage(closeWhileUnfocusedId, 1, "document-close-target", true),
+    { active: true, windowId: 80 },
+  )).ok,
+  true,
+);
+focusWindow(chrome.windows.WINDOW_ID_NONE);
+await flushTasks();
+const callsBeforeCloseWhileUnfocused = apiCalls.length;
+const closedWhileUnfocused = await sendContext(
+  11,
+  deleteMessage(closeWhileUnfocusedId, 2, "document-close-target"),
+  { active: true, windowId: 80 },
+);
+assert.equal(closedWhileUnfocused.ok, true);
+assert.deepEqual(
+  apiCalls.slice(callsBeforeCloseWhileUnfocused).filter(
+    (call) => call.contextId === closeWhileUnfocusedId,
+  ),
+  [{ method: "DELETE", contextId: closeWhileUnfocusedId }],
+  "closing the retained target must revoke it immediately during WINDOW_ID_NONE",
+);
+await new Promise((resolve) => setTimeout(resolve, 30));
+assert.equal(sessionState.marineRimeLeaseStateV1.suspendedRetainedTabId, null);
 
 console.log("Marine extension Rime service-worker smoke: OK");

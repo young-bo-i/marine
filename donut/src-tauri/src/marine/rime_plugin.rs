@@ -309,17 +309,19 @@ mod tests {
   }
 
   #[test]
-  fn bundled_manifest_declares_the_v3_contextual_presentation_contract() {
+  fn bundled_manifest_declares_the_v5_context_only_prepare_contract() {
     let manifest: serde_json::Value =
       serde_json::from_str(include_str!("../../../rime-plugin/manifest.json")).unwrap();
     assert_eq!(manifest["schemaVersion"], 1);
     assert_eq!(manifest["id"], "marine");
-    assert_eq!(manifest["version"], "0.3.0");
+    assert_eq!(manifest["version"], "0.5.0");
     let actions = manifest["actions"].as_array().unwrap();
     assert_eq!(actions.len(), 2);
     for action in actions {
-      assert_eq!(action["streamPath"], "/rime/invoke-stream");
+      assert_eq!(action["preparePath"], "/rime/prepare");
       assert_eq!(action["invokePath"], "/rime/invoke");
+      assert_eq!(action["requiresFocus"], false);
+      assert!(action.get("streamPath").is_none());
       assert_eq!(action["presentationId"], "marine.generate-comment");
       assert_eq!(action["presentationTitle"], "生成评论");
     }

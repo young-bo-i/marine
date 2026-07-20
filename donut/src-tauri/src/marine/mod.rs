@@ -1,11 +1,14 @@
-//! Marine — 截流 backend for the in-browser Marine extension.
+//! Marine — context, 话术, records, and UI metadata for the in-browser Marine
+//! extension.
 //!
 //! Page-context work (grab / comment extraction / reply injection) lives in the
 //! Marine browser extension itself. This module provides the services the
 //! extension calls over Donut's local REST API (`api_server.rs` `/v1/marine/*`):
-//! generation (`generate`) and posting history (`history`). The persona/话术 is
-//! pre-built inside the extension and sent with each generate call. `cdp` +
-//! `automation` remain the shared browser-automation stack used by the MCP server.
+//! frozen Rime context, connector-ready prompt preparation, and posting history.
+//! Model authorization and execution belong to Rime-side Codex, Claude Code,
+//! and OpenAI-compatible connectors.
+//! `cdp` + `automation` remain the shared browser-automation stack used by the MCP
+//! server.
 
 pub mod automation;
 pub mod bookmarks;
@@ -16,7 +19,7 @@ pub mod history;
 pub mod rime;
 pub mod rime_plugin;
 
-/// Build a `{ "code": ... }` error string (used by the generation engine).
+/// Build a structured `{ "code": ... }` local-API error string.
 pub(crate) fn err(code: &str) -> String {
   serde_json::json!({ "code": code }).to_string()
 }

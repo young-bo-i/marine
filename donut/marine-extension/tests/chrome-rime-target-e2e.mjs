@@ -861,9 +861,18 @@ async function main() {
     throw error;
   } finally {
     client?.close();
-    if (chrome && chrome.exitCode == null) chrome.kill("SIGTERM");
+    if (chrome && chrome.exitCode == null) {
+      const exited = new Promise((resolve) => chrome.once("exit", resolve));
+      chrome.kill("SIGTERM");
+      await Promise.race([exited, delay(3000)]);
+    }
     await new Promise((resolve) => apiServer.close(resolve));
-    await fs.rm(tempRoot, { recursive: true, force: true });
+    await fs.rm(tempRoot, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 100,
+    });
   }
 }
 

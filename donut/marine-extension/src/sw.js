@@ -16,6 +16,7 @@ let marineOperationQueue = Promise.resolve();
 // initialized from the first active-tab content message.
 let marineActiveTabId;
 let marineFocusedWindowId;
+let marineSuspendedRetainedTabId = null;
 let marineFocusEpoch = 0;
 const marineTabContexts = new Map();
 const marineTabEpochs = new Map();
@@ -55,6 +56,13 @@ async function marineRestoreState() {
       // Backward compatibility with lease state written before activeTabKnown.
       marineActiveTabId = state.activeTabId;
     }
+    if (Number.isInteger(state.suspendedRetainedTabId)) {
+      marineSuspendedRetainedTabId = state.suspendedRetainedTabId;
+      // A persisted activeTabKnown=null + suspended tab is the fail-closed
+      // WINDOW_ID_NONE state. Restore it explicitly so a restarted MV3 worker
+      // can renew only that exact retained lease while Chrome stays unfocused.
+      if (marineActiveTabId === null) marineFocusedWindowId = null;
+    }
     for (const [rawTabId, item] of Object.entries(state.tabs)) {
       const tabId = Number(rawTabId);
       if (!Number.isInteger(tabId) || !item) continue;
@@ -62,6 +70,7 @@ async function marineRestoreState() {
         contextId: String(item.contextId),
         revision: Number(item.revision) || 0,
         sourceId: String(item.sourceId || ''),
+        retainWhenUnfocused: item.retainWhenUnfocused === true,
       });
       if (item.sourceId) marineTabSources.set(tabId, String(item.sourceId));
       if (Number(item.revision) > 0) marineLatestRevisions.set(tabId, Number(item.revision));
@@ -83,12 +92,16 @@ function marinePersistState() {
         contextId: tracked.contextId || '',
         revision: marineLatestRevisions.get(tabId) || tracked.revision || 0,
         sourceId: marineTabSources.get(tabId) || tracked.sourceId || '',
+        retainWhenUnfocused: tracked.retainWhenUnfocused === true,
       };
     }
     void session.set({
       [marineSessionStateKey]: {
         activeTabKnown: marineActiveTabId !== undefined,
         activeTabId: Number.isInteger(marineActiveTabId) ? marineActiveTabId : null,
+        suspendedRetainedTabId: Number.isInteger(marineSuspendedRetainedTabId)
+          ? marineSuspendedRetainedTabId
+          : null,
         tabs,
       },
     }).catch(() => {});
@@ -700,6 +713,35 @@ async function marineConfirmSenderFocus(sender) {
   return marineSetActiveTab(tabId, () => marineFocusEpochIsCurrent(epoch, windowId));
 }
 
+function marineSuspendedRetainedContext(tabId) {
+  if (marineFocusedWindowId !== null || marineActiveTabId !== null ||
+      marineSuspendedRetainedTabId !== tabId) return null;
+  const tracked = marineTabContexts.get(tabId);
+  return tracked && tracked.retainWhenUnfocused === true ? tracked : null;
+}
+
+function marineExactSuspendedRetainedRenewal(msg, sender, expectedSource) {
+  const tabId = sender.tab && sender.tab.id;
+  const revision = Number(msg.revision) || 0;
+  const tracked = marineSuspendedRetainedContext(tabId);
+  return !!tracked && sender.tab.active === true && msg.op === 'put' &&
+    msg.leaseRenewal === true && msg.retainWhenUnfocused === true &&
+    !!msg.context && msg.context.contextId === msg.contextId &&
+    tracked.contextId === msg.contextId && tracked.sourceId === expectedSource &&
+    tracked.revision > 0 && revision === tracked.revision &&
+    marineTabSources.get(tabId) === expectedSource &&
+    marineLatestRevisions.get(tabId) === revision;
+}
+
+function marineExactSuspendedRetainedDelete(msg, sender, expectedSource) {
+  const tabId = sender.tab && sender.tab.id;
+  const revision = Number(msg.revision) || 0;
+  const tracked = marineSuspendedRetainedContext(tabId);
+  return !!tracked && msg.op === 'delete' && tracked.contextId === msg.contextId &&
+    tracked.sourceId === expectedSource && marineTabSources.get(tabId) === expectedSource &&
+    tracked.revision > 0 && revision >= tracked.revision;
+}
+
 async function marineApplyContextMessage(msg, sender, expectedEpoch, expectedSource, options = {}) {
   const tabId = sender.tab && sender.tab.id;
   if (tabId == null) throw new Error('缺少来源标签页');
@@ -710,19 +752,29 @@ async function marineApplyContextMessage(msg, sender, expectedEpoch, expectedSou
     if (revision && revision !== marineLatestRevisions.get(tabId)) return { ok: true, skipped: true };
     if (expectedEpoch !== marineTabEpoch(tabId)) return { ok: true, skipped: true };
     if (marineTabSources.get(tabId) !== expectedSource) return { ok: true, skipped: true };
+    let suspendedRenewalConfirmed = options.allowSuspendedRetainedRenewal === true &&
+      marineExactSuspendedRetainedRenewal(msg, sender, expectedSource);
     let senderFocusConfirmed = true;
-    if (marineActiveTabId === undefined || marineFocusedWindowId === undefined) {
+    if (!suspendedRenewalConfirmed &&
+        (marineActiveTabId === undefined || marineFocusedWindowId === undefined)) {
       senderFocusConfirmed = await marineConfirmSenderFocus(sender);
     }
-    if (!senderFocusConfirmed || marineActiveTabId !== tabId) {
+    suspendedRenewalConfirmed = options.allowSuspendedRetainedRenewal === true &&
+      marineExactSuspendedRetainedRenewal(msg, sender, expectedSource);
+    if ((!senderFocusConfirmed || marineActiveTabId !== tabId) && !suspendedRenewalConfirmed) {
       const deferred = options.allowDefer !== false
         && marineDeferPut(msg, sender, expectedEpoch, expectedSource);
       return { ok: true, skipped: true, deferred };
     }
+    const authorityIsCurrent = () => (
+      marineActiveTabId === tabId ||
+      (options.allowSuspendedRetainedRenewal === true &&
+        marineExactSuspendedRetainedRenewal(msg, sender, expectedSource))
+    );
     const wrote = await marineContextFetch('PUT', msg.contextId, msg.context, () => (
       expectedEpoch === marineTabEpoch(tabId)
         && marineTabSources.get(tabId) === expectedSource
-        && marineActiveTabId === tabId
+        && authorityIsCurrent()
         && (!revision || revision === marineLatestRevisions.get(tabId))
     ));
     if (!wrote) return { ok: true, skipped: true };
@@ -731,12 +783,17 @@ async function marineApplyContextMessage(msg, sender, expectedEpoch, expectedSou
     // letting an obsolete target come back after its clearing event.
     if (expectedEpoch !== marineTabEpoch(tabId)
         || marineTabSources.get(tabId) !== expectedSource
-        || marineActiveTabId !== tabId
+        || !authorityIsCurrent()
         || (revision && revision !== marineLatestRevisions.get(tabId))) {
       try { await marineContextFetch('DELETE', msg.contextId, null); } catch (e) {}
       return { ok: true, skipped: true };
     }
-    marineTabContexts.set(tabId, { contextId: msg.contextId, revision, sourceId: expectedSource });
+    marineTabContexts.set(tabId, {
+      contextId: msg.contextId,
+      revision,
+      sourceId: expectedSource,
+      retainWhenUnfocused: msg.retainWhenUnfocused === true,
+    });
     marinePersistState();
     return { ok: true };
   }
@@ -746,7 +803,10 @@ async function marineApplyContextMessage(msg, sender, expectedEpoch, expectedSou
     if (!contextId) return { ok: true, skipped: true };
     await marineContextFetch('DELETE', contextId, null);
     const current = marineTabContexts.get(tabId);
-    if (!current || current.contextId === contextId) marineTabContexts.delete(tabId);
+    if (!current || current.contextId === contextId) {
+      marineTabContexts.delete(tabId);
+      if (marineSuspendedRetainedTabId === tabId) marineSuspendedRetainedTabId = null;
+    }
     marinePersistState();
     return { ok: true };
   }
@@ -768,6 +828,7 @@ function marineClearTrackedTab(tabId, options = {}) {
   }
   const tracked = marineTabContexts.get(tabId);
   marineTabContexts.delete(tabId);
+  if (marineSuspendedRetainedTabId === tabId) marineSuspendedRetainedTabId = null;
   if (options.removed) marineRetiredSources.delete(tabId);
   marinePersistState();
   if (!tracked) return;
@@ -807,6 +868,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const revision = Number(msg.revision) || 0;
       if (tabId == null) return { immediate: { ok: false, error: '缺少来源标签页' } };
       const sourceId = marineSourceId(msg, sender, tabId);
+      const hasSuspendedRetainedLease = marineFocusedWindowId === null &&
+        marineActiveTabId === null && Number.isInteger(marineSuspendedRetainedTabId);
+      if (hasSuspendedRetainedLease && msg.op === 'put' &&
+          !marineExactSuspendedRetainedRenewal(msg, sender, sourceId)) {
+        // While Chrome is explicitly unfocused, never let another tab, a
+        // retired document, or a newer/older revision mutate worker ownership
+        // before it has re-proved foreground authority.
+        return { immediate: { ok: true, skipped: true } };
+      }
+      if (hasSuspendedRetainedLease && msg.op === 'delete' &&
+          tabId === marineSuspendedRetainedTabId &&
+          !marineExactSuspendedRetainedDelete(msg, sender, sourceId)) {
+        return { immediate: { ok: true, skipped: true } };
+      }
       const source = marinePrepareSource(tabId, sourceId);
       if (!source.accepted) return { immediate: { ok: true, skipped: true } };
       const latest = marineLatestRevisions.get(tabId) || 0;
@@ -822,7 +897,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (source.oldContext) {
           try { await marineContextFetch('DELETE', source.oldContext.contextId, null); } catch (e) {}
         }
-        return marineApplyContextMessage(msg, sender, expectedEpoch, sourceId);
+        return marineApplyContextMessage(msg, sender, expectedEpoch, sourceId, {
+          allowDefer: !hasSuspendedRetainedLease,
+          allowSuspendedRetainedRenewal: hasSuspendedRetainedLease &&
+            msg.op === 'put' && msg.leaseRenewal === true,
+        });
       });
       return { operation };
     }).then(result => result.immediate || result.operation)
@@ -841,10 +920,36 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (changes.marineCustomSampleMd || changes.marineCustomSampleName) marineSkillCache = null;
 });
 
-async function marineSetActiveTab(tabId, shouldApply = () => true) {
+async function marineSetActiveTab(tabId, shouldApply = () => true, options = {}) {
   await marineStateReady;
   if (!shouldApply()) return false;
   const previous = marineActiveTabId;
+  const previousContext = Number.isInteger(previous) ? marineTabContexts.get(previous) : null;
+  if (tabId == null && options.preserveRetained === true) {
+    if (previousContext && previousContext.retainWhenUnfocused === true) {
+      marineSuspendedRetainedTabId = previous;
+      marineActiveTabId = null;
+      marinePersistState();
+      return true;
+    }
+    // A focus-gain event first parks the current tab while Chrome resolves the
+    // newly focused window's active tab. Keep an already suspended XHS reply
+    // through that short query, but let ordinary (focus-bound) contexts fall
+    // through to the original clear path.
+    if (!Number.isInteger(previous) && Number.isInteger(marineSuspendedRetainedTabId)) {
+      marineActiveTabId = null;
+      marinePersistState();
+      return true;
+    }
+  }
+  const suspended = marineSuspendedRetainedTabId;
+  if (Number.isInteger(suspended) && tabId != null) {
+    marineSuspendedRetainedTabId = null;
+    if (suspended !== tabId) marineClearTrackedTab(suspended);
+  } else if (tabId == null && options.preserveRetained !== true) {
+    marineSuspendedRetainedTabId = null;
+    if (Number.isInteger(suspended)) marineClearTrackedTab(suspended);
+  }
   marineActiveTabId = tabId;
   marinePersistState();
   if (previous != null && previous !== tabId) marineClearTrackedTab(previous);
@@ -874,7 +979,11 @@ if (chrome.windows && chrome.windows.onFocusChanged) {
     const epoch = marineNextFocusEpoch();
     if (windowId === chrome.windows.WINDOW_ID_NONE) {
       marineFocusedWindowId = null;
-      void marineSetActiveTab(null, () => epoch === marineFocusEpoch && marineFocusedWindowId === null);
+      void marineSetActiveTab(
+        null,
+        () => epoch === marineFocusEpoch && marineFocusedWindowId === null,
+        { preserveRetained: true },
+      );
       return;
     }
     marineFocusedWindowId = windowId;
@@ -882,6 +991,7 @@ if (chrome.windows && chrome.windows.onFocusChanged) {
     void marineSetActiveTab(
       null,
       () => marineFocusEpochIsCurrent(epoch, windowId),
+      { preserveRetained: true },
     ).then(async cleared => {
       const tabs = await activeTabQuery;
       if (!cleared || !marineFocusEpochIsCurrent(epoch, windowId)) return;

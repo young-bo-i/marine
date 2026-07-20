@@ -54,14 +54,11 @@
         <button id="btn-copy" class="icon-btn" disabled title="复制全部内容" aria-label="复制全部内容">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V5a2 2 0 0 1 2-2h10"></path></svg>
         </button>
-        <button id="btn-codex" class="cta-2" disabled>
-          <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="8" width="16" height="11" rx="2.5"></rect><path d="M12 8V4.5M8.5 13h.01M15.5 13h.01"></path></svg>
-          生成话术
+        <button id="btn-record" class="cta-2" disabled>
+          记录已发布
         </button>
       </div>
       <span id="grab-status" class="status">正在自动检测当前页…</span>
-
-      <div id="replies" class="replies"></div>
 
       <div id="reload-hint" class="hint hidden">
         本页未注入脚本（扩展更新后已打开的页面需刷新一次）。<button id="btn-reload" class="link">刷新并重试</button>
@@ -101,27 +98,8 @@
       </div>
       <div id="sample-status" class="note" style="margin-top:6px">未导入补充范文（当前只用原版母稿）。</div>
 
-      <!-- 引擎 / 本地智能体（自动识别 + 卡片选用） -->
-      <div class="field-label cfg-gap">引擎 / 本地智能体</div>
-      <div class="note" style="margin-top:0">自动识别本机 codex / claude CLI，点卡片选用。</div>
-      <div id="agent-grid" class="agent-grid">
-        <button type="button" class="agent-card" data-provider="codex" id="ac-codex">
-          <div class="agent-head"><span class="agent-name">OpenAI GPT Codex</span><span class="agent-dot"></span></div>
-          <span id="ac-codex-status" class="agent-status">检测中…</span>
-          <span class="agent-use">使用中</span>
-        </button>
-        <button type="button" class="agent-card" data-provider="claude" id="ac-claude">
-          <div class="agent-head"><span class="agent-name">Anthropic Claude Code</span><span class="agent-dot"></span></div>
-          <span id="ac-claude-status" class="agent-status">检测中…</span>
-          <span class="agent-use">使用中</span>
-        </button>
-      </div>
-      <div id="cli-model-row" class="agent-cfg">
-        <label class="mini-label">CLI 模型（codex / claude，可选）</label>
-        <input id="pv-cli-model" class="cfg-input" placeholder="默认">
-      </div>
-      <button id="pv-save" class="cta-2 cfg-btn">保存引擎配置</button>
-      <div class="note">codex / claude 用各自订阅登录（<code>~/.codex</code>、<code>~/.claude</code>），无需额外配置。</div>
+      <div class="field-label cfg-gap">AI 模型连接器</div>
+      <div class="note" style="margin-top:0">模型执行与订阅授权已移到 RimeBuffer。请在输入法的「连接器 › AI 模型」中切换 Codex CLI、Claude Code CLI 或通用 Open API；Marine 只提供页面背景、话术与发布记录。</div>
     </section>
 
     <!-- 调试 -->
