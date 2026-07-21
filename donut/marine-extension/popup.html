@@ -88,9 +88,9 @@
         <div class="note">生产环境由 Marine 自动写入 <code>marine-runtime-config.json</code>。轻量开发桥可单独调试上下文；需要发布归档时，请连接真实 Marine 并选择一个身份。</div>
       </details>
 
-      <!-- 话术方案：原版母稿按页面内容路由 + 可导入本地 .md 补充范文 -->
+      <!-- 品牌话术由 Marine 客户端按 Profile 绑定；本地文件只作旧版/开发兜底。 -->
       <div class="field-label cfg-gap">话术方案</div>
-      <div class="note" style="margin-top:0">已内置 <code>Scholay</code> 原版母稿与场景路由，每次按页面背景选择最相关的一至两段。可再导入本地 <code>.md</code> 作为次级参考。</div>
+      <div class="note" style="margin-top:0">生产环境会使用 Marine 客户端「品牌工作台」中绑定到当前 Profile 的品牌、口径和场景范例。内置 <code>Scholay</code> 与本地 <code>.md</code> 仅用于旧版 Marine 或轻量开发桥兼容。</div>
       <div class="brand-row" style="margin-top:8px">
         <button id="sample-import" class="cta-2 brand-mini-btn">导入补充范文（.md）</button>
         <button id="sample-clear" class="cta-2 brand-mini-btn danger hidden">移除</button>

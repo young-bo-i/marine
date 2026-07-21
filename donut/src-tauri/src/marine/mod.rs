@@ -12,6 +12,7 @@
 
 pub mod automation;
 pub mod bookmarks;
+pub mod brand;
 pub mod cdp;
 pub mod extension;
 pub mod generate;

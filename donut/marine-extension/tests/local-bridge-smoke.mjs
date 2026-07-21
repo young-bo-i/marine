@@ -11,11 +11,14 @@ const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'marine-dev-bridge
 const runtimePath = path.join(temporaryRoot, 'runtime.json');
 const earlyRuntimePath = path.join(temporaryRoot, 'early-runtime.json');
 const failedRuntimePath = path.join(temporaryRoot, 'failed-runtime.json');
+const pluginRoot = path.join(temporaryRoot, 'plugins');
+const manifestPath = path.join(pluginRoot, 'marine', 'manifest.json');
 const child = spawn(process.execPath, [bridgePath], {
   env: {
     ...process.env,
     MARINE_EXTENSION_DEV_PORT: '0',
     MARINE_DEV_RUNTIME_PATH: runtimePath,
+    RIMEBUFFER_PLUGIN_ROOT: pluginRoot,
     MARINE_DEV_DRAFT: '固定测试草稿',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
@@ -41,6 +44,14 @@ async function waitForReady() {
 
 try {
   const ready = await waitForReady();
+  const runtime = JSON.parse(await fs.readFile(runtimePath, 'utf8'));
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  assert.equal(ready.manifestPath, manifestPath);
+  assert.equal(manifest.id, 'marine');
+  assert.equal(runtime.pluginId, 'marine');
+  assert.equal(runtime.instanceId.length > 0, true);
+  assert.equal(runtime.token, ready.token);
+  assert.equal((await fs.stat(runtimePath)).mode & 0o777, 0o600);
   const headers = {
     Authorization: `Bearer ${ready.token}`,
     'Content-Type': 'application/json',
@@ -123,22 +134,145 @@ try {
 
   const status = await fetch(`${ready.apiBase}/rime/status`, { headers });
   assert.equal((await status.json()).actionId, context.actionId);
-  const invoke = await fetch(`${ready.apiBase}/rime/invoke`, {
+  const wrongPlugin = await fetch(`${ready.apiBase}/rime/prepare`, {
     method: 'POST',
     headers,
     body: JSON.stringify({
+      pluginId: 'other-plugin',
+      runtimeInstanceId: runtime.instanceId,
       requestId: 'request-1',
       actionId: context.actionId,
       contextId: context.contextId,
     }),
   });
-  const result = await invoke.json();
-  assert.equal(result.blocks[0].text, '固定测试草稿');
+  assert.equal(wrongPlugin.status, 400);
+  const wrongRuntime = await fetch(`${ready.apiBase}/rime/prepare`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      pluginId: runtime.pluginId,
+      runtimeInstanceId: 'wrong-runtime-instance',
+      requestId: 'request-wrong-runtime',
+      actionId: context.actionId,
+      contextId: context.contextId,
+    }),
+  });
+  assert.equal(wrongRuntime.status, 400);
+  const mismatchedTarget = await fetch(`${ready.apiBase}/rime/prepare`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      pluginId: runtime.pluginId,
+      runtimeInstanceId: runtime.instanceId,
+      requestId: 'request-mismatched-target',
+      actionId: context.actionId,
+      contextId: 'ctx-dev-not-active',
+    }),
+  });
+  assert.equal(mismatchedTarget.status, 409);
+
+  const prepare = await fetch(`${ready.apiBase}/rime/prepare`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      pluginId: runtime.pluginId,
+      runtimeInstanceId: runtime.instanceId,
+      requestId: 'request-1',
+      actionId: context.actionId,
+      contextId: context.contextId,
+    }),
+  });
+  assert.equal(prepare.status, 200);
+  const result = await prepare.json();
+  assert.deepEqual({
+    protocolVersion: result.protocolVersion,
+    resultFormat: result.resultFormat,
+    pluginId: result.pluginId,
+    runtimeInstanceId: result.runtimeInstanceId,
+    requestId: result.requestId,
+    actionId: result.actionId,
+    contextId: result.contextId,
+  }, {
+    protocolVersion: 1,
+    resultFormat: 'blocks-v1',
+    pluginId: runtime.pluginId,
+    runtimeInstanceId: runtime.instanceId,
+    requestId: 'request-1',
+    actionId: context.actionId,
+    contextId: context.contextId,
+  });
+  assert.match(result.prompt, /固定测试草稿/);
+  assert.match(result.prompt, /"blocks"/);
+
+  const legacyInvoke = await fetch(`${ready.apiBase}/rime/invoke`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      requestId: 'legacy-request',
+      actionId: context.actionId,
+      contextId: context.contextId,
+    }),
+  });
+  assert.equal(legacyInvoke.status, 410);
+
+  const directContext = {
+    ...context,
+    contextId: 'ctx-dev-direct',
+    mode: 'direct',
+    actionId: 'marine.generate-direct',
+    label: '生成直评',
+    targetSummary: '当前作品',
+    target: null,
+    updatedAt: context.updatedAt + 1,
+  };
+  const directPut = await fetch(`${ready.apiBase}/rime/context`, {
+    method: 'PUT', headers, body: JSON.stringify(directContext),
+  });
+  assert.equal(directPut.status, 200);
+  const directPrepare = await fetch(`${ready.apiBase}/rime/prepare`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      pluginId: runtime.pluginId,
+      runtimeInstanceId: runtime.instanceId,
+      requestId: 'request-direct',
+      actionId: directContext.actionId,
+      contextId: directContext.contextId,
+    }),
+  });
+  assert.equal(directPrepare.status, 200);
+  assert.equal((await directPrepare.json()).actionId, directContext.actionId);
+
+  const largeContext = {
+    ...directContext,
+    contextId: 'ctx-dev-large',
+    payload: { subtitle: { text: 'x'.repeat(300_000) } },
+    updatedAt: context.updatedAt + 2,
+  };
+  const largePut = await fetch(`${ready.apiBase}/rime/context`, {
+    method: 'PUT', headers, body: JSON.stringify(largeContext),
+  });
+  assert.equal(largePut.status, 200);
+  const largePrepare = await fetch(`${ready.apiBase}/rime/prepare`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      pluginId: runtime.pluginId,
+      runtimeInstanceId: runtime.instanceId,
+      requestId: 'request-large',
+      actionId: largeContext.actionId,
+      contextId: largeContext.contextId,
+    }),
+  });
+  assert.equal(largePrepare.status, 200);
+  const largeResult = await largePrepare.json();
+  assert.equal(Buffer.byteLength(largeResult.prompt, 'utf8') <= 256 * 1024, true);
+  assert.match(largeResult.prompt, /页面数据已按 Rime 256 KiB 提示词上限截断/);
 
   const newerContext = {
     ...context,
     contextId: 'ctx-dev-newer',
-    updatedAt: context.updatedAt + 1,
+    updatedAt: context.updatedAt + 3,
   };
   const newerPut = await fetch(`${ready.apiBase}/rime/context`, {
     method: 'PUT', headers, body: JSON.stringify(newerContext),
@@ -150,6 +284,18 @@ try {
   });
   const noFallback = await fetch(`${ready.apiBase}/rime/status`, { headers });
   assert.equal((await noFallback.json()).available, false);
+  const prepareAfterDelete = await fetch(`${ready.apiBase}/rime/prepare`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      pluginId: runtime.pluginId,
+      runtimeInstanceId: runtime.instanceId,
+      requestId: 'request-after-delete',
+      actionId: newerContext.actionId,
+      contextId: newerContext.contextId,
+    }),
+  });
+  assert.equal(prepareAfterDelete.status, 404);
 
   await fetch(`${ready.apiBase}/rime/context?contextId=some-other-context`, {
     method: 'DELETE', headers,
@@ -171,16 +317,12 @@ try {
   const stillCleared = await fetch(`${ready.apiBase}/rime/status`, { headers });
   assert.equal((await stillCleared.json()).available, false);
 
-  const runtime = JSON.parse(await fs.readFile(runtimePath, 'utf8'));
-  assert.equal(runtime.instanceId.length > 0, true);
-  assert.equal(runtime.token, ready.token);
-  assert.equal((await fs.stat(runtimePath)).mode & 0o777, 0o600);
-
   const replacement = { ...runtime, instanceId: 'newer-bridge', processId: 999_999 };
   await fs.writeFile(runtimePath, JSON.stringify(replacement), { mode: 0o600 });
   child.kill('SIGTERM');
   await new Promise(resolve => child.once('exit', resolve));
   assert.deepEqual(JSON.parse(await fs.readFile(runtimePath, 'utf8')), replacement);
+  assert.equal(JSON.parse(await fs.readFile(manifestPath, 'utf8')).id, 'marine');
   await fs.unlink(runtimePath);
 
   let earlyOutput = '';
@@ -190,6 +332,7 @@ try {
       ...process.env,
       MARINE_EXTENSION_DEV_PORT: '0',
       MARINE_DEV_RUNTIME_PATH: earlyRuntimePath,
+      RIMEBUFFER_PLUGIN_ROOT: pluginRoot,
       MARINE_DEV_TEST_RUNTIME_WRITE_DELAY_MS: '300',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -230,6 +373,7 @@ try {
       ...process.env,
       MARINE_EXTENSION_DEV_PORT: '0',
       MARINE_DEV_RUNTIME_PATH: failedRuntimePath,
+      RIMEBUFFER_PLUGIN_ROOT: pluginRoot,
       MARINE_DEV_TEST_RUNTIME_WRITE_FAILURE: '1',
     },
     stdio: ['ignore', 'pipe', 'pipe'],

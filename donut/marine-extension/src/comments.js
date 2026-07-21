@@ -498,17 +498,67 @@ function marineExtractNoteText(platform, captures, opts) {
         if (parts.length) return parts.join('\n');
       }
       if (wantedAnswerId) {
-        for (const item of Array.from(document.querySelectorAll('.AnswerItem[data-zop]'))) {
-          let zop;
-          try { zop = JSON.parse(item.getAttribute('data-zop') || '{}'); } catch (e) { continue; }
-          if (String(zop.itemId || '') !== wantedAnswerId) continue;
+        const answerSelector = [
+          '.AnswerItem[data-zop]',
+          '.AnswerItem[itemprop="answer"]',
+          '.AnswerItem[name]',
+          '[itemprop="answer"][data-zop]',
+          '[itemprop="answer"][name]',
+        ].join(',');
+        for (const item of Array.from(document.querySelectorAll(answerSelector))) {
+          let zop = {};
+          const encoded = item.getAttribute('data-zop') || '';
+          if (encoded) {
+            try { zop = JSON.parse(encoded); } catch (e) { continue; }
+          }
+          if (zop.type && String(zop.type).toLowerCase() !== 'answer') continue;
+          const ids = new Set();
+          const addId = function (value) {
+            const id = String(value == null ? '' : value).trim();
+            if (/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(id)) ids.add(id);
+          };
+          addId(zop.itemId);
+          addId(item.getAttribute('name'));
+          for (const link of Array.from(item.querySelectorAll('a[href*="/answer/"]'))) {
+            if (link.closest('.Comments-container,.CommentListV2')) continue;
+            const match = String(link.getAttribute('href') || '').match(
+              /\/answer\/([A-Za-z0-9_-]+)(?:[/?#]|$)/,
+            );
+            addId(match && match[1]);
+          }
+          for (let current = item, depth = 0; current && depth < 6; depth++) {
+            const tracking = String(current.getAttribute('data-za-extra-module') || '').trim();
+            current = current.parentElement;
+            if (!tracking || tracking.length > 16384) continue;
+            let metadata;
+            try { metadata = JSON.parse(tracking); } catch (e) { continue; }
+            const card = metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+              ? metadata.card
+              : null;
+            const cardContent = card && typeof card === 'object' && !Array.isArray(card)
+              ? card.content
+              : null;
+            if (!cardContent || typeof cardContent !== 'object' || Array.isArray(cardContent) ||
+                String(cardContent.type || '').trim().toLowerCase() !== 'answer') continue;
+            addId(cardContent.token);
+            addId(cardContent.id);
+          }
+          if (ids.size !== 1) continue;
+          const itemId = Array.from(ids)[0];
+          if (itemId !== wantedAnswerId) continue;
           const contentEl = item.querySelector('.RichContent-inner, .RichContent, [itemprop="text"]');
           const content = String(contentEl && (contentEl.innerText || contentEl.textContent) || '')
             .replace(/\s+/g, ' ').trim();
           const parts = [];
           const title = directScope.title || zop.title || document.title || '';
           if (title) parts.push('# ' + String(title).trim());
-          const authorName = directScope.authorName || zop.authorName || '';
+          const authorName = directScope.authorName || zop.authorName || Array.from(
+            item.querySelectorAll('a[href*="/people/"]'),
+          ).filter(function (link) {
+            return !link.closest('.Comments-container,.CommentListV2');
+          }).map(function (link) {
+            return String(link.innerText || link.textContent || '').replace(/\s+/g, ' ').trim();
+          }).find(Boolean) || '';
           if (authorName) parts.push('> 回答者：' + authorName);
           if (content) parts.push('\n' + content);
           if (parts.length) return parts.join('\n');

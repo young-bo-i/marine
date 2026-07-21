@@ -26,11 +26,37 @@ const tabUpdated = eventSource();
 const tabRemoved = eventSource();
 const windowFocusChanged = eventSource();
 const apiCalls = [];
+const putBodies = [];
+const revokedContextIds = new Set();
 const putGates = new Map();
-const sessionState = {};
+const deleteGates = new Map();
+const restoredContextId = "restored-before-storage-hang";
+const restoredSourceId = "document-restored-before-storage-hang";
+const restoredRevision = 7;
+const sessionState = {
+  marineRimeLeaseStateV1: {
+    activeTabKnown: true,
+    activeTabId: 1,
+    suspendedRetainedTabId: null,
+    tabs: {
+      "1": {
+        contextId: restoredContextId,
+        revision: restoredRevision,
+        sourceId: restoredSourceId,
+        windowId: 10,
+        retainWhenUnfocused: true,
+        reservation: null,
+      },
+    },
+  },
+};
 const activeTabByWindow = new Map();
 const activeTabQueryGates = new Map();
 const activeTabQueryFailures = new Set();
+const activeTabQueryHangsOnce = new Set();
+const windowGetHangsOnce = new Set();
+let sessionGetHangsOnce = true;
+let sessionGetCalls = 0;
 let focusedWindowId = 10;
 
 function gatePut(contextId) {
@@ -43,6 +69,19 @@ function gatePut(contextId) {
     release = resolve;
   });
   putGates.set(contextId, { releasePromise, seen });
+  return { release, seenPromise };
+}
+
+function gateDelete(contextId) {
+  let release;
+  let seen;
+  const seenPromise = new Promise((resolve) => {
+    seen = resolve;
+  });
+  const releasePromise = new Promise((resolve) => {
+    release = resolve;
+  });
+  deleteGates.set(contextId, { releasePromise, seen });
   return { release, seenPromise };
 }
 
@@ -64,7 +103,11 @@ async function fetchMock(url, options = {}) {
     return {
       ok: true,
       async json() {
-        return { apiBase: "http://127.0.0.1:10108/v1/marine", token: "test-token" };
+        return {
+          apiBase: "http://127.0.0.1:10108/v1/marine",
+          token: "test-token",
+          profileId: "runtime-profile",
+        };
       },
     };
   }
@@ -81,13 +124,31 @@ async function fetchMock(url, options = {}) {
     || new URL(value).searchParams.get("contextId")
     || "";
   apiCalls.push({ method, contextId });
+  if (method === "PUT") putBodies.push(body);
+  if (method === "DELETE") {
+    const gate = deleteGates.get(contextId);
+    if (gate) {
+      gate.seen();
+      await gate.releasePromise;
+      deleteGates.delete(contextId);
+    }
+    if (contextId) revokedContextIds.add(contextId);
+    return { ok: true, status: 204, async text() { return ""; } };
+  }
+  if (method === "PUT" && revokedContextIds.has(contextId)) {
+    return {
+      ok: false,
+      status: 409,
+      async text() { return "browser target was already revoked"; },
+    };
+  }
   const gate = method === "PUT" ? putGates.get(contextId) : null;
   if (gate) {
     gate.seen();
     await gate.releasePromise;
     putGates.delete(contextId);
   }
-  return { ok: true, status: method === "DELETE" ? 204 : 200 };
+  return { ok: true, status: 200, async text() { return ""; } };
 }
 
 const chrome = {
@@ -109,6 +170,11 @@ const chrome = {
     },
     session: {
       async get(key) {
+        sessionGetCalls += 1;
+        if (sessionGetHangsOnce) {
+          sessionGetHangsOnce = false;
+          await new Promise(() => {});
+        }
         return { [key]: sessionState[key] };
       },
       async set(values) {
@@ -122,6 +188,7 @@ const chrome = {
     onUpdated: tabUpdated,
     onRemoved: tabRemoved,
     async query({ windowId }) {
+      if (activeTabQueryHangsOnce.delete(windowId)) await new Promise(() => {});
       const gate = activeTabQueryGates.get(windowId);
       if (gate) await gate;
       if (activeTabQueryFailures.delete(windowId)) throw new Error("injected tabs.query failure");
@@ -133,6 +200,7 @@ const chrome = {
     WINDOW_ID_NONE: -1,
     onFocusChanged: windowFocusChanged,
     async get(windowId) {
+      if (windowGetHangsOnce.delete(windowId)) await new Promise(() => {});
       return { id: windowId, focused: focusedWindowId === windowId };
     },
   },
@@ -140,7 +208,7 @@ const chrome = {
 
 const helperSource = fs.readFileSync(new URL("../src/scholay-skill.js", import.meta.url), "utf8");
 const source = fs.readFileSync(new URL("../src/sw.js", import.meta.url), "utf8");
-vm.runInNewContext(helperSource + "\n" + source, {
+const workerContext = vm.createContext({
   AbortController,
   URL,
   chrome,
@@ -152,7 +220,10 @@ vm.runInNewContext(helperSource + "\n" + source, {
   Promise,
   setTimeout,
   TextEncoder,
-}, { filename: "marine-extension/src/sw.js" });
+});
+vm.runInContext(helperSource + "\n" + source, workerContext, {
+  filename: "marine-extension/src/sw.js",
+});
 
 const onMessage = runtimeMessages.first();
 
@@ -165,6 +236,20 @@ function sendContext(tabId, message, tab = {}) {
     );
     assert.equal(asynchronous, true);
   });
+}
+
+async function expectAckBefore(promise, timeoutMs, detail) {
+  let timeout = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(detail)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 function putMessage(
@@ -185,6 +270,18 @@ function putMessage(
   };
 }
 
+function reserveMessage(contextId, revision, sourceId = "document-a") {
+  return {
+    op: "reserve",
+    contextId,
+    revision,
+    sourceId,
+    retainWhenUnfocused: true,
+    leaseRenewal: false,
+    context: null,
+  };
+}
+
 function deleteMessage(contextId, revision, sourceId) {
   return {
     op: "delete",
@@ -200,30 +297,187 @@ async function flushTasks() {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+async function waitFor(predicate, timeoutMs, detail) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(detail);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function workerLeaseSnapshot() {
+  return JSON.parse(vm.runInContext(`JSON.stringify({
+    phase: marineStatePhase,
+    activeTabId: marineActiveTabId,
+    focusedWindowId: marineFocusedWindowId,
+    suspendedRetainedTabId: marineSuspendedRetainedTabId,
+    contexts: Array.from(marineTabContexts.entries()),
+    sources: Array.from(marineTabSources.entries()),
+    revisions: Array.from(marineLatestRevisions.entries())
+  })`, workerContext));
+}
+
 function focusWindow(windowId) {
   focusedWindowId = windowId === chrome.windows.WINDOW_ID_NONE ? null : windowId;
   windowFocusChanged.emit(windowId);
 }
 
-// A service worker can start because a background window's content script
-// published first. `tab.active` is only window-local and must not promote that
-// sender without also verifying the focused window and its active tab.
 activeTabByWindow.set(10, 1);
 activeTabByWindow.set(11, 99);
+const stuckRestoreCleanup = gateDelete(restoredContextId);
+const sessionBeforeHungRestore = JSON.stringify(sessionState);
+const workerBeforeHungRestore = workerLeaseSnapshot();
 const callsBeforeColdBackgroundSender = apiCalls.length;
-const coldBackgroundSender = await sendContext(
-  99,
-  putMessage("cold-background-sender", 1, "document-cold-background"),
-  { active: true, windowId: 11 },
+const coldBackgroundSender = await expectAckBefore(
+  sendContext(
+    99,
+    putMessage("cold-background-sender", 1, "document-cold-background"),
+    { active: true, windowId: 11 },
+  ),
+  1400,
+  "a stuck storage.session restore must not outlive the content ACK deadline",
 );
 assert.equal(coldBackgroundSender.skipped, true);
 assert.equal(coldBackgroundSender.deferred, true);
+tabUpdated.emit(1, { status: "loading" });
+tabRemoved.emit(1);
+activeTabByWindow.set(10, 3);
+tabActivated.emit({ tabId: 3, windowId: 10 });
+focusWindow(10);
+await new Promise((resolve) => setTimeout(resolve, 30));
 assert.equal(
   apiCalls.length,
   callsBeforeColdBackgroundSender,
-  "a cold-start background sender must not establish the active lease",
+  "a message received before restore must not reach localhost",
 );
-tabRemoved.emit(99);
+assert.equal(
+  JSON.stringify(sessionState),
+  sessionBeforeHungRestore,
+  "a restore timeout must not overwrite the persisted lease",
+);
+assert.deepEqual(
+  workerLeaseSnapshot(),
+  workerBeforeHungRestore,
+  "messages and tab/window events must not mutate authority while restore is pending",
+);
+
+await waitFor(
+  () => sessionGetCalls >= 2,
+  1200,
+  "the worker did not retry the timed-out storage.session read",
+);
+await flushTasks();
+const restoredWorker = workerLeaseSnapshot();
+assert.equal(restoredWorker.phase, "ready");
+assert.equal("activeTabId" in restoredWorker, false);
+assert.equal("focusedWindowId" in restoredWorker, false);
+assert.deepEqual(restoredWorker.contexts, []);
+assert.deepEqual(restoredWorker.sources, []);
+assert.deepEqual(restoredWorker.revisions, []);
+await expectAckBefore(
+  stuckRestoreCleanup.seenPromise,
+  1400,
+  "the invalid restored context was not deleted",
+);
+
+// The destructive events tombstone the old lease before ready. Even while its
+// exact DELETE is stuck, the old document cannot renew and a fresh sender can
+// re-prove current focus without having its ACK blocked by that cleanup.
+const callsBeforeRestoredSender = apiCalls.length;
+const restoredRenewal = putMessage(
+  restoredContextId,
+  restoredRevision,
+  restoredSourceId,
+  true,
+  true,
+);
+assert.equal(
+  (await sendContext(1, restoredRenewal, { active: true, windowId: 10 })).skipped,
+  true,
+);
+const recoveredAfterPendingEventsId = "recovered-after-pending-tab-events";
+assert.equal(
+  (await expectAckBefore(
+    sendContext(
+      3,
+      putMessage(recoveredAfterPendingEventsId, 1, "document-after-pending-events", true),
+      { active: true, windowId: 10 },
+    ),
+    1400,
+    "a stuck restored-context DELETE must not block a fresh Rime ACK",
+  )).ok,
+  true,
+);
+assert.deepEqual(
+  apiCalls.slice(callsBeforeRestoredSender).filter((call) => call.method === "PUT"),
+  [{ method: "PUT", contextId: recoveredAfterPendingEventsId }],
+  "only the fresh focus-verified sender may reach localhost",
+);
+stuckRestoreCleanup.release();
+await flushTasks();
+
+// A previous context DELETE remains ordered ahead of the next PUT, but a slow
+// localhost cleanup must not delay the reservation ACK sent before page grab.
+const slowRestoreCleanup = gateDelete(recoveredAfterPendingEventsId);
+const replacementReservationId = "reservation-after-restored-context";
+const replacementReservation = await expectAckBefore(
+  sendContext(
+    3,
+    reserveMessage(replacementReservationId, 1, "document-after-restore"),
+    { active: true, windowId: 10 },
+  ),
+  1000,
+  "a slow old-context cleanup must not block the reservation ACK",
+);
+assert.equal(replacementReservation.ok, true);
+await expectAckBefore(
+  slowRestoreCleanup.seenPromise,
+  1400,
+  "the replaced context cleanup did not start",
+);
+slowRestoreCleanup.release();
+await flushTasks();
+tabUpdated.emit(3, { status: "loading" });
+activeTabByWindow.set(10, 1);
+await flushTasks();
+
+// Chrome focus APIs have occasionally returned Promises that never settle in
+// an upgraded live profile. Their timeout must ACK fail-closed, then let the
+// same sender prove ownership on its next attempt without reloading extension.
+activeTabQueryHangsOnce.add(10);
+focusWindow(10);
+await new Promise((resolve) => setTimeout(resolve, 450));
+windowGetHangsOnce.add(10);
+const callsBeforeHungFocusRecovery = apiCalls.length;
+const hungFocusAttempt = await expectAckBefore(
+  sendContext(
+    1,
+    reserveMessage("hung-focus-api-recovery", 1, "document-focus-hang"),
+    { active: true, windowId: 10 },
+  ),
+  1400,
+  "a stuck focus API must not outlive the content ACK deadline",
+);
+assert.equal(hungFocusAttempt.skipped, true);
+assert.equal(apiCalls.length, callsBeforeHungFocusRecovery);
+assert.equal(
+  (await sendContext(
+    1,
+    reserveMessage("hung-focus-api-recovery", 1, "document-focus-hang"),
+    { active: true, windowId: 10 },
+  )).ok,
+  true,
+  "the next focus check must recover without reloading the extension",
+);
+assert.equal(
+  (await sendContext(
+    1,
+    putMessage("hung-focus-api-recovery", 1, "document-focus-hang", true),
+    { active: true, windowId: 10 },
+  )).ok,
+  true,
+);
+tabUpdated.emit(1, { status: "loading" });
 await flushTasks();
 
 tabActivated.emit({ tabId: 1, windowId: 10 });
@@ -494,28 +748,74 @@ assert.deepEqual(
   "a verified sender must recover after a transient active-tab query failure",
 );
 
-// XHS uses one shared reply editor. The selected reply remains semantically
-// open while focus moves to Rime/Codex, so Chrome losing focus must park that
-// lease instead of deleting it. Returning to the same tab restores ownership;
-// switching to another tab still revokes it deterministically.
-const retainedContextId = "xhs-reply-retained-across-window-blur";
+// Both Marine actions declare requiresFocus=false. Losing Chrome focus must
+// park the exact retained lease even if its first localhost PUT is still in
+// flight; another tab/source/revision must not gain authority in that gap.
+const retainedContextId = "marine-action-retained-across-window-blur";
+const retainedPutGate = gatePut(retainedContextId);
+const callsBeforeRetainedPut = apiCalls.length;
 assert.equal(
   (await sendContext(
     10,
-    putMessage(retainedContextId, 2, "document-query-recovery", true),
+    reserveMessage(retainedContextId, 2, "document-query-recovery"),
     { active: true, windowId: 80 },
   )).ok,
   true,
+  "the exact target must be reserved before the slow page grab starts",
 );
-const callsBeforeRetainedBlur = apiCalls.length;
+assert.equal(
+  apiCalls.length,
+  callsBeforeRetainedPut,
+  "a pre-grab reservation must not expose an incomplete action to localhost",
+);
 focusWindow(chrome.windows.WINDOW_ID_NONE);
-await flushTasks();
+await new Promise((resolve) => setTimeout(resolve, 30));
+assert.equal(
+  sessionState.marineRimeLeaseStateV1.tabs["10"].reservation.contextId,
+  retainedContextId,
+  "the focus-verified reservation must survive WINDOW_ID_NONE and an MV3 restart",
+);
+const retainedPutPromise = sendContext(
+  10,
+  putMessage(retainedContextId, 2, "document-query-recovery", true),
+  { active: true, windowId: 80 },
+);
+await retainedPutGate.seenPromise;
+const callsBeforeRetainedBlur = apiCalls.length;
+const callsBeforePendingIntruders = apiCalls.length;
+for (const result of await Promise.all([
+  sendContext(11, putMessage(
+    retainedContextId, 2, "document-query-recovery", true,
+  ), { active: true, windowId: 80 }),
+  sendContext(10, putMessage(
+    retainedContextId, 3, "document-query-recovery", true,
+  ), { active: true, windowId: 80 }),
+  sendContext(10, putMessage(
+    retainedContextId, 2, "different-document", true,
+  ), { active: true, windowId: 80 }),
+])) {
+  assert.equal(result.skipped, true);
+}
+assert.equal(
+  apiCalls.length,
+  callsBeforePendingIntruders,
+  "no competing message may reach localhost while the first retained PUT is suspended",
+);
+retainedPutGate.release();
+assert.equal((await retainedPutPromise).ok, true);
+assert.deepEqual(
+  apiCalls.slice(callsBeforeRetainedPut).filter(
+    (call) => call.contextId === retainedContextId,
+  ),
+  [{ method: "PUT", contextId: retainedContextId }],
+  "the first retained PUT must finish without a compensating DELETE after WINDOW_ID_NONE",
+);
 assert.equal(
   apiCalls.slice(callsBeforeRetainedBlur).some(
     (call) => call.method === "DELETE" && call.contextId === retainedContextId,
   ),
   false,
-  "a retained XHS reply must survive Chrome WINDOW_ID_NONE",
+  "a retained Marine action must survive Chrome WINDOW_ID_NONE",
 );
 await new Promise((resolve) => setTimeout(resolve, 30));
 assert.equal(
@@ -597,7 +897,7 @@ assert.equal(
     (call) => call.method === "DELETE" && call.contextId === retainedContextId,
   ),
   false,
-  "returning to the same Chrome tab must restore the parked XHS reply",
+  "returning to the same Chrome tab must restore the parked Marine action",
 );
 
 activeTabByWindow.set(80, 11);
@@ -608,13 +908,13 @@ assert.equal(
     (call) => call.method === "DELETE" && call.contextId === retainedContextId,
   ),
   true,
-  "switching away from the XHS page must revoke the retained reply context",
+  "switching away from the Marine target tab must revoke the retained action",
 );
 
 // Closing the actual retained target while Chrome is unfocused is different
 // from a renewal: the same source may advance its revision and DELETE must hit
 // localhost immediately instead of waiting for browser focus to return.
-const closeWhileUnfocusedId = "xhs-reply-closed-while-unfocused";
+const closeWhileUnfocusedId = "marine-target-closed-while-unfocused";
 assert.equal(
   (await sendContext(
     11,
@@ -641,5 +941,194 @@ assert.deepEqual(
 );
 await new Promise((resolve) => setTimeout(resolve, 30));
 assert.equal(sessionState.marineRimeLeaseStateV1.suspendedRetainedTabId, null);
+
+// The content transport gives up waiting for an ACK before the worker's fetch
+// timeout. A higher-revision close must therefore cancel the exact pending PUT
+// synchronously, even though its DELETE operation queues behind that fetch.
+focusWindow(80);
+await flushTasks();
+const slowContextId = "retained-put-closed-before-slow-ack";
+assert.equal(
+  (await sendContext(
+    11,
+    reserveMessage(slowContextId, 1, "document-slow-close"),
+    { active: true, windowId: 80 },
+  )).ok,
+  true,
+);
+const slowPutGate = gatePut(slowContextId);
+const callsBeforeSlowClose = apiCalls.length;
+const slowPutPromise = sendContext(
+  11,
+  putMessage(slowContextId, 1, "document-slow-close", true),
+  { active: true, windowId: 80 },
+);
+await slowPutGate.seenPromise;
+focusWindow(chrome.windows.WINDOW_ID_NONE);
+await flushTasks();
+const slowDeletePromise = sendContext(
+  11,
+  deleteMessage(slowContextId, 2, "document-slow-close"),
+  { active: true, windowId: 80 },
+);
+await flushTasks();
+slowPutGate.release();
+const [slowPutResult, slowDeleteResult] = await Promise.all([
+  slowPutPromise,
+  slowDeletePromise,
+]);
+assert.equal(slowPutResult.skipped, true);
+assert.equal(slowDeleteResult.ok, true);
+assert.deepEqual(
+  apiCalls.slice(callsBeforeSlowClose).filter((call) => call.contextId === slowContextId),
+  [
+    { method: "PUT", contextId: slowContextId },
+    { method: "DELETE", contextId: slowContextId },
+    { method: "DELETE", contextId: slowContextId },
+  ],
+  "a close arriving before the slow PUT ACK must revoke and tombstone that exact lease",
+);
+
+// A browser/extension can activate another tab while Chrome itself is not the
+// focused application. That owner-window tab switch still revokes the parked
+// lease; an activation in an unrelated Chrome window does not.
+focusWindow(80);
+await flushTasks();
+const activationContextId = "retained-revoked-by-unfocused-tab-activation";
+assert.equal(
+  (await sendContext(
+    11,
+    reserveMessage(activationContextId, 3, "document-slow-close"),
+    { active: true, windowId: 80 },
+  )).ok,
+  true,
+);
+assert.equal(
+  (await sendContext(
+    11,
+    putMessage(activationContextId, 3, "document-slow-close", true),
+    { active: true, windowId: 80 },
+  )).ok,
+  true,
+);
+focusWindow(chrome.windows.WINDOW_ID_NONE);
+await flushTasks();
+const callsBeforeOtherWindowActivation = apiCalls.length;
+tabActivated.emit({ tabId: 99, windowId: 999 });
+await flushTasks();
+assert.equal(
+  apiCalls.length,
+  callsBeforeOtherWindowActivation,
+  "an unrelated background-window activation must not revoke the owner lease",
+);
+tabActivated.emit({ tabId: 12, windowId: 80 });
+await flushTasks();
+assert.equal(
+  apiCalls.slice(callsBeforeOtherWindowActivation).some((call) =>
+    call.method === "DELETE" && call.contextId === activationContextId),
+  true,
+  "a different tab activated in the owner window must revoke the suspended lease",
+);
+
+// A normal same-window tab switch revokes and tombstones the old tab's server
+// context. The old ID must stay rejected after return; content converges by
+// deleting that obsolete activation idempotently, reserving a fresh ID at a
+// higher revision, and publishing the full replacement context.
+activeTabByWindow.set(80, 13);
+focusWindow(80);
+await flushTasks();
+const foregroundContextId = "same-editor-before-tab-away";
+assert.equal(
+  (await sendContext(
+    13,
+    putMessage(foregroundContextId, 1, "document-tab-return", true),
+    { active: true, windowId: 80 },
+  )).ok,
+  true,
+);
+const callsBeforeForegroundTabAway = apiCalls.length;
+activeTabByWindow.set(80, 14);
+tabActivated.emit({ tabId: 14, windowId: 80 });
+await flushTasks();
+assert.deepEqual(
+  apiCalls.slice(callsBeforeForegroundTabAway).filter(
+    (call) => call.contextId === foregroundContextId,
+  ),
+  [{ method: "DELETE", contextId: foregroundContextId }],
+  "switching tabs must first revoke the previously published context",
+);
+activeTabByWindow.set(80, 13);
+tabActivated.emit({ tabId: 13, windowId: 80 });
+await flushTasks();
+const callsBeforeForegroundReassert = apiCalls.length;
+const tombstonedRenewal = putMessage(
+  foregroundContextId,
+  1,
+  "document-tab-return",
+  true,
+  true,
+);
+tombstonedRenewal.context.updatedAt = 2_000_000;
+const tombstonedRenewalResult = await sendContext(
+  13,
+  tombstonedRenewal,
+  { active: true, windowId: 80 },
+);
+assert.equal(tombstonedRenewalResult.ok, false);
+assert.match(tombstonedRenewalResult.error, /HTTP 409/);
+assert.deepEqual(
+  apiCalls.slice(callsBeforeForegroundReassert).filter(
+    (call) => call.contextId === foregroundContextId,
+  ),
+  [{ method: "PUT", contextId: foregroundContextId }],
+  "production tombstones must reject attempts to renew the deleted activation ID",
+);
+
+const replacementContextId = "same-editor-new-activation-after-tab-return";
+assert.notEqual(replacementContextId, foregroundContextId);
+assert.equal(
+  (await sendContext(
+    13,
+    deleteMessage(foregroundContextId, 2, "document-tab-return"),
+    { active: true, windowId: 80 },
+  )).ok,
+  true,
+);
+assert.equal(
+  (await sendContext(
+    13,
+    reserveMessage(replacementContextId, 3, "document-tab-return"),
+    { active: true, windowId: 80 },
+  )).ok,
+  true,
+);
+const callsBeforeReplacementPut = apiCalls.length;
+assert.equal(
+  (await sendContext(
+    13,
+    putMessage(replacementContextId, 3, "document-tab-return", true),
+    { active: true, windowId: 80 },
+  )).ok,
+  true,
+);
+assert.deepEqual(
+  apiCalls.slice(callsBeforeReplacementPut).filter(
+    (call) => call.contextId === replacementContextId,
+  ),
+  [{ method: "PUT", contextId: replacementContextId }],
+  "a fresh activation ID must converge to an actionable context after tab return",
+);
+await new Promise((resolve) => setTimeout(resolve, 30));
+assert.equal(
+  sessionState.marineRimeLeaseStateV1.tabs["13"].contextId,
+  replacementContextId,
+  "the replacement context must again become the worker's tracked lease",
+);
+assert.ok(putBodies.length > 0, "the worker must publish at least one Rime context");
+assert.equal(
+  putBodies.every((body) => body.profileId === "runtime-profile"),
+  true,
+  "every Rime context must carry the runtime-stamped Marine profile identity",
+);
 
 console.log("Marine extension Rime service-worker smoke: OK");

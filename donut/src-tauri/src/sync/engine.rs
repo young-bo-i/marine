@@ -19,6 +19,20 @@ use tokio::sync::{Mutex as TokioMutex, Semaphore};
 /// entity's user-edit timestamp in unix seconds. Used to resolve sync conflicts
 /// (last-write-wins) from a HEAD request without downloading the object body.
 const UPDATED_AT_META_KEY: &str = "updated-at";
+static POSTING_HISTORY_SYNC_LOCK: std::sync::LazyLock<TokioMutex<()>> =
+  std::sync::LazyLock::new(|| TokioMutex::new(()));
+
+fn posting_history_key_parts(key: &str) -> Option<(&str, &str)> {
+  let rest = key.strip_prefix("marine/history/")?;
+  let (profile_id, file_name) = rest.split_once('/')?;
+  if profile_id.is_empty() || file_name.contains('/') {
+    return None;
+  }
+  uuid::Uuid::parse_str(profile_id).ok()?;
+  let record_id = file_name.strip_suffix(".json")?;
+  uuid::Uuid::parse_str(record_id).ok()?;
+  Some((profile_id, record_id))
+}
 
 lazy_static::lazy_static! {
   static ref SYNC_CANCEL_FLAGS: StdMutex<HashMap<String, Arc<AtomicBool>>> =
@@ -113,6 +127,7 @@ fn merge_profile_metadata_lww(local: &BrowserProfile, remote: &BrowserProfile) -
     merged.proxy_id = remote.proxy_id.clone();
     merged.vpn_id = remote.vpn_id.clone();
     merged.group_id = remote.group_id.clone();
+    merged.brand_id = remote.brand_id.clone();
     merged.updated_at = remote.updated_at;
   }
   merged
@@ -451,6 +466,89 @@ impl SyncEngine {
         presign.metadata.as_ref(),
       )
       .await?;
+    Ok(())
+  }
+
+  /// Merge the append-only Marine posting ledger across devices.
+  ///
+  /// Each record is an immutable object. Sync therefore takes the union of
+  /// local and remote records instead of applying last-write-wins to a whole
+  /// profile history file, which would lose concurrent comments.
+  pub async fn sync_posting_history(&self) -> SyncResult<()> {
+    self.sync_posting_history_inner(false).await
+  }
+
+  async fn sync_posting_history_inner(&self, force_upload: bool) -> SyncResult<()> {
+    const PREFIX: &str = "marine/history/";
+    let _sync_guard = POSTING_HISTORY_SYNC_LOCK.lock().await;
+
+    let local_records = crate::marine::history::HISTORY_MANAGER
+      .lock()
+      .map_err(|_| SyncError::IoError("Posting history manager lock poisoned".into()))?
+      .list_all()
+      .map_err(|e| SyncError::IoError(format!("Failed to list posting history: {e}")))?;
+    let mut local_ids: HashSet<String> = local_records
+      .iter()
+      .map(|record| record.id.clone())
+      .collect();
+
+    let remote_objects = self.client.list_all(PREFIX).await?;
+    let remote_keys: HashSet<String> = remote_objects
+      .iter()
+      .map(|object| object.key.clone())
+      .collect();
+
+    // Upload local-only records. The cloud account is already isolated by the
+    // sync token; profile_id provides the second namespace dimension.
+    for record in &local_records {
+      let key = format!("{PREFIX}{}/{}.json", record.profile_id, record.id);
+      if !force_upload && remote_keys.contains(&key) {
+        continue;
+      }
+      let json = serde_json::to_string(record)
+        .map_err(|e| SyncError::InvalidData(format!("Failed to serialize posting record: {e}")))?;
+      self
+        .upload_config_json(&key, &json, record.posted_at)
+        .await?;
+    }
+
+    // Download remote-only records and pass them through HistoryManager::append
+    // so platform receipt IDs retain their existing business-level dedupe.
+    for object in remote_objects {
+      let Some((profile_id, record_id)) = posting_history_key_parts(&object.key) else {
+        log::warn!(
+          "Ignoring malformed posting history sync key: {}",
+          object.key
+        );
+        continue;
+      };
+      if local_ids.contains(record_id) {
+        continue;
+      }
+
+      let presign = self.client.presign_download(&object.key).await?;
+      let raw = self.client.download_bytes(&presign.url).await?;
+      let plaintext = encryption::maybe_unseal_after_download(&raw).map_err(|e| {
+        SyncError::InvalidData(format!("Failed to decrypt posting history object: {e}"))
+      })?;
+      let record: crate::marine::history::PostingRecord = serde_json::from_slice(&plaintext)
+        .map_err(|e| SyncError::InvalidData(format!("Invalid posting history object: {e}")))?;
+      if record.profile_id != profile_id || record.id != record_id {
+        log::warn!(
+          "Ignoring posting history object whose identity does not match its key: {}",
+          object.key
+        );
+        continue;
+      }
+
+      crate::marine::history::HISTORY_MANAGER
+        .lock()
+        .map_err(|_| SyncError::IoError("Posting history manager lock poisoned".into()))?
+        .append(record)
+        .map_err(|e| SyncError::IoError(format!("Failed to merge posting history: {e}")))?;
+      local_ids.insert(record_id.to_string());
+    }
+
     Ok(())
   }
 
@@ -3851,6 +3949,9 @@ pub async fn sync_now(app_handle: tauri::AppHandle) -> Result<(), String> {
   if let Err(e) = engine.check_for_missing_synced_entities(&app_handle).await {
     log::warn!("sync_now: failed to check for missing entities: {e}");
   }
+  if let Err(e) = engine.sync_posting_history().await {
+    log::warn!("sync_now: failed to sync Marine posting history: {e}");
+  }
 
   // Push: queue all locally sync-enabled profiles for upload.
   if let Some(scheduler) = super::get_global_scheduler() {
@@ -4112,6 +4213,14 @@ pub async fn rollover_encryption_for_all_entities(
     );
   }
 
+  // Ledger records are immutable, but an encryption password change must
+  // rewrite their envelopes even when the remote object keys already exist.
+  if let Ok(engine) = SyncEngine::create_from_settings(&app_handle).await {
+    if let Err(error) = engine.sync_posting_history_inner(true).await {
+      log::warn!("Rollover: posting history re-encryption failed: {error}");
+    }
+  }
+
   if !deferred.is_empty() || !deferred_groups.is_empty() || !deferred_vpns.is_empty() {
     tauri::async_runtime::spawn(async move {
       tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -4136,6 +4245,22 @@ pub async fn rollover_encryption_for_all_entities(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn posting_history_keys_are_strictly_partitioned() {
+    let profile_id = uuid::Uuid::new_v4().to_string();
+    let record_id = uuid::Uuid::new_v4().to_string();
+    let key = format!("marine/history/{profile_id}/{record_id}.json");
+    assert_eq!(
+      posting_history_key_parts(&key),
+      Some((profile_id.as_str(), record_id.as_str()))
+    );
+    assert!(posting_history_key_parts("marine/history/not-a-uuid/item.json").is_none());
+    assert!(posting_history_key_parts(&format!(
+      "marine/history/{profile_id}/nested/{record_id}.json"
+    ))
+    .is_none());
+  }
 
   #[test]
   fn test_checkpoint_sqlite_wal_files() {
@@ -4274,6 +4399,7 @@ mod tests {
       tags: vec![name.to_string()],
       note: Some(name.to_string()),
       proxy_id: Some(format!("{name}-proxy")),
+      brand_id: Some(format!("{name}-brand")),
       updated_at,
       ..Default::default()
     }
@@ -4290,6 +4416,7 @@ mod tests {
     assert_eq!(merged.tags, vec!["remote".to_string()]);
     assert_eq!(merged.note.as_deref(), Some("remote"));
     assert_eq!(merged.proxy_id.as_deref(), Some("remote-proxy"));
+    assert_eq!(merged.brand_id.as_deref(), Some("remote-brand"));
     assert_eq!(merged.updated_at, Some(200));
     // Identity preserved (merge is into the local profile).
     assert_eq!(merged.id, local.id);
@@ -4306,6 +4433,7 @@ mod tests {
     assert_eq!(merged.tags, vec!["local".to_string()]);
     assert_eq!(merged.note.as_deref(), Some("local"));
     assert_eq!(merged.proxy_id.as_deref(), Some("local-proxy"));
+    assert_eq!(merged.brand_id.as_deref(), Some("local-brand"));
     assert_eq!(merged.updated_at, Some(200));
   }
 

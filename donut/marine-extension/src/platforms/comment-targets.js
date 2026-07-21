@@ -4,8 +4,20 @@
 (function (root) {
   'use strict';
 
-  const ZHIHU_ANSWER_SELECTOR = '.AnswerItem[data-zop]';
+  const ZHIHU_ANSWER_SELECTOR = [
+    '.AnswerItem[data-zop]',
+    '.AnswerItem[itemprop="answer"]',
+    '.AnswerItem[name]',
+    '[itemprop="answer"][data-zop]',
+    '[itemprop="answer"][name]',
+  ].join(',');
   const ZHIHU_COMMENT_SELECTOR = '.CommentItemV2[data-id],.CommentItem[data-id]';
+  const ZHIHU_EDITOR_SELECTOR = [
+    '.public-DraftEditor-content[role="textbox"]',
+    '[role="textbox"][contenteditable="true"]',
+    '[role="textbox"][contenteditable="plaintext-only"]',
+    'textarea',
+  ].join(',');
   const XHS_COMMENT_SELECTOR = '.comment-item[id^="comment-"]';
   const XHS_NOTE_ROOT_SELECTOR = [
     '#noteContainer',
@@ -278,10 +290,59 @@
     const element = asElement(value);
     if (!element || !stableId(safeAttribute(element, 'data-id'))) return false;
     if (safeMatches(element, ZHIHU_COMMENT_SELECTOR)) return true;
-    if (!safeClosest(element, '.Modal-content')) return false;
+    if (!safeClosest(element, '.Modal-content,.Comments-container,.CommentListV2')) return false;
     return safeQueryAll(element, 'button', 80).some(function (button) {
       return elementText(button, 24) === '回复' && safeClosest(button, '[data-id]') === element;
     });
+  }
+
+  function zhihuAnswerIdsFromLinks(element) {
+    const ids = new Set();
+    for (const link of safeQueryAll(element, 'a[href*="/answer/"]', 120)) {
+      if (safeClosest(link, '.Comments-container,.CommentListV2')) continue;
+      const href = safeAttribute(link, 'href');
+      const match = href.match(/\/answer\/([A-Za-z0-9_-]+)(?:[/?#]|$)/);
+      const id = stableId(match && match[1]);
+      if (id) ids.add(id);
+    }
+    return ids;
+  }
+
+  function zhihuAnswerTitleFromLink(element, linkedId) {
+    if (!linkedId) return '';
+    const link = safeQueryAll(element, 'a[href*="/answer/"]', 120).find(function (candidate) {
+      if (safeClosest(candidate, '.Comments-container,.CommentListV2')) return false;
+      const href = safeAttribute(candidate, 'href');
+      const match = href.match(/\/answer\/([A-Za-z0-9_-]+)(?:[/?#]|$)/);
+      return stableId(match && match[1]) === linkedId && !!elementText(candidate, 300);
+    });
+    return elementText(link, 300);
+  }
+
+  function zhihuAnswerIdsFromTrackingMetadata(element) {
+    const ids = new Set();
+    // Search-result answers keep their stable token on the surrounding card,
+    // not on the inner AnswerItem. Stay close to that item and accept only an
+    // explicit Answer payload; other analytics cards can carry unrelated ids.
+    for (let current = asElement(element), depth = 0; current && depth < 6; depth++) {
+      const encoded = safeAttribute(current, 'data-za-extra-module');
+      current = asElement(current.parentElement);
+      if (!encoded || encoded.length > 16_384) continue;
+      let data;
+      try { data = JSON.parse(encoded); } catch (error) { continue; }
+      if (!data || typeof data !== 'object' || Array.isArray(data)) continue;
+      const card = data.card;
+      const content = card && typeof card === 'object' && !Array.isArray(card)
+        ? card.content
+        : null;
+      if (!content || typeof content !== 'object' || Array.isArray(content)) continue;
+      if (String(content.type || '').trim().toLowerCase() !== 'answer') continue;
+      for (const value of [content.token, content.id]) {
+        const id = stableId(value);
+        if (id) ids.add(id);
+      }
+    }
+    return ids;
   }
 
   function zhihuAnswerScope(value) {
@@ -290,20 +351,51 @@
       : safeClosest(value, ZHIHU_ANSWER_SELECTOR);
     if (!element) return null;
     const encoded = safeAttribute(element, 'data-zop');
-    if (!encoded || encoded.length > 8192) return null;
-    let data;
-    try { data = JSON.parse(encoded); } catch (error) { return null; }
-    if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
-    if (data.type && String(data.type).toLowerCase() !== 'answer') return null;
-    const id = stableId(data.itemId);
-    if (!id) return null;
+    let data = null;
+    if (encoded) {
+      if (encoded.length > 8192) return null;
+      try { data = JSON.parse(encoded); } catch (error) { return null; }
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+      if (data.type && String(data.type).toLowerCase() !== 'answer') return null;
+    }
+    const ids = new Set();
+    for (const value of [data && data.itemId, safeAttribute(element, 'name')]) {
+      const id = stableId(value);
+      if (id) ids.add(id);
+    }
+    const linkedIds = zhihuAnswerIdsFromLinks(element);
+    for (const id of linkedIds) ids.add(id);
+    for (const id of zhihuAnswerIdsFromTrackingMetadata(element)) ids.add(id);
+    if (ids.size !== 1) return null;
+    const id = Array.from(ids)[0];
+    const authorName = normalizeText(data && data.authorName, 120) ||
+      safeQueryAll(element, 'a[href*="/people/"]', 80)
+        .filter(function (link) {
+          return !safeClosest(link, '.Comments-container,.CommentListV2');
+        })
+        .map(function (link) { return elementText(link, 120); })
+        .find(Boolean) || '';
+    const linkedId = linkedIds.size === 1 ? Array.from(linkedIds)[0] : '';
+    const title = normalizeText(data && data.title, 300) ||
+      zhihuAnswerTitleFromLink(element, linkedId) || elementText(
+        safeQuery(element, 'h1,h2,h3,[itemprop="name"]'), 300,
+      );
     return {
       id,
       kind: 'answer',
-      title: normalizeText(data.title, 300),
-      authorName: normalizeText(data.authorName, 120),
+      title,
+      authorName,
       element,
     };
+  }
+
+  function isZhihuEditableCandidate(value) {
+    const element = asElement(value);
+    if (!element || !isEditableElement(element)) return false;
+    if (safeMatches(element, '.public-DraftEditor-content[role="textbox"]')) return true;
+    const tag = String(element.tagName || '').toLowerCase();
+    if (tag === 'textarea') return true;
+    return safeAttribute(element, 'role').toLowerCase() === 'textbox';
   }
 
   function zhihuScopeFromPath(path) {
@@ -325,8 +417,7 @@
   }
 
   function isZhihuCommentEditor(editor) {
-    if (!safeMatches(editor, '.public-DraftEditor-content[role="textbox"]')) return false;
-    if (!isEditableElement(editor)) return false;
+    if (!isZhihuEditableCandidate(editor)) return false;
     if (safeClosest(editor, '.CommentEditorV2,.CommentBox,.Comments-container,.CommentListV2')) {
       return true;
     }
@@ -429,7 +520,7 @@
 
     commentSearchRoot: function (documentLike) {
       const modal = safeQuery(documentLike, '.Modal-content');
-      if (modal && safeQuery(modal, '.public-DraftEditor-content[role="textbox"]') &&
+      if (modal && safeQuery(modal, ZHIHU_EDITOR_SELECTOR) &&
           safeQuery(modal, '[data-id]')) return modal;
       return safeQuery(documentLike,
         '.Modal-content .Comments-container,.Modal-content .CommentListV2,' +
@@ -449,15 +540,19 @@
       const authorElement = ownedElements(
         commentElement, 'a[href*="/people/"]', isZhihuCommentBoundary, 120,
       ).find(function (element) {
-        return !zhihuEditableAncestorWithin(element, commentElement);
+        return !zhihuEditableAncestorWithin(element, commentElement) && !!elementText(element, 120);
       });
       const authorName = elementText(authorElement, 120);
       // The 2026 modal mounts a reply DraftJS editor inside the same data-id
       // floor. Only the first owned, non-editor paragraph is the comment body;
       // never inspect paragraphs in contenteditable descendants.
-      const bodyElement = ownedElements(commentElement, 'p', isZhihuCommentBoundary, 120)
+      const bodyElement = ownedElements(
+        commentElement, '.CommentContent', isZhihuCommentBoundary, 120,
+      ).find(function (element) {
+        return !zhihuEditableAncestorWithin(element, commentElement) && !!elementText(element, 4000);
+      }) || ownedElements(commentElement, 'p', isZhihuCommentBoundary, 120)
         .find(function (element) {
-          return !zhihuEditableAncestorWithin(element, commentElement);
+          return !zhihuEditableAncestorWithin(element, commentElement) && !!elementText(element, 4000);
         });
       const text = elementText(bodyElement, 4000);
       return {
@@ -478,7 +573,7 @@
     },
 
     editorContextLabel: function (editor) {
-      if (!safeMatches(editor, '.public-DraftEditor-content[role="textbox"]')) return '';
+      if (!isZhihuEditableCandidate(editor)) return '';
       const attributed = editorAttributeLabel(editor);
       if (/^(?:正在)?回复(?:给)?\s*/.test(attributed)) return attributed;
       const owner = safeClosest(editor, '.CommentEditorV2,.CommentBox');
@@ -491,8 +586,8 @@
       if (local) return local;
       const modal = safeClosest(editor, '.Modal-content');
       const modalEditors = safeQueryAll(
-        modal, '.public-DraftEditor-content[role="textbox"]', 40,
-      ).filter(isEditableElement);
+        modal, ZHIHU_EDITOR_SELECTOR, 40,
+      ).filter(isZhihuEditableCandidate);
       // Never borrow a reply label from another DraftJS box in the same
       // portal. Modal-level fallback is safe only while this is its sole
       // editor; normal direct/reply boxes must resolve from their own owner.
@@ -513,6 +608,9 @@
       if (!isZhihuCommentEditor(editor)) return null;
       const owned = zhihuAnswerScope(editor);
       if (owned) return bindZhihuScope(owned, editor);
+      // A structurally owned but malformed/ambiguous answer must stay disabled.
+      // Never let a recent portal selection leak into another inline answer.
+      if (safeClosest(editor, ZHIHU_ANSWER_SELECTOR)) return null;
 
       const previous = rememberedScope(previousScope, 'answer', documentLike);
       if (previous && !previous.invalidated) {

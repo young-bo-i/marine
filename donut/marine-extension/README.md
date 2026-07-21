@@ -17,7 +17,7 @@
 pnpm dev:marine-extension-bridge
 ```
 
-它会打印一组 `apiBase/token`，并为 Rime 写入仅本次进程有效的 `MarineDev/etinput-runtime.json`。把这两项填进扩展侧栏的“手动配置”，重新加载扩展页面即可。开发桥只返回固定调试草稿；可用 `MARINE_DEV_DRAFT="你的测试文字"` 自定义。它不会向网页输入或发布，按 `Ctrl-C` 会清理自己拥有的 runtime 文件。真实智能体生成仍在发布前用 Marine 桌面端联调。
+它会同步 Marine 的 Rime 插件 manifest，打印一组 `apiBase/token`，并为 Rime 写入仅本次进程有效的 `MarineDev/etinput-runtime.json`。把 `apiBase/token` 填进扩展侧栏的“手动配置”，重新加载扩展页面；同时在 Rime 中把 Marine 设为当前 buffer 插件，并选择一个已就绪的 AI 连接器。开发桥实现与生产一致的 `/rime/prepare` 合同，模型仍由 Rime 当前连接器运行；可用 `MARINE_DEV_DRAFT="你的测试文字"` 把期望文字写进提示词做联调，最终结果仍由模型生成。它不会向网页输入或发布，按 `Ctrl-C` 会清理自己拥有的 runtime 文件，不会删除已安装的 manifest。
 
 连接真实 Marine 本地 API 时，独立 Chrome 还需要在同一配置区选择一个 Marine 身份。这个选择只决定发布记录归入哪个本地身份，不会切换网站账号。
 
@@ -41,7 +41,7 @@ MARINE_CHROME_HEADLESS=1 pnpm test:marine-extension:e2e
 ## 与 Marine/Rime 的边界
 
 - Chrome 扩展负责：识别当前页面与评论层级、抓取上下文、显示投放目标、维护焦点租约。
-- Rime Action Plugin 负责：显式请求本地智能体、接收结果、校验结果仍绑定原目标，再放入缓冲区或收件箱。
+- Rime Action Plugin 负责：轮询可用目标、显式调用当前 AI 连接器、接收结果、校验结果仍绑定原目标，再放入缓冲区或收件箱。
 - Marine 桌面端负责：生产环境的本地 API 与运行时能力令牌。Marine 真正退出后，Marine 动作应不可用。
 
 “先开缓冲模式”与“先聚焦评论框”都允许；任何一边准备好时都不会自动触发生成，更不会自动发布。

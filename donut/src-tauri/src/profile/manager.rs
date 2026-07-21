@@ -870,6 +870,34 @@ impl ProfileManager {
     Ok(profile)
   }
 
+  /// Bind a Marine brand voice to this profile. The binding is profile
+  /// metadata, so it follows the same persistence and sync path as tags/notes.
+  pub fn update_profile_brand(
+    &self,
+    profile_id: &str,
+    brand_id: Option<String>,
+  ) -> Result<BrowserProfile, Box<dyn std::error::Error>> {
+    let profile_uuid =
+      uuid::Uuid::parse_str(profile_id).map_err(|_| format!("Invalid profile ID: {profile_id}"))?;
+    let profiles = self.list_profiles()?;
+    let mut profile = profiles
+      .into_iter()
+      .find(|candidate| candidate.id == profile_uuid)
+      .ok_or_else(|| format!("Profile with ID '{profile_id}' not found"))?;
+
+    profile.brand_id = brand_id
+      .map(|value| value.trim().to_string())
+      .filter(|value| !value.is_empty());
+    profile.updated_at = Some(crate::proxy_manager::now_secs());
+    self.save_profile(&profile)?;
+    crate::sync::queue_profile_sync_if_eligible(&profile);
+
+    if let Err(error) = events::emit_empty("profiles-changed") {
+      log::warn!("Failed to emit Marine profile brand update: {error}");
+    }
+    Ok(profile)
+  }
+
   pub fn update_profile_launch_hook(
     &self,
     _app_handle: &tauri::AppHandle,

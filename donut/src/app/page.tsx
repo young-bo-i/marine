@@ -12,7 +12,6 @@ import { CamoufoxDeprecationDialog } from "@/components/camoufox-deprecation-dia
 import { CloneProfileDialog } from "@/components/clone-profile-dialog";
 import { CloseConfirmDialog } from "@/components/close-confirm-dialog";
 import { CommandPalette } from "@/components/command-palette";
-import { CommentHistoryPage } from "@/components/comment-history-page";
 import { CookieCopyDialog } from "@/components/cookie-copy-dialog";
 import { CookieManagementDialog } from "@/components/cookie-management-dialog";
 import { CreateProfileDialog } from "@/components/create-profile-dialog";
@@ -25,6 +24,7 @@ import { GroupManagementDialog } from "@/components/group-management-dialog";
 import HomeHeader from "@/components/home-header";
 import { ImportProfileDialog } from "@/components/import-profile-dialog";
 import { IntegrationsDialog } from "@/components/integrations-dialog";
+import { MarineWorkspacePage } from "@/components/marine-workspace-page";
 import { ONBOARDING_TOUR } from "@/components/onboarding-provider";
 import { PermissionDialog } from "@/components/permission-dialog";
 import { ProfilesDataTable } from "@/components/profile-data-table";
@@ -245,6 +245,7 @@ export default function Home() {
   const syncUnlocked = crossOsUnlocked || selfHostedSyncConfigured;
 
   const [currentPage, setCurrentPage] = useState<AppPage>("profiles");
+  const [marineBrandDirty, setMarineBrandDirty] = useState(false);
   const [accountDialogOpen, setAccountDialogOpen] = useState(false);
   // Tracks which tab inside the shared proxy-management page should be active.
   // The VPN rail item routes to the same page but pre-selects the VPN tab.
@@ -339,56 +340,71 @@ export default function Home() {
     setSelectedProfiles([]);
   }, []);
 
-  const handleRailNavigate = useCallback((page: AppPage) => {
-    // Always reset every sub-page-able dialog before opening the next one,
-    // so navigating from one rail item to another doesn't stack two
-    // sub-pages on top of each other.
-    setSettingsDialogOpen(false);
-    setProxyManagementDialogOpen(false);
-    setExtensionManagementDialogOpen(false);
-    setGroupManagementDialogOpen(false);
-    setIntegrationsDialogOpen(false);
-    setImportProfileDialogOpen(false);
-    setAccountDialogOpen(false);
+  const handleRailNavigate = useCallback(
+    (page: AppPage) => {
+      if (
+        currentPage === "marine" &&
+        page !== "marine" &&
+        marineBrandDirty &&
+        !window.confirm(t("marine.brandStudio.discardChanges"))
+      ) {
+        return;
+      }
+      if (currentPage === "marine" && page !== "marine") {
+        setMarineBrandDirty(false);
+      }
 
-    setCurrentPage(page);
-    switch (page) {
-      case "profiles":
-        break;
-      case "settings":
-        setSettingsDialogOpen(true);
-        break;
-      case "proxies":
-        setProxyManagementInitialTab("proxies");
-        setProxyManagementDialogOpen(true);
-        break;
-      case "extensions":
-        setExtensionManagementDialogOpen(true);
-        break;
-      case "groups":
-        setGroupManagementDialogOpen(true);
-        break;
-      case "integrations":
-        setIntegrationsDialogOpen(true);
-        break;
-      case "import":
-        setImportProfileDialogOpen(true);
-        break;
-      case "vpns":
-        // VPNs share the proxy management page; pre-select the VPN tab so
-        // the user lands directly on the right list.
-        setProxyManagementInitialTab("vpns");
-        setProxyManagementDialogOpen(true);
-        break;
-      case "account":
-        setAccountDialogOpen(true);
-        break;
-      case "shortcuts":
-      case "marine":
-        // Plain page render — nothing else to open.
-        break;
-    }
-  }, []);
+      // Always reset every sub-page-able dialog before opening the next one,
+      // so navigating from one rail item to another doesn't stack two
+      // sub-pages on top of each other.
+      setSettingsDialogOpen(false);
+      setProxyManagementDialogOpen(false);
+      setExtensionManagementDialogOpen(false);
+      setGroupManagementDialogOpen(false);
+      setIntegrationsDialogOpen(false);
+      setImportProfileDialogOpen(false);
+      setAccountDialogOpen(false);
+
+      setCurrentPage(page);
+      switch (page) {
+        case "profiles":
+          break;
+        case "settings":
+          setSettingsDialogOpen(true);
+          break;
+        case "proxies":
+          setProxyManagementInitialTab("proxies");
+          setProxyManagementDialogOpen(true);
+          break;
+        case "extensions":
+          setExtensionManagementDialogOpen(true);
+          break;
+        case "groups":
+          setGroupManagementDialogOpen(true);
+          break;
+        case "integrations":
+          setIntegrationsDialogOpen(true);
+          break;
+        case "import":
+          setImportProfileDialogOpen(true);
+          break;
+        case "vpns":
+          // VPNs share the proxy management page; pre-select the VPN tab so
+          // the user lands directly on the right list.
+          setProxyManagementInitialTab("vpns");
+          setProxyManagementDialogOpen(true);
+          break;
+        case "account":
+          setAccountDialogOpen(true);
+          break;
+        case "shortcuts":
+        case "marine":
+          // Plain page render — nothing else to open.
+          break;
+      }
+    },
+    [currentPage, marineBrandDirty, t],
+  );
 
   const runShortcut = useCallback(
     (id: ShortcutId) => {
@@ -1635,7 +1651,7 @@ export default function Home() {
 
   return (
     <div className="flex h-dvh flex-col bg-background font-(family-name:--font-geist-sans)">
-      <CloseConfirmDialog />
+      <CloseConfirmDialog hasUnsavedChanges={marineBrandDirty} />
       <CamoufoxDeprecationDialog profiles={profiles} />
       <HomeHeader
         onCreateProfileDialogOpen={setCreateProfileDialogOpen}
@@ -1702,7 +1718,9 @@ export default function Home() {
             <ShortcutsPage groupTargets={orderedGroupTargets} />
           )}
 
-          {currentPage === "marine" && <CommentHistoryPage />}
+          {currentPage === "marine" && (
+            <MarineWorkspacePage onDirtyChange={setMarineBrandDirty} />
+          )}
 
           {settingsDialogOpen && (
             <SettingsDialog

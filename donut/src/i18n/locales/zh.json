@@ -1882,7 +1882,13 @@
     "marineGenerateFailed": "生成失败。{{detail}}",
     "marineGenerateTimeout": "生成超时。",
     "marineFillFailed": "无法填入回复框。{{detail}}",
-    "marineMarkPostedFailed": "无法标记为已发布。{{detail}}"
+    "marineMarkPostedFailed": "无法标记为已发布。{{detail}}",
+    "marineBrandNotFound": "未找到该品牌。",
+    "marineBrandBuiltIn": "内置品牌不能删除。",
+    "marineBrandRevisionConflict": "该品牌已在其他位置更新，请刷新后重试。",
+    "marineBrandInvalid": "品牌配置无效。",
+    "marineBrandStorageFailed": "无法保存品牌配置。",
+    "marineBrandInUse": "该品牌仍绑定到 {{count}} 个配置文件。"
   },
   "rail": {
     "profiles": "配置文件",
@@ -1900,7 +1906,7 @@
     "network": "网络",
     "integrations": "集成",
     "account": "账号",
-    "marine": "评论账本"
+    "marine": "Marine"
   },
   "pageTitle": {
     "proxies": "网络",
@@ -1912,7 +1918,7 @@
     "account": "账户",
     "import": "导入配置文件",
     "shortcuts": "键盘快捷键",
-    "marine": "评论账本"
+    "marine": "Marine"
   },
   "encryption": {
     "required": {
@@ -2102,6 +2108,166 @@
     "acknowledge": "知道了"
   },
   "marine": {
+    "workspace": {
+      "tabsLabel": "Marine 工作台",
+      "tabs": {
+        "brands": "品牌工作台",
+        "history": "评论账本"
+      }
+    },
+    "brandStudio": {
+      "title": "品牌工作台",
+      "description": "把品牌定位、表达口径、规则、场景范例和 Profile 绑定集中管理。",
+      "loading": "正在加载品牌…",
+      "loadFailed": "无法加载品牌",
+      "loadFailedDescription": "品牌数据暂时不可用，请确认 Marine 后端就绪后重试。",
+      "brandList": "品牌",
+      "searchLabel": "搜索品牌",
+      "searchPlaceholder": "搜索品牌",
+      "newNameLabel": "新品牌名称",
+      "newNamePlaceholder": "新品牌名称",
+      "create": "新建品牌",
+      "empty": "还没有品牌，请在上方创建第一个。",
+      "emptySearch": "没有匹配的品牌。",
+      "builtIn": "内置",
+      "profileCount": "{{count}} 个 Profile",
+      "revision": "版本 {{revision}}",
+      "unsaved": "有未保存修改",
+      "discardChanges": "要放弃这个品牌尚未保存的修改吗？",
+      "sections": {
+        "identity": "品牌与产品",
+        "identityDescription": "定义品牌是谁、服务谁，以及可以可信地表达什么。",
+        "tone": "表达语气",
+        "toneDescription": "把抽象的话术风格变成可复用的生成参数。",
+        "rules": "该做与不该做",
+        "rulesDescription": "每行一条明确规则，让生成边界保持清晰。",
+        "examples": "场景范例",
+        "examplesDescription": "按平台、直评或回复类型和关键词路由相关范例。",
+        "bindings": "Profile 绑定",
+        "bindingsDescription": "选择默认使用这个品牌的浏览器 Profile。"
+      },
+      "fields": {
+        "positioning": "品牌定位",
+        "audience": "目标受众"
+      },
+      "placeholders": {
+        "positioning": "品牌做什么，以及它为什么不同",
+        "audience": "这个品牌在和谁说话",
+        "persona": "人设、视角、用词和叙事方式",
+        "product": "产品、卖点、证据、链接和红线",
+        "commentStyle": "评论应该怎么说，以及如何自然带出品牌",
+        "rules": "每行一条规则"
+      },
+      "tone": {
+        "warmth": "亲和度",
+        "expertise": "专业度",
+        "wit": "幽默感",
+        "directness": "直接度",
+        "emoji": "Emoji 使用",
+        "length": "回复长度"
+      },
+      "emoji": {
+        "none": "不用",
+        "light": "少量",
+        "moderate": "适中",
+        "rich": "较多"
+      },
+      "length": {
+        "short": "短",
+        "medium": "中",
+        "long": "长"
+      },
+      "languages": {
+        "zh_CN": "中文",
+        "en": "英语",
+        "ja": "日语",
+        "ko": "韩语"
+      },
+      "platforms": {
+        "all": "全部平台",
+        "bilibili": "哔哩哔哩",
+        "xiaohongshu": "小红书",
+        "zhihu": "知乎",
+        "douyin": "抖音"
+      },
+      "kinds": {
+        "both": "直评与回复",
+        "direct": "直评",
+        "reply": "回复"
+      },
+      "examples": {
+        "add": "添加范例",
+        "delete": "删除范例",
+        "empty": "还没有场景范例。",
+        "enabled": "启用",
+        "untitled": "未命名范例",
+        "title": "场景标题",
+        "titlePlaceholder": "例如：投稿被拒与返修",
+        "keywords": "路由关键词",
+        "keywordsPlaceholder": "用逗号分隔关键词",
+        "platform": "平台",
+        "kind": "评论类型",
+        "text": "范例话术",
+        "textPlaceholder": "这个场景下的一条权威范例"
+      },
+      "bindings": {
+        "searchLabel": "搜索 Profile",
+        "searchPlaceholder": "搜索 Profile、备注或标签",
+        "empty": "没有匹配的 Profile。",
+        "boundToCurrent": "正在使用这个品牌",
+        "boundToOther": "当前使用 {{name}}",
+        "usesDefault": "使用默认 {{name}} 话术",
+        "confirmReassign": "{{profile}} 当前使用 {{brand}}，要改绑到这个品牌吗？"
+      },
+      "preview": {
+        "title": "实时路由预览",
+        "description": "测试 Marine 将选择哪些范例，以及会交给 Rime 的完整 skill。",
+        "saveFirst": "预览已包含当前未保存草稿，确认效果后请记得保存。",
+        "platform": "平台",
+        "mode": "评论类型",
+        "pageTitle": "页面标题",
+        "pageTitlePlaceholder": "粘贴或描述页面标题",
+        "targetSummary": "目标摘要",
+        "targetSummaryPlaceholder": "作品或目标评论主要在说什么",
+        "sourceText": "页面正文",
+        "sourceTextPlaceholder": "粘贴有代表性的页面文字来测试路由",
+        "selectedExamples": "命中的范例",
+        "loading": "正在更新预览…",
+        "failed": "预览失败，请检查已保存品牌后重试。",
+        "empty": "填写预览背景来检查路由结果。",
+        "noExamples": "当前背景没有命中范例。",
+        "skill": "编译后的 Skill"
+      },
+      "sync": {
+        "enabled": "云同步已开启",
+        "disabled": "仅保存在本地",
+        "lastSync": "上次同步于 {{time}}"
+      },
+      "delete": {
+        "title": "删除品牌",
+        "description": "确定删除 {{name}} 吗？此操作无法撤销。",
+        "inUse": "请先解除所有 Profile 绑定，再删除这个品牌。",
+        "builtIn": "内置品牌不能删除。"
+      },
+      "noSelection": {
+        "title": "选择或创建品牌",
+        "description": "从左侧选择品牌，编辑它的身份、范例和 Profile 绑定。"
+      },
+      "toasts": {
+        "loadFailed": "无法加载 Marine 品牌",
+        "created": "品牌已创建",
+        "createFailed": "无法创建品牌",
+        "saved": "品牌已保存",
+        "saveFailed": "无法保存品牌",
+        "conflict": "这个品牌已在另一台设备上更新",
+        "conflictDescription": "请刷新获取最新版本，再重新应用你的修改。",
+        "deleted": "品牌已删除",
+        "deleteFailed": "无法删除品牌",
+        "brandInUse": "请先解除所有 Profile 绑定，再删除这个品牌",
+        "bindingSaved": "Profile 绑定已更新",
+        "bindingFailed": "无法更新 Profile 绑定"
+      }
+    },
     "title": "Marine",
     "description": "从运行中配置文件的当前页面提取字幕和正文。",
     "noRunningProfiles": "没有运行中的 Wayfern 或 Camoufox 配置文件，请先启动一个。",

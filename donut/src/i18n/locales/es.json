@@ -1882,7 +1882,13 @@
     "marineGenerateFailed": "Falló la generación. {{detail}}",
     "marineGenerateTimeout": "La generación agotó el tiempo.",
     "marineFillFailed": "No se pudo rellenar la respuesta. {{detail}}",
-    "marineMarkPostedFailed": "No se pudo marcar como publicado. {{detail}}"
+    "marineMarkPostedFailed": "No se pudo marcar como publicado. {{detail}}",
+    "marineBrandNotFound": "No se encontró la marca.",
+    "marineBrandBuiltIn": "La marca integrada no se puede eliminar.",
+    "marineBrandRevisionConflict": "Esta marca se actualizó en otro lugar. Actualiza y vuelve a intentarlo.",
+    "marineBrandInvalid": "La configuración de la marca no es válida.",
+    "marineBrandStorageFailed": "No se pudo guardar la configuración de la marca.",
+    "marineBrandInUse": "Esta marca sigue vinculada a {{count}} perfiles."
   },
   "rail": {
     "profiles": "Perfiles",
@@ -1900,7 +1906,7 @@
     "network": "Red",
     "integrations": "Integraciones",
     "account": "Cuenta",
-    "marine": "Registro de comentarios"
+    "marine": "Marine"
   },
   "pageTitle": {
     "proxies": "Red",
@@ -1912,7 +1918,7 @@
     "account": "Cuenta",
     "import": "Importar perfil",
     "shortcuts": "Atajos de teclado",
-    "marine": "Registro de comentarios"
+    "marine": "Marine"
   },
   "encryption": {
     "required": {
@@ -2102,6 +2108,166 @@
     "acknowledge": "Entendido"
   },
   "marine": {
+    "workspace": {
+      "tabsLabel": "Espacio de trabajo de Marine",
+      "tabs": {
+        "brands": "Estudio de marca",
+        "history": "Registro de comentarios"
+      }
+    },
+    "brandStudio": {
+      "title": "Estudio de marca",
+      "description": "Organiza el posicionamiento, la voz, las reglas, los ejemplos y las asignaciones de perfiles en un solo lugar.",
+      "loading": "Cargando marcas…",
+      "loadFailed": "No se pudieron cargar las marcas",
+      "loadFailedDescription": "Los datos de marca no están disponibles temporalmente. Inténtalo de nuevo cuando el backend de Marine esté listo.",
+      "brandList": "Marcas",
+      "searchLabel": "Buscar marcas",
+      "searchPlaceholder": "Buscar marcas",
+      "newNameLabel": "Nombre de la nueva marca",
+      "newNamePlaceholder": "Nombre de la nueva marca",
+      "create": "Crear marca",
+      "empty": "Aún no hay marcas. Crea la primera arriba.",
+      "emptySearch": "Ninguna marca coincide con la búsqueda.",
+      "builtIn": "Integrada",
+      "profileCount": "{{count}} perfiles",
+      "revision": "Revisión {{revision}}",
+      "unsaved": "Cambios sin guardar",
+      "discardChanges": "¿Descartar los cambios sin guardar de esta marca?",
+      "sections": {
+        "identity": "Marca y producto",
+        "identityDescription": "Define quién es la marca, a quién sirve y qué puede afirmar con credibilidad.",
+        "tone": "Voz y tono",
+        "toneDescription": "Convierte una guía de voz abstracta en controles de generación reutilizables.",
+        "rules": "Qué hacer y qué evitar",
+        "rulesDescription": "Usa una regla clara por línea para mantener límites precisos.",
+        "examples": "Ejemplos por escenario",
+        "examplesDescription": "Dirige ejemplos relevantes por plataforma, tipo de respuesta y palabras clave.",
+        "bindings": "Asignaciones de perfiles",
+        "bindingsDescription": "Elige qué perfiles del navegador usan esta marca por defecto."
+      },
+      "fields": {
+        "positioning": "Posicionamiento",
+        "audience": "Público"
+      },
+      "placeholders": {
+        "positioning": "Qué hace la marca y por qué es diferente",
+        "audience": "A quién se dirige esta marca",
+        "persona": "Voz, punto de vista, vocabulario y estilo narrativo",
+        "product": "Productos, ventajas, pruebas, enlaces y límites",
+        "commentStyle": "Cómo deben sonar los comentarios e introducir la marca",
+        "rules": "Una regla por línea"
+      },
+      "tone": {
+        "warmth": "Cercanía",
+        "expertise": "Experiencia",
+        "wit": "Ingenio",
+        "directness": "Franqueza",
+        "emoji": "Uso de emoji",
+        "length": "Longitud de respuesta"
+      },
+      "emoji": {
+        "none": "Ninguno",
+        "light": "Escaso",
+        "moderate": "Moderado",
+        "rich": "Frecuente"
+      },
+      "length": {
+        "short": "Corta",
+        "medium": "Media",
+        "long": "Larga"
+      },
+      "languages": {
+        "zh_CN": "Chino",
+        "en": "Inglés",
+        "ja": "Japonés",
+        "ko": "Coreano"
+      },
+      "platforms": {
+        "all": "Todas las plataformas",
+        "bilibili": "Bilibili",
+        "xiaohongshu": "Xiaohongshu",
+        "zhihu": "Zhihu",
+        "douyin": "Douyin"
+      },
+      "kinds": {
+        "both": "Comentario directo y respuesta",
+        "direct": "Comentario directo",
+        "reply": "Respuesta"
+      },
+      "examples": {
+        "add": "Añadir ejemplo",
+        "delete": "Eliminar ejemplo",
+        "empty": "Aún no hay ejemplos de escenario.",
+        "enabled": "Activo",
+        "untitled": "Ejemplo sin título",
+        "title": "Título del escenario",
+        "titlePlaceholder": "Por ejemplo: rechazo y revisión de un envío",
+        "keywords": "Palabras clave de ruta",
+        "keywordsPlaceholder": "Separa palabras con comas",
+        "platform": "Plataforma",
+        "kind": "Tipo de comentario",
+        "text": "Texto de ejemplo",
+        "textPlaceholder": "Un ejemplo canónico para este escenario"
+      },
+      "bindings": {
+        "searchLabel": "Buscar perfiles",
+        "searchPlaceholder": "Buscar perfiles, notas o etiquetas",
+        "empty": "Ningún perfil coincide con la búsqueda.",
+        "boundToCurrent": "Usa esta marca",
+        "boundToOther": "Actualmente usa {{name}}",
+        "usesDefault": "Usa la voz predeterminada {{name}}",
+        "confirmReassign": "{{profile}} usa actualmente {{brand}}. ¿Quieres reasignarlo a esta marca?"
+      },
+      "preview": {
+        "title": "Vista previa de ruta en vivo",
+        "description": "Comprueba qué ejemplos y Skill compilado enviará Marine a Rime.",
+        "saveFirst": "La vista previa incluye este borrador sin guardar. Guárdalo cuando el resultado sea correcto.",
+        "platform": "Plataforma",
+        "mode": "Tipo de comentario",
+        "pageTitle": "Título de página",
+        "pageTitlePlaceholder": "Pega o describe el título de la página",
+        "targetSummary": "Resumen del objetivo",
+        "targetSummaryPlaceholder": "Qué dice la publicación o el comentario objetivo",
+        "sourceText": "Texto fuente",
+        "sourceTextPlaceholder": "Pega texto representativo para probar la ruta",
+        "selectedExamples": "Ejemplos seleccionados",
+        "loading": "Actualizando vista previa…",
+        "failed": "La vista previa falló. Comprueba la marca guardada e inténtalo de nuevo.",
+        "empty": "Añade contexto para inspeccionar la ruta.",
+        "noExamples": "Ningún ejemplo coincide con este contexto.",
+        "skill": "Skill compilado"
+      },
+      "sync": {
+        "enabled": "Sincronización en la nube activa",
+        "disabled": "Solo local",
+        "lastSync": "Última sincronización: {{time}}"
+      },
+      "delete": {
+        "title": "Eliminar marca",
+        "description": "¿Eliminar {{name}}? Esta acción no se puede deshacer.",
+        "inUse": "Desvincula todos los perfiles antes de eliminar esta marca.",
+        "builtIn": "Las marcas integradas no se pueden eliminar."
+      },
+      "noSelection": {
+        "title": "Elige o crea una marca",
+        "description": "Selecciona una marca para editar su identidad, ejemplos y perfiles asignados."
+      },
+      "toasts": {
+        "loadFailed": "No se pudieron cargar las marcas de Marine",
+        "created": "Marca creada",
+        "createFailed": "No se pudo crear la marca",
+        "saved": "Marca guardada",
+        "saveFailed": "No se pudo guardar la marca",
+        "conflict": "Esta marca cambió en otro dispositivo",
+        "conflictDescription": "Actualiza para cargar la revisión más reciente y vuelve a aplicar tus cambios.",
+        "deleted": "Marca eliminada",
+        "deleteFailed": "No se pudo eliminar la marca",
+        "brandInUse": "Desvincula todos los perfiles antes de eliminar esta marca",
+        "bindingSaved": "Asignación de perfil actualizada",
+        "bindingFailed": "No se pudo actualizar la asignación del perfil"
+      }
+    },
     "title": "Marine",
     "description": "Extrae subtítulos y el texto del artículo de la página activa de un perfil en ejecución.",
     "noRunningProfiles": "No hay ningún perfil de Wayfern o Camoufox en ejecución. Inicia uno primero.",

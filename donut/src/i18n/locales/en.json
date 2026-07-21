@@ -1882,7 +1882,13 @@
     "marineGenerateFailed": "Generation failed. {{detail}}",
     "marineGenerateTimeout": "Generation timed out.",
     "marineFillFailed": "Couldn't fill the reply box. {{detail}}",
-    "marineMarkPostedFailed": "Couldn't mark as posted. {{detail}}"
+    "marineMarkPostedFailed": "Couldn't mark as posted. {{detail}}",
+    "marineBrandNotFound": "Brand not found.",
+    "marineBrandBuiltIn": "The built-in brand cannot be deleted.",
+    "marineBrandRevisionConflict": "This brand was updated elsewhere. Refresh and try again.",
+    "marineBrandInvalid": "The brand configuration is invalid.",
+    "marineBrandStorageFailed": "Couldn't save the brand configuration.",
+    "marineBrandInUse": "This brand is still linked to {{count}} profiles."
   },
   "rail": {
     "profiles": "Profiles",
@@ -1900,7 +1906,7 @@
     "network": "Network",
     "integrations": "Integrations",
     "account": "Account",
-    "marine": "Comment ledger"
+    "marine": "Marine"
   },
   "pageTitle": {
     "proxies": "Network",
@@ -1912,7 +1918,7 @@
     "account": "Account",
     "import": "Import profile",
     "shortcuts": "Keyboard shortcuts",
-    "marine": "Comment ledger"
+    "marine": "Marine"
   },
   "encryption": {
     "required": {
@@ -2102,6 +2108,166 @@
     "acknowledge": "Got it"
   },
   "marine": {
+    "workspace": {
+      "tabsLabel": "Marine workspace",
+      "tabs": {
+        "brands": "Brand studio",
+        "history": "Comment ledger"
+      }
+    },
+    "brandStudio": {
+      "title": "Brand studio",
+      "description": "Organize brand positioning, voice, rules, scenarios, and profile assignments in one workspace.",
+      "loading": "Loading brands…",
+      "loadFailed": "Couldn't load brands",
+      "loadFailedDescription": "Brand data is temporarily unavailable. Try again after the Marine backend is ready.",
+      "brandList": "Brands",
+      "searchLabel": "Search brands",
+      "searchPlaceholder": "Search brands",
+      "newNameLabel": "New brand name",
+      "newNamePlaceholder": "New brand name",
+      "create": "Create brand",
+      "empty": "No brands yet. Create the first one above.",
+      "emptySearch": "No brands match this search.",
+      "builtIn": "Built in",
+      "profileCount": "{{count}} profiles",
+      "revision": "Revision {{revision}}",
+      "unsaved": "Unsaved changes",
+      "discardChanges": "Discard the unsaved changes to this brand?",
+      "sections": {
+        "identity": "Brand and product",
+        "identityDescription": "Define who the brand is, who it serves, and what it can credibly say.",
+        "tone": "Voice and tone",
+        "toneDescription": "Turn abstract voice guidance into reusable generation controls.",
+        "rules": "Do and don't",
+        "rulesDescription": "Use one clear rule per line so generation boundaries stay precise.",
+        "examples": "Scenario examples",
+        "examplesDescription": "Route relevant examples by platform, reply mode, and keywords.",
+        "bindings": "Profile assignments",
+        "bindingsDescription": "Choose which browser profiles use this brand by default."
+      },
+      "fields": {
+        "positioning": "Positioning",
+        "audience": "Audience"
+      },
+      "placeholders": {
+        "positioning": "What the brand does and why it is distinct",
+        "audience": "Who this brand is speaking to",
+        "persona": "Voice, perspective, vocabulary, and narrative style",
+        "product": "Products, benefits, proof points, links, and red lines",
+        "commentStyle": "How comments should sound and introduce the brand",
+        "rules": "One rule per line"
+      },
+      "tone": {
+        "warmth": "Warmth",
+        "expertise": "Expertise",
+        "wit": "Wit",
+        "directness": "Directness",
+        "emoji": "Emoji use",
+        "length": "Reply length"
+      },
+      "emoji": {
+        "none": "None",
+        "light": "Light",
+        "moderate": "Moderate",
+        "rich": "Frequent"
+      },
+      "length": {
+        "short": "Short",
+        "medium": "Medium",
+        "long": "Long"
+      },
+      "languages": {
+        "zh_CN": "Chinese",
+        "en": "English",
+        "ja": "Japanese",
+        "ko": "Korean"
+      },
+      "platforms": {
+        "all": "All platforms",
+        "bilibili": "Bilibili",
+        "xiaohongshu": "Xiaohongshu",
+        "zhihu": "Zhihu",
+        "douyin": "Douyin"
+      },
+      "kinds": {
+        "both": "Direct and reply",
+        "direct": "Direct comment",
+        "reply": "Reply"
+      },
+      "examples": {
+        "add": "Add example",
+        "delete": "Delete example",
+        "empty": "No scenario examples yet.",
+        "enabled": "Enabled",
+        "untitled": "Untitled example",
+        "title": "Scenario title",
+        "titlePlaceholder": "For example: submission rejection and revision",
+        "keywords": "Routing keywords",
+        "keywordsPlaceholder": "Separate keywords with commas",
+        "platform": "Platform",
+        "kind": "Comment type",
+        "text": "Example copy",
+        "textPlaceholder": "A canonical example for this scenario"
+      },
+      "bindings": {
+        "searchLabel": "Search profiles",
+        "searchPlaceholder": "Search profiles, notes, or tags",
+        "empty": "No profiles match this search.",
+        "boundToCurrent": "Uses this brand",
+        "boundToOther": "Currently uses {{name}}",
+        "usesDefault": "Uses the default {{name}} voice",
+        "confirmReassign": "{{profile}} currently uses {{brand}}. Reassign it to this brand?"
+      },
+      "preview": {
+        "title": "Live route preview",
+        "description": "Test which examples and compiled skill Marine will send to Rime.",
+        "saveFirst": "The preview includes this unsaved draft. Save it when the result looks right.",
+        "platform": "Platform",
+        "mode": "Comment type",
+        "pageTitle": "Page title",
+        "pageTitlePlaceholder": "Paste or describe the page title",
+        "targetSummary": "Target summary",
+        "targetSummaryPlaceholder": "What the post or target comment is saying",
+        "sourceText": "Source text",
+        "sourceTextPlaceholder": "Paste representative page text for routing",
+        "selectedExamples": "Selected examples",
+        "loading": "Updating preview…",
+        "failed": "Preview failed. Check the saved brand and try again.",
+        "empty": "Add preview context to inspect the route.",
+        "noExamples": "No example matched this context.",
+        "skill": "Compiled skill"
+      },
+      "sync": {
+        "enabled": "Cloud sync on",
+        "disabled": "Local only",
+        "lastSync": "Last synced {{time}}"
+      },
+      "delete": {
+        "title": "Delete brand",
+        "description": "Delete {{name}}? This cannot be undone.",
+        "inUse": "Unbind every profile before deleting this brand.",
+        "builtIn": "Built-in brands cannot be deleted."
+      },
+      "noSelection": {
+        "title": "Choose or create a brand",
+        "description": "Select a brand from the list to edit its identity, examples, and profile assignments."
+      },
+      "toasts": {
+        "loadFailed": "Couldn't load Marine brands",
+        "created": "Brand created",
+        "createFailed": "Couldn't create brand",
+        "saved": "Brand saved",
+        "saveFailed": "Couldn't save brand",
+        "conflict": "This brand changed on another device",
+        "conflictDescription": "Refresh to load the latest revision, then reapply your changes.",
+        "deleted": "Brand deleted",
+        "deleteFailed": "Couldn't delete brand",
+        "brandInUse": "Unbind every profile before deleting this brand",
+        "bindingSaved": "Profile assignment updated",
+        "bindingFailed": "Couldn't update profile assignment"
+      }
+    },
     "title": "Marine",
     "description": "Extract subtitles and article text from the active page of a running profile.",
     "noRunningProfiles": "No running Wayfern or Camoufox profile. Launch one first.",

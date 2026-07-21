@@ -80,6 +80,15 @@ impl RimeTarget {
 #[serde(rename_all = "camelCase")]
 pub struct RimeContext {
   pub context_id: String,
+  /// Browser profile stamped into the extension runtime by Marine. Empty is
+  /// accepted only for the lightweight development bridge and older clients.
+  #[serde(default)]
+  pub profile_id: String,
+  /// Canonical brand snapshot resolved by Marine when the context is accepted.
+  #[serde(default)]
+  pub brand_id: String,
+  #[serde(default)]
+  pub brand_revision: u64,
   pub mode: RimeContextMode,
   pub action_id: String,
   pub label: String,
@@ -147,6 +156,9 @@ impl RimeContext {
       serde_json::json!({
         "version": RIME_CONTEXT_ENVELOPE_VERSION,
         "contextId": self.context_id,
+        "profileId": self.profile_id,
+        "brandId": self.brand_id,
+        "brandRevision": self.brand_revision,
         "updatedAt": self.updated_at,
         "platform": self.platform,
         "url": self.url,
@@ -408,17 +420,33 @@ impl RimeContextStore {
       }
 
       // A strictly newer publication for the currently active context is a
-      // lease renewal, not a supersession. Refresh it in place so the context
-      // id is never tombstoned merely for staying focused. DELETE and an
-      // actually different active context still use `revoke` below.
+      // lease renewal, not a new semantic target. Keep the brand snapshot
+      // frozen and reject any attempt to mutate page/target semantics under an
+      // existing context id.
+      let stored_context = state
+        .contexts
+        .get(&context_id)
+        .map(|stored| stored.context.clone())
+        .ok_or(RimeContextError::ContextMismatch)?;
+      let mut renewed = context;
+      if !stored_context.profile_id.is_empty() && renewed.profile_id == stored_context.profile_id {
+        renewed.brand_id = stored_context.brand_id.clone();
+        renewed.brand_revision = stored_context.brand_revision;
+        renewed.skill = stored_context.skill.clone();
+      }
+      let mut comparable = renewed.clone();
+      comparable.updated_at = stored_context.updated_at;
+      if comparable != stored_context {
+        return Err(RimeContextError::ContextMismatch);
+      }
       state.next_received_order = state.next_received_order.saturating_add(1);
       let received_order = state.next_received_order;
       state.high_watermark_millis = updated_at_millis;
-      state.high_watermark_wire = context.updated_at;
+      state.high_watermark_wire = renewed.updated_at;
       state.contexts.insert(
         context_id,
         StoredRimeContext {
-          context,
+          context: renewed,
           updated_at_millis,
           received_order,
         },
@@ -811,6 +839,9 @@ mod tests {
   fn direct_context(updated_at: u64) -> RimeContext {
     RimeContext {
       context_id: "ctx-direct".into(),
+      profile_id: String::new(),
+      brand_id: String::new(),
+      brand_revision: 0,
       mode: RimeContextMode::Direct,
       action_id: DIRECT_ACTION_ID.into(),
       label: "Marine · 直评".into(),
@@ -1133,6 +1164,53 @@ mod tests {
       .unwrap();
     assert_eq!(current.updated_at, now_millis - 100);
     assert_eq!(current.title, original_title);
+  }
+
+  #[test]
+  fn same_id_renewal_cannot_replace_target_semantics() {
+    let now = 1_800_000_000;
+    let store = RimeContextStore::default();
+    let mut context = direct_context(now * MILLIS_PER_SEC - 200);
+    store.set(context.clone(), now).unwrap();
+
+    context.updated_at += 100;
+    context.title = "different page".into();
+    assert!(matches!(
+      store.set(context, now),
+      Err(RimeContextError::ContextMismatch)
+    ));
+  }
+
+  #[test]
+  fn same_id_profile_renewal_keeps_the_frozen_brand_revision() {
+    let now = 1_800_000_000;
+    let store = RimeContextStore::default();
+    let mut context = direct_context(now * MILLIS_PER_SEC - 200);
+    context.profile_id = uuid::Uuid::new_v4().to_string();
+    context.brand_id = "brand-a".into();
+    context.brand_revision = 3;
+    context.skill = "frozen skill".into();
+    store.set(context.clone(), now).unwrap();
+
+    context.updated_at += 100;
+    context.brand_id = "brand-b".into();
+    context.brand_revision = 4;
+    context.skill = "newer brand must wait for a new target lease".into();
+    store.set(context.clone(), now).unwrap();
+
+    let current = store
+      .context_for_invoke(
+        &RimeInvokeRequest {
+          request_id: "req-frozen-brand".into(),
+          action_id: DIRECT_ACTION_ID.into(),
+          context_id: context.context_id,
+        },
+        now,
+      )
+      .unwrap();
+    assert_eq!(current.brand_id, "brand-a");
+    assert_eq!(current.brand_revision, 3);
+    assert_eq!(current.skill, "frozen skill");
   }
 
   #[test]

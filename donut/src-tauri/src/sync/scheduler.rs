@@ -32,6 +32,7 @@ struct ProfileStopTime {
 pub struct SyncScheduler {
   running: Arc<AtomicBool>,
   pending_profiles: Arc<Mutex<HashMap<String, ProfileStopTime>>>,
+  pending_posting_history: Arc<AtomicBool>,
   pending_proxies: Arc<Mutex<HashSet<String>>>,
   pending_groups: Arc<Mutex<HashSet<String>>>,
   pending_vpns: Arc<Mutex<HashSet<String>>>,
@@ -53,6 +54,7 @@ impl SyncScheduler {
     Self {
       running: Arc::new(AtomicBool::new(false)),
       pending_profiles: Arc::new(Mutex::new(HashMap::new())),
+      pending_posting_history: Arc::new(AtomicBool::new(false)),
       pending_proxies: Arc::new(Mutex::new(HashSet::new())),
       pending_groups: Arc::new(Mutex::new(HashSet::new())),
       pending_vpns: Arc::new(Mutex::new(HashSet::new())),
@@ -74,6 +76,10 @@ impl SyncScheduler {
 
   /// Check if any sync operation is currently in progress
   pub async fn is_sync_in_progress(&self) -> bool {
+    if self.pending_posting_history.load(Ordering::SeqCst) {
+      return true;
+    }
+
     let in_flight = self.in_flight_profiles.lock().await;
     if !in_flight.is_empty() {
       return true;
@@ -177,6 +183,10 @@ impl SyncScheduler {
 
   pub async fn queue_profile_sync(&self, profile_id: String) {
     self.queue_profile_sync_internal(profile_id).await;
+  }
+
+  pub fn queue_posting_history_sync(&self) {
+    self.pending_posting_history.store(true, Ordering::SeqCst);
   }
 
   pub async fn queue_profile_sync_immediate(&self, profile_id: String) {
@@ -333,6 +343,7 @@ impl SyncScheduler {
         tokio::select! {
           Some(work_item) = work_rx.recv() => {
             match work_item {
+              SyncWorkItem::PostingHistory => scheduler.queue_posting_history_sync(),
               SyncWorkItem::Profile(id) => scheduler.queue_profile_sync(id).await,
               SyncWorkItem::Proxy(id) => scheduler.queue_proxy_sync(id).await,
               SyncWorkItem::Group(id) => scheduler.queue_group_sync(id).await,
@@ -355,6 +366,7 @@ impl SyncScheduler {
   }
 
   async fn process_pending(&self, app_handle: &tauri::AppHandle) {
+    self.process_pending_posting_history(app_handle).await;
     self.process_pending_profiles(app_handle).await;
     self.process_pending_proxies(app_handle).await;
     self.process_pending_groups(app_handle).await;
@@ -362,6 +374,21 @@ impl SyncScheduler {
     self.process_pending_extensions(app_handle).await;
     self.process_pending_extension_groups(app_handle).await;
     self.process_pending_tombstones(app_handle).await;
+  }
+
+  async fn process_pending_posting_history(&self, app_handle: &tauri::AppHandle) {
+    if !self.pending_posting_history.swap(false, Ordering::SeqCst) {
+      return;
+    }
+    match SyncEngine::create_from_settings(app_handle).await {
+      Ok(engine) => {
+        if let Err(error) = engine.sync_posting_history().await {
+          log::error!("Failed to sync Marine posting history: {error}");
+          self.pending_posting_history.store(true, Ordering::SeqCst);
+        }
+      }
+      Err(error) => log::debug!("Posting history sync is not configured: {error}"),
+    }
   }
 
   async fn process_pending_profiles(&self, app_handle: &tauri::AppHandle) {

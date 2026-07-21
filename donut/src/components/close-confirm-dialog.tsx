@@ -14,7 +14,11 @@ import {
 } from "@/components/ui/dialog";
 import { RippleButton } from "./ui/ripple";
 
-export function CloseConfirmDialog() {
+export function CloseConfirmDialog({
+  hasUnsavedChanges = false,
+}: {
+  hasUnsavedChanges?: boolean;
+}) {
   const { t, i18n } = useTranslation();
   const [isOpen, setIsOpen] = useState(false);
 
@@ -57,6 +61,12 @@ export function CloseConfirmDialog() {
   };
 
   const handleQuit = async () => {
+    if (
+      hasUnsavedChanges &&
+      !window.confirm(t("marine.brandStudio.discardChanges"))
+    ) {
+      return;
+    }
     setIsOpen(false);
     try {
       await invoke("confirm_quit");

@@ -304,8 +304,14 @@ export class SyncService implements OnModuleInit {
     const key = this.scopeKey(ctx, dto.key);
     this.validateKeyAccess(ctx, key);
 
-    // Check profile limit for cloud users
-    if (ctx.mode === "cloud" && ctx.profileLimit > 0) {
+    // Profile quotas must never block unrelated config objects such as the
+    // Marine ledger or brand assets. Those objects share this generic upload
+    // endpoint but do not create browser profiles.
+    if (
+      ctx.mode === "cloud" &&
+      ctx.profileLimit > 0 &&
+      dto.key.startsWith("profiles/")
+    ) {
       await this.checkProfileLimit(ctx);
     }
 
@@ -462,8 +468,14 @@ export class SyncService implements OnModuleInit {
     dto: PresignUploadBatchRequestDto,
     ctx: UserContext,
   ): Promise<PresignUploadBatchResponseDto> {
-    // Check profile limit for cloud users
-    if (ctx.mode === "cloud" && ctx.profileLimit > 0) {
+    // Only profile uploads consume the profile quota. A mixed batch containing
+    // profile data still receives the same guard, while brand/history-only
+    // batches remain independent from the number of browser profiles.
+    if (
+      ctx.mode === "cloud" &&
+      ctx.profileLimit > 0 &&
+      dto.items.some((item) => item.key.startsWith("profiles/"))
+    ) {
       await this.checkProfileLimit(ctx);
     }
 
@@ -638,7 +650,14 @@ export class SyncService implements OnModuleInit {
     ctx: UserContext,
     pollIntervalMs = 5000,
   ): Observable<SubscribeEventDto> {
-    const basePrefixes = ["profiles/", "proxies/", "groups/", "tombstones/"];
+    const basePrefixes = [
+      "profiles/",
+      "proxies/",
+      "groups/",
+      "marine/brands/",
+      "marine/history/",
+      "tombstones/",
+    ];
     const scopes = this.scopesFor(ctx);
 
     // Per-connection state (not shared across subscribers).
@@ -701,7 +720,7 @@ export class SyncService implements OnModuleInit {
         }
 
         // Phase 2 — one LIST per scope (not per base prefix). Filter to the
-        // four base prefixes client-side. This is the cost we pay only when
+        // supported data prefixes client-side. This is the cost we pay only when
         // a manifest told us there's something new to look at.
         const currentState = new Map<string, string>();
         for (const scope of scopes) {
@@ -724,7 +743,7 @@ export class SyncService implements OnModuleInit {
                   ? fullKey.substring(scope.length)
                   : fullKey;
                 // Skip the manifest object itself + anything outside the
-                // four data prefixes.
+                // supported data prefixes.
                 if (relativeKey === MANIFEST_KEY) continue;
                 if (!basePrefixes.some((bp) => relativeKey.startsWith(bp))) {
                   continue;

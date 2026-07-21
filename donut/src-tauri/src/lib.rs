@@ -1320,6 +1320,122 @@ fn marine_list_posting_history() -> Result<Vec<marine::history::PostingRecord>, 
     })
 }
 
+fn marine_brand_error(error: marine::brand::BrandError) -> String {
+  use marine::brand::BrandError;
+  match error {
+    BrandError::Conflict { expected, actual } => serde_json::json!({
+      "code": "MARINE_BRAND_REVISION_CONFLICT",
+      "params": { "expected": expected.to_string(), "actual": actual.to_string() }
+    })
+    .to_string(),
+    BrandError::Invalid(field) => serde_json::json!({
+      "code": "MARINE_BRAND_INVALID",
+      "params": { "field": field }
+    })
+    .to_string(),
+    BrandError::Storage(detail) => {
+      log::error!("Marine brand storage failed: {detail}");
+      marine::err("MARINE_BRAND_STORAGE_FAILED")
+    }
+    other => marine::err(other.code()),
+  }
+}
+
+fn marine_brand_manager(
+) -> Result<std::sync::MutexGuard<'static, marine::brand::BrandManager>, String> {
+  marine::brand::BRAND_MANAGER.lock().map_err(|_| {
+    log::error!("Marine brand manager lock poisoned");
+    marine::err("INTERNAL_ERROR")
+  })
+}
+
+#[tauri::command]
+fn marine_list_brands() -> Result<Vec<marine::brand::BrandProfile>, String> {
+  marine_brand_manager()?.list().map_err(marine_brand_error)
+}
+
+#[tauri::command]
+fn marine_create_brand(name: String) -> Result<marine::brand::BrandProfile, String> {
+  let brand = marine_brand_manager()?
+    .create(name)
+    .map_err(marine_brand_error)?;
+  let _ = events::emit_empty("marine-brands-changed");
+  Ok(brand)
+}
+
+#[tauri::command]
+fn marine_save_brand(
+  brand: marine::brand::BrandProfile,
+  expected_revision: u64,
+) -> Result<marine::brand::BrandProfile, String> {
+  let brand = marine_brand_manager()?
+    .save(brand, expected_revision)
+    .map_err(marine_brand_error)?;
+  let _ = events::emit_empty("marine-brands-changed");
+  Ok(brand)
+}
+
+#[tauri::command]
+fn marine_delete_brand(brand_id: String, expected_revision: u64) -> Result<(), String> {
+  let bound_count = profile::ProfileManager::instance()
+    .list_profiles()
+    .map_err(|error| {
+      log::error!("Failed to inspect Marine brand bindings: {error}");
+      marine::err("INTERNAL_ERROR")
+    })?
+    .into_iter()
+    .filter(|profile| profile.brand_id.as_deref() == Some(brand_id.as_str()))
+    .count();
+  if bound_count > 0 {
+    return Err(
+      serde_json::json!({
+        "code": "MARINE_BRAND_IN_USE",
+        "params": { "count": bound_count.to_string() }
+      })
+      .to_string(),
+    );
+  }
+  marine_brand_manager()?
+    .delete(&brand_id, expected_revision)
+    .map_err(marine_brand_error)?;
+  let _ = events::emit_empty("marine-brands-changed");
+  Ok(())
+}
+
+#[tauri::command]
+fn marine_preview_brand(
+  brand: marine::brand::BrandProfile,
+  context: marine::brand::BrandPreviewContext,
+) -> Result<marine::brand::BrandPreview, String> {
+  marine_brand_manager()?
+    .compile(&brand, &context)
+    .map_err(marine_brand_error)
+}
+
+#[tauri::command]
+fn marine_bind_profile_brand(
+  profile_id: String,
+  brand_id: Option<String>,
+) -> Result<profile::BrowserProfile, String> {
+  let brand_id = brand_id
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty());
+  if let Some(id) = brand_id.as_deref() {
+    marine_brand_manager()?
+      .get(id)
+      .map_err(marine_brand_error)?;
+  }
+  if uuid::Uuid::parse_str(&profile_id).is_err() {
+    return Err(marine::err("INVALID_PROFILE_ID"));
+  }
+  profile::ProfileManager::instance()
+    .update_profile_brand(&profile_id, brand_id)
+    .map_err(|error| {
+      log::error!("Failed to bind Marine brand to profile: {error}");
+      marine::err("PROFILE_NOT_FOUND")
+    })
+}
+
 /// Update the tray menu labels with localized strings pushed from the frontend
 /// (which owns the active language). The item ids are unchanged so the existing
 /// menu-event handler keeps matching.
@@ -1391,8 +1507,13 @@ fn setup_system_tray(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::E
     .on_menu_event(|app_handle, event| match event.id().as_ref() {
       "tray_show" => show_main_window(app_handle),
       "tray_quit" => {
-        QUIT_CONFIRMED.store(true, Ordering::SeqCst);
-        app_handle.exit(0);
+        // Route tray quit through the same frontend confirmation as the
+        // window close button. This also lets the brand studio warn about an
+        // unsaved voice draft instead of losing it through a direct exit.
+        show_main_window(app_handle);
+        if let Err(error) = app_handle.emit("close-confirm-requested", ()) {
+          log::warn!("Failed to emit close-confirm-requested from tray: {error}");
+        }
       }
       _ => {}
     })
@@ -2270,6 +2391,9 @@ pub fn run() {
               {
                 log::warn!("Failed to check for missing entities: {}", e);
               }
+              if let Err(e) = engine.sync_posting_history().await {
+                log::warn!("Failed to sync Marine posting history: {}", e);
+              }
             }
             Err(e) => {
               log::warn!("Sync not configured, skipping missing profile check: {}", e);
@@ -2418,6 +2542,12 @@ pub fn run() {
       stop_api_server,
       get_api_server_status,
       marine_list_posting_history,
+      marine_list_brands,
+      marine_create_brand,
+      marine_save_brand,
+      marine_delete_brand,
+      marine_preview_brand,
+      marine_bind_profile_brand,
       get_all_traffic_snapshots,
       get_profile_traffic_snapshot,
       clear_all_traffic_stats,

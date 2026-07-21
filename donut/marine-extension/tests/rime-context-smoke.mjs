@@ -299,6 +299,28 @@ let delivery = await deliver({
 assert.equal(delivery.applied, true);
 assert.equal(transportCalls.length, 2, "a closed cold-start port must retry and require an ACK");
 
+transportSandbox.marineRimeTarget.active = { contextId: "ctx-reserved-before-grab" };
+transportSandbox.marineRimeTarget.revision = 2;
+delivery = await deliver({
+  op: "reserve",
+  contextId: "ctx-reserved-before-grab",
+  context: null,
+  revision: 2,
+  sourceId: "source-a",
+  retainWhenUnfocused: true,
+}, [{ ok: true }]);
+assert.equal(delivery.applied, true);
+assert.deepEqual(transportCalls[0], {
+  __marineRimeContext: true,
+  op: "reserve",
+  contextId: "ctx-reserved-before-grab",
+  context: null,
+  revision: 2,
+  sourceId: "source-a",
+  retainWhenUnfocused: true,
+  leaseRenewal: false,
+});
+
 transportSandbox.marineRimeTarget.active = {
   contextId: "ctx-retained-renewal",
   publishedRevision: 1,
@@ -390,6 +412,371 @@ delivery = await deliver({
 assert.equal(delivery.stale, true);
 assert.equal(transportCalls.length, 0, "an old DELETE may never remove the current target");
 
+const queuedSendStart = contentIsoSource.indexOf("function marineRimeSend(op");
+const queuedSendEnd = contentIsoSource.indexOf(
+  "async function marineRimeGrabContext",
+  queuedSendStart,
+);
+const queuedSendSource = contentIsoSource.slice(queuedSendStart, queuedSendEnd);
+vm.runInContext(`let marineRimeSendQueue = Promise.resolve();\n${queuedSendSource}\n` +
+  "globalThis.__marineQueuedSend = marineRimeSend;", transportSandbox, {
+  filename: "marine-extension/src/content-iso.js#serialized-send",
+});
+let releaseQueuedPut;
+transportCalls.length = 0;
+transportOutcomes = [
+  () => new Promise((resolve) => { releaseQueuedPut = resolve; }),
+  { ok: true },
+];
+transportSandbox.marineRimeTarget.active = { contextId: "ctx-queued-clear" };
+transportSandbox.marineRimeTarget.revision = 10;
+transportSandbox.marineRimeTarget.sourceId = "source-queued-clear";
+const queuedPut = transportSandbox.__marineQueuedSend(
+  "put",
+  "ctx-queued-clear",
+  { contextId: "ctx-queued-clear" },
+  10,
+);
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.equal(transportCalls.length, 1);
+assert.equal(transportCalls[0].op, "put");
+transportSandbox.marineRimeTarget.active = null;
+transportSandbox.marineRimeTarget.revision = 11;
+const queuedDelete = transportSandbox.__marineQueuedSend(
+  "delete",
+  "ctx-queued-clear",
+  null,
+  11,
+);
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.equal(
+  transportCalls.length,
+  1,
+  "content clear must queue behind the in-flight PUT instead of racing it",
+);
+releaseQueuedPut({ ok: true });
+const [queuedPutResult, queuedDeleteResult] = await Promise.all([
+  queuedPut,
+  queuedDelete,
+]);
+assert.equal(queuedPutResult.stale, true);
+assert.equal(queuedDeleteResult.applied, true);
+assert.deepEqual(
+  transportCalls.map((call) => ({ op: call.op, contextId: call.contextId })),
+  [
+    { op: "put", contextId: "ctx-queued-clear" },
+    { op: "delete", contextId: "ctx-queued-clear" },
+  ],
+  "once the old PUT ACKs, the queued DELETE must be delivered last so it cannot revive",
+);
+
+const lifecycleStart = contentIsoSource.indexOf(
+  "function marineRimePersistentTargetIsOpen",
+);
+const lifecycleEnd = contentIsoSource.indexOf(
+  "function marineRimeTryPendingReply",
+  lifecycleStart,
+);
+const lifecycleSource = contentIsoSource.slice(lifecycleStart, lifecycleEnd);
+const lifecycleSandbox = {
+  adapter: null,
+  cleared: null,
+  document: {},
+  location: {},
+  marineRimeTarget: { active: null, windowFocused: true, lifecycleTimer: null },
+  marineRimeSiteAdapter() { return lifecycleSandbox.adapter; },
+  marineVisible(element) { return element.visible !== false; },
+  marineRimeCommentId(element) { return element.currentId || ""; },
+  marineRimeCommentContainer(element) { return element.boundary || null; },
+  marineRimeEditorContextLabel(element) { return element.label || "回复 @Alice :"; },
+  marineRimeReplyPlaceholderAuthor(value) {
+    return String(value || "").replace(/^回复\s*@?/, "").replace(/\s*[:：]\s*$/, "").trim();
+  },
+  marineRimeNormalizeCommentIdentity(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
+  },
+  marineRimeIsReplyEditorPlaceholder(value) { return /^\s*回复(?:\s|@|$)/.test(value); },
+  marineRimeEditorBelongsTo() { return true; },
+  marineRimeDomTarget(element) {
+    return { id: element.currentId || "", authorName: element.authorName || "Alice" };
+  },
+  marineRimeClearPendingReply() {},
+  marineRimeSchedulePosition() {},
+  marineRimeReleaseDirectScope() {},
+  marineRimeClear(reason) {
+    lifecycleSandbox.cleared = reason;
+    lifecycleSandbox.marineRimeTarget.active = null;
+  },
+  clearTimeout,
+  setTimeout,
+};
+vm.createContext(lifecycleSandbox);
+vm.runInContext(`${lifecycleSource}\n` +
+  "globalThis.__marineRetainOrClear = marineRimeRetainOrClear;" +
+  "globalThis.__marineScheduleLifecycleCheck = marineRimeScheduleLifecycleCheck;",
+  lifecycleSandbox, {
+  filename: "marine-extension/src/content-iso.js#retained-lifecycle",
+});
+const liveElement = () => ({ isConnected: true, visible: true });
+const liveReply = () => ({
+  mode: "reply",
+  editor: liveElement(),
+  commentEl: Object.assign(liveElement(), { currentId: "42", authorName: "Alice" }),
+  target: { id: "42", authorName: "Alice" },
+});
+
+lifecycleSandbox.marineRimeTarget.active = liveReply();
+lifecycleSandbox.marineRimeTarget.windowFocused = false;
+assert.equal(lifecycleSandbox.__marineRetainOrClear("editor-blur"), true);
+assert.equal(lifecycleSandbox.cleared, null,
+  "a Bilibili/Zhihu target must survive editor focusout caused by application blur");
+
+lifecycleSandbox.marineRimeTarget.active = liveReply();
+lifecycleSandbox.marineRimeTarget.windowFocused = true;
+assert.equal(lifecycleSandbox.__marineRetainOrClear("editor-blur"), false);
+assert.equal(lifecycleSandbox.cleared, "editor-blur",
+  "the same target must still clear when focus moves elsewhere inside the page");
+
+lifecycleSandbox.cleared = null;
+lifecycleSandbox.adapter = { persistentTargetIsOpen() { return true; } };
+lifecycleSandbox.marineRimeTarget.active = liveReply();
+assert.equal(lifecycleSandbox.__marineRetainOrClear("editor-blur"), true);
+assert.equal(lifecycleSandbox.cleared, null,
+  "an adapter-confirmed shared reply target may survive an in-page editor blur");
+
+lifecycleSandbox.adapter = null;
+lifecycleSandbox.marineRimeTarget.windowFocused = false;
+const removedReply = liveReply();
+removedReply.commentEl.isConnected = false;
+lifecycleSandbox.marineRimeTarget.active = removedReply;
+assert.equal(lifecycleSandbox.__marineRetainOrClear("window-blur"), false);
+assert.equal(lifecycleSandbox.cleared, "window-blur",
+  "application blur must not retain a reply whose exact target disappeared");
+
+lifecycleSandbox.cleared = null;
+lifecycleSandbox.marineRimeTarget.windowFocused = false;
+const recycledReply = liveReply();
+recycledReply.commentEl.currentId = "43";
+lifecycleSandbox.marineRimeTarget.active = recycledReply;
+assert.equal(lifecycleSandbox.__marineRetainOrClear("window-blur"), false);
+assert.equal(lifecycleSandbox.cleared, "window-blur",
+  "a recycled comment node with a different id must revoke the old exact target");
+
+lifecycleSandbox.cleared = null;
+const retargetedEditorReply = liveReply();
+retargetedEditorReply.editor.label = "回复 @Bob :";
+lifecycleSandbox.marineRimeTarget.active = retargetedEditorReply;
+assert.equal(lifecycleSandbox.__marineRetainOrClear("window-blur"), false);
+assert.equal(lifecycleSandbox.cleared, "window-blur",
+  "a shared editor retargeted to another author must revoke the old reply");
+
+lifecycleSandbox.cleared = null;
+lifecycleSandbox.marineRimeTarget.active = {
+  mode: "direct",
+  editor: liveElement(),
+  directScope: null,
+};
+assert.equal(lifecycleSandbox.__marineRetainOrClear("window-blur"), true);
+assert.equal(lifecycleSandbox.cleared, null,
+  "direct actions must share the same cross-application lifetime contract");
+
+lifecycleSandbox.__marineScheduleLifecycleCheck();
+const firstLifecycleTimer = lifecycleSandbox.marineRimeTarget.lifecycleTimer;
+lifecycleSandbox.__marineScheduleLifecycleCheck();
+assert.equal(
+  lifecycleSandbox.marineRimeTarget.lifecycleTimer,
+  firstLifecycleTimer,
+  "continuous page mutations must not starve the target-liveness check",
+);
+clearTimeout(firstLifecycleTimer);
+lifecycleSandbox.marineRimeTarget.lifecycleTimer = null;
+
+const activateStart = contentIsoSource.indexOf(
+  "function marineRimeBeginPublish",
+);
+const activateEnd = contentIsoSource.indexOf(
+  "async function marineRimeRenew",
+  activateStart,
+);
+const activateSource = contentIsoSource.slice(activateStart, activateEnd);
+let foregroundRenewals = 0;
+const foregroundEditor = {};
+const foregroundWireCalls = [];
+let foregroundActivationSerial = 0;
+let releaseForegroundPublish;
+let foregroundPublishGate;
+let foregroundRefreshCallback = null;
+function resetForegroundPublishGate() {
+  foregroundPublishGate = new Promise((resolve) => {
+    releaseForegroundPublish = resolve;
+  });
+}
+resetForegroundPublishGate();
+const foregroundSandbox = {
+  clearTimeout,
+  Date,
+  document: { hidden: false },
+  marineRimeTarget: {
+    active: {
+      contextId: "ctx-old-activation",
+      semanticKey: "same-editor",
+      editor: foregroundEditor,
+      publishedAt: Date.now(),
+    },
+    foregroundReassertRequired: false,
+    foregroundReassertContextId: null,
+    revision: 1,
+    windowFocused: true,
+    grabCache: null,
+    refreshTimer: null,
+  },
+  marineRimeTryPendingReply() {},
+  marineRimeClassify(editor) {
+    return { editor, commentEl: {}, target: {}, directScope: null };
+  },
+  marineRimeSemanticKey() { return "same-editor"; },
+  marineRimeSchedulePosition() {},
+  marineRimeRenew() {
+    foregroundRenewals += 1;
+    return Promise.resolve();
+  },
+  marineRimePublish(info, revision) {
+    foregroundWireCalls.push({ op: "put", contextId: info.contextId, revision });
+    return foregroundPublishGate.then(() => {
+      info.publishedRevision = revision;
+      info.publishedAt = Date.now();
+      if (foregroundSandbox.marineRimeTarget.foregroundReassertContextId === info.contextId) {
+        foregroundSandbox.marineRimeTarget.foregroundReassertRequired = false;
+        foregroundSandbox.marineRimeTarget.foregroundReassertContextId = null;
+      }
+    });
+  },
+  marineRimeClear() {},
+  marineRimeSend(op, contextId, context, revision) {
+    foregroundWireCalls.push({ op, contextId, revision });
+    return Promise.resolve({ applied: true });
+  },
+  marineRimeContextId() {
+    foregroundActivationSerial += 1;
+    return `ctx-new-activation-${foregroundActivationSerial}`;
+  },
+  marineRimeRender() {},
+  setTimeout(callback, delay) {
+    if (delay === 700) {
+      foregroundRefreshCallback = callback;
+      return 700;
+    }
+    return setTimeout(callback, delay);
+  },
+};
+vm.createContext(foregroundSandbox);
+vm.runInContext(`${activateSource}\n` +
+  "globalThis.__marineMarkForegroundLeaseUncertain = marineRimeMarkForegroundLeaseUncertain;" +
+  "globalThis.__marineActivate = marineRimeActivate;" +
+  "globalThis.__marineContextDataChanged = marineRimeContextDataChanged;", foregroundSandbox, {
+  filename: "marine-extension/src/content-iso.js#foreground-reassert",
+});
+foregroundSandbox.__marineMarkForegroundLeaseUncertain();
+assert.equal(foregroundSandbox.marineRimeTarget.foregroundReassertRequired, true);
+foregroundSandbox.marineRimeTarget.windowFocused = false;
+foregroundSandbox.__marineActivate(foregroundEditor);
+assert.equal(foregroundWireCalls.length, 0);
+assert.equal(
+  foregroundSandbox.marineRimeTarget.active.contextId,
+  "ctx-old-activation",
+  "delayed refreshes during window.blur must leave the Rime-owned lease untouched",
+);
+foregroundSandbox.marineRimeTarget.windowFocused = true;
+foregroundSandbox.__marineActivate(foregroundEditor);
+assert.equal(foregroundSandbox.marineRimeTarget.active.contextId, "ctx-new-activation-1");
+assert.equal(foregroundSandbox.marineRimeTarget.revision, 3);
+assert.equal(foregroundSandbox.marineRimeTarget.foregroundReassertRequired, true);
+assert.equal(
+  foregroundSandbox.marineRimeTarget.foregroundReassertContextId,
+  "ctx-new-activation-1",
+);
+foregroundSandbox.__marineActivate(foregroundEditor);
+assert.deepEqual(
+  foregroundWireCalls,
+  [
+    { op: "delete", contextId: "ctx-old-activation", revision: 2 },
+    { op: "reserve", contextId: "ctx-new-activation-1", revision: 3 },
+    { op: "put", contextId: "ctx-new-activation-1", revision: 3 },
+  ],
+  "duplicate focus/visible events must share one fresh reserve + full PUT activation",
+);
+assert.equal(foregroundSandbox.marineRimeTarget.revision, 3);
+releaseForegroundPublish();
+await foregroundPublishGate;
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.equal(foregroundSandbox.marineRimeTarget.foregroundReassertRequired, false);
+assert.equal(foregroundSandbox.marineRimeTarget.foregroundReassertContextId, null);
+const foregroundWireCount = foregroundWireCalls.length;
+foregroundSandbox.__marineActivate(foregroundEditor);
+assert.equal(
+  foregroundWireCalls.length,
+  foregroundWireCount,
+  "an ordinary duplicate focus event must keep the 30-second publish suppression",
+);
+assert.equal(foregroundRenewals, 0);
+
+resetForegroundPublishGate();
+foregroundWireCalls.length = 0;
+const refreshedActive = foregroundSandbox.marineRimeTarget.active;
+refreshedActive.publishedAt = 0;
+refreshedActive.publishedRevision = 0;
+refreshedActive.activationRevision = 3;
+refreshedActive.publishInFlightRevision = 0;
+refreshedActive.publishInFlightPromise = null;
+foregroundSandbox.marineRimeTarget.revision = 3;
+foregroundSandbox.__marineContextDataChanged();
+assert.equal(typeof foregroundRefreshCallback, "function");
+foregroundRefreshCallback();
+assert.equal(foregroundSandbox.marineRimeTarget.revision, 4);
+assert.equal(refreshedActive.activationRevision, 4);
+foregroundSandbox.__marineActivate(foregroundEditor);
+assert.equal(
+  foregroundSandbox.marineRimeTarget.revision,
+  4,
+  "an unpublished activation must reuse the latest data-refresh revision",
+);
+assert.deepEqual(
+  foregroundWireCalls,
+  [
+    { op: "reserve", contextId: "ctx-new-activation-1", revision: 4 },
+    { op: "put", contextId: "ctx-new-activation-1", revision: 4 },
+  ],
+  "data refresh plus duplicate activation must keep one in-flight full PUT revision",
+);
+releaseForegroundPublish();
+await foregroundPublishGate;
+await new Promise((resolve) => setTimeout(resolve, 0));
+const visibilityStart = contentIsoSource.indexOf(
+  "document.addEventListener('visibilitychange'",
+);
+const visibilityEnd = contentIsoSource.indexOf(
+  "window.addEventListener('pagehide'",
+  visibilityStart,
+);
+assert.match(
+  contentIsoSource.slice(visibilityStart, visibilityEnd),
+  /if \(document\.hidden\) \{\s*marineRimeMarkForegroundLeaseUncertain\(\)/,
+  "a real hidden-document transition must arm foreground lease reassertion",
+);
+const windowBlurStart = contentIsoSource.indexOf(
+  "window.addEventListener('blur'",
+);
+const windowBlurEnd = contentIsoSource.indexOf(
+  "window.addEventListener('focus'",
+  windowBlurStart,
+);
+assert.equal(foregroundSandbox.document.hidden, false);
+assert.match(
+  contentIsoSource.slice(windowBlurStart, windowBlurEnd),
+  /windowFocused = false;\s*marineRimeMarkForegroundLeaseUncertain\(\);\s*marineRimeRetainOrClear\('window-blur'\)/,
+  "switching between visible Chrome windows must mark authority uncertain without document.hidden",
+);
+
 const publishStart = contentIsoSource.indexOf("async function marineRimePublish");
 const publishEnd = contentIsoSource.indexOf("function marineRimeContextDataChanged", publishStart);
 const publishSource = contentIsoSource.slice(publishStart, publishEnd);
@@ -399,11 +786,51 @@ assert.ok(publishSource.indexOf("await marineRimeSend('put'") <
   publishSource.indexOf("published.publishedAt = Date.now()"));
 assert.ok(publishSource.indexOf("published.publishedRevision = revision") <
   publishSource.indexOf("published.publishedAt = Date.now()"));
+assert.match(
+  publishSource,
+  /foregroundReassertContextId === info\.contextId[\s\S]*foregroundReassertRequired = false;[\s\S]*foregroundReassertContextId = null;/,
+  "only a successful fresh full PUT may clear foreground reassertion state",
+);
+const beginPublishStart = contentIsoSource.indexOf("function marineRimeBeginPublish");
+const beginPublishEnd = contentIsoSource.indexOf(
+  "function marineRimeContextDataChanged",
+  beginPublishStart,
+);
+const beginPublishSource = contentIsoSource.slice(beginPublishStart, beginPublishEnd);
+assert.ok(beginPublishStart >= 0 && beginPublishEnd > beginPublishStart);
+assert.ok(
+  beginPublishSource.indexOf("marineRimeSend('reserve'") <
+    beginPublishSource.indexOf("marineRimePublish(info, revision)"),
+  "the worker must receive an exact reservation before the slow context grab",
+);
+const sendStart = contentIsoSource.indexOf("function marineRimeSend(op");
+const sendEnd = contentIsoSource.indexOf("async function marineRimeGrabContext", sendStart);
+const sendSource = contentIsoSource.slice(sendStart, sendEnd);
+assert.match(
+  sendSource,
+  /retainWhenUnfocused:\s*\(op === 'put' \|\| op === 'reserve'\) &&\s*!!active && active\.contextId === contextId/,
+  "both direct and reply PUTs must advertise cross-application retention",
+);
+assert.doesNotMatch(
+  sendSource,
+  /retainWhenUnfocused:[\s\S]*marineRimePersistentTargetIsOpen/,
+  "cross-application retention must not remain limited to XHS persistent editors",
+);
 const renewStart = contentIsoSource.indexOf("async function marineRimeRenew");
 const renewEnd = contentIsoSource.indexOf("function marineRimeClear", renewStart);
 const renewSource = contentIsoSource.slice(renewStart, renewEnd);
 assert.match(renewSource, /Number\(active\.publishedRevision\)/);
 assert.match(renewSource, /\{ leaseRenewal: true \}/);
+assert.match(
+  renewSource,
+  /marineRimeTarget\.windowFocused === false/,
+  "an exact acknowledged lease must remain renewable while Rime owns application focus",
+);
+assert.doesNotMatch(
+  renewSource,
+  /publishedContext \|\| document\.hidden/,
+  "a minimized retained target must not stop renewing solely because the document is hidden",
+);
 assert.doesNotMatch(renewSource, /\+\+marineRimeTarget\.revision/);
 assert.doesNotMatch(transportSource, /sendMessage\([^)]*,\s*function/);
 

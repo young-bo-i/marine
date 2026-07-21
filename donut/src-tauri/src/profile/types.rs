@@ -64,9 +64,8 @@ pub struct BrowserProfile {
   pub ephemeral: bool,
   #[serde(default)]
   pub extension_group_id: Option<String>,
-  /// Marine: optional id of the 话术/persona bound to this profile. Inert
-  /// placeholder — the extension currently ships a built-in skill; kept for
-  /// forward compatibility, `None` for profiles not used for comment-marketing.
+  /// Marine brand voice bound to this profile. `None` keeps the built-in
+  /// Scholay compatibility default until the user chooses a brand explicitly.
   #[serde(default)]
   pub brand_id: Option<String>,
   #[serde(default)]

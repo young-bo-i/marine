@@ -270,7 +270,7 @@ mod tests {
       serde_json::from_str(include_str!("../../../marine-extension/manifest.json")).unwrap();
     let version = manifest["version"].as_str().unwrap();
     let worker = manifest["background"]["service_worker"].as_str().unwrap();
-    assert_eq!(version, "0.1.5");
+    assert_eq!(version, "0.1.8");
     assert_eq!(worker, format!("src/sw-entry-{version}.js"));
     let entry = fs::read_to_string(
       Path::new(env!("CARGO_MANIFEST_DIR"))

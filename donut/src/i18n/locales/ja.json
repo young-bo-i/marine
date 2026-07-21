@@ -1882,7 +1882,13 @@
     "marineGenerateFailed": "生成に失敗しました。{{detail}}",
     "marineGenerateTimeout": "生成がタイムアウトしました。",
     "marineFillFailed": "返信欄に入力できませんでした。{{detail}}",
-    "marineMarkPostedFailed": "投稿済みにできませんでした。{{detail}}"
+    "marineMarkPostedFailed": "投稿済みにできませんでした。{{detail}}",
+    "marineBrandNotFound": "ブランドが見つかりません。",
+    "marineBrandBuiltIn": "組み込みブランドは削除できません。",
+    "marineBrandRevisionConflict": "このブランドは別の場所で更新されました。再読み込みしてもう一度お試しください。",
+    "marineBrandInvalid": "ブランド設定が無効です。",
+    "marineBrandStorageFailed": "ブランド設定を保存できませんでした。",
+    "marineBrandInUse": "このブランドはまだ {{count}} 件のプロファイルに紐づいています。"
   },
   "rail": {
     "profiles": "プロファイル",
@@ -1900,7 +1906,7 @@
     "network": "ネットワーク",
     "integrations": "連携",
     "account": "アカウント",
-    "marine": "コメント台帳"
+    "marine": "Marine"
   },
   "pageTitle": {
     "proxies": "ネットワーク",
@@ -1912,7 +1918,7 @@
     "account": "アカウント",
     "import": "プロファイルをインポート",
     "shortcuts": "キーボードショートカット",
-    "marine": "コメント台帳"
+    "marine": "Marine"
   },
   "encryption": {
     "required": {
@@ -2102,6 +2108,166 @@
     "acknowledge": "了解しました"
   },
   "marine": {
+    "workspace": {
+      "tabsLabel": "Marine ワークスペース",
+      "tabs": {
+        "brands": "ブランドスタジオ",
+        "history": "コメント台帳"
+      }
+    },
+    "brandStudio": {
+      "title": "ブランドスタジオ",
+      "description": "ブランドの位置づけ、話し方、ルール、シナリオ例、プロファイル割り当てを一元管理します。",
+      "loading": "ブランドを読み込み中…",
+      "loadFailed": "ブランドを読み込めません",
+      "loadFailedDescription": "ブランドデータを一時的に利用できません。Marine バックエンドの準備後に再試行してください。",
+      "brandList": "ブランド",
+      "searchLabel": "ブランドを検索",
+      "searchPlaceholder": "ブランドを検索",
+      "newNameLabel": "新しいブランド名",
+      "newNamePlaceholder": "新しいブランド名",
+      "create": "ブランドを作成",
+      "empty": "ブランドがありません。上で最初のブランドを作成してください。",
+      "emptySearch": "一致するブランドがありません。",
+      "builtIn": "組み込み",
+      "profileCount": "{{count}} プロファイル",
+      "revision": "リビジョン {{revision}}",
+      "unsaved": "未保存の変更",
+      "discardChanges": "このブランドの未保存の変更を破棄しますか？",
+      "sections": {
+        "identity": "ブランドと製品",
+        "identityDescription": "ブランドの立場、対象者、信頼して伝えられる内容を定義します。",
+        "tone": "声とトーン",
+        "toneDescription": "抽象的な文体ガイドを再利用可能な生成設定にします。",
+        "rules": "すること・しないこと",
+        "rulesDescription": "生成境界を明確にするため、1 行に 1 つのルールを入力します。",
+        "examples": "シナリオ例",
+        "examplesDescription": "プラットフォーム、返信形式、キーワードで関連例を振り分けます。",
+        "bindings": "プロファイル割り当て",
+        "bindingsDescription": "このブランドを既定で使うブラウザプロファイルを選択します。"
+      },
+      "fields": {
+        "positioning": "ポジショニング",
+        "audience": "対象ユーザー"
+      },
+      "placeholders": {
+        "positioning": "ブランドの役割と違い",
+        "audience": "このブランドが語りかける相手",
+        "persona": "人格、視点、語彙、物語のスタイル",
+        "product": "製品、利点、根拠、リンク、禁止事項",
+        "commentStyle": "コメントの口調と自然なブランド紹介方法",
+        "rules": "1 行に 1 つのルール"
+      },
+      "tone": {
+        "warmth": "親しみやすさ",
+        "expertise": "専門性",
+        "wit": "機知",
+        "directness": "率直さ",
+        "emoji": "絵文字の使用",
+        "length": "返信の長さ"
+      },
+      "emoji": {
+        "none": "なし",
+        "light": "少なめ",
+        "moderate": "普通",
+        "rich": "多め"
+      },
+      "length": {
+        "short": "短い",
+        "medium": "標準",
+        "long": "長い"
+      },
+      "languages": {
+        "zh_CN": "中国語",
+        "en": "英語",
+        "ja": "日本語",
+        "ko": "韓国語"
+      },
+      "platforms": {
+        "all": "すべてのプラットフォーム",
+        "bilibili": "Bilibili",
+        "xiaohongshu": "小紅書",
+        "zhihu": "知乎",
+        "douyin": "Douyin"
+      },
+      "kinds": {
+        "both": "直接コメントと返信",
+        "direct": "直接コメント",
+        "reply": "返信"
+      },
+      "examples": {
+        "add": "例を追加",
+        "delete": "例を削除",
+        "empty": "シナリオ例はまだありません。",
+        "enabled": "有効",
+        "untitled": "無題の例",
+        "title": "シナリオ名",
+        "titlePlaceholder": "例：投稿拒否と修正",
+        "keywords": "振り分けキーワード",
+        "keywordsPlaceholder": "キーワードをカンマで区切る",
+        "platform": "プラットフォーム",
+        "kind": "コメント形式",
+        "text": "例文",
+        "textPlaceholder": "このシナリオの基準となる例文"
+      },
+      "bindings": {
+        "searchLabel": "プロファイルを検索",
+        "searchPlaceholder": "プロファイル、メモ、タグを検索",
+        "empty": "一致するプロファイルがありません。",
+        "boundToCurrent": "このブランドを使用中",
+        "boundToOther": "現在 {{name}} を使用中",
+        "usesDefault": "既定の {{name}} ボイスを使用",
+        "confirmReassign": "{{profile}} は現在 {{brand}} を使用しています。このブランドに変更しますか？"
+      },
+      "preview": {
+        "title": "リアルタイム振り分けプレビュー",
+        "description": "Marine が Rime に渡す例とコンパイル済み Skill を確認します。",
+        "saveFirst": "プレビューには未保存の下書きが含まれます。結果を確認したら保存してください。",
+        "platform": "プラットフォーム",
+        "mode": "コメント形式",
+        "pageTitle": "ページタイトル",
+        "pageTitlePlaceholder": "ページタイトルを貼り付けるか説明する",
+        "targetSummary": "対象の要約",
+        "targetSummaryPlaceholder": "投稿または対象コメントの要点",
+        "sourceText": "元のテキスト",
+        "sourceTextPlaceholder": "振り分けテスト用の代表的な本文を貼り付ける",
+        "selectedExamples": "選択された例",
+        "loading": "プレビューを更新中…",
+        "failed": "プレビューに失敗しました。保存済みブランドを確認して再試行してください。",
+        "empty": "背景情報を入力して振り分けを確認してください。",
+        "noExamples": "この背景に一致する例はありません。",
+        "skill": "コンパイル済み Skill"
+      },
+      "sync": {
+        "enabled": "クラウド同期オン",
+        "disabled": "ローカルのみ",
+        "lastSync": "最終同期 {{time}}"
+      },
+      "delete": {
+        "title": "ブランドを削除",
+        "description": "{{name}} を削除しますか？この操作は元に戻せません。",
+        "inUse": "削除する前にすべてのプロファイル割り当てを解除してください。",
+        "builtIn": "組み込みブランドは削除できません。"
+      },
+      "noSelection": {
+        "title": "ブランドを選択または作成",
+        "description": "一覧からブランドを選び、情報、例、プロファイル割り当てを編集します。"
+      },
+      "toasts": {
+        "loadFailed": "Marine ブランドを読み込めません",
+        "created": "ブランドを作成しました",
+        "createFailed": "ブランドを作成できません",
+        "saved": "ブランドを保存しました",
+        "saveFailed": "ブランドを保存できません",
+        "conflict": "別のデバイスでブランドが変更されました",
+        "conflictDescription": "最新リビジョンを読み込み、変更をもう一度適用してください。",
+        "deleted": "ブランドを削除しました",
+        "deleteFailed": "ブランドを削除できません",
+        "brandInUse": "削除する前にすべてのプロファイル割り当てを解除してください",
+        "bindingSaved": "プロファイル割り当てを更新しました",
+        "bindingFailed": "プロファイル割り当てを更新できません"
+      }
+    },
     "title": "Marine",
     "description": "実行中のプロファイルのアクティブなページから字幕と本文を抽出します。",
     "noRunningProfiles": "実行中の Wayfern または Camoufox プロファイルがありません。先に起動してください。",

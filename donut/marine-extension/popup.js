@@ -285,10 +285,12 @@ async function loadSampleStatus() {
   try { o = await chrome.storage.local.get(['marineCustomSampleName', 'marineCustomSampleMd']); } catch (e) {}
   if (o && o.marineCustomSampleMd) {
     const kb = (o.marineCustomSampleMd.length / 1024).toFixed(1);
-    if (st) st.textContent = '已导入补充范文：' + (o.marineCustomSampleName || 'custom.md') + '（' + kb + 'KB，作为原版母稿之后的次级参照）';
+    if (st) st.textContent = '已导入兼容范文：' + (o.marineCustomSampleName || 'custom.md') + '（' + kb + 'KB；仅用于旧版 Marine / 轻量开发桥）';
     if (clr) clr.classList.remove('hidden');
   } else {
-    if (st) st.textContent = '未导入补充范文（当前只用原版母稿）。';
+    if (st) st.textContent = effectiveConfig.profileId
+      ? '当前 Profile 的品牌与范例由 Marine 客户端品牌工作台管理。'
+      : '未导入兼容范文（轻量开发桥当前只用内置母稿）。';
     if (clr) clr.classList.add('hidden');
   }
 }

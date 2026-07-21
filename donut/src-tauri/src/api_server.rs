@@ -48,6 +48,7 @@ pub struct ApiProfile {
   pub is_running: bool,
   pub proxy_bypass_rules: Vec<String>,
   pub vpn_id: Option<String>,
+  pub brand_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -112,6 +113,7 @@ pub struct UpdateProfileRequest {
   pub proxy_bypass_rules: Option<Vec<String>>,
   /// One of "Disabled", "Regular", "Encrypted".
   pub sync_mode: Option<String>,
+  pub brand_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -647,6 +649,126 @@ fn resolve_marine_identity(profile_id: &str) -> Result<MarineIdentity, (StatusCo
     })
 }
 
+fn available_marine_brand(
+  requested_brand_id: Option<String>,
+) -> Result<crate::marine::brand::BrandProfile, (StatusCode, String)> {
+  let requested_brand_id = requested_brand_id
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.trim().is_empty())
+    .unwrap_or_else(|| crate::marine::brand::BUILTIN_BRAND_ID.to_string());
+  let manager = crate::marine::brand::BRAND_MANAGER.lock().map_err(|_| {
+    (
+      StatusCode::INTERNAL_SERVER_ERROR,
+      crate::marine::err("MARINE_BRAND_STORAGE_FAILED"),
+    )
+  })?;
+  match manager.get(&requested_brand_id) {
+    Ok(brand) => Ok(brand),
+    Err(crate::marine::brand::BrandError::NotFound)
+      if requested_brand_id != crate::marine::brand::BUILTIN_BRAND_ID =>
+    {
+      // Profile metadata can arrive before brand transport on another device.
+      // Keep Rime usable and record the voice actually used instead of leaving
+      // a dangling binding capable of disabling generation.
+      log::warn!(
+        "Marine brand {requested_brand_id} is unavailable locally; using the built-in fallback"
+      );
+      manager
+        .get(crate::marine::brand::BUILTIN_BRAND_ID)
+        .map_err(|error| (StatusCode::CONFLICT, crate::marine::err(error.code())))
+    }
+    Err(error) => Err((StatusCode::CONFLICT, crate::marine::err(error.code()))),
+  }
+}
+
+fn canonical_marine_brand_id(profile_id: &str) -> Result<String, (StatusCode, String)> {
+  let parsed_id =
+    uuid::Uuid::parse_str(profile_id).map_err(|_| history_invalid("profile_id must be a UUID"))?;
+  let profile = ProfileManager::instance()
+    .list_profiles()
+    .map_err(history_storage_error)?
+    .into_iter()
+    .find(|profile| profile.id == parsed_id)
+    .ok_or_else(|| {
+      history_api_error(
+        StatusCode::NOT_FOUND,
+        "MARINE_HISTORY_PROFILE_NOT_FOUND",
+        "Marine identity not found",
+      )
+    })?;
+  Ok(available_marine_brand(profile.brand_id)?.id)
+}
+
+fn selected_rime_source_text(payload: &serde_json::Value) -> String {
+  for (section, field) in [
+    ("subtitle", "text"),
+    ("comments", "agentMd"),
+    ("article", "markdown"),
+  ] {
+    if let Some(value) = payload
+      .get(section)
+      .and_then(|value| value.get(field))
+      .and_then(serde_json::Value::as_str)
+      .filter(|value| !value.trim().is_empty())
+    {
+      return value.to_string();
+    }
+  }
+  String::new()
+}
+
+fn freeze_profile_brand(mut context: RimeContext) -> Result<RimeContext, (StatusCode, String)> {
+  let profile_id = context.profile_id.trim();
+  if profile_id.is_empty() {
+    // Lightweight bridge and legacy extension fallback: their bundled skill
+    // remains authoritative because no Marine profile identity is available.
+    return Ok(context);
+  }
+  let parsed_id = uuid::Uuid::parse_str(profile_id).map_err(|_| {
+    (
+      StatusCode::BAD_REQUEST,
+      crate::marine::err("INVALID_PROFILE_ID"),
+    )
+  })?;
+  let profile = ProfileManager::instance()
+    .list_profiles()
+    .map_err(history_storage_error)?
+    .into_iter()
+    .find(|profile| profile.id == parsed_id)
+    .ok_or_else(|| {
+      (
+        StatusCode::NOT_FOUND,
+        crate::marine::err("PROFILE_NOT_FOUND"),
+      )
+    })?;
+  let brand = available_marine_brand(profile.brand_id)?;
+  let preview_context = crate::marine::brand::BrandPreviewContext {
+    platform: context.platform.clone(),
+    title: context.title.clone(),
+    target_summary: context.target_summary.clone(),
+    mode: match context.mode {
+      RimeContextMode::Direct => "direct",
+      RimeContextMode::Reply => "reply",
+    }
+    .into(),
+    source_text: selected_rime_source_text(&context.payload),
+  };
+  let preview = crate::marine::brand::BRAND_MANAGER
+    .lock()
+    .map_err(|_| {
+      (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        crate::marine::err("MARINE_BRAND_STORAGE_FAILED"),
+      )
+    })?
+    .compile(&brand, &preview_context)
+    .map_err(|error| (StatusCode::BAD_REQUEST, crate::marine::err(error.code())))?;
+  context.brand_id = preview.brand_id;
+  context.brand_revision = preview.revision;
+  context.skill = preview.skill;
+  Ok(context)
+}
+
 fn manual_history_record(
   request: MarineHistoryAppendRequest,
   identity: &MarineIdentity,
@@ -891,9 +1013,10 @@ async fn marine_get_history(
 )]
 async fn marine_append_history(
   State(_state): State<ApiServerState>,
-  Json(req): Json<MarineHistoryAppendRequest>,
+  Json(mut req): Json<MarineHistoryAppendRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
   let identity = resolve_marine_identity(&req.profile_id)?;
+  req.brand_id = canonical_marine_brand_id(&req.profile_id)?;
   let record = manual_history_record(req, &identity, crate::proxy_manager::now_secs())
     .map_err(history_invalid)?;
   HISTORY_MANAGER
@@ -901,6 +1024,9 @@ async fn marine_append_history(
     .map_err(|_| history_storage_error("history manager lock poisoned"))?
     .append(record)
     .map_err(history_manager_error)?;
+  if let Some(scheduler) = crate::sync::get_global_scheduler() {
+    scheduler.queue_posting_history_sync();
+  }
   Ok(StatusCode::OK)
 }
 
@@ -911,9 +1037,10 @@ async fn marine_append_history(
 )]
 async fn marine_append_published_history(
   State(_state): State<ApiServerState>,
-  Json(req): Json<MarinePublishedHistoryRequest>,
+  Json(mut req): Json<MarinePublishedHistoryRequest>,
 ) -> Result<Json<PostingRecord>, (StatusCode, String)> {
   let identity = resolve_marine_identity(&req.profile_id)?;
+  req.brand_id = canonical_marine_brand_id(&req.profile_id)?;
   let record = published_history_record(req, &identity, crate::proxy_manager::now_secs())
     .map_err(history_invalid)?;
   let outcome = HISTORY_MANAGER
@@ -921,6 +1048,9 @@ async fn marine_append_published_history(
     .map_err(|_| history_storage_error("history manager lock poisoned"))?
     .append(record)
     .map_err(history_manager_error)?;
+  if let Some(scheduler) = crate::sync::get_global_scheduler() {
+    scheduler.queue_posting_history_sync();
+  }
   Ok(Json(outcome.record().clone()))
 }
 
@@ -965,6 +1095,7 @@ async fn marine_put_rime_context(
   Extension(store): Extension<RimeContextStore>,
   Json(context): Json<RimeContext>,
 ) -> Result<Json<RimeStatus>, (StatusCode, String)> {
+  let context = freeze_profile_brand(context)?;
   store
     .set(context, rime_now_secs())
     .map(Json)
@@ -1518,6 +1649,7 @@ async fn get_profiles() -> Result<Json<ApiProfilesResponse>, StatusCode> {
           is_running: profile.process_id.is_some(), // Simple check based on process_id
           proxy_bypass_rules: profile.proxy_bypass_rules.clone(),
           vpn_id: profile.vpn_id.clone(),
+          brand_id: profile.brand_id.clone(),
         })
         .collect();
 
@@ -1572,6 +1704,7 @@ async fn get_profile(
             is_running: profile.process_id.is_some(), // Simple check based on process_id
             proxy_bypass_rules: profile.proxy_bypass_rules.clone(),
             vpn_id: profile.vpn_id.clone(),
+            brand_id: profile.brand_id.clone(),
           },
         }))
       } else {
@@ -1746,6 +1879,7 @@ async fn create_profile(
           is_running: false,
           proxy_bypass_rules: profile.proxy_bypass_rules,
           vpn_id: profile.vpn_id,
+          brand_id: profile.brand_id,
         },
       }))
     }
@@ -1915,6 +2049,27 @@ async fn update_profile(
       .update_profile_proxy_bypass_rules(&state.app_handle, &id, proxy_bypass_rules)
       .is_err()
     {
+      return Err(StatusCode::BAD_REQUEST);
+    }
+  }
+
+  if let Some(brand_id) = request.brand_id {
+    let brand_id = if brand_id.trim().is_empty() {
+      None
+    } else {
+      Some(brand_id.trim().to_string())
+    };
+    if let Some(value) = brand_id.as_deref() {
+      let available = crate::marine::brand::BRAND_MANAGER
+        .lock()
+        .ok()
+        .and_then(|manager| manager.get(value).ok())
+        .is_some();
+      if !available {
+        return Err(StatusCode::BAD_REQUEST);
+      }
+    }
+    if profile_manager.update_profile_brand(&id, brand_id).is_err() {
       return Err(StatusCode::BAD_REQUEST);
     }
   }
@@ -3223,6 +3378,14 @@ mod tests {
     }
   }
 
+  #[test]
+  fn unavailable_synced_brand_falls_back_without_disabling_rime() {
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = crate::app_dirs::set_test_data_dir(temp.path().to_path_buf());
+    let brand = available_marine_brand(Some(uuid::Uuid::new_v4().to_string())).unwrap();
+    assert_eq!(brand.id, crate::marine::brand::BUILTIN_BRAND_ID);
+  }
+
   fn test_published_history_request() -> MarinePublishedHistoryRequest {
     MarinePublishedHistoryRequest {
       schema_version: 1,
@@ -3321,6 +3484,9 @@ mod tests {
   fn rime_test_context(context_id: &str) -> RimeContext {
     RimeContext {
       context_id: context_id.into(),
+      profile_id: String::new(),
+      brand_id: String::new(),
+      brand_revision: 0,
       mode: RimeContextMode::Direct,
       action_id: crate::marine::rime::DIRECT_ACTION_ID.into(),
       label: "Marine · 直评".into(),

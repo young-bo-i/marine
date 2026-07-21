@@ -134,6 +134,11 @@ pub fn history_dir() -> PathBuf {
   data_dir().join("history")
 }
 
+/// Marine brand voice definitions and routed examples.
+pub fn brands_dir() -> PathBuf {
+  data_dir().join("brands")
+}
+
 pub fn dns_blocklist_dir() -> PathBuf {
   cache_dir().join("dns_blocklists")
 }

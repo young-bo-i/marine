@@ -316,7 +316,11 @@
     try { return CSS.escape(String(s)); } catch (e) { return String(s).replace(/["\\]/g, '\\$&'); }
   }
   function marineTextOf(el) {
-    try { return (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim(); }
+    try {
+      return (el.innerText || el.textContent || '')
+        .replace(/[\u200b-\u200d\u2060\ufeff]/g, '')
+        .replace(/\s+/g, ' ').trim();
+    }
     catch (e) { return ''; }
   }
   function marineVisible(el) {
@@ -586,6 +590,13 @@
     navigationEventCutoff: 0,
     lifecycleObserver: null,
     lifecycleTimer: null,
+    visibilityTimer: null,
+    foregroundReassertRequired: false,
+    foregroundReassertContextId: null,
+    windowFocused: (function () {
+      try { return document.hasFocus(); }
+      catch (e) { return true; }
+    })(),
     diagnosticSequence: 0,
     diagnosticLastAt: new Map(),
   };
@@ -613,7 +624,7 @@
 
   function marineRimeOperationIsCurrent(operation) {
     const active = marineRimeTarget.active;
-    if (operation.op === 'put') {
+    if (operation.op === 'put' || operation.op === 'reserve') {
       const revisionMatches = operation.leaseRenewal === true
         ? Number(active && active.publishedRevision) === operation.revision
         : marineRimeTarget.revision === operation.revision;
@@ -1642,8 +1653,12 @@
       context,
       revision,
       sourceId: marineRimeTarget.sourceId,
-      retainWhenUnfocused: op === 'put' && !!active && active.contextId === contextId &&
-        marineRimePersistentTargetIsOpen(active),
+      // `requiresFocus: false` is part of both Marine action contracts. Every
+      // acknowledged direct/reply target may therefore survive Chrome losing
+      // application focus. Site adapters separately decide whether an editor
+      // blur *inside the page* still represents the same semantic target.
+      retainWhenUnfocused: (op === 'put' || op === 'reserve') &&
+        !!active && active.contextId === contextId,
       leaseRenewal: op === 'put' && !!options && options.leaseRenewal === true,
     };
     const result = marineRimeSendQueue.catch(function () {}).then(function () {
@@ -1734,7 +1749,69 @@
     published.publishedContext = context;
     published.publishedRevision = revision;
     published.publishedAt = Date.now();
+    if (marineRimeTarget.foregroundReassertRequired &&
+        marineRimeTarget.foregroundReassertContextId === info.contextId) {
+      marineRimeTarget.foregroundReassertRequired = false;
+      marineRimeTarget.foregroundReassertContextId = null;
+    }
     marineLog('ok', 'rime-target', '已锁定 ' + context.label + '：' + context.targetSummary);
+  }
+
+  function marineRimeBeginPublish(info, revision) {
+    if (!info) return Promise.resolve();
+    const inFlightRevision = Number(info.publishInFlightRevision) || 0;
+    if (inFlightRevision > 0 && inFlightRevision !== revision) {
+      info.pendingPublishRevision = Math.max(
+        Number(info.pendingPublishRevision) || 0,
+        revision,
+      );
+      return info.publishInFlightPromise || Promise.resolve();
+    }
+    if (inFlightRevision === revision) {
+      return info.publishInFlightPromise || Promise.resolve();
+    }
+    if (Number(info.publishRetryRevision) !== revision) {
+      info.publishRetryRevision = revision;
+      info.publishRetryCount = 0;
+    }
+    info.publishInFlightRevision = revision;
+    // Reserve the exact target before the potentially slow page/subtitle grab.
+    // The worker records only identity/authority metadata; Rime does not see an
+    // actionable context until the full PUT has passed every size check.
+    void marineRimeSend('reserve', info.contextId, null, revision);
+    const publishPromise = marineRimePublish(info, revision);
+    info.publishInFlightPromise = publishPromise;
+    const settlePublish = function () {
+      if (Number(info.publishInFlightRevision) !== revision) return;
+      info.publishInFlightRevision = 0;
+      info.publishInFlightPromise = null;
+      const pendingRevision = Number(info.pendingPublishRevision) || 0;
+      info.pendingPublishRevision = 0;
+      if (pendingRevision > 0 && marineRimeTarget.active === info &&
+          marineRimeTarget.revision === pendingRevision &&
+          (!marineRimeTarget.foregroundReassertRequired ||
+            marineRimeTarget.foregroundReassertContextId === info.contextId)) {
+        marineRimeBeginPublish(info, pendingRevision);
+        return;
+      }
+      if (marineRimeTarget.active !== info || marineRimeTarget.revision !== revision ||
+          Number(info.publishedRevision) === revision || document.hidden ||
+          marineRimeTarget.windowFocused === false ||
+          Number(info.publishRetryCount) >= 2) return;
+      info.publishRetryCount += 1;
+      setTimeout(function () {
+        if (marineRimeTarget.active === info && marineRimeTarget.revision === revision &&
+            !marineRimeTarget.foregroundReassertRequired) {
+          marineRimeBeginPublish(info, revision);
+        } else if (marineRimeTarget.active === info &&
+            marineRimeTarget.revision === revision &&
+            marineRimeTarget.foregroundReassertContextId === info.contextId) {
+          marineRimeBeginPublish(info, revision);
+        }
+      }, 250);
+    };
+    void publishPromise.then(settlePublish, settlePublish);
+    return publishPromise;
   }
 
   function marineRimeContextDataChanged() {
@@ -1747,8 +1824,42 @@
       const active = marineRimeTarget.active;
       if (!active) return;
       const revision = ++marineRimeTarget.revision;
-      void marineRimePublish(active, revision);
+      active.activationRevision = revision;
+      marineRimeBeginPublish(active, revision);
     }, 700);
+  }
+
+  function marineRimeMarkForegroundLeaseUncertain() {
+    marineRimeTarget.foregroundReassertRequired = true;
+    marineRimeTarget.foregroundReassertContextId = null;
+  }
+
+  function marineRimeHasForegroundAuthority() {
+    return !document.hidden && marineRimeTarget.windowFocused !== false;
+  }
+
+  function marineRimeInstallActivation(info, current, foregroundReassert) {
+    if (current) {
+      marineRimeTarget.active = null;
+      const clearRevision = ++marineRimeTarget.revision;
+      // ContextStore tombstones deleted context IDs. Returning foreground
+      // authority must therefore create a distinct lease rather than trying
+      // to renew the old ID after a tab/window switch may have revoked it.
+      marineRimeSend('delete', current.contextId, null, clearRevision);
+    }
+    info.contextId = marineRimeContextId(info);
+    const revision = ++marineRimeTarget.revision;
+    info.activationRevision = revision;
+    marineRimeTarget.active = info;
+    if (foregroundReassert) {
+      marineRimeTarget.foregroundReassertRequired = true;
+      marineRimeTarget.foregroundReassertContextId = info.contextId;
+    } else {
+      marineRimeTarget.foregroundReassertRequired = false;
+      marineRimeTarget.foregroundReassertContextId = null;
+    }
+    marineRimeRender();
+    marineRimeBeginPublish(info, revision);
   }
 
   function marineRimeActivate(editor) {
@@ -1761,35 +1872,42 @@
       current.target = info.target;
       current.directScope = info.directScope;
       marineRimeSchedulePosition();
-      if (!current.publishedAt) {
-        const revision = ++marineRimeTarget.revision;
-        void marineRimePublish(current, revision);
+      if (marineRimeTarget.foregroundReassertRequired &&
+          marineRimeTarget.foregroundReassertContextId !== current.contextId) {
+        if (!marineRimeHasForegroundAuthority()) return;
+        // window.blur also covers switching between two visible Chrome
+        // windows, where document.hidden never changes. Defer replacement
+        // until this document regains authority, then use a fresh activation
+        // ID because the worker may already have tombstoned the previous one.
+        marineRimeInstallActivation(info, current, true);
+      } else if (!current.publishedAt) {
+        const revision = Number(current.activationRevision) || ++marineRimeTarget.revision;
+        current.activationRevision = revision;
+        marineRimeBeginPublish(current, revision);
       } else if (Date.now() - current.publishedAt > 30000) void marineRimeRenew();
       return;
     }
-    if (current) {
-      marineRimeTarget.active = null;
-      const clearRevision = ++marineRimeTarget.revision;
-      // Revoke the old lease before any subtitle/comment network work for the
-      // new target. The overlay below may change immediately, but Rime can no
-      // longer act on the visually obsolete target during the grab.
-      marineRimeSend('delete', current.contextId, null, clearRevision);
-    }
-    info.contextId = marineRimeContextId(info);
-    const revision = ++marineRimeTarget.revision;
-    marineRimeTarget.active = info;
-    marineRimeRender();
-    void marineRimePublish(info, revision);
+    if (marineRimeTarget.foregroundReassertRequired &&
+        !marineRimeHasForegroundAuthority()) return;
+    marineRimeInstallActivation(
+      info,
+      current,
+      marineRimeTarget.foregroundReassertRequired,
+    );
   }
 
   async function marineRimeRenew() {
     const active = marineRimeTarget.active;
-    if (!active || !active.publishedContext || document.hidden) return;
+    if (!active || !active.publishedContext ||
+        (document.hidden && marineRimeTarget.windowFocused !== false)) return;
     const focused = marineDeepActiveElement(document);
-    if (focused !== active.editor) return;
+    const canRenew = focused === active.editor ||
+      marineRimeTarget.windowFocused === false ||
+      marineRimePersistentTargetIsOpen(active);
+    if (!canRenew || !marineRimeTargetIsOpen(active)) return;
     // A lease renewal is not a new target/content generation. Reuse the exact
     // revision that the worker last acknowledged so WINDOW_ID_NONE can refresh
-    // only the already-tracked retained reply, never grant a newer/stale PUT.
+    // only the already-tracked retained action, never grant a newer/stale PUT.
     const revision = Number(active.publishedRevision) || 0;
     if (revision <= 0) return;
     const context = Object.assign({}, active.publishedContext, {
@@ -1823,10 +1941,63 @@
     catch (e) { return false; }
   }
 
+  function marineRimeElementIsOpen(element) {
+    return !!element && element.isConnected && marineVisible(element);
+  }
+
+  function marineRimeReplyTargetStillMatches(info) {
+    const targetId = String(info && info.target && info.target.id || '').trim();
+    if (!targetId || !info.commentEl || !info.editor) return false;
+
+    // A virtualized list may recycle the exact same node for another comment.
+    // Prefer the site's explicit DOM id, then fall back to the same exact
+    // resolver that established a deterministic/captured target initially.
+    const currentDomId = String(marineRimeCommentId(info.commentEl) || '').trim();
+    if (currentDomId && currentDomId !== targetId) return false;
+
+    const editorBoundary = marineRimeCommentContainer(info.editor);
+    if (editorBoundary && editorBoundary !== info.commentEl) return false;
+    const label = marineRimeEditorContextLabel(info.editor);
+    const labelAuthor = marineRimeReplyPlaceholderAuthor(label);
+    const targetAuthor = marineRimeNormalizeCommentIdentity(
+      info.target && info.target.authorName,
+    );
+    if (marineRimeIsReplyEditorPlaceholder(label) && labelAuthor && targetAuthor &&
+        marineRimeNormalizeCommentIdentity(labelAuthor) !== targetAuthor) return false;
+    if (!editorBoundary && !marineRimeEditorBelongsTo(info.editor, info.commentEl) &&
+        !marineRimeIsReplyEditorPlaceholder(label)) return false;
+    if (currentDomId) return true;
+
+    const currentTarget = marineRimeDomTarget(info.commentEl, labelAuthor);
+    if (String(currentTarget && currentTarget.id || '').trim() !== targetId) return false;
+    const currentAuthor = marineRimeNormalizeCommentIdentity(
+      currentTarget && currentTarget.authorName,
+    );
+    return !targetAuthor || !currentAuthor || currentAuthor === targetAuthor;
+  }
+
+  function marineRimeTargetIsOpen(info) {
+    if (!info || !marineRimeElementIsOpen(info.editor)) return false;
+    if (info.directScope) {
+      if (info.directScope.invalidated === true) return false;
+      if (info.directScope.element && !marineRimeElementIsOpen(info.directScope.element)) return false;
+    }
+    if (info.mode !== 'reply') return true;
+    if (!String(info.target && info.target.id || '').trim() ||
+        !marineRimeElementIsOpen(info.commentEl)) return false;
+    if (!marineRimeReplyTargetStillMatches(info)) return false;
+    const adapter = marineRimeSiteAdapter();
+    if (!adapter || typeof adapter.persistentTargetIsOpen !== 'function') return true;
+    return marineRimePersistentTargetIsOpen(info);
+  }
+
   function marineRimeRetainOrClear(reason) {
     const active = marineRimeTarget.active;
     marineRimeClearPendingReply(reason);
-    if (active && marineRimePersistentTargetIsOpen(active)) {
+    const crossApplicationBlur = reason === 'window-blur' ||
+      reason === 'window-hidden' || marineRimeTarget.windowFocused === false;
+    if (active && marineRimeTargetIsOpen(active) &&
+        (crossApplicationBlur || marineRimePersistentTargetIsOpen(active))) {
       marineRimeSchedulePosition();
       return true;
     }
@@ -1837,10 +2008,8 @@
   function marineRimeCheckPersistentTarget() {
     marineRimeTarget.lifecycleTimer = null;
     const active = marineRimeTarget.active;
-    if (!active || active.mode !== 'reply' || !active.publishedContext) return;
-    const adapter = marineRimeSiteAdapter();
-    if (!adapter || typeof adapter.persistentTargetIsOpen !== 'function') return;
-    if (marineRimePersistentTargetIsOpen(active)) return;
+    if (!active) return;
+    if (marineRimeTargetIsOpen(active)) return;
     marineRimeReleaseDirectScope('target-closed-scope', false);
     marineRimeClearPendingReply('target-closed');
     marineRimeClear('target-closed');
@@ -1848,10 +2017,10 @@
 
   function marineRimeScheduleLifecycleCheck() {
     const active = marineRimeTarget.active;
-    if (!active || active.mode !== 'reply' || !active.publishedContext) return;
-    const adapter = marineRimeSiteAdapter();
-    if (!adapter || typeof adapter.persistentTargetIsOpen !== 'function') return;
-    if (marineRimeTarget.lifecycleTimer) clearTimeout(marineRimeTarget.lifecycleTimer);
+    if (!active) return;
+    // Leading throttle: a busy video/comment DOM must not postpone the target
+    // disappearance check forever by continuously resetting a trailing timer.
+    if (marineRimeTarget.lifecycleTimer) return;
     marineRimeTarget.lifecycleTimer = setTimeout(marineRimeCheckPersistentTarget, 50);
   }
 
@@ -1886,6 +2055,7 @@
   }
 
   function marineRimeHandleClick(event) {
+    marineRimeTarget.windowFocused = true;
     const adapter = marineRimeSiteAdapter();
     if (adapter && typeof adapter.shouldClearTargetFromEventPath === 'function') {
       let shouldClear = false;
@@ -1980,6 +2150,8 @@
       setTimeout(function () { marineRimeRefreshFromEvent(event); }, 0);
     } else {
       marineRimeClearPendingReply('outside-click');
+      const active = marineRimeTarget.active;
+      if (active && !marineRimePersistentTargetIsOpen(active)) marineRimeClear('outside-click');
     }
   }
 
@@ -2031,6 +2203,7 @@
     if (!marineRimeAdapterSupportsPage(adapter)) return;
     document.addEventListener('click', marineRimeHandleClick, true);
     document.addEventListener('focusin', function (event) {
+      marineRimeTarget.windowFocused = true;
       const editor = marineRimeEditorFromEvent(event);
       // Moving between descendants of a real editor should retain the lease.
       // A focusin on an ordinary button/link must not cancel the focusout
@@ -2042,6 +2215,7 @@
     }, true);
     document.addEventListener('focusout', marineRimeHandleFocusOut, true);
     document.addEventListener('keydown', function (event) {
+      marineRimeTarget.windowFocused = true;
       if (event && event.key === 'Escape') {
         marineRimeReleaseDirectScope('escape', true);
         marineRimeClearPendingReply('escape');
@@ -2050,14 +2224,37 @@
     window.addEventListener('scroll', marineRimeSchedulePosition, true);
     window.addEventListener('resize', marineRimeSchedulePosition, false);
     window.addEventListener('blur', function () {
+      marineRimeTarget.windowFocused = false;
+      marineRimeMarkForegroundLeaseUncertain();
       marineRimeRetainOrClear('window-blur');
     });
-    window.addEventListener('focus', function () { setTimeout(function () { marineRimeRefreshFromEvent(null); }, 0); });
+    window.addEventListener('focus', function () {
+      marineRimeTarget.windowFocused = true;
+      setTimeout(function () { marineRimeRefreshFromEvent(null); }, 0);
+    });
     document.addEventListener('visibilitychange', function () {
       if (document.hidden) {
+        marineRimeMarkForegroundLeaseUncertain();
         marineRimeClearPendingReply('tab-hidden');
-        marineRimeClear('tab-hidden');
-      } else setTimeout(function () { marineRimeRefreshFromEvent(null); }, 0);
+        if (marineRimeTarget.visibilityTimer) clearTimeout(marineRimeTarget.visibilityTimer);
+        // `visibilitychange` can accompany either a real tab switch or an
+        // application/minimize transition. Give window.blur one task to mark
+        // the latter; tabs.onActivated remains the authoritative tab-switch
+        // revocation in the service worker.
+        marineRimeTarget.visibilityTimer = setTimeout(function () {
+          marineRimeTarget.visibilityTimer = null;
+          if (!document.hidden) return;
+          if (marineRimeTarget.windowFocused === false) {
+            marineRimeRetainOrClear('window-hidden');
+          } else marineRimeClear('tab-hidden');
+        }, 50);
+      } else {
+        if (marineRimeTarget.visibilityTimer) {
+          clearTimeout(marineRimeTarget.visibilityTimer);
+          marineRimeTarget.visibilityTimer = null;
+        }
+        setTimeout(function () { marineRimeRefreshFromEvent(null); }, 0);
+      }
     });
     try {
       if (window.navigation && window.navigation.addEventListener) {

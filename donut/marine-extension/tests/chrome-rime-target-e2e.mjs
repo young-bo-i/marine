@@ -6,14 +6,13 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  extensionIdFromManifest,
+  findExtensionTestBrowser,
+} from "./extension-test-browser.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const extensionSource = path.resolve(here, "..");
-const chromeCandidates = [
-  process.env.MARINE_CHROME_BINARY,
-  path.join(os.homedir(), "Library/Caches/ms-playwright/chromium-1228/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"),
-  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-].filter(Boolean);
 const artifactPath = "/private/tmp/marine-rime-target-e2e.png";
 
 const fixtureHtml = `<!doctype html>
@@ -387,15 +386,9 @@ async function pressTab(client, shift = false) {
 }
 
 async function main() {
-  let chromeBinary;
-  for (const candidate of chromeCandidates) {
-    try {
-      await fs.access(candidate);
-      chromeBinary = candidate;
-      break;
-    } catch {}
-  }
-  if (!chromeBinary) throw new Error("Chrome for Testing/Chromium was not found");
+  const { binary: chromeBinary, version: chromeVersion } =
+    await findExtensionTestBrowser({ edgeEnvironment: true });
+  console.log(`Marine E2E browser: ${chromeVersion} (${chromeBinary})`);
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "marine-chrome-rime-"));
   const extensionDir = path.join(tempRoot, "extension");
   const userDataDir = path.join(tempRoot, "chrome-profile");
@@ -437,9 +430,11 @@ async function main() {
   let client;
   let debugPort;
   let chromeStderr = "";
+  let expectedExtensionId = "";
   const runtimeIssues = [];
   try {
     await fs.cp(extensionSource, extensionDir, { recursive: true });
+    expectedExtensionId = await extensionIdFromManifest(extensionDir);
     await fs.writeFile(
       path.join(extensionDir, "marine-runtime-config.json"),
       JSON.stringify({
@@ -530,7 +525,7 @@ async function main() {
     );
     await waitFor(
       () => evaluate(client, "document.documentElement.getAttribute('data-marine-rime-ready') === '1'"),
-      "Marine Rime content script did not become ready",
+      `Marine Rime content script did not become ready (expected extension ${expectedExtensionId})`,
     );
     assert.equal(await evaluate(client, "window.fixtureHandshakePortCount"), 0,
       "the page observed the private published-receipt MessagePort handshake");
@@ -604,7 +599,7 @@ async function main() {
       () => evaluate(client, "document.querySelectorAll('[data-marine-rime-target]').length === 3"),
       "Marine target overlay was not injected after editor focus",
     );
-    const directPut = await waitFor(
+    let directPut = await waitFor(
       () => apiCalls.find((call) => call.method === "PUT" && call.body?.mode === "direct"),
       "direct target was not published",
       20000,
@@ -632,6 +627,31 @@ async function main() {
       text: "Marine · 直评",
     });
 
+    const callsBeforeDirectWindowBlur = apiCalls.length;
+    await evaluate(client, "window.dispatchEvent(new Event('blur')); true");
+    await delay(250);
+    assert.equal(
+      apiCalls.slice(callsBeforeDirectWindowBlur).some((call) =>
+        call.method === "DELETE" && call.contextId === directPut.contextId),
+      false,
+      "the direct action must remain available while Rime owns application focus",
+    );
+    const directBeforeForegroundReturn = directPut;
+    const callsBeforeDirectForegroundReturn = apiCalls.length;
+    await evaluate(client, "window.dispatchEvent(new Event('focus')); true");
+    directPut = await waitFor(
+      () => apiCalls.slice(callsBeforeDirectForegroundReturn).find((call) =>
+        call.method === "PUT" && call.body?.mode === "direct" &&
+        call.contextId !== directBeforeForegroundReturn.contextId),
+      "direct target did not receive a fresh activation after foreground return",
+    );
+    assert.equal(
+      apiCalls.slice(callsBeforeDirectForegroundReturn).some((call) =>
+        call.method === "DELETE" && call.contextId === directBeforeForegroundReturn.contextId),
+      true,
+      "foreground return must retire the old direct activation before replacing it",
+    );
+
     await clickSelector(client, ".reply");
     await waitFor(
       () => apiCalls.some((call) => call.method === "DELETE" && call.contextId === directPut.contextId),
@@ -643,7 +663,7 @@ async function main() {
       () => evaluate(client, "window.fixtureReplyFocused === true"),
       "the delayed globally-mounted reply editor was not focused",
     );
-    const replyPut = await waitFor(
+    let replyPut = await waitFor(
       () => apiCalls.find((call) => call.method === "PUT" && call.body?.mode === "reply"),
       "reply target was not published",
     );
@@ -663,6 +683,31 @@ async function main() {
     assert.equal(replyPut.body.payload.subtitle, undefined);
     assert.doesNotMatch(replyPut.body.target.text, /嵌套楼层/);
     assert.doesNotMatch(replyPut.body.target.text, /Alice|回复|点赞/);
+
+    const callsBeforeReplyWindowBlur = apiCalls.length;
+    await evaluate(client, "window.dispatchEvent(new Event('blur')); true");
+    await delay(250);
+    assert.equal(
+      apiCalls.slice(callsBeforeReplyWindowBlur).some((call) =>
+        call.method === "DELETE" && call.contextId === replyPut.contextId),
+      false,
+      "the exact Bilibili reply must survive an application-level window blur",
+    );
+    const replyBeforeForegroundReturn = replyPut;
+    const callsBeforeReplyForegroundReturn = apiCalls.length;
+    await evaluate(client, "window.dispatchEvent(new Event('focus')); true");
+    replyPut = await waitFor(
+      () => apiCalls.slice(callsBeforeReplyForegroundReturn).find((call) =>
+        call.method === "PUT" && call.body?.mode === "reply" &&
+        call.contextId !== replyBeforeForegroundReturn.contextId),
+      "reply target did not receive a fresh activation after foreground return",
+    );
+    assert.equal(
+      apiCalls.slice(callsBeforeReplyForegroundReturn).some((call) =>
+        call.method === "DELETE" && call.contextId === replyBeforeForegroundReturn.contextId),
+      true,
+      "foreground return must retire the old reply activation before replacing it",
+    );
 
     const directDeleteIndex = apiCalls.findIndex((call) =>
       call.method === "DELETE" && call.contextId === directPut.contextId);
@@ -774,11 +819,15 @@ async function main() {
     assert.equal(closedShadowPut.body.target.authorName, "Carol");
     assert.equal(closedShadowPut.body.target.text, "closed Shadow DOM 里的精确楼层正文[笑哭]尾句。");
     assert.doesNotMatch(closedShadowPut.body.target.text, /Carol|回复|发布/);
-    await clickSelector(client, "#outside");
+    const callsBeforeClosedTargetRemoval = apiCalls.length;
+    await evaluate(client, "window.dispatchEvent(new Event('blur')); true");
+    await evaluate(client, "document.querySelector('#comment-45').remove(); true");
     await waitFor(
-      () => apiCalls.some((call) => call.method === "DELETE" && call.contextId === closedShadowPut.contextId),
-      "closed-shadow reply target was not cleared",
+      () => apiCalls.slice(callsBeforeClosedTargetRemoval).some((call) =>
+        call.method === "DELETE" && call.contextId === closedShadowPut.contextId),
+      "a retained closed-shadow reply was not revoked when its target disappeared",
     );
+    await evaluate(client, "window.dispatchEvent(new Event('focus')); true");
 
     const putsBeforeNavigation = apiCalls.length;
     await clickSelector(client, "#direct");
@@ -817,6 +866,9 @@ async function main() {
     console.log("Marine Chrome Rime target e2e: OK");
     console.log(`Visual artifact: ${artifactPath}`);
   } catch (error) {
+    if (expectedExtensionId) {
+      console.error(`Expected Marine extension ID: ${expectedExtensionId}`);
+    }
     if (client) {
       try {
         console.error("Page diagnostic:", JSON.stringify(await evaluate(client,

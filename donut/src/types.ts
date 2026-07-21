@@ -35,7 +35,7 @@ export interface BrowserProfile {
   ephemeral?: boolean;
   extension_group_id?: string;
   /** Marine: bound BrandSkill (persona voice); undefined for non-persona profiles. */
-  brand_id?: string;
+  brand_id?: string | null;
   proxy_bypass_rules?: string[];
   created_by_id?: string;
   created_by_email?: string;
@@ -44,6 +44,65 @@ export interface BrowserProfile {
   created_at?: number;
   dns_blocklist?: string;
   password_protected?: boolean;
+}
+
+export interface BrandTone {
+  warmth: number;
+  expertise: number;
+  wit: number;
+  directness: number;
+  emoji: string;
+  length: string;
+}
+
+export type BrandExampleKind = "both" | "direct" | "reply";
+
+export interface BrandExample {
+  id: string;
+  title: string;
+  text: string;
+  keywords: string[];
+  platform: string;
+  kind: BrandExampleKind;
+  enabled: boolean;
+}
+
+export interface BrandProfile {
+  schemaVersion: number;
+  id: string;
+  name: string;
+  displayName: string;
+  language: string;
+  platforms: string[];
+  positioning: string;
+  audience: string;
+  personaVoice: string;
+  productInfo: string;
+  commentStyle: string;
+  doRules: string[];
+  dontRules: string[];
+  tone: BrandTone;
+  examples: BrandExample[];
+  revision: number;
+  updatedAt: number;
+  builtIn: boolean;
+  syncEnabled: boolean;
+  lastSync?: number;
+}
+
+export interface BrandPreviewContext {
+  platform: string;
+  title: string;
+  targetSummary: string;
+  mode: "direct" | "reply";
+  sourceText: string;
+}
+
+export interface BrandPreview {
+  brandId: string;
+  revision: number;
+  selectedExampleIds: string[];
+  skill: string;
 }
 
 export interface Extension {

@@ -45,6 +45,12 @@ export type BackendErrorCode =
   | "MARINE_GENERATE_TIMEOUT"
   | "MARINE_FILL_FAILED"
   | "MARINE_MARK_POSTED_FAILED"
+  | "MARINE_BRAND_NOT_FOUND"
+  | "MARINE_BRAND_BUILT_IN"
+  | "MARINE_BRAND_REVISION_CONFLICT"
+  | "MARINE_BRAND_INVALID"
+  | "MARINE_BRAND_STORAGE_FAILED"
+  | "MARINE_BRAND_IN_USE"
   | "INTERNAL_ERROR";
 
 export interface BackendError {
@@ -178,6 +184,20 @@ export function translateBackendError(t: TFunction, err: unknown): string {
     case "MARINE_MARK_POSTED_FAILED":
       return t("backendErrors.marineMarkPostedFailed", {
         detail: parsed.params?.message ?? "",
+      });
+    case "MARINE_BRAND_NOT_FOUND":
+      return t("backendErrors.marineBrandNotFound");
+    case "MARINE_BRAND_BUILT_IN":
+      return t("backendErrors.marineBrandBuiltIn");
+    case "MARINE_BRAND_REVISION_CONFLICT":
+      return t("backendErrors.marineBrandRevisionConflict");
+    case "MARINE_BRAND_INVALID":
+      return t("backendErrors.marineBrandInvalid");
+    case "MARINE_BRAND_STORAGE_FAILED":
+      return t("backendErrors.marineBrandStorageFailed");
+    case "MARINE_BRAND_IN_USE":
+      return t("backendErrors.marineBrandInUse", {
+        count: parsed.params?.count ?? "0",
       });
     case "INTERNAL_ERROR":
       return t("backendErrors.internal", {

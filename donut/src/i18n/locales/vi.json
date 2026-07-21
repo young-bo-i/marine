@@ -1882,7 +1882,13 @@
     "marineGenerateFailed": "Tạo thất bại. {{detail}}",
     "marineGenerateTimeout": "Tạo đã hết thời gian chờ.",
     "marineFillFailed": "Không thể điền vào ô trả lời. {{detail}}",
-    "marineMarkPostedFailed": "Không thể đánh dấu đã đăng. {{detail}}"
+    "marineMarkPostedFailed": "Không thể đánh dấu đã đăng. {{detail}}",
+    "marineBrandNotFound": "Không tìm thấy thương hiệu.",
+    "marineBrandBuiltIn": "Không thể xóa thương hiệu tích hợp sẵn.",
+    "marineBrandRevisionConflict": "Thương hiệu này đã được cập nhật ở nơi khác. Hãy tải lại rồi thử lại.",
+    "marineBrandInvalid": "Cấu hình thương hiệu không hợp lệ.",
+    "marineBrandStorageFailed": "Không thể lưu cấu hình thương hiệu.",
+    "marineBrandInUse": "Thương hiệu này vẫn đang liên kết với {{count}} profile."
   },
   "rail": {
     "profiles": "Profile",
@@ -1900,7 +1906,7 @@
     "network": "Mạng",
     "integrations": "Tích hợp",
     "account": "Tài khoản",
-    "marine": "Nhật ký bình luận"
+    "marine": "Marine"
   },
   "pageTitle": {
     "proxies": "Mạng",
@@ -1912,7 +1918,7 @@
     "account": "Tài khoản",
     "import": "Nhập profile",
     "shortcuts": "Phím tắt",
-    "marine": "Nhật ký bình luận"
+    "marine": "Marine"
   },
   "encryption": {
     "required": {
@@ -2102,6 +2108,166 @@
     "acknowledge": "Đã hiểu"
   },
   "marine": {
+    "workspace": {
+      "tabsLabel": "Không gian làm việc Marine",
+      "tabs": {
+        "brands": "Xưởng thương hiệu",
+        "history": "Nhật ký bình luận"
+      }
+    },
+    "brandStudio": {
+      "title": "Xưởng thương hiệu",
+      "description": "Quản lý định vị, giọng điệu, quy tắc, ví dụ tình huống và gán profile trong một nơi.",
+      "loading": "Đang tải thương hiệu…",
+      "loadFailed": "Không thể tải thương hiệu",
+      "loadFailedDescription": "Dữ liệu thương hiệu tạm thời không khả dụng. Hãy thử lại khi backend Marine đã sẵn sàng.",
+      "brandList": "Thương hiệu",
+      "searchLabel": "Tìm thương hiệu",
+      "searchPlaceholder": "Tìm thương hiệu",
+      "newNameLabel": "Tên thương hiệu mới",
+      "newNamePlaceholder": "Tên thương hiệu mới",
+      "create": "Tạo thương hiệu",
+      "empty": "Chưa có thương hiệu. Hãy tạo thương hiệu đầu tiên ở trên.",
+      "emptySearch": "Không có thương hiệu phù hợp với tìm kiếm.",
+      "builtIn": "Tích hợp sẵn",
+      "profileCount": "{{count}} profile",
+      "revision": "Bản sửa đổi {{revision}}",
+      "unsaved": "Thay đổi chưa lưu",
+      "discardChanges": "Bỏ các thay đổi chưa lưu của thương hiệu này?",
+      "sections": {
+        "identity": "Thương hiệu và sản phẩm",
+        "identityDescription": "Xác định thương hiệu là ai, phục vụ ai và có thể nói gì một cách đáng tin cậy.",
+        "tone": "Giọng nói và sắc thái",
+        "toneDescription": "Biến hướng dẫn giọng điệu thành các điều khiển tạo nội dung có thể tái sử dụng.",
+        "rules": "Nên làm và không nên làm",
+        "rulesDescription": "Mỗi dòng một quy tắc rõ ràng để giữ ranh giới tạo nội dung chính xác.",
+        "examples": "Ví dụ theo tình huống",
+        "examplesDescription": "Định tuyến ví dụ theo nền tảng, kiểu trả lời và từ khóa.",
+        "bindings": "Gán profile",
+        "bindingsDescription": "Chọn các profile trình duyệt mặc định dùng thương hiệu này."
+      },
+      "fields": {
+        "positioning": "Định vị",
+        "audience": "Đối tượng"
+      },
+      "placeholders": {
+        "positioning": "Thương hiệu làm gì và khác biệt ở đâu",
+        "audience": "Thương hiệu này đang nói với ai",
+        "persona": "Giọng nói, góc nhìn, từ vựng và cách kể chuyện",
+        "product": "Sản phẩm, lợi ích, bằng chứng, liên kết và giới hạn",
+        "commentStyle": "Bình luận nên có giọng điệu nào và giới thiệu thương hiệu ra sao",
+        "rules": "Mỗi dòng một quy tắc"
+      },
+      "tone": {
+        "warmth": "Thân thiện",
+        "expertise": "Chuyên môn",
+        "wit": "Hóm hỉnh",
+        "directness": "Trực tiếp",
+        "emoji": "Mức dùng emoji",
+        "length": "Độ dài phản hồi"
+      },
+      "emoji": {
+        "none": "Không dùng",
+        "light": "Ít",
+        "moderate": "Vừa phải",
+        "rich": "Thường xuyên"
+      },
+      "length": {
+        "short": "Ngắn",
+        "medium": "Vừa",
+        "long": "Dài"
+      },
+      "languages": {
+        "zh_CN": "Tiếng Trung",
+        "en": "Tiếng Anh",
+        "ja": "Tiếng Nhật",
+        "ko": "Tiếng Hàn"
+      },
+      "platforms": {
+        "all": "Mọi nền tảng",
+        "bilibili": "Bilibili",
+        "xiaohongshu": "Xiaohongshu",
+        "zhihu": "Zhihu",
+        "douyin": "Douyin"
+      },
+      "kinds": {
+        "both": "Bình luận trực tiếp và trả lời",
+        "direct": "Bình luận trực tiếp",
+        "reply": "Trả lời"
+      },
+      "examples": {
+        "add": "Thêm ví dụ",
+        "delete": "Xóa ví dụ",
+        "empty": "Chưa có ví dụ tình huống.",
+        "enabled": "Bật",
+        "untitled": "Ví dụ chưa đặt tên",
+        "title": "Tên tình huống",
+        "titlePlaceholder": "Ví dụ: bài gửi bị từ chối và chỉnh sửa",
+        "keywords": "Từ khóa định tuyến",
+        "keywordsPlaceholder": "Phân tách từ khóa bằng dấu phẩy",
+        "platform": "Nền tảng",
+        "kind": "Loại bình luận",
+        "text": "Nội dung ví dụ",
+        "textPlaceholder": "Một ví dụ chuẩn cho tình huống này"
+      },
+      "bindings": {
+        "searchLabel": "Tìm profile",
+        "searchPlaceholder": "Tìm profile, ghi chú hoặc thẻ",
+        "empty": "Không có profile phù hợp với tìm kiếm.",
+        "boundToCurrent": "Đang dùng thương hiệu này",
+        "boundToOther": "Hiện đang dùng {{name}}",
+        "usesDefault": "Dùng giọng {{name}} mặc định",
+        "confirmReassign": "{{profile}} hiện đang dùng {{brand}}. Chuyển sang thương hiệu này?"
+      },
+      "preview": {
+        "title": "Xem trước định tuyến trực tiếp",
+        "description": "Kiểm tra các ví dụ và Skill đã biên dịch mà Marine sẽ gửi cho Rime.",
+        "saveFirst": "Bản xem trước có chứa bản nháp chưa lưu. Hãy lưu khi kết quả đã đúng.",
+        "platform": "Nền tảng",
+        "mode": "Loại bình luận",
+        "pageTitle": "Tiêu đề trang",
+        "pageTitlePlaceholder": "Dán hoặc mô tả tiêu đề trang",
+        "targetSummary": "Tóm tắt mục tiêu",
+        "targetSummaryPlaceholder": "Bài đăng hoặc bình luận mục tiêu đang nói gì",
+        "sourceText": "Văn bản nguồn",
+        "sourceTextPlaceholder": "Dán đoạn văn đại diện để thử định tuyến",
+        "selectedExamples": "Ví dụ được chọn",
+        "loading": "Đang cập nhật xem trước…",
+        "failed": "Xem trước thất bại. Hãy kiểm tra thương hiệu đã lưu rồi thử lại.",
+        "empty": "Thêm ngữ cảnh để kiểm tra định tuyến.",
+        "noExamples": "Không có ví dụ phù hợp với ngữ cảnh này.",
+        "skill": "Skill đã biên dịch"
+      },
+      "sync": {
+        "enabled": "Đã bật đồng bộ đám mây",
+        "disabled": "Chỉ lưu cục bộ",
+        "lastSync": "Đồng bộ gần nhất: {{time}}"
+      },
+      "delete": {
+        "title": "Xóa thương hiệu",
+        "description": "Xóa {{name}}? Không thể hoàn tác thao tác này.",
+        "inUse": "Hãy bỏ gán tất cả profile trước khi xóa thương hiệu này.",
+        "builtIn": "Không thể xóa thương hiệu tích hợp sẵn."
+      },
+      "noSelection": {
+        "title": "Chọn hoặc tạo thương hiệu",
+        "description": "Chọn một thương hiệu để sửa thông tin, ví dụ và profile được gán."
+      },
+      "toasts": {
+        "loadFailed": "Không thể tải thương hiệu Marine",
+        "created": "Đã tạo thương hiệu",
+        "createFailed": "Không thể tạo thương hiệu",
+        "saved": "Đã lưu thương hiệu",
+        "saveFailed": "Không thể lưu thương hiệu",
+        "conflict": "Thương hiệu này đã thay đổi trên thiết bị khác",
+        "conflictDescription": "Hãy làm mới để tải bản sửa đổi mới nhất rồi áp dụng lại thay đổi.",
+        "deleted": "Đã xóa thương hiệu",
+        "deleteFailed": "Không thể xóa thương hiệu",
+        "brandInUse": "Hãy bỏ gán tất cả profile trước khi xóa thương hiệu này",
+        "bindingSaved": "Đã cập nhật gán profile",
+        "bindingFailed": "Không thể cập nhật gán profile"
+      }
+    },
     "title": "Marine",
     "description": "Trích xuất phụ đề và nội dung bài viết từ trang đang mở của một profile đang chạy.",
     "noRunningProfiles": "Không có profile Wayfern hoặc Camoufox nào đang chạy. Hãy khởi chạy một profile trước.",

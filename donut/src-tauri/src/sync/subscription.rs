@@ -20,6 +20,7 @@ pub struct SubscribeEvent {
 
 #[derive(Debug, Clone)]
 pub enum SyncWorkItem {
+  PostingHistory,
   Profile(String),
   Proxy(String),
   Group(String),
@@ -292,6 +293,8 @@ impl SyncSubscription {
           .or_else(|| rest.split('/').next().filter(|s| !s.is_empty()))
       });
       profile_id.map(|s| SyncWorkItem::Profile(s.to_string()))
+    } else if key.starts_with("marine/history/") {
+      Some(SyncWorkItem::PostingHistory)
     } else if key.starts_with("proxies/") {
       key
         .strip_prefix("proxies/")

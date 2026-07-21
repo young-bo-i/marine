@@ -6,24 +6,17 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  extensionIdFromManifest,
+  findExtensionTestBrowser,
+} from "./extension-test-browser.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const extensionSource = path.resolve(here, "..");
-const chromeCandidates = [
-  process.env.MARINE_CHROME_BINARY,
-  process.env.MARINE_EDGE_BINARY,
-  path.join(
-    os.homedir(),
-    "Library/Caches/ms-playwright/chromium-1228/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
-  ),
-  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-  "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-  "/Applications/Microsoft Edge Beta.app/Contents/MacOS/Microsoft Edge Beta",
-].filter(Boolean);
 
 const xhsNoteId = "abcdef1234567890abcdef12";
 const xhsCommentId = "0123456789abcdef01234567";
-const zhihuUrl = "https://www.zhihu.com/question/1";
+const zhihuUrl = "https://www.zhihu.com/search?type=content&q=fixture";
 const xhsUrl = `https://www.xiaohongshu.com/explore/${xhsNoteId}`;
 
 const zhihuInitialData = JSON.stringify({
@@ -67,31 +60,53 @@ const sharedFixtureStyle = `
 const zhihuFixtureHtml = `<!doctype html>
 <html><head><meta charset="utf-8"><title>Fixture 问题标题 - 知乎</title><style>${sharedFixtureStyle}</style></head>
 <body>
-  <article class="AnswerItem fixture-card" data-zop='{"type":"answer","itemId":"101","title":"Fixture 问题标题","authorName":"知答作者"}'>
-    <h1>Fixture 问题标题</h1>
-    <div class="RichContent"><p>这是回答 101 的精确正文。</p></div>
-    <button id="open-comments" type="button">评论 1</button>
-  </article>
-  <article class="AnswerItem fixture-card" data-zop='{"type":"answer","itemId":"202","title":"Fixture 问题标题","authorName":"知答乙"}'>
-    <div class="RichContent"><p>这是回答 202，不能串到 101 的评论框。</p></div>
-    <button id="open-comments-202" type="button">0 条评论</button>
-  </article>
-  <section id="zh-modal" class="Modal-wrapper" hidden>
-    <div class="Modal-content fixture-card">
-      <h2 class="Modal-title">评论</h2>
-      <div class="Comments-container">
-        <form class="CommentBox CommentEditorV2">
+  <section class="Card SearchResult-Card AnswerItem-hotLanding fixture-card"
+    data-za-extra-module='{"card":{"content":{"type":"Answer","token":"101"}}}'>
+    <article class="ContentItem AnswerItem" itemprop="answer" itemscope
+      data-za-extra-module='{"card":{"content":{"type":"Question","id":"9001"}}}'>
+      <a class="AuthorInfo-name" href="/people/answer-author-101">知答作者</a>
+      <a href="/question/1/answer/101">Fixture 问题标题</a>
+      <div class="RichContent"><p>这是回答 101 的精确正文。</p></div>
+      <button id="open-comments" type="button">评论 1</button>
+      <div id="zh-comments-101" class="Comments-container" hidden>
+        <form>
           <div id="zh-placeholder" class="public-DraftEditorPlaceholder-root fixture-placeholder">写下你的评论</div>
-          <div id="zh-editor" class="public-DraftEditor-content" role="textbox" contenteditable="true">知乎未发送草稿</div>
+          <div id="zh-editor" class="notranslate public-DraftEditor-content" role="textbox" contenteditable="true">知乎未发送草稿</div>
           <button data-submit type="submit">发布</button>
         </form>
         <div class="fixture-comment" data-id="zh-comment-42">
+          <a class="fixture-avatar" href="/people/zh-commenter-42"><img alt=""></a>
           <a class="fixture-author" href="/people/zh-commenter-42">知乎评论者</a>
-          <p>知乎精确评论正文</p>
-          <button id="zh-reply" type="button">回复</button>
+          <div class="CommentContent">知乎精确评论正文</div>
+          <button id="zh-reply" type="button"><span style="display:inline-flex">&#8203;<svg></svg></span>回复</button>
         </div>
       </div>
+    </article>
+  </section>
+  <section class="Card SearchResult-Card AnswerItem-hotLanding fixture-card"
+    data-za-extra-module='{"card":{"content":{"type":"Answer","token":"202"}}}'>
+    <article class="ContentItem AnswerItem" itemprop="answer" itemscope>
+      <a class="AuthorInfo-name" href="/people/answer-author-202">知答乙</a>
+      <a href="/question/1/answer/202">第二条回答</a>
+      <div class="RichContent"><p>这是回答 202，不能串到 101 的评论框。</p></div>
+      <button id="open-comments-202" type="button">0 条评论</button>
+    </article>
+  </section>
+  <section id="zh-modal" class="Modal-wrapper" hidden>
+    <div class="Modal-content fixture-card">
+      <h2 class="Modal-title">评论</h2>
     </div>
+  </section>
+  <section class="Card SearchResult-Card AnswerItem-hotLanding fixture-card"
+    data-za-extra-module='{"card":{"content":{"type":"Answer","token":"303"}}}'>
+    <article class="ContentItem AnswerItem" itemprop="answer" itemscope
+      data-za-extra-module='{"card":{"content":{"type":"Answer","token":"404"}}}'>
+      <h2>冲突回答必须保持禁用</h2>
+      <button id="open-comments-conflict" type="button">评论</button>
+      <div id="zh-comments-conflict" class="Comments-container" hidden>
+        <div id="zh-editor-conflict" role="textbox" contenteditable="true"></div>
+      </div>
+    </article>
   </section>
   <button id="fixture-outside" type="button">离开评论框</button>
   <script id="js-initialData" type="application/json">${zhihuInitialData}</script>
@@ -102,20 +117,25 @@ const zhihuFixtureHtml = `<!doctype html>
     document.addEventListener('submit',event=>{window.fixtureEvents.submit++;event.preventDefault()},true);
     document.querySelector('[data-submit]').addEventListener('click',()=>window.fixtureEvents.submitClick++);
     document.querySelector('#open-comments').addEventListener('click',()=>{
-      document.querySelector('#zh-modal').hidden=false;
+      document.querySelector('#zh-comments-101').hidden=false;
       setTimeout(()=>document.querySelector('#zh-editor').focus(),0);
     });
     document.querySelector('#open-comments-202').addEventListener('click',()=>{
-      document.querySelector('#zh-modal').hidden=false;
+      const modal=document.querySelector('#zh-modal');
+      modal.querySelector('.Modal-content').appendChild(document.querySelector('#zh-comments-101'));
+      modal.hidden=false;
       setTimeout(()=>document.querySelector('#zh-editor').focus(),0);
+    });
+    document.querySelector('#open-comments-conflict').addEventListener('click',()=>{
+      document.querySelector('#zh-comments-conflict').hidden=false;
+      setTimeout(()=>document.querySelector('#zh-editor-conflict').focus(),0);
     });
     document.querySelector('#zh-reply').addEventListener('click',()=>{
       const floor=document.querySelector('[data-id="zh-comment-42"]');
       let editor=document.querySelector('#zh-reply-editor');
       if(!editor){
         const box=document.createElement('div');
-        box.className='CommentEditorV2';
-        box.innerHTML='<div class="public-DraftEditorPlaceholder-root">回复 @知乎评论者 :</div><div id="zh-reply-editor" class="public-DraftEditor-content" role="textbox" contenteditable="true" aria-label="回复 @知乎评论者 :"><p>知乎恢复草稿不可进入 target</p></div>';
+        box.innerHTML='<div class="CommentEditorV2-placeholder">回复 @知乎评论者 :</div><div id="zh-reply-editor" class="RichTextEditor-content" role="textbox" contenteditable="true"><p>知乎恢复草稿不可进入 target</p></div>';
         floor.appendChild(box);
         editor=box.querySelector('#zh-reply-editor');
       }
@@ -300,7 +320,7 @@ async function clickSelector(client, selector) {
   });
 }
 
-async function navigateFixture(client, url) {
+async function navigateFixture(client, url, expectedExtensionId) {
   await client.send("Page.navigate", { url });
   await waitFor(
     () => evaluate(client, "document.readyState === 'complete'"),
@@ -312,7 +332,7 @@ async function navigateFixture(client, url) {
         client,
         "document.documentElement.getAttribute('data-marine-rime-ready') === '1'",
       ),
-    `Marine target tracker did not become ready: ${url}`,
+    `Marine target tracker did not become ready: ${url} (expected extension ${expectedExtensionId})`,
   );
 }
 
@@ -351,18 +371,9 @@ async function assertFixtureUntouched(client, editorSelector, expectedDraft) {
 }
 
 async function main() {
-  let chromeBinary;
-  for (const candidate of chromeCandidates) {
-    try {
-      await fs.access(candidate);
-      chromeBinary = candidate;
-      break;
-    } catch {}
-  }
-  if (!chromeBinary)
-    throw new Error(
-      "Chrome for Testing, Google Chrome, or Microsoft Edge was not found",
-    );
+  const { binary: chromeBinary, version: chromeVersion } =
+    await findExtensionTestBrowser({ edgeEnvironment: true });
+  console.log(`Marine E2E browser: ${chromeVersion} (${chromeBinary})`);
 
   const tempRoot = await fs.mkdtemp(
     path.join(os.tmpdir(), "marine-site-targets-"),
@@ -375,6 +386,8 @@ async function main() {
   let browser;
   let client;
   let browserStderr = "";
+  let expectedExtensionId = "";
+  const executionContexts = new Map();
 
   const apiServer = http.createServer(async (request, response) => {
     if (request.method === "OPTIONS") {
@@ -411,6 +424,7 @@ async function main() {
 
   try {
     await fs.cp(extensionSource, extensionDir, { recursive: true });
+    expectedExtensionId = await extensionIdFromManifest(extensionDir);
     await fs.writeFile(
       path.join(extensionDir, "marine-runtime-config.json"),
       JSON.stringify({
@@ -468,6 +482,16 @@ async function main() {
         details.exception?.description || details.text || "runtime exception",
       );
     });
+    client.on("Runtime.executionContextCreated", (event) => {
+      const context = event.context;
+      if (context?.id) executionContexts.set(context.id, context);
+    });
+    client.on("Runtime.executionContextDestroyed", (event) => {
+      executionContexts.delete(event.executionContextId);
+    });
+    client.on("Runtime.executionContextsCleared", () => {
+      executionContexts.clear();
+    });
     client.on("Fetch.requestPaused", async (event) => {
       const url = event.request.url;
       const body = url.startsWith(zhihuUrl) ? zhihuFixtureHtml : xhsFixtureHtml;
@@ -482,10 +506,11 @@ async function main() {
     });
     await client.send("Page.enable");
     await client.send("Runtime.enable");
+    await client.send("Page.bringToFront");
     await client.send("Fetch.enable", {
       patterns: [
         {
-          urlPattern: "https://www.zhihu.com/question/1*",
+          urlPattern: "https://www.zhihu.com/search*",
           resourceType: "Document",
         },
         {
@@ -495,11 +520,11 @@ async function main() {
       ],
     });
 
-    await navigateFixture(client, zhihuUrl);
+    await navigateFixture(client, zhihuUrl, expectedExtensionId);
     await delay(500);
     let checkpoint = apiCalls.length;
     await clickSelector(client, "#open-comments");
-    const zhihuDirect = await waitFor(
+    let zhihuDirect = await waitFor(
       () =>
         apiCalls
           .slice(checkpoint)
@@ -532,10 +557,36 @@ async function main() {
         color: "rgb(23, 114, 246)",
       },
     );
+    checkpoint = apiCalls.length;
+    await evaluate(client, "window.dispatchEvent(new Event('blur')); true");
+    await delay(250);
+    assert.equal(
+      apiCalls.slice(checkpoint).some((call) =>
+        call.method === "DELETE" && call.contextId === zhihuDirect.body.contextId),
+      false,
+      "知乎 direct target must survive an application-level window blur",
+    );
+    const zhihuDirectBeforeForegroundReturn = zhihuDirect;
+    const callsBeforeZhihuDirectForegroundReturn = apiCalls.length;
+    await evaluate(client, "window.dispatchEvent(new Event('focus')); true");
+    zhihuDirect = await waitFor(
+      () => apiCalls.slice(callsBeforeZhihuDirectForegroundReturn).find((call) =>
+        call.method === "PUT" && call.body?.mode === "direct" &&
+        call.body?.platform === "zhihu" &&
+        call.body?.contextId !== zhihuDirectBeforeForegroundReturn.body.contextId),
+      "知乎 direct target 前台恢复后没有建立新 activation",
+    );
+    assert.equal(
+      apiCalls.slice(callsBeforeZhihuDirectForegroundReturn).some((call) =>
+        call.method === "DELETE" &&
+        call.contextId === zhihuDirectBeforeForegroundReturn.body.contextId),
+      true,
+      "知乎 direct 前台恢复必须先撤销旧 activation",
+    );
 
     checkpoint = apiCalls.length;
     await clickSelector(client, "#zh-reply");
-    const zhihuReply = await waitFor(
+    let zhihuReply = await waitFor(
       () =>
         apiCalls
           .slice(checkpoint)
@@ -572,6 +623,32 @@ async function main() {
       "#zh-reply-editor",
       "知乎恢复草稿不可进入 target",
     );
+    checkpoint = apiCalls.length;
+    await evaluate(client, "window.dispatchEvent(new Event('blur')); true");
+    await delay(250);
+    assert.equal(
+      apiCalls.slice(checkpoint).some((call) =>
+        call.method === "DELETE" && call.contextId === zhihuReply.body.contextId),
+      false,
+      "知乎 exact reply target must survive an application-level window blur",
+    );
+    const zhihuReplyBeforeForegroundReturn = zhihuReply;
+    const callsBeforeZhihuReplyForegroundReturn = apiCalls.length;
+    await evaluate(client, "window.dispatchEvent(new Event('focus')); true");
+    zhihuReply = await waitFor(
+      () => apiCalls.slice(callsBeforeZhihuReplyForegroundReturn).find((call) =>
+        call.method === "PUT" && call.body?.mode === "reply" &&
+        call.body?.platform === "zhihu" &&
+        call.body?.contextId !== zhihuReplyBeforeForegroundReturn.body.contextId),
+      "知乎 reply target 前台恢复后没有建立新 activation",
+    );
+    assert.equal(
+      apiCalls.slice(callsBeforeZhihuReplyForegroundReturn).some((call) =>
+        call.method === "DELETE" &&
+        call.contextId === zhihuReplyBeforeForegroundReturn.body.contextId),
+      true,
+      "知乎 reply 前台恢复必须先撤销旧 activation",
+    );
     await clickSelector(client, "#fixture-outside");
     await waitFor(
       () => evaluate(client, `(() => {
@@ -593,11 +670,11 @@ async function main() {
               call.body?.mode === "direct" &&
               call.body?.platform === "zhihu",
           ),
-      "知乎 reused modal did not switch to the second answer scope",
+      "知乎 reused portal did not switch to the second answer scope",
     );
     assert.equal(
       zhihuSecondDirect.body.targetSummary,
-      "直评回答 @知答乙 · Fixture 问题标题",
+      "直评回答 @知答乙 · 第二条回答",
     );
     assert.match(
       zhihuSecondDirect.body.payload.article.markdown,
@@ -608,8 +685,34 @@ async function main() {
       /回答 101 的精确正文/,
     );
     await clickSelector(client, "#fixture-outside");
+    await waitFor(
+      () => evaluate(client, `(() => {
+        const badge=document.querySelector('[data-marine-rime-target="badge"]');
+        return document.activeElement?.id==='fixture-outside' && badge?.style.display==='none';
+      })()`),
+      "知乎 second direct target did not clear before the conflict check",
+    );
 
-    await navigateFixture(client, xhsUrl);
+    checkpoint = apiCalls.length;
+    await clickSelector(client, "#open-comments-conflict");
+    await delay(700);
+    assert.equal(
+      apiCalls.slice(checkpoint).some((call) =>
+        call.method === "PUT" && call.body?.platform === "zhihu"),
+      false,
+      "知乎 conflicting analytics answer ids must fail closed",
+    );
+    assert.equal(
+      await evaluate(client, `(() => {
+        const badge=document.querySelector('[data-marine-rime-target="badge"]');
+        return badge?.style.display || 'none';
+      })()`),
+      "none",
+      "知乎 ambiguous answer must not expose an active target badge",
+    );
+    await clickSelector(client, "#fixture-outside");
+
+    await navigateFixture(client, xhsUrl, expectedExtensionId);
     await delay(500);
     await clickSelector(client, "#fixture-outside");
     checkpoint = apiCalls.length;
@@ -796,6 +899,9 @@ async function main() {
 
     console.log("Marine Chrome multi-site target e2e: OK");
   } catch (error) {
+    if (expectedExtensionId) {
+      console.error(`Expected Marine extension ID: ${expectedExtensionId}`);
+    }
     if (client) {
       try {
         console.error(
@@ -812,6 +918,32 @@ async function main() {
         }))()`,
             ),
           ),
+        );
+      } catch {}
+      try {
+        const extensionContext = Array.from(executionContexts.values()).find(
+          (context) =>
+            context.origin === `chrome-extension://${expectedExtensionId}` ||
+            String(context.name || "").includes(expectedExtensionId),
+        );
+        const isolatedResult = extensionContext
+          ? await client.send("Runtime.evaluate", {
+              expression:
+                "typeof marineDebug === 'object' ? marineDebug.buffer().filter((entry) => String(entry?.tag || '').startsWith('rime-')).slice(-80) : []",
+              contextId: extensionContext.id,
+              returnByValue: true,
+            })
+          : null;
+        console.error(
+          "Rime target diagnostics:",
+          JSON.stringify(isolatedResult?.result?.value || []),
+          "contexts:",
+          JSON.stringify(Array.from(executionContexts.values()).map((context) => ({
+            id: context.id,
+            name: context.name,
+            origin: context.origin,
+            auxData: context.auxData,
+          }))),
         );
       } catch {}
     }
