@@ -1848,6 +1848,7 @@
     "profileNotProtected": "Profile không được bảo vệ bằng mật khẩu",
     "profileAlreadyProtected": "Profile đã được bảo vệ bằng mật khẩu",
     "profileRunning": "Không thể thực hiện hành động này khi profile đang chạy",
+    "profileInUseOnDevice": "Hồ sơ này đang được sử dụng trên thiết bị {{device}}. Hãy đóng nó ở đó trước.",
     "profileEphemeral": "Profile tạm thời không thể đặt mật khẩu — dữ liệu sẽ bị xóa khi thoát.",
     "profileMissingSalt": "Profile thiếu salt mã hóa",
     "profileLocked": "Profile đã bị khóa. Hãy nhập mật khẩu trước.",

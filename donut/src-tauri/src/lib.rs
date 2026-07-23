@@ -2145,6 +2145,14 @@ pub fn run() {
                     }
                   }
 
+                  // Release the cross-device profile lock when the browser
+                  // exits naturally (user closed the window). The explicit
+                  // kill path releases it in browser_runner; without this the
+                  // other machine would wait out the 90s lock TTL.
+                  if !is_running {
+                    crate::team_lock::release_team_lock_if_needed(&profile).await;
+                  }
+
                   last_running_states.insert(profile_id, is_running);
                 } else {
                   // Update the state even if unchanged to ensure we have it tracked
@@ -2244,6 +2252,32 @@ pub fn run() {
 
         if let Err(e) = subscription_manager.start(app_handle_sync.clone()).await {
           log::warn!("Failed to start sync subscription: {e}");
+        }
+
+        // Self-hosted cross-device profile locks: resolving the sync token
+        // needs the AppHandle, so hand the lock manager its server config here
+        // and start its heartbeat/refresh loop. Cloud mode manages locks via
+        // the cloud API instead (connected on login).
+        if !crate::cloud_auth::CLOUD_AUTH.is_logged_in().await {
+          let settings_manager = crate::settings_manager::SettingsManager::instance();
+          // `.ok()` immediately drops the non-Send `Box<dyn Error>` variants so
+          // nothing !Send is held across the awaits below.
+          let server_url = settings_manager
+            .load_settings()
+            .ok()
+            .and_then(|s| s.sync_server_url);
+          if let Some(server_url) = server_url {
+            let token = settings_manager
+              .get_sync_token(&app_handle_sync)
+              .await
+              .ok()
+              .flatten();
+            if let Some(token) = token {
+              crate::team_lock::configure_self_hosted_locks(server_url, token);
+              crate::team_lock::PROFILE_LOCK.connect().await;
+              log::info!("Self-hosted profile locks configured");
+            }
+          }
         }
 
         if let Some(work_rx) = work_rx {

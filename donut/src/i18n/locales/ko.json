@@ -1848,6 +1848,7 @@
     "profileNotProtected": "프로필이 비밀번호로 보호되지 않습니다",
     "profileAlreadyProtected": "프로필이 이미 비밀번호로 보호되어 있습니다",
     "profileRunning": "프로필이 실행 중인 동안에는 이 작업을 수행할 수 없습니다",
+    "profileInUseOnDevice": "이 프로필은 {{device}} 기기에서 사용 중입니다. 먼저 해당 기기에서 닫아 주세요.",
     "profileEphemeral": "임시 프로필은 비밀번호로 보호할 수 없습니다 — 종료 시 데이터가 삭제됩니다.",
     "profileMissingSalt": "프로필에 암호화 솔트가 없습니다",
     "profileLocked": "프로필이 잠겨 있습니다. 먼저 비밀번호를 입력하세요.",

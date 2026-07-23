@@ -14,6 +14,7 @@ export type BackendErrorCode =
   | "PROFILE_EPHEMERAL"
   | "PROFILE_MISSING_SALT"
   | "PROFILE_LOCKED"
+  | "PROFILE_IN_USE_ON_DEVICE"
   | "INVALID_PROFILE_ID"
   | "PASSWORD_TOO_SHORT"
   | "INVALID_LAUNCH_HOOK_URL"
@@ -101,6 +102,10 @@ export function translateBackendError(t: TFunction, err: unknown): string {
       return t("backendErrors.profileAlreadyProtected");
     case "PROFILE_RUNNING":
       return t("backendErrors.profileRunning");
+    case "PROFILE_IN_USE_ON_DEVICE":
+      return t("backendErrors.profileInUseOnDevice", {
+        device: parsed.params?.device ?? "",
+      });
     case "PROFILE_EPHEMERAL":
       return t("backendErrors.profileEphemeral");
     case "PROFILE_MISSING_SALT":

@@ -1848,6 +1848,7 @@
     "profileNotProtected": "プロファイルはパスワード保護されていません",
     "profileAlreadyProtected": "プロファイルはすでにパスワード保護されています",
     "profileRunning": "プロファイルの実行中はこの操作を実行できません",
+    "profileInUseOnDevice": "このプロファイルはデバイス {{device}} で使用中です。先にそちらで閉じてください。",
     "profileEphemeral": "エフェメラル プロファイルにはパスワードを設定できません — 終了時にデータが消去されます。",
     "profileMissingSalt": "プロファイルに暗号化ソルトがありません",
     "profileLocked": "プロファイルはロックされています。先にパスワードを入力してください。",
