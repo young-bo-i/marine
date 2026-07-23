@@ -16,7 +16,7 @@ REMOTE_DIR="/opt/donut-sync"
 # Assemble a clean deploy dir: compose + .env at the root, source under donut-sync/
 STAGE="$(mktemp -d)"; trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/donut-sync"
-cp "$HERE/package.json" "$HERE/tsconfig.json" "$HERE/tsconfig.build.json" "$HERE/Dockerfile" "$STAGE/donut-sync/"
+cp "$HERE/package.json" "$HERE/package-lock.json" "$HERE/tsconfig.json" "$HERE/tsconfig.build.json" "$HERE/Dockerfile" "$STAGE/donut-sync/"
 cp -R "$HERE/src" "$STAGE/donut-sync/src"
 cp "$HERE/docker-compose.prod.yml" "$STAGE/docker-compose.yml"
 cp "$HERE/.env" "$STAGE/.env"

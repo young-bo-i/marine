@@ -108,6 +108,14 @@ export class SyncService implements OnModuleInit {
         secretAccessKey,
       },
       forcePathStyle,
+      // Keep presigned URLs clean. Since aws-sdk v3.729 the default
+      // (`WHEN_SUPPORTED`) injects an `x-amz-checksum-crc32` /
+      // `x-amz-sdk-checksum-algorithm` header into every PutObject — including
+      // presigns — which our non-SDK (reqwest) client never echoes, so MinIO
+      // rejects the PUT ("headers present which were not signed"). Only add a
+      // checksum when the operation actually requires one.
+      requestChecksumCalculation: "WHEN_REQUIRED",
+      responseChecksumValidation: "WHEN_REQUIRED",
     });
 
     this.backendInternalUrl = this.configService.get<string>(
@@ -324,7 +332,21 @@ export class SyncService implements OnModuleInit {
       Metadata: metadata,
     });
 
-    const url = await getSignedUrl(this.s3Client, command, { expiresIn });
+    // aws-sdk v3 (>=3.729) HOISTS `x-amz-meta-*` into the presigned URL's query
+    // string and signs only `host` (SignedHeaders=host). Our Rust client sends
+    // the metadata as a real request header, so MinIO sees an unsigned x-amz-*
+    // header and rejects the PUT with 400 AccessDenied ("There were headers
+    // present in the request which were not signed"). Forcing the metadata
+    // header to be UN-hoistable keeps it in SignedHeaders, matching exactly what
+    // the client PUTs (verified against MinIO: PUT now 200, HEAD still returns
+    // the metadata so LWW-via-HEAD keeps working).
+    const unhoistableHeaders = metadata
+      ? new Set(Object.keys(metadata).map((k) => `x-amz-meta-${k.toLowerCase()}`))
+      : undefined;
+    const url = await getSignedUrl(this.s3Client, command, {
+      expiresIn,
+      ...(unhoistableHeaders ? { unhoistableHeaders } : {}),
+    });
 
     // Report profile usage after upload presign if key is under profiles/
     if (ctx.mode === "cloud" && dto.key.startsWith("profiles/")) {

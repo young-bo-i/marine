@@ -5,9 +5,13 @@
 /.pnp
 .pnp.js
 
-# npm/yarn lock files (project uses pnpm only)
+# npm/yarn lock files (the frontend uses pnpm only)
 **/package-lock.json
 **/yarn.lock
+# ...but the self-hosted donut-sync server uses npm and MUST commit its
+# lockfile, so `npm ci` in its Dockerfile produces reproducible builds (an
+# unpinned aws-sdk auto-upgrade is what broke presigned uploads once).
+!donut-sync/package-lock.json
 
 # testing
 /coverage

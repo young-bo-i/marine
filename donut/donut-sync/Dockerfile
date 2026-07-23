@@ -1,9 +1,14 @@
 FROM node:22-alpine AS builder
 
 WORKDIR /build
-COPY donut-sync/package.json donut-sync/tsconfig.json donut-sync/tsconfig.build.json ./
+COPY donut-sync/package.json donut-sync/package-lock.json donut-sync/tsconfig.json donut-sync/tsconfig.build.json ./
 COPY donut-sync/src/ src/
-RUN npm install
+# `npm ci` installs the EXACT versions from package-lock.json. This is what
+# stops a rebuild from silently upgrading the aws-sdk (the upgrade to a version
+# that hoists x-amz-meta-* is what broke presigned uploads against MinIO).
+# --include=dev because the build needs @nestjs/cli (`nest`), a devDependency,
+# and this builder stage must get it regardless of any production npm default.
+RUN npm ci --include=dev
 RUN npm run build
 RUN npm prune --omit=dev
 
