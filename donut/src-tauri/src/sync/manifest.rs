@@ -412,6 +412,11 @@ pub struct ManifestDiff {
   pub files_to_download: Vec<ManifestFileEntry>,
   pub files_to_delete_local: Vec<String>,
   pub files_to_delete_remote: Vec<String>,
+  /// Paths where BOTH devices changed the file since the last agreed state (a
+  /// true conflict). These are a subset of `files_to_download` (remote wins by
+  /// default); the caller backs up the local copy before overwriting so the
+  /// loser's bytes are never silently lost. Empty on the 2-way path.
+  pub conflicts: Vec<String>,
 }
 
 impl ManifestDiff {
@@ -421,6 +426,144 @@ impl ManifestDiff {
       && self.files_to_delete_local.is_empty()
       && self.files_to_delete_remote.is_empty()
   }
+}
+
+/// Path to the per-device baseline manifest — the file set both sides agreed on
+/// at the end of the last successful sync. Stored under `.donut-sync/` (which is
+/// excluded from sync), so it is local to this device and never uploaded.
+pub fn get_baseline_path(profile_dir: &Path) -> std::path::PathBuf {
+  profile_dir.join(".donut-sync").join("baseline.json")
+}
+
+/// Load this device's baseline manifest, or None if there isn't one yet
+/// (first sync, or a legacy profile that pre-dates 3-way reconcile).
+pub fn load_baseline(profile_dir: &Path) -> Option<SyncManifest> {
+  let content = fs::read_to_string(get_baseline_path(profile_dir)).ok()?;
+  serde_json::from_str(&content).ok()
+}
+
+/// Persist the baseline manifest (the state both sides now agree on).
+pub fn save_baseline(profile_dir: &Path, manifest: &SyncManifest) -> SyncResult<()> {
+  let path = get_baseline_path(profile_dir);
+  if let Some(parent) = path.parent() {
+    fs::create_dir_all(parent).map_err(|e| {
+      SyncError::IoError(format!(
+        "Failed to create baseline dir {}: {e}",
+        parent.display()
+      ))
+    })?;
+  }
+  let json = serde_json::to_string(manifest)
+    .map_err(|e| SyncError::SerializationError(format!("Failed to serialize baseline: {e}")))?;
+  fs::write(&path, json)
+    .map_err(|e| SyncError::IoError(format!("Failed to write baseline {}: {e}", path.display())))?;
+  Ok(())
+}
+
+/// Three-way per-file reconcile against a shared `baseline` (the last agreed
+/// state), so two devices editing DIFFERENT files converge and neither silently
+/// clobbers the other.
+///
+/// For each path we compare the local hash (L), remote hash (R) and baseline
+/// hash (B):
+/// - `L == R` → already agreed, nothing to do.
+/// - `L == B, R != B` → only remote changed → download (or delete local if
+///   remote removed it).
+/// - `R == B, L != B` → only local changed → upload (or delete remote if local
+///   removed it).
+/// - `L != B && R != B` (both moved) → true conflict: remote wins, but the path
+///   is recorded in `conflicts` so the caller backs up the local copy first.
+///
+/// A missing baseline (first sync / legacy) makes B == None everywhere, which
+/// degrades gracefully: local-only files upload, remote-only files download,
+/// files that differ on both sides are treated as conflicts (remote wins +
+/// backup), and NOTHING is deleted (a delete needs baseline evidence that the
+/// file once existed and one side removed it). This is strictly safer than the
+/// old whole-profile max-mtime direction, which clobbered the "losing" side.
+pub fn compute_diff_3way(
+  local: &SyncManifest,
+  remote: Option<&SyncManifest>,
+  baseline: Option<&SyncManifest>,
+) -> ManifestDiff {
+  let mut diff = ManifestDiff::default();
+
+  let Some(remote) = remote else {
+    // Nothing on the server yet — upload everything we have.
+    diff.files_to_upload = local.files.clone();
+    return diff;
+  };
+
+  // Data-loss guard: local empty but remote populated means the on-disk profile
+  // data was wiped while metadata survived. Never read that as "user deleted
+  // everything" (which would delete remote) — recover by downloading.
+  if local.files.is_empty() && !remote.files.is_empty() {
+    log::info!(
+      "Local manifest empty but remote has {} files — downloading to recover",
+      remote.files.len()
+    );
+    diff.files_to_download = remote.files.clone();
+    return diff;
+  }
+
+  let local_files: HashMap<&str, &ManifestFileEntry> =
+    local.files.iter().map(|f| (f.path.as_str(), f)).collect();
+  let remote_files: HashMap<&str, &ManifestFileEntry> =
+    remote.files.iter().map(|f| (f.path.as_str(), f)).collect();
+  let baseline_files: HashMap<&str, &ManifestFileEntry> = baseline
+    .map(|b| b.files.iter().map(|f| (f.path.as_str(), f)).collect())
+    .unwrap_or_default();
+
+  let mut all_paths: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+  all_paths.extend(local_files.keys().copied());
+  all_paths.extend(remote_files.keys().copied());
+  all_paths.extend(baseline_files.keys().copied());
+
+  for path in all_paths {
+    let l = local_files.get(path).map(|f| f.hash.as_str());
+    let r = remote_files.get(path).map(|f| f.hash.as_str());
+    let b = baseline_files.get(path).map(|f| f.hash.as_str());
+
+    if l == r {
+      continue; // both sides agree (present-equal, or both absent)
+    }
+
+    let local_unchanged = l == b;
+    let remote_unchanged = r == b;
+
+    if local_unchanged {
+      // Only remote moved.
+      match remote_files.get(path) {
+        Some(re) => diff.files_to_download.push((*re).clone()),
+        None => diff.files_to_delete_local.push(path.to_string()),
+      }
+    } else if remote_unchanged {
+      // Only local moved.
+      match local_files.get(path) {
+        Some(le) => diff.files_to_upload.push((*le).clone()),
+        None => diff.files_to_delete_remote.push(path.to_string()),
+      }
+    } else {
+      // Both moved since baseline → conflict.
+      match (local_files.get(path), remote_files.get(path)) {
+        (Some(_le), Some(re)) => {
+          // Both edited: remote wins, back up local (recorded in conflicts).
+          diff.files_to_download.push((*re).clone());
+          diff.conflicts.push(path.to_string());
+        }
+        (Some(le), None) => {
+          // Local edited, remote deleted: keep the edit (resurrect on remote).
+          diff.files_to_upload.push((*le).clone());
+        }
+        (None, Some(re)) => {
+          // Local deleted, remote edited: keep the edit (resurrect locally).
+          diff.files_to_download.push((*re).clone());
+        }
+        (None, None) => {}
+      }
+    }
+  }
+
+  diff
 }
 
 /// Compute what needs to be synced between local and remote
@@ -904,5 +1047,130 @@ mod tests {
       files_before, manifest2.files,
       "rewriting profile-root metadata.json must not change the manifest file set"
     );
+  }
+
+  /// Build a manifest from (path, hash) pairs for 3-way reconcile tests.
+  fn mk(files: &[(&str, &str)]) -> SyncManifest {
+    let mut m = SyncManifest::new("test".to_string(), vec![]);
+    m.files = files
+      .iter()
+      .map(|(p, h)| ManifestFileEntry {
+        path: p.to_string(),
+        size: 1,
+        mtime: 1,
+        hash: h.to_string(),
+      })
+      .collect();
+    m
+  }
+
+  #[test]
+  fn test_3way_only_remote_changed_downloads() {
+    let base = mk(&[("a", "v1")]);
+    let local = mk(&[("a", "v1")]); // unchanged locally
+    let remote = mk(&[("a", "v2")]); // remote edited
+    let diff = compute_diff_3way(&local, Some(&remote), Some(&base));
+    assert_eq!(diff.files_to_download.len(), 1);
+    assert_eq!(diff.files_to_download[0].hash, "v2");
+    assert!(diff.files_to_upload.is_empty());
+    assert!(diff.conflicts.is_empty());
+  }
+
+  #[test]
+  fn test_3way_only_local_changed_uploads() {
+    let base = mk(&[("a", "v1")]);
+    let local = mk(&[("a", "v2")]); // local edited
+    let remote = mk(&[("a", "v1")]); // remote unchanged
+    let diff = compute_diff_3way(&local, Some(&remote), Some(&base));
+    assert_eq!(diff.files_to_upload.len(), 1);
+    assert_eq!(diff.files_to_upload[0].hash, "v2");
+    assert!(diff.files_to_download.is_empty());
+  }
+
+  #[test]
+  fn test_3way_both_changed_is_conflict_remote_wins() {
+    let base = mk(&[("a", "v1")]);
+    let local = mk(&[("a", "vLocal")]);
+    let remote = mk(&[("a", "vRemote")]);
+    let diff = compute_diff_3way(&local, Some(&remote), Some(&base));
+    // Remote wins (download), but the path is flagged so the caller backs up local.
+    assert_eq!(diff.files_to_download.len(), 1);
+    assert_eq!(diff.files_to_download[0].hash, "vRemote");
+    assert_eq!(diff.conflicts, vec!["a".to_string()]);
+    assert!(diff.files_to_upload.is_empty());
+  }
+
+  #[test]
+  fn test_3way_concurrent_edits_to_different_files_dont_clobber() {
+    // The core two-device bug: A edits x, B edits y. Neither may lose.
+    let base = mk(&[("x", "x1"), ("y", "y1")]);
+    let local = mk(&[("x", "x2"), ("y", "y1")]); // this device edited x
+    let remote = mk(&[("x", "x1"), ("y", "y2")]); // other device edited y
+    let diff = compute_diff_3way(&local, Some(&remote), Some(&base));
+    assert_eq!(diff.files_to_upload.len(), 1);
+    assert_eq!(diff.files_to_upload[0].path, "x");
+    assert_eq!(diff.files_to_download.len(), 1);
+    assert_eq!(diff.files_to_download[0].path, "y");
+    assert!(diff.conflicts.is_empty());
+    assert!(diff.files_to_delete_local.is_empty());
+    assert!(diff.files_to_delete_remote.is_empty());
+  }
+
+  #[test]
+  fn test_3way_local_delete_propagates_to_remote() {
+    let base = mk(&[("a", "v1"), ("b", "v1")]);
+    let local = mk(&[("a", "v1")]); // b deleted locally
+    let remote = mk(&[("a", "v1"), ("b", "v1")]); // remote still has b
+    let diff = compute_diff_3way(&local, Some(&remote), Some(&base));
+    assert_eq!(diff.files_to_delete_remote, vec!["b".to_string()]);
+    assert!(diff.files_to_download.is_empty());
+    assert!(diff.files_to_upload.is_empty());
+  }
+
+  #[test]
+  fn test_3way_remote_delete_propagates_to_local() {
+    let base = mk(&[("a", "v1"), ("b", "v1")]);
+    let local = mk(&[("a", "v1"), ("b", "v1")]);
+    let remote = mk(&[("a", "v1")]); // b deleted on other device
+    let diff = compute_diff_3way(&local, Some(&remote), Some(&base));
+    assert_eq!(diff.files_to_delete_local, vec!["b".to_string()]);
+  }
+
+  #[test]
+  fn test_3way_no_baseline_never_deletes() {
+    // First sync (no baseline): local-only uploads, remote-only downloads,
+    // differing files conflict (remote wins), and NOTHING is deleted.
+    let local = mk(&[("shared", "sL"), ("localonly", "l1")]);
+    let remote = mk(&[("shared", "sR"), ("remoteonly", "r1")]);
+    let diff = compute_diff_3way(&local, Some(&remote), None);
+    assert!(diff.files_to_delete_local.is_empty());
+    assert!(diff.files_to_delete_remote.is_empty());
+    assert!(diff.files_to_upload.iter().any(|f| f.path == "localonly"));
+    assert!(diff
+      .files_to_download
+      .iter()
+      .any(|f| f.path == "remoteonly"));
+    // "shared" differs on both with no baseline → conflict.
+    assert_eq!(diff.conflicts, vec!["shared".to_string()]);
+  }
+
+  #[test]
+  fn test_3way_empty_local_recovers_from_remote() {
+    // Data-loss guard: wiped local dir must download, never delete remote.
+    let base = mk(&[("a", "v1")]);
+    let local = mk(&[]);
+    let remote = mk(&[("a", "v1")]);
+    let diff = compute_diff_3way(&local, Some(&remote), Some(&base));
+    assert_eq!(diff.files_to_download.len(), 1);
+    assert!(diff.files_to_delete_remote.is_empty());
+  }
+
+  #[test]
+  fn test_3way_in_sync_is_noop() {
+    let base = mk(&[("a", "v1")]);
+    let local = mk(&[("a", "v1")]);
+    let remote = mk(&[("a", "v1")]);
+    let diff = compute_diff_3way(&local, Some(&remote), Some(&base));
+    assert!(diff.is_empty());
   }
 }

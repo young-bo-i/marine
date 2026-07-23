@@ -1,5 +1,31 @@
 use super::types::*;
 use reqwest::Client;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use std::time::Duration;
+
+/// TCP/TLS connect timeout. A dead peer must fail fast, not hang a whole sync.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Per-request cap for small control-plane calls (stat/list/presign/delete).
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Per-request cap for a single file transfer (GET/PUT of one profile file).
+/// Generous so a large blob on a slow link isn't cut off, but still bounded so
+/// a stalled socket can never freeze the scheduler forever.
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
+/// Max retries for a control-plane call before surfacing the error.
+const MAX_CONTROL_RETRIES: u32 = 4;
+
+/// Exponential backoff with jitter for a control-plane retry. Base 300ms,
+/// doubling, capped at 5s, plus up to 250ms of jitter to avoid two devices
+/// retrying in lockstep. Jitter is derived from the clock (no rng dependency).
+async fn backoff_sleep(attempt: u32) {
+  let base = 300u64.saturating_mul(1u64 << attempt.min(4));
+  let jitter = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|d| (d.subsec_nanos() % 250) as u64)
+    .unwrap_or(0);
+  tokio::time::sleep(Duration::from_millis(base.min(5000) + jitter)).await;
+}
 
 #[derive(Clone)]
 pub struct SyncClient {
@@ -10,8 +36,15 @@ pub struct SyncClient {
 
 impl SyncClient {
   pub fn new(base_url: String, token: String) -> Self {
+    // A connect timeout bounds every request at the dial stage; per-request
+    // `.timeout()` calls below bound the transfer stage. Without these a single
+    // stalled request would block the scheduler tick indefinitely.
+    let client = Client::builder()
+      .connect_timeout(CONNECT_TIMEOUT)
+      .build()
+      .unwrap_or_else(|_| Client::new());
     Self {
-      client: Client::new(),
+      client,
       base_url: base_url.trim_end_matches('/').to_string(),
       token,
     }
@@ -21,28 +54,79 @@ impl SyncClient {
     format!("{}/v1/objects/{}", self.base_url, path)
   }
 
-  pub async fn stat(&self, key: &str) -> SyncResult<StatResponse> {
-    let response = self
-      .client
-      .post(self.url("stat"))
-      .header("Authorization", format!("Bearer {}", self.token))
-      .json(&StatRequest {
-        key: key.to_string(),
-      })
-      .send()
-      .await
-      .map_err(|e| SyncError::NetworkError(e.to_string()))?;
+  /// POST a JSON body to a control-plane endpoint and decode the JSON response,
+  /// with bounded retry + backoff. Retries transient failures (connect/timeout,
+  /// 429, 5xx); a 4xx is a hard error (surfaced as `AuthError`) and never
+  /// retried. This is the single choke point that gives every control-plane
+  /// call a timeout and retry, so one flaky request no longer aborts a sync.
+  async fn post_json<Req, Res>(&self, path: &str, body: &Req) -> SyncResult<Res>
+  where
+    Req: Serialize,
+    Res: DeserializeOwned,
+  {
+    let url = self.url(path);
+    let mut attempt = 0u32;
+    loop {
+      let result = self
+        .client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", self.token))
+        .timeout(CONTROL_TIMEOUT)
+        .json(body)
+        .send()
+        .await;
 
-    if response.status().is_client_error() {
-      let status = response.status();
-      let body = response.text().await.unwrap_or_default();
-      return Err(SyncError::AuthError(format!("({status}) {body}")));
+      match result {
+        Ok(resp) => {
+          let status = resp.status();
+          if status.is_success() {
+            return resp
+              .json::<Res>()
+              .await
+              .map_err(|e| SyncError::SerializationError(e.to_string()));
+          }
+
+          // 429 + 5xx are transient; retry with backoff. 4xx is a hard error.
+          let retryable = status.as_u16() == 429 || status.is_server_error();
+          if retryable && attempt < MAX_CONTROL_RETRIES {
+            attempt += 1;
+            log::debug!("Retry {attempt}/{MAX_CONTROL_RETRIES} for {path}: HTTP {status}");
+            backoff_sleep(attempt).await;
+            continue;
+          }
+
+          let body_txt = resp.text().await.unwrap_or_default();
+          return if status.is_client_error() {
+            Err(SyncError::AuthError(format!("({status}) {body_txt}")))
+          } else {
+            Err(SyncError::NetworkError(format!(
+              "Server error {status}: {body_txt}"
+            )))
+          };
+        }
+        Err(e) => {
+          let retryable = e.is_timeout() || e.is_connect() || e.is_request();
+          if retryable && attempt < MAX_CONTROL_RETRIES {
+            attempt += 1;
+            log::debug!("Retry {attempt}/{MAX_CONTROL_RETRIES} for {path}: {e}");
+            backoff_sleep(attempt).await;
+            continue;
+          }
+          return Err(SyncError::NetworkError(e.to_string()));
+        }
+      }
     }
+  }
 
-    response
-      .json()
+  pub async fn stat(&self, key: &str) -> SyncResult<StatResponse> {
+    self
+      .post_json(
+        "stat",
+        &StatRequest {
+          key: key.to_string(),
+        },
+      )
       .await
-      .map_err(|e| SyncError::SerializationError(e.to_string()))
   }
 
   pub async fn presign_upload(
@@ -65,81 +149,42 @@ impl SyncClient {
     content_type: Option<&str>,
     metadata: Option<std::collections::HashMap<String, String>>,
   ) -> SyncResult<PresignUploadResponse> {
-    let response = self
-      .client
-      .post(self.url("presign-upload"))
-      .header("Authorization", format!("Bearer {}", self.token))
-      .json(&PresignUploadRequest {
-        key: key.to_string(),
-        content_type: content_type.map(|s| s.to_string()),
-        expires_in: Some(3600),
-        metadata,
-      })
-      .send()
+    self
+      .post_json(
+        "presign-upload",
+        &PresignUploadRequest {
+          key: key.to_string(),
+          content_type: content_type.map(|s| s.to_string()),
+          expires_in: Some(3600),
+          metadata,
+        },
+      )
       .await
-      .map_err(|e| SyncError::NetworkError(e.to_string()))?;
-
-    if response.status().is_client_error() {
-      let status = response.status();
-      let body = response.text().await.unwrap_or_default();
-      return Err(SyncError::AuthError(format!("({status}) {body}")));
-    }
-
-    response
-      .json()
-      .await
-      .map_err(|e| SyncError::SerializationError(e.to_string()))
   }
 
   pub async fn presign_download(&self, key: &str) -> SyncResult<PresignDownloadResponse> {
-    let response = self
-      .client
-      .post(self.url("presign-download"))
-      .header("Authorization", format!("Bearer {}", self.token))
-      .json(&PresignDownloadRequest {
-        key: key.to_string(),
-        expires_in: Some(3600),
-      })
-      .send()
+    self
+      .post_json(
+        "presign-download",
+        &PresignDownloadRequest {
+          key: key.to_string(),
+          expires_in: Some(3600),
+        },
+      )
       .await
-      .map_err(|e| SyncError::NetworkError(e.to_string()))?;
-
-    if response.status().is_client_error() {
-      let status = response.status();
-      let body = response.text().await.unwrap_or_default();
-      return Err(SyncError::AuthError(format!("({status}) {body}")));
-    }
-
-    response
-      .json()
-      .await
-      .map_err(|e| SyncError::SerializationError(e.to_string()))
   }
 
   pub async fn delete(&self, key: &str, tombstone_key: Option<&str>) -> SyncResult<DeleteResponse> {
-    let response = self
-      .client
-      .post(self.url("delete"))
-      .header("Authorization", format!("Bearer {}", self.token))
-      .json(&DeleteRequest {
-        key: key.to_string(),
-        tombstone_key: tombstone_key.map(|s| s.to_string()),
-        deleted_at: Some(chrono::Utc::now().to_rfc3339()),
-      })
-      .send()
+    self
+      .post_json(
+        "delete",
+        &DeleteRequest {
+          key: key.to_string(),
+          tombstone_key: tombstone_key.map(|s| s.to_string()),
+          deleted_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+      )
       .await
-      .map_err(|e| SyncError::NetworkError(e.to_string()))?;
-
-    if response.status().is_client_error() {
-      let status = response.status();
-      let body = response.text().await.unwrap_or_default();
-      return Err(SyncError::AuthError(format!("({status}) {body}")));
-    }
-
-    response
-      .json()
-      .await
-      .map_err(|e| SyncError::SerializationError(e.to_string()))
   }
 
   pub async fn list(&self, prefix: &str) -> SyncResult<ListResponse> {
@@ -151,29 +196,16 @@ impl SyncClient {
     prefix: &str,
     continuation_token: Option<String>,
   ) -> SyncResult<ListResponse> {
-    let response = self
-      .client
-      .post(self.url("list"))
-      .header("Authorization", format!("Bearer {}", self.token))
-      .json(&ListRequest {
-        prefix: prefix.to_string(),
-        max_keys: Some(1000),
-        continuation_token,
-      })
-      .send()
+    self
+      .post_json(
+        "list",
+        &ListRequest {
+          prefix: prefix.to_string(),
+          max_keys: Some(1000),
+          continuation_token,
+        },
+      )
       .await
-      .map_err(|e| SyncError::NetworkError(e.to_string()))?;
-
-    if response.status().is_client_error() {
-      let status = response.status();
-      let body = response.text().await.unwrap_or_default();
-      return Err(SyncError::AuthError(format!("({status}) {body}")));
-    }
-
-    response
-      .json()
-      .await
-      .map_err(|e| SyncError::SerializationError(e.to_string()))
   }
 
   /// List all objects under a prefix, paginating through all results
@@ -221,6 +253,7 @@ impl SyncClient {
     let mut req = self
       .client
       .put(presigned_url)
+      .timeout(TRANSFER_TIMEOUT)
       .header("Content-Length", data.len().to_string())
       .body(data.to_vec());
 
@@ -254,6 +287,7 @@ impl SyncClient {
     let response = self
       .client
       .get(presigned_url)
+      .timeout(TRANSFER_TIMEOUT)
       .send()
       .await
       .map_err(|e| SyncError::NetworkError(e.to_string()))?;
@@ -291,26 +325,8 @@ impl SyncClient {
         expires_in: Some(3600),
       };
 
-      let response = self
-        .client
-        .post(self.url("presign-upload-batch"))
-        .header("Authorization", format!("Bearer {}", self.token))
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| SyncError::NetworkError(e.to_string()))?;
-
-      if response.status().is_client_error() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(SyncError::AuthError(format!("({status}) {body}")));
-      }
-
-      let batch_response: PresignUploadBatchResponse = response
-        .json()
-        .await
-        .map_err(|e| SyncError::SerializationError(e.to_string()))?;
-
+      let batch_response: PresignUploadBatchResponse =
+        self.post_json("presign-upload-batch", &request).await?;
       all_items.extend(batch_response.items);
     }
 
@@ -330,26 +346,8 @@ impl SyncClient {
         expires_in: Some(3600),
       };
 
-      let response = self
-        .client
-        .post(self.url("presign-download-batch"))
-        .header("Authorization", format!("Bearer {}", self.token))
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| SyncError::NetworkError(e.to_string()))?;
-
-      if response.status().is_client_error() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(SyncError::AuthError(format!("({status}) {body}")));
-      }
-
-      let batch_response: PresignDownloadBatchResponse = response
-        .json()
-        .await
-        .map_err(|e| SyncError::SerializationError(e.to_string()))?;
-
+      let batch_response: PresignDownloadBatchResponse =
+        self.post_json("presign-download-batch", &request).await?;
       all_items.extend(batch_response.items);
     }
 
@@ -361,28 +359,15 @@ impl SyncClient {
     prefix: &str,
     tombstone_key: Option<&str>,
   ) -> SyncResult<DeletePrefixResponse> {
-    let response = self
-      .client
-      .post(self.url("delete-prefix"))
-      .header("Authorization", format!("Bearer {}", self.token))
-      .json(&DeletePrefixRequest {
-        prefix: prefix.to_string(),
-        tombstone_key: tombstone_key.map(|s| s.to_string()),
-        deleted_at: Some(chrono::Utc::now().to_rfc3339()),
-      })
-      .send()
+    self
+      .post_json(
+        "delete-prefix",
+        &DeletePrefixRequest {
+          prefix: prefix.to_string(),
+          tombstone_key: tombstone_key.map(|s| s.to_string()),
+          deleted_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+      )
       .await
-      .map_err(|e| SyncError::NetworkError(e.to_string()))?;
-
-    if response.status().is_client_error() {
-      let status = response.status();
-      let body = response.text().await.unwrap_or_default();
-      return Err(SyncError::AuthError(format!("({status}) {body}")));
-    }
-
-    response
-      .json()
-      .await
-      .map_err(|e| SyncError::SerializationError(e.to_string()))
   }
 }

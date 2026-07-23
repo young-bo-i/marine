@@ -1,6 +1,9 @@
 use super::client::SyncClient;
 use super::encryption;
-use super::manifest::{compute_diff, generate_manifest, get_cache_path, HashCache, SyncManifest};
+use super::manifest::{
+  compute_diff_3way, generate_manifest, get_cache_path, load_baseline, save_baseline, HashCache,
+  ManifestFileEntry, SyncManifest,
+};
 use super::types::*;
 use crate::events;
 use crate::profile::types::{BrowserProfile, SyncMode};
@@ -91,30 +94,63 @@ fn is_critical_file(path: &str) -> bool {
     .any(|pattern| path.contains(pattern))
 }
 
+/// Result of a batch file transfer. Per-file failures are RECORDED here instead
+/// of aborting the whole sync, so the caller can advance the shared baseline /
+/// remote manifest for exactly the files that actually transferred — the remote
+/// manifest never references bytes that aren't in the bucket, and failed files
+/// stay "needs sync" and retry on the next pass (no silent drift, no lying
+/// manifest).
+#[derive(Default)]
+struct TransferOutcome {
+  /// Paths that transferred (or were legitimately skipped as already-present).
+  succeeded: HashSet<String>,
+  /// Non-critical per-file failures — retried next sync.
+  failed: HashSet<String>,
+  /// Critical-file failures (Cookies/Login Data/…). Surfaced as a sync error so
+  /// the user sees it, but the profile is still left CONSISTENT first.
+  critical_failed: Vec<String>,
+}
+
 /// Merge remote profile CONFIG metadata into the local profile using
 /// `updated_at` last-write-wins.
 ///
-/// Remote config fields (name / tags / note / proxy / vpn / group) are applied
-/// ONLY when the remote edit is STRICTLY newer than the local one. When remote
-/// wins we also adopt its `updated_at` so both sides agree and the next sync
-/// doesn't re-merge (ping-pong). When the remote is older-or-equal we keep the
-/// local values untouched — the upload side (`upload_profile_metadata`, itself
-/// `updated_at`-gated) has already pushed our newer edit to remote, so a stale
-/// remote must never clobber a local rename. `last_sync` is bookkeeping and is
-/// handled by the caller, never here.
+/// When the remote edit is STRICTLY newer, we adopt the **entire** remote config
+/// body and then restore only the fields that are device-local, runtime, or
+/// per-device disk bookkeeping (which must never be taken from a peer). When the
+/// remote is older-or-equal we keep the local profile untouched — the upload
+/// side (`upload_profile_metadata`, itself `updated_at`-gated) has already pushed
+/// our newer edit, so a stale remote must never clobber it.
+///
+/// The old version hand-picked six fields (name/tags/note/proxy/vpn/group) but
+/// still adopted `remote.updated_at`, so any OTHER synced field
+/// (`launch_hook`, `launch_url`, `proxy_bypass_rules`, `dns_blocklist`,
+/// `extension_group_id`, `brand_id`, fingerprint configs, …) could never
+/// converge: the losing device's stale value survived AND its `updated_at` now
+/// equalled remote, freezing the merge forever. Adopting the whole body fixes
+/// that for every field, present and future. `last_sync` is bookkeeping and is
+/// re-stamped by the caller.
 fn merge_profile_metadata_lww(local: &BrowserProfile, remote: &BrowserProfile) -> BrowserProfile {
-  let mut merged = local.clone();
   let local_ua = local.updated_at.unwrap_or(0);
   let remote_ua = remote.updated_at.unwrap_or(0);
-  if remote_ua > local_ua {
-    merged.name = remote.name.clone();
-    merged.tags = remote.tags.clone();
-    merged.note = remote.note.clone();
-    merged.proxy_id = remote.proxy_id.clone();
-    merged.vpn_id = remote.vpn_id.clone();
-    merged.group_id = remote.group_id.clone();
-    merged.updated_at = remote.updated_at;
+  if remote_ua <= local_ua {
+    // Stale-or-equal remote never wins — keep local verbatim (no ping-pong).
+    return local.clone();
   }
+
+  // Remote edit is strictly newer: take the whole remote config, then restore
+  // the fields that describe THIS device / this on-disk copy and are not part
+  // of the shared, user-editable config the other device is allowed to change.
+  let mut merged = remote.clone();
+  merged.id = local.id; // identity is the key — always local (equal anyway)
+  merged.process_id = local.process_id; // runtime: is it running here right now
+  merged.last_launch = local.last_launch; // runtime: when it last launched here
+  merged.last_sync = local.last_sync; // bookkeeping (caller re-stamps)
+  merged.sync_mode = local.sync_mode; // per-device sync setting
+  merged.encryption_salt = local.encryption_salt.clone(); // per-device E2E salt
+  merged.password_protected = local.password_protected; // on-disk encryption here
+  merged.host_os = local.host_os.clone(); // which OS this copy lives on
+  merged.ephemeral = local.ephemeral; // per-device runtime flag
+  merged.default_bookmarks_seeded = local.default_bookmarks_seeded; // per-device disk bookkeeping
   merged
 }
 
@@ -182,13 +218,19 @@ fn checkpoint_sqlite_wal_files(profile_dir: &Path) {
   }
 }
 
-/// Resume state persisted to disk so interrupted syncs can continue
+/// Resume state persisted to disk so interrupted syncs can continue.
+///
+/// `completed_files` maps path → the content HASH that was transferred, so a
+/// resume only skips a file when the CURRENT target hash still matches what was
+/// already moved. Previously it was a path-only set: if a file changed on the
+/// other device after an interrupted sync (within the 12h TTL), the resume
+/// wrongly skipped transferring the new content, freezing the two devices apart.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SyncResumeState {
   profile_id: String,
   direction: String,
   started_at: String,
-  completed_files: HashSet<String>,
+  completed_files: HashMap<String, String>,
 }
 
 impl SyncResumeState {
@@ -451,6 +493,7 @@ impl SyncEngine {
         presign.metadata.as_ref(),
       )
       .await?;
+    super::subscription::note_local_write(remote_key);
     Ok(())
   }
 
@@ -596,41 +639,46 @@ impl SyncEngine {
       .download_manifest(&remote_manifest_key, encryption_key.as_ref())
       .await?;
 
-    // Compute diff
-    let diff = compute_diff(&local_manifest, remote_manifest.as_ref());
+    // Per-file three-way reconcile against this device's baseline (the state
+    // both sides agreed on at the last sync). Two devices editing DIFFERENT
+    // files now converge, and neither silently clobbers the other.
+    let baseline = load_baseline(&profile_dir);
+    let diff = compute_diff_3way(&local_manifest, remote_manifest.as_ref(), baseline.as_ref());
 
-    // Transfer browser files only when the manifest diff is non-empty. The
-    // config metadata reconcile below runs REGARDLESS — a config-only edit made
-    // while the browser is idle produces an empty file diff (metadata.json is
-    // excluded from the manifest) yet still must be pushed to remote.
+    // Track exactly what actually transferred, so the manifest/baseline we
+    // publish reflect reality (never referencing bytes that aren't in the
+    // bucket) and failed files stay "needs sync" and retry.
+    let mut upload_outcome = TransferOutcome::default();
+    let mut download_outcome = TransferOutcome::default();
+    let mut deleted_local_ok: HashSet<String> = HashSet::new();
+    let mut deleted_remote_ok: HashSet<String> = HashSet::new();
+
     if diff.is_empty() {
       log::info!("Profile {} file set already in sync", profile_id);
+      // Keep the baseline fresh so a future edge (e.g. both sides converged to
+      // the same content) doesn't leave a stale baseline behind.
+      if baseline.is_none() {
+        let mut b = local_manifest.clone();
+        b.encrypted = encryption_key.is_some();
+        let _ = save_baseline(&profile_dir, &b);
+      }
     } else {
-      // Whether this sync will modify remote file OBJECTS. compute_diff is
-      // directional (either upload-side or download-side, never both), so this
-      // is true exactly when we are the newer side with real file changes. It
-      // gates the manifest.json re-upload: a download-only sync must not re-PUT
-      // the manifest (the remote manifest already matches, so it would only bump
-      // timestamps and echo back over SSE as a spurious change).
-      let has_upload_work =
-        !diff.files_to_upload.is_empty() || !diff.files_to_delete_remote.is_empty();
-
-      let upload_bytes: u64 = diff.files_to_upload.iter().map(|f| f.size).sum();
-      let download_bytes: u64 = diff.files_to_download.iter().map(|f| f.size).sum();
       let total_files = diff.files_to_upload.len()
         + diff.files_to_download.len()
         + diff.files_to_delete_local.len()
         + diff.files_to_delete_remote.len();
-
       log::info!(
-        "Profile {} diff: {} to upload, {} to download, {} to delete local, {} to delete remote",
+        "Profile {} diff: {} up, {} down, {} del-local, {} del-remote, {} conflict(s)",
         profile_id,
         diff.files_to_upload.len(),
         diff.files_to_download.len(),
         diff.files_to_delete_local.len(),
-        diff.files_to_delete_remote.len()
+        diff.files_to_delete_remote.len(),
+        diff.conflicts.len()
       );
 
+      let upload_bytes: u64 = diff.files_to_upload.iter().map(|f| f.size).sum();
+      let download_bytes: u64 = diff.files_to_download.iter().map(|f| f.size).sum();
       let _ = events::emit(
         "profile-sync-progress",
         serde_json::json!({
@@ -642,9 +690,35 @@ impl SyncEngine {
         }),
       );
 
-      // Perform uploads
+      // Conflict = both devices changed the same file. Remote wins (see
+      // compute_diff_3way), but we back up the local copy first so the loser's
+      // bytes are recoverable — never a silent clobber.
+      if !diff.conflicts.is_empty() {
+        let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let backup_root = profile_dir
+          .join(".donut-sync")
+          .join("conflicts")
+          .join(&stamp);
+        for path in &diff.conflicts {
+          let src = profile_dir.join(path);
+          if src.exists() {
+            let dst = backup_root.join(path);
+            if let Some(parent) = dst.parent() {
+              let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::copy(&src, &dst);
+          }
+        }
+        log::warn!(
+          "Profile {}: {} file conflict(s), remote won; local copies backed up under {}",
+          profile_id,
+          diff.conflicts.len(),
+          backup_root.display()
+        );
+      }
+
       if !diff.files_to_upload.is_empty() {
-        self
+        upload_outcome = self
           .upload_profile_files(
             app_handle,
             &profile_id,
@@ -663,9 +737,8 @@ impl SyncEngine {
         return Err(SyncError::Cancelled);
       }
 
-      // Perform downloads
       if !diff.files_to_download.is_empty() {
-        self
+        download_outcome = self
           .download_profile_files(
             app_handle,
             &profile_id,
@@ -684,52 +757,148 @@ impl SyncEngine {
         return Err(SyncError::Cancelled);
       }
 
-      // Delete local files that don't exist remotely (when remote is newer)
       for path in &diff.files_to_delete_local {
         let file_path = profile_dir.join(path);
-        if file_path.exists() {
-          let _ = fs::remove_file(&file_path);
+        if !file_path.exists() || fs::remove_file(&file_path).is_ok() {
+          deleted_local_ok.insert(path.clone());
           log::debug!("Deleted local file: {}", path);
         }
       }
 
-      // Delete remote files that don't exist locally (when local is newer)
       for path in &diff.files_to_delete_remote {
         let remote_key = format!("{}profiles/{}/files/{}", key_prefix, profile_id, path);
-        let _ = self.client.delete(&remote_key, None).await;
-        log::debug!("Deleted remote file: {}", path);
+        if self.client.delete(&remote_key, None).await.is_ok() {
+          deleted_remote_ok.insert(path.clone());
+          super::subscription::note_local_write(&remote_key);
+          log::debug!("Deleted remote file: {}", path);
+        }
       }
 
-      // Upload manifest.json last for atomicity — but ONLY when we changed
-      // remote files (see has_upload_work above).
-      if has_upload_work {
-        let mut final_manifest = local_manifest;
-        final_manifest.encrypted = encryption_key.is_some();
+      // Advance the shared state for exactly what transferred. `remote_files`
+      // mirrors the bucket (start from remote, apply our successful uploads /
+      // remote-deletes); `baseline_files` is what THIS device now agrees is in
+      // sync. A file whose transfer FAILED keeps its old entry in both, so it
+      // is neither published as present-when-absent nor marked in-sync — it just
+      // retries next pass. This is what makes a partial failure safe (C3/C6/C14).
+      let local_by_path: HashMap<String, ManifestFileEntry> = local_manifest
+        .files
+        .iter()
+        .map(|f| (f.path.clone(), f.clone()))
+        .collect();
+      let remote_by_path: HashMap<String, ManifestFileEntry> = remote_manifest
+        .as_ref()
+        .map(|m| {
+          m.files
+            .iter()
+            .map(|f| (f.path.clone(), f.clone()))
+            .collect()
+        })
+        .unwrap_or_default();
 
+      let mut remote_files: HashMap<String, ManifestFileEntry> = remote_by_path.clone();
+      let mut baseline_files: HashMap<String, ManifestFileEntry> = baseline
+        .as_ref()
+        .map(|b| {
+          b.files
+            .iter()
+            .map(|f| (f.path.clone(), f.clone()))
+            .collect()
+        })
+        .unwrap_or_default();
+
+      for path in &deleted_local_ok {
+        baseline_files.remove(path);
+      }
+      for path in &deleted_remote_ok {
+        remote_files.remove(path);
+        baseline_files.remove(path);
+      }
+      for path in &upload_outcome.succeeded {
+        if let Some(le) = local_by_path.get(path) {
+          remote_files.insert(path.clone(), le.clone());
+          baseline_files.insert(path.clone(), le.clone());
+        }
+      }
+      for path in &download_outcome.succeeded {
+        if let Some(re) = remote_by_path.get(path) {
+          baseline_files.insert(path.clone(), re.clone());
+        }
+      }
+      // Establish a baseline entry for files already identical on both sides.
+      for (path, le) in &local_by_path {
+        if remote_by_path.get(path).map(|re| &re.hash) == Some(&le.hash) {
+          baseline_files
+            .entry(path.clone())
+            .or_insert_with(|| le.clone());
+        }
+      }
+
+      // Publish the remote manifest ONLY when we changed remote objects — a
+      // download-only sync leaves the remote manifest untouched (zero-PUT
+      // invariant, no spurious SSE echo).
+      if !upload_outcome.succeeded.is_empty() || !deleted_remote_ok.is_empty() {
+        let mut published =
+          SyncManifest::new(profile_id.clone(), local_manifest.exclude_globs.clone());
+        published.updated_at = local_manifest.updated_at.clone();
+        published.files = remote_files.into_values().collect();
+        published.files.sort_by(|a, b| a.path.cmp(&b.path));
+        published.encrypted = encryption_key.is_some();
         self
           .upload_manifest(
             &profile_id,
-            &final_manifest,
+            &published,
             encryption_key.as_ref(),
             &key_prefix,
           )
           .await?;
       }
 
-      // File transfer completed successfully — clean up resume state
-      SyncResumeState::delete(&profile_dir);
+      // Save this device's new baseline (the agreed state).
+      let mut new_baseline =
+        SyncManifest::new(profile_id.clone(), local_manifest.exclude_globs.clone());
+      new_baseline.updated_at = local_manifest.updated_at.clone();
+      new_baseline.files = baseline_files.into_values().collect();
+      new_baseline.files.sort_by(|a, b| a.path.cmp(&b.path));
+      new_baseline.encrypted = encryption_key.is_some();
+      let _ = save_baseline(&profile_dir, &new_baseline);
+
+      // Drop resume state only on a fully clean run; keep it (hash-validated) so
+      // a partial failure resumes cheaply next time.
+      if upload_outcome.failed.is_empty() && download_outcome.failed.is_empty() {
+        SyncResumeState::delete(&profile_dir);
+      }
     }
 
-    // Reconcile the profile CONFIG metadata.json on EVERY sync, independent of
-    // the file diff. metadata.json is excluded from the file manifest, so a
-    // config-only edit (rename / tags / note / proxy-vpn-group reassignment)
-    // done while the browser is idle produces an empty file diff — but the edit
-    // must still reach remote and be restorable on a fresh machine. This is
-    // idempotent (HEAD + updated_at compare, uploads on a missing remote), so an
-    // unchanged profile performs no PUT here.
-    self
-      .upload_profile_metadata(&profile_id, profile, &key_prefix)
-      .await?;
+    // Reconcile the profile CONFIG metadata.json with a SINGLE HEAD, then
+    // transfer only in the direction that is actually stale. Previously this
+    // path always downloaded the body even on a no-op sync (C8); now the GET
+    // only happens when the remote edit is strictly newer.
+    let remote_metadata_key = format!("{}profiles/{}/metadata.json", key_prefix, profile_id);
+    let local_updated = profile.updated_at.unwrap_or(0);
+    let mut updated_profile = profile.clone();
+    match self.client.stat(&remote_metadata_key).await {
+      Ok(stat) if stat.exists => {
+        let remote_updated = self.remote_updated_at(&stat, &remote_metadata_key).await;
+        if remote_updated > local_updated {
+          if let Ok(remote_meta) = self.download_profile_metadata(&remote_metadata_key).await {
+            updated_profile = merge_profile_metadata_lww(profile, &remote_meta);
+          }
+        } else if local_updated > remote_updated {
+          self
+            .upload_profile_metadata(&profile_id, profile, &key_prefix)
+            .await?;
+        }
+      }
+      Ok(_) => {
+        // Remote missing (new profile / fresh-machine restore) — push ours.
+        self
+          .upload_profile_metadata(&profile_id, profile, &key_prefix)
+          .await?;
+      }
+      Err(e) => {
+        log::warn!("metadata.json stat failed for {profile_id}: {e} — keeping local");
+      }
+    }
 
     // Sync associated proxy, group, and VPN. Each is idempotent (LWW via
     // updated_at → no PUT when unchanged), so running them on every sync is safe.
@@ -743,17 +912,6 @@ impl SyncEngine {
       let _ = self.sync_vpn(vpn_id, Some(app_handle)).await;
     }
 
-    // Download remote profile CONFIG metadata and merge with last-write-wins:
-    // remote name/tags/note/proxy/vpn/group are applied ONLY when the remote
-    // edit is strictly newer (updated_at). A stale remote must never clobber a
-    // local rename — the upload above has already pushed our newer edit. When
-    // the download fails we keep the local profile as-is. `last_sync` is
-    // bookkeeping and is always bumped.
-    let remote_metadata_key = format!("{}profiles/{}/metadata.json", key_prefix, profile_id);
-    let mut updated_profile = match self.download_profile_metadata(&remote_metadata_key).await {
-      Ok(remote_meta) => merge_profile_metadata_lww(profile, &remote_meta),
-      Err(_) => profile.clone(),
-    };
     updated_profile.last_sync = Some(
       std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -762,6 +920,27 @@ impl SyncEngine {
     );
     let _ = profile_manager.save_profile(&updated_profile);
     let _ = events::emit("profiles-changed", ());
+
+    // A critical file that couldn't transfer is surfaced as an error (so the
+    // user sees it and the scheduler retries) — but only AFTER the profile was
+    // left in a consistent state above, so it never wedges convergence.
+    let mut critical_failed = upload_outcome.critical_failed;
+    critical_failed.extend(download_outcome.critical_failed);
+    if !critical_failed.is_empty() {
+      let _ = events::emit(
+        "profile-sync-status",
+        serde_json::json!({
+          "profile_id": profile_id,
+          "profile_name": profile.name,
+          "status": "error"
+        }),
+      );
+      return Err(SyncError::IoError(format!(
+        "Critical files failed to transfer for profile {}: {}",
+        profile_id,
+        critical_failed.join(", ")
+      )));
+    }
 
     let _ = events::emit(
       "profile-sync-status",
@@ -842,6 +1021,7 @@ impl SyncEngine {
       .client
       .upload_bytes(&presign.url, &upload_data, Some(content_type))
       .await?;
+    super::subscription::note_local_write(&remote_key);
 
     Ok(())
   }
@@ -969,28 +1149,38 @@ impl SyncEngine {
     profile_id: &str,
     profile_name: &str,
     profile_dir: &Path,
-    files: &[super::manifest::ManifestFileEntry],
+    files: &[ManifestFileEntry],
     encryption_key: Option<&[u8; 32]>,
     key_prefix: &str,
     cancel_flag: &Arc<AtomicBool>,
-  ) -> SyncResult<()> {
+  ) -> SyncResult<TransferOutcome> {
+    let mut outcome = TransferOutcome::default();
     if files.is_empty() {
-      return Ok(());
+      return Ok(outcome);
     }
 
-    // Load resume state to skip already-uploaded files
+    // Load resume state. Skip a file ONLY when its already-transferred hash
+    // still equals the current target hash (C4: a path-only skip froze files
+    // that changed on the other device after an interrupted sync).
     let mut resume_state = SyncResumeState::load(profile_dir)
       .filter(|s| s.profile_id == profile_id && s.direction == "upload");
 
-    let already_done: HashSet<String> = resume_state
+    let already_done: HashMap<String, String> = resume_state
       .as_ref()
       .map(|s| s.completed_files.clone())
       .unwrap_or_default();
 
     let files_to_process: Vec<_> = files
       .iter()
-      .filter(|f| !already_done.contains(&f.path))
+      .filter(|f| already_done.get(&f.path) != Some(&f.hash))
       .collect();
+    // Files already at the target hash count as succeeded so the caller advances
+    // the baseline for them.
+    for f in files {
+      if already_done.get(&f.path) == Some(&f.hash) {
+        outcome.succeeded.insert(f.path.clone());
+      }
+    }
     let skipped = files.len() - files_to_process.len();
 
     if skipped > 0 {
@@ -1009,7 +1199,7 @@ impl SyncEngine {
     );
 
     if files_to_process.is_empty() {
-      return Ok(());
+      return Ok(outcome);
     }
 
     // Initialize resume state if not resuming
@@ -1018,7 +1208,7 @@ impl SyncEngine {
         profile_id: profile_id.to_string(),
         direction: "upload".to_string(),
         started_at: Utc::now().to_rfc3339(),
-        completed_files: HashSet::new(),
+        completed_files: HashMap::new(),
       });
     }
     let resume_state = Arc::new(TokioMutex::new(resume_state.unwrap()));
@@ -1047,7 +1237,7 @@ impl SyncEngine {
     let total_bytes: u64 = files.iter().map(|f| f.size).sum();
     let already_bytes: u64 = files
       .iter()
-      .filter(|f| already_done.contains(&f.path))
+      .filter(|f| already_done.get(&f.path) == Some(&f.hash))
       .map(|f| f.size)
       .sum();
 
@@ -1090,26 +1280,17 @@ impl SyncEngine {
       let sem = semaphore.clone();
       let file_path = profile_dir.join(&file.path);
       let relative_path = file.path.clone();
+      let file_hash = file.hash.clone();
       let file_size = file.size;
       let remote_key = format!(
         "{}profiles/{}/files/{}",
         key_prefix, profile_id_owned, file.path
       );
+      // The batch presign may have omitted this key; the task re-presigns as
+      // needed rather than aborting the whole sync.
       let url = url_map.get(&remote_key).cloned();
       let critical = is_critical_file(&file.path);
 
-      if url.is_none() {
-        log::warn!("No presigned URL for {}", remote_key);
-        if critical {
-          return Err(SyncError::NetworkError(format!(
-            "No presigned URL for critical file: {}",
-            file.path
-          )));
-        }
-        continue;
-      }
-
-      let url = url.unwrap();
       let client = client.clone();
       let tracker = tracker.clone();
       let resume_state = resume_state.clone();
@@ -1156,30 +1337,55 @@ impl SyncEngine {
           data
         };
 
-        // Retry loop for network uploads
+        // Retry loop for network uploads. On a missing/expired URL we re-presign
+        // (C13) so a sync running past the 1h presign window can still finish.
+        let mut current_url = url;
         let mut last_err = String::new();
         for attempt in 0..MAX_FILE_RETRIES {
+          if cancel_flag_task.load(Ordering::Relaxed) {
+            return Err((relative_path, "cancelled".to_string(), false));
+          }
+          if current_url.is_none() || attempt > 0 {
+            match client
+              .presign_upload(&remote_key, content_type.as_deref())
+              .await
+            {
+              Ok(p) => current_url = Some(p.url),
+              Err(e) => {
+                last_err = format!("re-presign failed: {e}");
+                if attempt < MAX_FILE_RETRIES - 1 {
+                  tokio::time::sleep(std::time::Duration::from_millis(500 * (attempt as u64 + 1)))
+                    .await;
+                }
+                continue;
+              }
+            }
+          }
+          let Some(u) = current_url.clone() else {
+            continue;
+          };
           match client
-            .upload_bytes(&url, &upload_data, content_type.as_deref())
+            .upload_bytes(&u, &upload_data, content_type.as_deref())
             .await
           {
             Ok(()) => {
               tracker.record_success(file_size);
-
-              // Record in resume state, save periodically
+              super::subscription::note_local_write(&remote_key);
               {
                 let mut state = resume_state.lock().await;
-                state.completed_files.insert(relative_path.clone());
+                state
+                  .completed_files
+                  .insert(relative_path.clone(), file_hash.clone());
                 let count = save_counter.fetch_add(1, Ordering::Relaxed);
                 if count.is_multiple_of(50) {
                   let _ = state.save(&profile_dir_clone);
                 }
               }
-
               return Ok(relative_path);
             }
             Err(e) => {
               last_err = format!("{}", e);
+              current_url = None; // force a fresh presign on the next attempt
               if attempt < MAX_FILE_RETRIES - 1 {
                 log::debug!(
                   "Retry {}/{} for {}: {}",
@@ -1205,15 +1411,22 @@ impl SyncEngine {
       }));
     }
 
-    // Collect results
-    let mut critical_failures = Vec::new();
-    let mut non_critical_failures = Vec::new();
-
+    // Collect results into the outcome. Per-file failures are RECORDED, not
+    // fatal: the caller advances the baseline/manifest only for the files in
+    // `succeeded`, so a failed file simply stays "needs sync" and retries.
     for handle in handles {
       match handle.await {
-        Ok(Ok(_)) => {}
-        Ok(Err((path, msg, true))) => critical_failures.push((path, msg)),
-        Ok(Err((path, msg, false))) => non_critical_failures.push((path, msg)),
+        Ok(Ok(path)) => {
+          outcome.succeeded.insert(path);
+        }
+        Ok(Err((path, msg, true))) => {
+          log::warn!("Critical file failed to upload {path}: {msg}");
+          outcome.critical_failed.push(path.clone());
+          outcome.failed.insert(path);
+        }
+        Ok(Err((path, _msg, false))) => {
+          outcome.failed.insert(path);
+        }
         Err(e) => {
           log::warn!("Upload task panicked: {}", e);
         }
@@ -1228,23 +1441,15 @@ impl SyncEngine {
 
     tracker.emit_final();
 
-    if !non_critical_failures.is_empty() {
+    if !outcome.failed.is_empty() {
       log::warn!(
-        "Upload completed with {} non-critical failures for profile {}",
-        non_critical_failures.len(),
+        "Upload completed with {} failed file(s) for profile {}",
+        outcome.failed.len(),
         profile_id_owned
       );
     }
 
-    if !critical_failures.is_empty() {
-      let file_list: Vec<&str> = critical_failures.iter().map(|(p, _)| p.as_str()).collect();
-      return Err(SyncError::IoError(format!(
-        "Critical files failed to upload: {}. Sync aborted to prevent data loss.",
-        file_list.join(", ")
-      )));
-    }
-
-    Ok(())
+    Ok(outcome)
   }
 
   #[allow(clippy::too_many_arguments)]
@@ -1254,13 +1459,14 @@ impl SyncEngine {
     profile_id: &str,
     profile_name: &str,
     profile_dir: &Path,
-    files: &[super::manifest::ManifestFileEntry],
+    files: &[ManifestFileEntry],
     encryption_key: Option<&[u8; 32]>,
     key_prefix: &str,
     cancel_flag: &Arc<AtomicBool>,
-  ) -> SyncResult<()> {
+  ) -> SyncResult<TransferOutcome> {
+    let mut outcome = TransferOutcome::default();
     if files.is_empty() {
-      return Ok(());
+      return Ok(outcome);
     }
 
     // The profile-root `metadata.json` is the profile CONFIG blob, synced
@@ -1269,7 +1475,7 @@ impl SyncEngine {
     // split) may still list it; downloading `files/metadata.json` then 404s.
     // Drop it here so a normal pull skips the expected-missing legacy entry at
     // debug instead of retrying 3x and warning.
-    let files: Vec<super::manifest::ManifestFileEntry> = files
+    let files: Vec<ManifestFileEntry> = files
       .iter()
       .filter(|f| {
         if f.path == "metadata.json" {
@@ -1285,23 +1491,29 @@ impl SyncEngine {
       .cloned()
       .collect();
     if files.is_empty() {
-      return Ok(());
+      return Ok(outcome);
     }
     let files = files.as_slice();
 
-    // Load resume state to skip already-downloaded files
+    // Load resume state. Skip a file only when its already-downloaded hash still
+    // matches the current target hash (C4).
     let mut resume_state = SyncResumeState::load(profile_dir)
       .filter(|s| s.profile_id == profile_id && s.direction == "download");
 
-    let already_done: HashSet<String> = resume_state
+    let already_done: HashMap<String, String> = resume_state
       .as_ref()
       .map(|s| s.completed_files.clone())
       .unwrap_or_default();
 
     let files_to_process: Vec<_> = files
       .iter()
-      .filter(|f| !already_done.contains(&f.path))
+      .filter(|f| already_done.get(&f.path) != Some(&f.hash))
       .collect();
+    for f in files {
+      if already_done.get(&f.path) == Some(&f.hash) {
+        outcome.succeeded.insert(f.path.clone());
+      }
+    }
     let skipped = files.len() - files_to_process.len();
 
     if skipped > 0 {
@@ -1320,7 +1532,7 @@ impl SyncEngine {
     );
 
     if files_to_process.is_empty() {
-      return Ok(());
+      return Ok(outcome);
     }
 
     // Initialize resume state if not resuming
@@ -1329,7 +1541,7 @@ impl SyncEngine {
         profile_id: profile_id.to_string(),
         direction: "download".to_string(),
         started_at: Utc::now().to_rfc3339(),
-        completed_files: HashSet::new(),
+        completed_files: HashMap::new(),
       });
     }
     let resume_state = Arc::new(TokioMutex::new(resume_state.unwrap()));
@@ -1352,7 +1564,7 @@ impl SyncEngine {
     let total_bytes: u64 = files.iter().map(|f| f.size).sum();
     let already_bytes: u64 = files
       .iter()
-      .filter(|f| already_done.contains(&f.path))
+      .filter(|f| already_done.get(&f.path) == Some(&f.hash))
       .map(|f| f.size)
       .sum();
 
@@ -1393,6 +1605,7 @@ impl SyncEngine {
       let sem = semaphore.clone();
       let file_path = profile_dir.join(&file.path);
       let relative_path = file.path.clone();
+      let file_hash = file.hash.clone();
       let file_size = file.size;
       let remote_key = format!(
         "{}profiles/{}/files/{}",
@@ -1401,18 +1614,6 @@ impl SyncEngine {
       let url = url_map.get(&remote_key).cloned();
       let critical = is_critical_file(&file.path);
 
-      if url.is_none() {
-        log::warn!("No presigned URL for {}", remote_key);
-        if critical {
-          return Err(SyncError::NetworkError(format!(
-            "No presigned URL for critical file: {}",
-            file.path
-          )));
-        }
-        continue;
-      }
-
-      let url = url.unwrap();
       let client = client.clone();
       let tracker = tracker.clone();
       let resume_state = resume_state.clone();
@@ -1427,13 +1628,31 @@ impl SyncEngine {
           return Err((relative_path, "cancelled".to_string(), false));
         }
 
-        // Retry loop for network downloads
+        // Retry loop for network downloads. Re-presign a missing/expired URL
+        // (C13) so a long sync past the 1h presign window still completes.
+        let mut current_url = url;
         let mut last_err = String::new();
         for attempt in 0..MAX_FILE_RETRIES {
           if cancel_flag_task.load(Ordering::Relaxed) {
             return Err((relative_path, "cancelled".to_string(), false));
           }
-          match client.download_bytes(&url).await {
+          if current_url.is_none() || attempt > 0 {
+            match client.presign_download(&remote_key).await {
+              Ok(p) => current_url = Some(p.url),
+              Err(e) => {
+                last_err = format!("re-presign failed: {e}");
+                if attempt < MAX_FILE_RETRIES - 1 {
+                  tokio::time::sleep(std::time::Duration::from_millis(500 * (attempt as u64 + 1)))
+                    .await;
+                }
+                continue;
+              }
+            }
+          }
+          let Some(u) = current_url.clone() else {
+            continue;
+          };
+          match client.download_bytes(&u).await {
             Ok(data) => {
               let write_data = if let Some(ref key) = enc_key {
                 match encryption::decrypt_bytes(key, &data) {
@@ -1463,7 +1682,9 @@ impl SyncEngine {
 
               {
                 let mut state = resume_state.lock().await;
-                state.completed_files.insert(relative_path.clone());
+                state
+                  .completed_files
+                  .insert(relative_path.clone(), file_hash.clone());
                 let count = save_counter.fetch_add(1, Ordering::Relaxed);
                 if count.is_multiple_of(50) {
                   let _ = state.save(&profile_dir_clone);
@@ -1474,6 +1695,7 @@ impl SyncEngine {
             }
             Err(e) => {
               last_err = format!("{}", e);
+              current_url = None; // force a fresh presign on the next attempt
               if attempt < MAX_FILE_RETRIES - 1 {
                 log::debug!(
                   "Retry {}/{} for {}: {}",
@@ -1499,14 +1721,19 @@ impl SyncEngine {
       }));
     }
 
-    let mut critical_failures = Vec::new();
-    let mut non_critical_failures = Vec::new();
-
     for handle in handles {
       match handle.await {
-        Ok(Ok(_)) => {}
-        Ok(Err((path, msg, true))) => critical_failures.push((path, msg)),
-        Ok(Err((path, msg, false))) => non_critical_failures.push((path, msg)),
+        Ok(Ok(path)) => {
+          outcome.succeeded.insert(path);
+        }
+        Ok(Err((path, msg, true))) => {
+          log::warn!("Critical file failed to download {path}: {msg}");
+          outcome.critical_failed.push(path.clone());
+          outcome.failed.insert(path);
+        }
+        Ok(Err((path, _msg, false))) => {
+          outcome.failed.insert(path);
+        }
         Err(e) => {
           log::warn!("Download task panicked: {}", e);
         }
@@ -1521,23 +1748,15 @@ impl SyncEngine {
 
     tracker.emit_final();
 
-    if !non_critical_failures.is_empty() {
+    if !outcome.failed.is_empty() {
       log::warn!(
-        "Download completed with {} non-critical failures for profile {}",
-        non_critical_failures.len(),
+        "Download completed with {} failed file(s) for profile {}",
+        outcome.failed.len(),
         profile_id_owned
       );
     }
 
-    if !critical_failures.is_empty() {
-      let file_list: Vec<&str> = critical_failures.iter().map(|(p, _)| p.as_str()).collect();
-      return Err(SyncError::IoError(format!(
-        "Critical files failed to download: {}. Sync aborted to prevent data loss.",
-        file_list.join(", ")
-      )));
-    }
-
-    Ok(())
+    Ok(outcome)
   }
 
   async fn sync_proxy(
@@ -2088,18 +2307,34 @@ impl SyncEngine {
         ))
       })?;
 
-      let (file_payload, file_content_type) = encryption::maybe_seal_for_upload(&file_data)
-        .map_err(|e| SyncError::InvalidData(format!("Failed to seal extension file: {e}")))?;
-
       let file_remote_key = format!("extensions/{}/file/{}", ext.id, ext.file_name);
-      let file_presign = self
+
+      // Skip re-uploading an unchanged binary (C10). A metadata-only edit (e.g.
+      // a rename) bumps updated_at but leaves the file identical, and the old
+      // code re-PUT the whole binary every time. Compare the remote size as a
+      // cheap unchanged-check. (Under E2E the sealed size differs, so encrypted
+      // profiles safely fall back to re-uploading.)
+      let unchanged = self
         .client
-        .presign_upload(&file_remote_key, Some(file_content_type))
-        .await?;
-      self
-        .client
-        .upload_bytes(&file_presign.url, &file_payload, Some(file_content_type))
-        .await?;
+        .stat(&file_remote_key)
+        .await
+        .ok()
+        .map(|s| s.exists && s.size == Some(file_data.len() as u64))
+        .unwrap_or(false);
+
+      if !unchanged {
+        let (file_payload, file_content_type) = encryption::maybe_seal_for_upload(&file_data)
+          .map_err(|e| SyncError::InvalidData(format!("Failed to seal extension file: {e}")))?;
+        let file_presign = self
+          .client
+          .presign_upload(&file_remote_key, Some(file_content_type))
+          .await?;
+        self
+          .client
+          .upload_bytes(&file_presign.url, &file_payload, Some(file_content_type))
+          .await?;
+        super::subscription::note_local_write(&file_remote_key);
+      }
     }
 
     // Update local extension with new last_sync
@@ -2507,7 +2742,7 @@ impl SyncEngine {
     if !manifest.files.is_empty() {
       let cancel_flag = register_sync_cancel(profile_id);
       let _cancel_guard = SyncCancelGuard(profile_id.to_string());
-      self
+      let outcome = self
         .download_profile_files(
           app_handle,
           profile_id,
@@ -2519,6 +2754,17 @@ impl SyncEngine {
           &cancel_flag,
         )
         .await?;
+      // Recovery must be all-or-nothing on critical files: if a Cookies/Login
+      // Data/… download failed, fail loudly so the restore retries rather than
+      // silently registering an incomplete profile. (download_profile_files no
+      // longer aborts internally — it records failures in the outcome.)
+      if !outcome.critical_failed.is_empty() {
+        return Err(SyncError::IoError(format!(
+          "Profile {} recovery: critical files failed to download: {}",
+          profile_id,
+          outcome.critical_failed.join(", ")
+        )));
+      }
     }
 
     // Verify critical files after download

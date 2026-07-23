@@ -2,11 +2,66 @@ use crate::events;
 use crate::settings_manager::SettingsManager;
 use reqwest::Client;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
+
+/// How long a locally-written key stays "ours" for self-echo suppression. The
+/// server polls S3 every 5s and broadcasts changes (including back to the writer,
+/// which has no origin filter), so a window a few poll cycles wide catches the
+/// echo. If the window is missed the change is still reconciled correctly on the
+/// next sync trigger (3-way + updated_at LWW) — suppression is a frequency
+/// optimization that can never cause drift.
+const SELF_WRITE_TTL: Duration = Duration::from_secs(15);
+
+lazy_static::lazy_static! {
+  /// server-relative key → time THIS device last wrote it.
+  static ref RECENT_LOCAL_WRITES: StdMutex<HashMap<String, Instant>> =
+    StdMutex::new(HashMap::new());
+}
+
+/// Record that this device just wrote `key` to the server, so the SSE echo of
+/// our own write is dropped instead of queuing a pointless self-sync (C7).
+/// The team prefix (if any) is stripped so it matches the server-emitted key.
+pub fn note_local_write(key: &str) {
+  let rel = strip_team_prefix(key).to_string();
+  if let Ok(mut m) = RECENT_LOCAL_WRITES.lock() {
+    let now = Instant::now();
+    m.retain(|_, t| now.duration_since(*t) < SELF_WRITE_TTL);
+    m.insert(rel, now);
+  }
+}
+
+/// True — consuming the record — if `key` was written locally within the TTL.
+fn take_recent_local_write(key: &str) -> bool {
+  if let Ok(mut m) = RECENT_LOCAL_WRITES.lock() {
+    if let Some(t) = m.get(key) {
+      if Instant::now().duration_since(*t) < SELF_WRITE_TTL {
+        m.remove(key);
+        return true;
+      }
+    }
+  }
+  false
+}
+
+/// Strip a leading `teams/<id>/` scope so keys match the server-emitted,
+/// prefix-stripped SSE keys.
+fn strip_team_prefix(key: &str) -> &str {
+  if key.starts_with("teams/") {
+    if let Some(rest) = key.find('/').and_then(|first_slash| {
+      key[first_slash + 1..]
+        .find('/')
+        .map(|second_slash| first_slash + 1 + second_slash + 1)
+    }) {
+      return &key[rest..];
+    }
+  }
+  key
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubscribeEvent {
@@ -257,19 +312,6 @@ impl SyncSubscription {
     data_line.and_then(|data| serde_json::from_str(data).ok())
   }
 
-  fn strip_team_prefix(key: &str) -> &str {
-    if key.starts_with("teams/") {
-      if let Some(rest) = key.find('/').and_then(|first_slash| {
-        key[first_slash + 1..]
-          .find('/')
-          .map(|second_slash| first_slash + 1 + second_slash + 1)
-      }) {
-        return &key[rest..];
-      }
-    }
-    key
-  }
-
   fn handle_event(event: &SubscribeEvent, work_tx: &mpsc::UnboundedSender<SyncWorkItem>) {
     let Some(raw_key) = &event.key else {
       return;
@@ -279,7 +321,15 @@ impl SyncSubscription {
       return;
     }
 
-    let key = Self::strip_team_prefix(raw_key);
+    let key = strip_team_prefix(raw_key);
+
+    // Drop the echo of a write THIS device just made (C7). Without this, every
+    // successful upload is broadcast back to us (the server has no origin
+    // filter) and re-runs a full profile sync on the writer itself.
+    if take_recent_local_write(key) {
+      log::debug!("Dropping self-write echo for {key}");
+      return;
+    }
 
     let work_item = if key.starts_with("profiles/") {
       // Match both bundle uploads (profiles/{id}.tar.gz) and delta sync updates
