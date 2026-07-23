@@ -68,6 +68,11 @@ const MAX_FILE_RETRIES: u32 = 3;
 
 /// Critical file patterns — if any of these fail to upload/download, the sync is aborted.
 const CRITICAL_FILE_PATTERNS: &[&str] = &[
+  // Wayfern's portable cookie-encryption key. Cookies are useless without it
+  // (Chromium silently WIPES undecryptable cookies, i.e. all logins), so a key
+  // that can't transfer must fail the sync loudly rather than leave a profile
+  // whose Cookies and key don't match.
+  "os_crypt_key",
   "Cookies",
   "Login Data",
   "Local Storage",
@@ -690,10 +695,15 @@ impl SyncEngine {
         }),
       );
 
-      // Conflict = both devices changed the same file. Remote wins (see
-      // compute_diff_3way), but we back up the local copy first so the loser's
-      // bytes are recoverable — never a silent clobber.
-      if !diff.conflicts.is_empty() {
+      // Conflict = both devices changed the same file. The newer copy wins
+      // (compute_diff_3way), and the loser is backed up first so a conflict is
+      // never a silent clobber:
+      //  - remote won (`conflicts`)        → back up the LOCAL copy, then the
+      //    download overwrites it;
+      //  - local won (`conflict_uploads`)  → back up the REMOTE copy, then our
+      //    upload overwrites it on the server (the other device will later
+      //    blind-download our winner over its local copy).
+      if !diff.conflicts.is_empty() || !diff.conflict_uploads.is_empty() {
         let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
         let backup_root = profile_dir
           .join(".donut-sync")
@@ -709,10 +719,28 @@ impl SyncEngine {
             let _ = fs::copy(&src, &dst);
           }
         }
+        for path in &diff.conflict_uploads {
+          let remote_key = format!("{}profiles/{}/files/{}", key_prefix, profile_id, path);
+          if let Ok(presign) = self.client.presign_download(&remote_key).await {
+            if let Ok(raw) = self.client.download_bytes(&presign.url).await {
+              let data = match encryption_key.as_ref() {
+                Some(key) => encryption::decrypt_bytes(key, &raw).unwrap_or(raw),
+                None => raw,
+              };
+              let dst = backup_root.join(path);
+              if let Some(parent) = dst.parent() {
+                let _ = fs::create_dir_all(parent);
+              }
+              let _ = fs::write(&dst, &data);
+            }
+          }
+        }
         log::warn!(
-          "Profile {}: {} file conflict(s), remote won; local copies backed up under {}",
+          "Profile {}: {} conflict(s) (remote newer: {}, local newer: {}); losers backed up under {}",
           profile_id,
+          diff.conflicts.len() + diff.conflict_uploads.len(),
           diff.conflicts.len(),
+          diff.conflict_uploads.len(),
           backup_root.display()
         );
       }

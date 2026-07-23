@@ -413,10 +413,15 @@ pub struct ManifestDiff {
   pub files_to_delete_local: Vec<String>,
   pub files_to_delete_remote: Vec<String>,
   /// Paths where BOTH devices changed the file since the last agreed state (a
-  /// true conflict). These are a subset of `files_to_download` (remote wins by
-  /// default); the caller backs up the local copy before overwriting so the
-  /// loser's bytes are never silently lost. Empty on the 2-way path.
+  /// true conflict) and the REMOTE side won (its copy is newer). Subset of
+  /// `files_to_download`; the caller backs up the local copy before overwriting
+  /// so the loser's bytes are never silently lost. Empty on the 2-way path.
   pub conflicts: Vec<String>,
+  /// True conflicts where the LOCAL side won (its copy is newer). Subset of
+  /// `files_to_upload`; the caller backs up the remote copy before overwriting
+  /// it on the server, because the other device will later blind-download our
+  /// winner over its local copy.
+  pub conflict_uploads: Vec<String>,
 }
 
 impl ManifestDiff {
@@ -471,15 +476,18 @@ pub fn save_baseline(profile_dir: &Path, manifest: &SyncManifest) -> SyncResult<
 ///   remote removed it).
 /// - `R == B, L != B` → only local changed → upload (or delete remote if local
 ///   removed it).
-/// - `L != B && R != B` (both moved) → true conflict: remote wins, but the path
-///   is recorded in `conflicts` so the caller backs up the local copy first.
+/// - `L != B && R != B` (both moved) → true conflict: the side with the NEWER
+///   file mtime wins (tie → remote). The path is recorded in `conflicts`
+///   (remote won → back up local first) or `conflict_uploads` (local won →
+///   back up the remote copy first).
 ///
 /// A missing baseline (first sync / legacy) makes B == None everywhere, which
 /// degrades gracefully: local-only files upload, remote-only files download,
-/// files that differ on both sides are treated as conflicts (remote wins +
-/// backup), and NOTHING is deleted (a delete needs baseline evidence that the
-/// file once existed and one side removed it). This is strictly safer than the
-/// old whole-profile max-mtime direction, which clobbered the "losing" side.
+/// files that differ on both sides are treated as conflicts (newer mtime wins,
+/// loser backed up), and NOTHING is deleted (a delete needs baseline evidence
+/// that the file once existed and one side removed it). This is strictly safer
+/// than the old whole-profile max-mtime direction, which clobbered the "losing"
+/// side.
 pub fn compute_diff_3way(
   local: &SyncManifest,
   remote: Option<&SyncManifest>,
@@ -545,10 +553,22 @@ pub fn compute_diff_3way(
     } else {
       // Both moved since baseline → conflict.
       match (local_files.get(path), remote_files.get(path)) {
-        (Some(_le), Some(re)) => {
-          // Both edited: remote wins, back up local (recorded in conflicts).
-          diff.files_to_download.push((*re).clone());
-          diff.conflicts.push(path.to_string());
+        (Some(le), Some(re)) => {
+          // Both edited: the NEWER copy (file mtime) wins, ties go to remote.
+          // "Always remote wins" ate fresh logins: with both browsers open, the
+          // machine that synced LAST had its just-written Cookies replaced by
+          // the other side's earlier upload. mtime is genuine on both sides
+          // here — a conflict requires the browser to have really written the
+          // file since the last sync (a downloaded-untouched copy hashes equal
+          // to baseline and never reaches this branch). The loser is backed up
+          // either way.
+          if le.mtime > re.mtime {
+            diff.files_to_upload.push((*le).clone());
+            diff.conflict_uploads.push(path.to_string());
+          } else {
+            diff.files_to_download.push((*re).clone());
+            diff.conflicts.push(path.to_string());
+          }
         }
         (Some(le), None) => {
           // Local edited, remote deleted: keep the edit (resurrect on remote).
@@ -1089,6 +1109,7 @@ mod tests {
 
   #[test]
   fn test_3way_both_changed_is_conflict_remote_wins() {
+    // Equal mtimes (mk sets mtime=1 everywhere) → tie → remote wins.
     let base = mk(&[("a", "v1")]);
     let local = mk(&[("a", "vLocal")]);
     let remote = mk(&[("a", "vRemote")]);
@@ -1098,6 +1119,52 @@ mod tests {
     assert_eq!(diff.files_to_download[0].hash, "vRemote");
     assert_eq!(diff.conflicts, vec!["a".to_string()]);
     assert!(diff.files_to_upload.is_empty());
+    assert!(diff.conflict_uploads.is_empty());
+  }
+
+  /// Like `mk` but with an explicit mtime per file, for conflict-resolution tests.
+  fn mk_mt(files: &[(&str, &str, i64)]) -> SyncManifest {
+    let mut m = SyncManifest::new("test".to_string(), vec![]);
+    m.files = files
+      .iter()
+      .map(|(p, h, t)| ManifestFileEntry {
+        path: p.to_string(),
+        size: 1,
+        mtime: *t,
+        hash: h.to_string(),
+      })
+      .collect();
+    m
+  }
+
+  #[test]
+  fn test_3way_conflict_newer_local_wins() {
+    // The login-loss scenario: both machines used the profile, but the LOCAL
+    // copy (e.g. Cookies written by the just-closed browser with a fresh login)
+    // is newer → local must win and be uploaded, with the remote loser flagged
+    // for backup. "Always remote wins" would have eaten the login.
+    let base = mk_mt(&[("Cookies", "v1", 100)]);
+    let local = mk_mt(&[("Cookies", "vLoginFresh", 300)]); // newer
+    let remote = mk_mt(&[("Cookies", "vStale", 200)]);
+    let diff = compute_diff_3way(&local, Some(&remote), Some(&base));
+    assert_eq!(diff.files_to_upload.len(), 1);
+    assert_eq!(diff.files_to_upload[0].hash, "vLoginFresh");
+    assert_eq!(diff.conflict_uploads, vec!["Cookies".to_string()]);
+    assert!(diff.files_to_download.is_empty());
+    assert!(diff.conflicts.is_empty());
+  }
+
+  #[test]
+  fn test_3way_conflict_newer_remote_wins() {
+    let base = mk_mt(&[("Cookies", "v1", 100)]);
+    let local = mk_mt(&[("Cookies", "vOld", 200)]);
+    let remote = mk_mt(&[("Cookies", "vNewer", 300)]); // newer
+    let diff = compute_diff_3way(&local, Some(&remote), Some(&base));
+    assert_eq!(diff.files_to_download.len(), 1);
+    assert_eq!(diff.files_to_download[0].hash, "vNewer");
+    assert_eq!(diff.conflicts, vec!["Cookies".to_string()]);
+    assert!(diff.files_to_upload.is_empty());
+    assert!(diff.conflict_uploads.is_empty());
   }
 
   #[test]
