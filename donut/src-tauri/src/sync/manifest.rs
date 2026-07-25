@@ -79,6 +79,13 @@ pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
   // regeneration. Keep excluding it so any markers left on disk from
   // prior builds never get uploaded.
   ".last-fp-refresh",
+  // The bundled Marine extension is re-synced into every profile from this
+  // build's own copy on each launch (`marine::extension::ensure_for_profile`),
+  // so uploading it is pure waste — and `marine-ext/marine-runtime-config.json`
+  // holds a PLAINTEXT bearer token for the local API. Syncing it would push that
+  // credential to remote storage (unencrypted unless the profile opts into E2E)
+  // and restore a stale one onto other machines. Never sync this directory.
+  "**/marine-ext/**",
 ];
 
 /// A single file entry in the manifest
@@ -132,6 +139,13 @@ impl SyncManifest {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HashCache {
   pub entries: HashMap<String, HashCacheEntry>,
+  /// Whether any `insert` actually changed an entry since this cache was loaded.
+  ///
+  /// Deliberately not persisted: a cache freshly read off disk is by definition
+  /// identical to its file. Without this, a sync cycle where nothing on disk had
+  /// changed still re-serialized and rewrote a byte-identical file every time.
+  #[serde(skip)]
+  dirty: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,9 +201,21 @@ impl HashCache {
   }
 
   pub fn insert(&mut self, path: String, size: u64, mtime: i64, hash: String) {
-    self
-      .entries
-      .insert(path, HashCacheEntry { size, mtime, hash });
+    let entry = HashCacheEntry { size, mtime, hash };
+    let unchanged = self.entries.get(&path).is_some_and(|existing| {
+      existing.size == entry.size && existing.mtime == entry.mtime && existing.hash == entry.hash
+    });
+    if unchanged {
+      return;
+    }
+    self.dirty = true;
+    self.entries.insert(path, entry);
+  }
+
+  /// Whether this cache differs from what is on disk. Callers use it to skip a
+  /// pointless rewrite on a cycle where nothing was rehashed.
+  pub fn is_dirty(&self) -> bool {
+    self.dirty
   }
 }
 
@@ -204,6 +230,16 @@ fn build_exclude_globset(patterns: &[String]) -> SyncResult<GlobSet> {
   builder
     .build()
     .map_err(|e| SyncError::InvalidData(format!("Failed to build exclude globset: {e}")))
+}
+
+/// GlobSet of [`DEFAULT_EXCLUDE_PATTERNS`], for callers that walk a profile
+/// directory and must skip exactly what the manifest skips.
+pub fn default_exclude_globset() -> SyncResult<GlobSet> {
+  let patterns: Vec<String> = DEFAULT_EXCLUDE_PATTERNS
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+  build_exclude_globset(&patterns)
 }
 
 /// Compute blake3 hash of a file
@@ -696,6 +732,24 @@ mod tests {
     assert_eq!(cache.get("test.txt", 100, 1234567890), Some("abc123"));
     assert_eq!(cache.get("test.txt", 100, 999), None); // Different mtime
     assert_eq!(cache.get("test.txt", 50, 1234567890), None); // Different size
+
+    // The dirty flag gates the on-disk rewrite, so re-inserting an identical
+    // entry must NOT mark the cache dirty, and a cache read back off disk must
+    // start clean.
+    assert!(cache.is_dirty(), "a fresh insert must mark the cache dirty");
+    let mut clean = HashCache::default();
+    clean.insert("a".to_string(), 1, 2, "h".to_string());
+    clean.dirty = false;
+    clean.insert("a".to_string(), 1, 2, "h".to_string());
+    assert!(
+      !clean.is_dirty(),
+      "re-inserting an identical entry must not mark the cache dirty"
+    );
+    clean.insert("a".to_string(), 1, 3, "h".to_string());
+    assert!(
+      clean.is_dirty(),
+      "a changed mtime must mark the cache dirty"
+    );
 
     cache.save(&cache_path).unwrap();
 
@@ -1239,5 +1293,28 @@ mod tests {
     let remote = mk(&[("a", "v1")]);
     let diff = compute_diff_3way(&local, Some(&remote), Some(&base));
     assert!(diff.is_empty());
+  }
+
+  /// `marine-ext/marine-runtime-config.json` carries a plaintext bearer token for
+  /// the local API. It must never reach remote storage, and the whole directory is
+  /// regenerated on every launch, so nothing in it is worth syncing.
+  #[test]
+  fn marine_extension_dir_is_never_synced() {
+    let patterns: Vec<String> = DEFAULT_EXCLUDE_PATTERNS
+      .iter()
+      .map(|p| (*p).to_string())
+      .collect();
+    let globset = build_exclude_globset(&patterns).unwrap();
+    for path in [
+      "profile/marine-ext/marine-runtime-config.json",
+      "profile/marine-ext/manifest.json",
+      "profile/marine-ext/src/sw.js",
+      "profile/marine-ext/skills/scholay/母稿.md",
+    ] {
+      assert!(globset.is_match(path), "{path} must be excluded from sync");
+    }
+    // Guard against an over-broad pattern swallowing real profile data.
+    assert!(!globset.is_match("profile/Default/Cookies"));
+    assert!(!globset.is_match("profile/Default/Extensions/abc/1.0/manifest.json"));
   }
 }

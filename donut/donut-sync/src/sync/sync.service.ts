@@ -341,7 +341,9 @@ export class SyncService implements OnModuleInit {
     // the client PUTs (verified against MinIO: PUT now 200, HEAD still returns
     // the metadata so LWW-via-HEAD keeps working).
     const unhoistableHeaders = metadata
-      ? new Set(Object.keys(metadata).map((k) => `x-amz-meta-${k.toLowerCase()}`))
+      ? new Set(
+          Object.keys(metadata).map((k) => `x-amz-meta-${k.toLowerCase()}`),
+        )
       : undefined;
     const url = await getSignedUrl(this.s3Client, command, {
       expiresIn,
@@ -660,7 +662,20 @@ export class SyncService implements OnModuleInit {
     ctx: UserContext,
     pollIntervalMs = 5000,
   ): Observable<SubscribeEventDto> {
-    const basePrefixes = ["profiles/", "proxies/", "groups/", "tombstones/"];
+    // Every entity class the client can act on. `vpns/`, `extensions/` and
+    // `extension_groups/` were missing here, so edits to those never reached
+    // another device even though the client already parses those keys into work
+    // items and the scheduler already queues them — the change simply was never
+    // announced. Keep this list in sync with `handle_event` in subscription.rs.
+    const basePrefixes = [
+      "profiles/",
+      "proxies/",
+      "groups/",
+      "vpns/",
+      "extensions/",
+      "extension_groups/",
+      "tombstones/",
+    ];
     const scopes = this.scopesFor(ctx);
 
     // Per-connection state (not shared across subscribers).

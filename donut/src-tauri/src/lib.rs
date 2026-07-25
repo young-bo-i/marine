@@ -1305,19 +1305,31 @@ fn show_main_window(app_handle: &tauri::AppHandle) {
   }
 }
 
+/// `async` + `spawn_blocking` is load-bearing, not stylistic. `list_all` reads,
+/// parses and sorts every profile's ledger; as a synchronous command Tauri ran
+/// that on the main thread, and the ledger page re-invokes it on every
+/// `history-changed` event — i.e. the UI froze for the length of a full ledger
+/// read every time a comment was posted.
 #[tauri::command]
-fn marine_list_posting_history() -> Result<Vec<marine::history::PostingRecord>, String> {
-  marine::history::HISTORY_MANAGER
-    .lock()
-    .map_err(|_| {
-      log::error!("Marine posting history manager lock poisoned");
-      marine::err("INTERNAL_ERROR")
-    })?
-    .list_all()
-    .map_err(|error| {
-      log::error!("Failed to list Marine posting history: {error}");
-      marine::err("INTERNAL_ERROR")
-    })
+async fn marine_list_posting_history() -> Result<Vec<marine::history::PostingRecord>, String> {
+  tauri::async_runtime::spawn_blocking(|| {
+    marine::history::HISTORY_MANAGER
+      .lock()
+      .map_err(|_| {
+        log::error!("Marine posting history manager lock poisoned");
+        marine::err("INTERNAL_ERROR")
+      })?
+      .list_all()
+      .map_err(|error| {
+        log::error!("Failed to list Marine posting history: {error}");
+        marine::err("INTERNAL_ERROR")
+      })
+  })
+  .await
+  .map_err(|error| {
+    log::error!("Marine posting history task failed: {error}");
+    marine::err("INTERNAL_ERROR")
+  })?
 }
 
 /// Update the tray menu labels with localized strings pushed from the frontend

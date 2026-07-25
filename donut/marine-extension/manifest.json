@@ -30,18 +30,44 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": ["*://*.bilibili.com/*"],
       "js": ["src/publish-receipt.js", "src/publish-bridge.js"],
       "run_at": "document_start",
       "world": "ISOLATED",
       "all_frames": true
     },
     {
-      "matches": ["<all_urls>"],
+      "matches": ["*://*.bilibili.com/*"],
       "js": ["src/content-main.js"],
       "run_at": "document_start",
       "world": "MAIN",
       "all_frames": true
+    },
+    {
+      "matches": ["<all_urls>"],
+      "exclude_matches": ["*://*.bilibili.com/*"],
+      "js": ["src/content-main.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "*://*.youtube.com/*",
+        "*://*.youtu.be/*",
+        "*://*.bilibili.com/*",
+        "*://*.zhihu.com/*",
+        "*://*.xiaohongshu.com/*",
+        "*://*.xhslink.com/*",
+        "*://*.douyin.com/*"
+      ],
+      "js": [
+        "src/platforms/youtube.js",
+        "src/platforms/bilibili.js",
+        "src/platforms/comment-targets.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
     },
     {
       "matches": ["<all_urls>"],
@@ -51,9 +77,6 @@
         "src/extract-text.js",
         "src/comments.js",
         "src/rime-context.js",
-        "src/platforms/youtube.js",
-        "src/platforms/bilibili.js",
-        "src/platforms/comment-targets.js",
         "src/content-iso.js"
       ],
       "run_at": "document_idle",
@@ -68,7 +91,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["popup.html", "popup.css", "popup.js", "skills/*"],
+      "resources": ["popup.html"],
       "matches": ["<all_urls>"]
     }
   ]

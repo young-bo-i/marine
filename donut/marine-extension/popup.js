@@ -1,5 +1,6 @@
 // popup.js — 一键抓取（字幕/评论/正文）、话术资料配置与发布记录。
-// AI 执行归 RimeBuffer 的可切换连接器所有；Marine 不启动模型。
+// 话术由本机智能体（Codex/Claude）经 Donut 后端 /v1/marine/generate-stream 执行：
+// 选中评论/回复框后点页内浮出的「生成」按钮，结果只填草稿，绝不自动发送。
 const $ = sel => document.querySelector(sel);
 
 // 嵌入模式：作为注入网页的悬浮侧栏（panel-inject.js）加载时，URL 带 ?tabId=<宿主标签页>，
@@ -129,7 +130,7 @@ async function grab() {
     setStatus(
       any
         ? (configReady()
-          ? '✓ 已检测；话术将在 RimeBuffer 中调用所选 AI 连接器生成'
+          ? '✓ 已检测；选中评论/回复框后点页内浮出的「生成」按钮，用本机连接器生成话术'
           : '✓ 已检测，可复制（未连接 Marine，无法同步话术与记录）')
         : '本页暂无可抓内容',
       any ? 'ok' : '',
@@ -279,6 +280,66 @@ $('#cfg-profile').addEventListener('change', async () => {
 const SKILL_BRAND = 'scholay';
 
 // ---- 导入本地 .md 作为补充范文（存 chrome.storage，生成时并入 skill）----
+// ---- AI 模型连接器：自动探测本机 codex/claude + 读写 provider-config ----
+const CONNECTOR_LABEL = { codex: 'Codex', claude: 'Claude Code', openai: '通用 OpenAI 兼容端点' };
+// PUT /provider-config 是整体替换：保留 GET 到的完整配置，保存时只改 provider，
+// 不清空经 API 设置的 cli_model / openai_base_url / openai_model。
+let marineConnectorConfig = {};
+
+async function loadConnectorOptions() {
+  const select = $('#cfg-connector');
+  const status = $('#cfg-connector-status');
+  if (!select || !status) return;
+  if (!configReady()) { status.textContent = '连接本地 API 后即可选择本机智能体连接器。'; return; }
+  let agents = [];
+  try { agents = await apiFetch('/agents') || []; }
+  catch (e) { status.textContent = '检测智能体失败：' + String(e && e.message || e); return; }
+  if (!Array.isArray(agents)) agents = [];
+  let config = {};
+  try { config = await apiFetch('/provider-config') || {}; } catch (e) {}
+  marineConnectorConfig = config || {};
+  const provider = typeof config.provider === 'string' ? config.provider : '';
+  // 若经 API 配了 popup 下拉里没有的 provider（如 openai），动态补一项，保证保存时不被复位。
+  if (provider && !Array.from(select.options).some(o => o.value === provider)) {
+    const opt = document.createElement('option');
+    opt.value = provider;
+    opt.textContent = (CONNECTOR_LABEL[provider] || provider) + '（经 API 配置）';
+    select.appendChild(opt);
+  }
+  select.value = provider;
+  const ready = agents.filter(a => a && a.detected && a.authed).map(a => a.id);
+  const parts = agents.map(a => {
+    const name = CONNECTOR_LABEL[a.id] || a.id;
+    const state = (a.detected && a.authed) ? '✓ 已连接' : a.detected ? '· 已安装未登录' : '· 未安装';
+    return name + ' ' + state;
+  });
+  let hint;
+  if (!ready.length) hint = '未检测到已登录的本机智能体，请先安装并登录 Codex 或 Claude Code CLI。';
+  else if (!select.value) hint = '自动将使用 ' + (CONNECTOR_LABEL[ready.includes('codex') ? 'codex' : ready[0]] || ready[0]) + '。';
+  else if (!ready.includes(select.value)) hint = '注意：所选连接器当前未就绪。';
+  else hint = '当前使用 ' + (CONNECTOR_LABEL[select.value] || select.value) + '。';
+  status.textContent = parts.join('　') + (parts.length ? ' · ' : '') + hint;
+}
+
+if ($('#cfg-connector-save')) $('#cfg-connector-save').addEventListener('click', async () => {
+  const select = $('#cfg-connector');
+  const status = $('#cfg-connector-status');
+  if (!select) return;
+  try {
+    const c = marineConnectorConfig || {};
+    await apiFetch('/provider-config', { method: 'PUT', body: JSON.stringify({
+      provider: select.value || null,
+      cli_model: c.cli_model != null ? c.cli_model : null,
+      openai_base_url: c.openai_base_url != null ? c.openai_base_url : null,
+      openai_model: c.openai_model != null ? c.openai_model : null,
+    }) });
+    if (status) status.textContent = '已保存，正在刷新…';
+    await loadConnectorOptions();
+  } catch (e) {
+    if (status) status.textContent = '保存失败：' + String(e && e.message || e);
+  }
+});
+
 async function loadSampleStatus() {
   const st = $('#sample-status'), clr = $('#sample-clear');
   let o = {};
@@ -445,6 +506,7 @@ chrome.tabs.onUpdated.addListener((tabId, ci) => {
   await attach();
 
   await loadConnFields();
+  try { await loadConnectorOptions(); } catch (e) {}  // AI 连接器：探测 + 当前选择
   try { await loadSampleStatus(); } catch (e) {}   // 本地导入范文状态（与 API 无关）
   if (!configReady()) setStatus('未连接本地 API —— 请在「配置」中手动连接，或由 Marine 自动注入', '');
 })();
@@ -467,7 +529,10 @@ async function loadLogs() {
   try { const r = await send('GET_LOGS'); ((r && r.logs) || []).forEach(dbgRender); } catch (e) {}
 }
 chrome.runtime.onMessage.addListener((msg, sender) => {
-  if (msg && msg.__marineLog && sender && sender.tab && sender.tab.id === activeTabId) dbgRender(msg.__marineLog);
+  if (!msg || !sender || !sender.tab || sender.tab.id !== activeTabId) return;
+  // 合批推送是当前格式；单条格式保留，兼容页面里还没被替换掉的旧注入脚本。
+  if (Array.isArray(msg.__marineLogBatch)) msg.__marineLogBatch.forEach(dbgRender);
+  else if (msg.__marineLog) dbgRender(msg.__marineLog);
 });
 $('#dbg-clear').addEventListener('click', async () => {
   const b = $('#dbg-log'); if (b) b.innerHTML = '';

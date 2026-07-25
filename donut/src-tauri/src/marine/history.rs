@@ -53,6 +53,13 @@ pub struct PostingRecord {
   pub root_id: Option<String>,
   #[serde(default)]
   pub context_id: Option<String>,
+  /// Who produced the comment text: `extension` (in-page button — browser-side
+  /// self-serve generation), `rime` (the input method's connector), or `manual`
+  /// (typed by hand / not Marine-generated). Absent when unknown. This is the
+  /// generation source, distinct from `confirmation_source` (how the post was
+  /// confirmed) and `brand_id` (which talk-track pack).
+  #[serde(default)]
+  pub generation_source: Option<String>,
   /// `manual` for legacy/operator confirmation, or a platform receipt source.
   #[serde(default = "default_confirmation_source")]
   pub confirmation_source: String,
@@ -299,6 +306,7 @@ mod tests {
       parent_id: None,
       root_id: None,
       context_id: None,
+      generation_source: None,
       confirmation_source: "bilibili-api".into(),
       status: "published".into(),
       posted_at,

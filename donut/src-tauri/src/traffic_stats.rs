@@ -380,11 +380,22 @@ pub fn list_traffic_stats() -> Vec<TrafficStats> {
 
   let mut stats_map: HashMap<String, TrafficStats> = HashMap::new();
   let mut files_to_delete: Vec<std::path::PathBuf> = Vec::new();
+  // Keys whose on-disk file no longer matches what we hold in memory. Only those
+  // get written back: this function runs on the 1 Hz traffic poll, and saving
+  // every entry unconditionally meant one file write per profile per second.
+  let mut dirty: std::collections::HashSet<String> = std::collections::HashSet::new();
 
   if let Ok(entries) = fs::read_dir(&storage_dir) {
     for entry in entries.flatten() {
       let path = entry.path();
-      if path.extension().is_some_and(|ext| ext == "json") {
+      // `*.session.json` are live counters written by proxy workers with a
+      // different shape; they parse as `TrafficStats` only to fail. Skip them
+      // instead of paying a read + failed parse per file on every poll.
+      let is_session_file = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".session.json"));
+      if !is_session_file && path.extension().is_some_and(|ext| ext == "json") {
         if let Ok(content) = fs::read_to_string(&path) {
           if let Ok(s) = serde_json::from_str::<TrafficStats>(&content) {
             // Determine the key for this stats entry
@@ -399,12 +410,16 @@ pub fn list_traffic_stats() -> Vec<TrafficStats> {
             if let Some(existing) = stats_map.get_mut(&key) {
               // Merge stats from this file into existing
               merge_traffic_stats(existing, &s);
+              dirty.insert(key.clone());
               if is_old_proxy_file {
                 files_to_delete.push(path.clone());
               }
             } else {
               stats_map.insert(key.clone(), s);
               if is_old_proxy_file {
+                // Migrated out of a proxy-id file: the canonical profile-id file
+                // has to be written before the old one is deleted.
+                dirty.insert(key.clone());
                 files_to_delete.push(path.clone());
               }
             }
@@ -415,9 +430,11 @@ pub fn list_traffic_stats() -> Vec<TrafficStats> {
   }
 
   // Save merged stats and delete old files
-  for stats in stats_map.values() {
-    if let Err(e) = save_traffic_stats(stats) {
-      log::warn!("Failed to save merged traffic stats: {}", e);
+  for key in &dirty {
+    if let Some(stats) = stats_map.get(key) {
+      if let Err(e) = save_traffic_stats(stats) {
+        log::warn!("Failed to save merged traffic stats: {}", e);
+      }
     }
   }
 
@@ -1019,14 +1036,11 @@ pub fn get_traffic_snapshot_for_profile(profile_id: &str) -> Option<TrafficSnaps
   Some(stats.to_snapshot())
 }
 
-/// Load session snapshot from disk (written by proxy worker processes)
-fn load_session_snapshot(profile_id: &str) -> Option<SessionSnapshot> {
-  let session_file = get_traffic_stats_dir().join(format!("{}.session.json", profile_id));
-  if !session_file.exists() {
-    return None;
-  }
-
-  let content = fs::read_to_string(&session_file).ok()?;
+/// Read a session snapshot (written by proxy worker processes) from a path the
+/// caller already obtained from a directory walk — no path rebuild, and no
+/// `exists()` stat for something the dirent just proved is there.
+fn read_session_snapshot(session_file: &std::path::Path) -> Option<SessionSnapshot> {
+  let content = fs::read_to_string(session_file).ok()?;
   serde_json::from_str::<SessionSnapshot>(&content).ok()
 }
 
@@ -1035,14 +1049,17 @@ fn load_session_snapshot(profile_id: &str) -> Option<SessionSnapshot> {
 pub fn get_all_traffic_snapshots_realtime() -> Vec<TrafficSnapshot> {
   use std::collections::HashMap;
 
-  // Start with disk-stored stats
-  let mut snapshots: HashMap<String, TrafficSnapshot> = list_traffic_stats()
-    .into_iter()
-    .map(|s| {
-      let key = s.profile_id.clone().unwrap_or_else(|| s.proxy_id.clone());
-      (key, s.to_snapshot())
-    })
-    .collect();
+  // Start with disk-stored stats. `last_flush_timestamp` is carried over from
+  // this same pass: the session-merge loop below needs it, and re-deriving it
+  // via `load_traffic_stats` meant reading and parsing every stats file a
+  // second time on every 1 Hz poll.
+  let mut snapshots: HashMap<String, TrafficSnapshot> = HashMap::new();
+  let mut last_flush_by_key: HashMap<String, u64> = HashMap::new();
+  for s in list_traffic_stats() {
+    let key = s.profile_id.clone().unwrap_or_else(|| s.proxy_id.clone());
+    last_flush_by_key.insert(key.clone(), s.last_flush_timestamp);
+    snapshots.insert(key, s.to_snapshot());
+  }
 
   // Try to merge in real-time data from active tracker (if in same process)
   if let Some(tracker) = get_traffic_tracker() {
@@ -1062,17 +1079,13 @@ pub fn get_all_traffic_snapshots_realtime() -> Vec<TrafficSnapshot> {
       if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
         if file_name.ends_with(".session.json") {
           if let Some(profile_id) = file_name.strip_suffix(".session.json") {
-            if let Some(session) = load_session_snapshot(profile_id) {
+            if let Some(session) = read_session_snapshot(&path) {
               // Merge session data with disk snapshot
               if let Some(snapshot) = snapshots.get_mut(profile_id) {
                 // Only merge session data if it's newer than the last flush
                 // Session snapshots written before the last flush contain bytes already
                 // included in disk totals, so merging them would cause double-counting
-                let disk_stats = load_traffic_stats(profile_id);
-                let last_flush = disk_stats
-                  .as_ref()
-                  .map(|s| s.last_flush_timestamp)
-                  .unwrap_or(0);
+                let last_flush = last_flush_by_key.get(profile_id).copied().unwrap_or(0);
 
                 if session.timestamp > last_flush {
                   // Session data contains in-memory counters not yet flushed to disk

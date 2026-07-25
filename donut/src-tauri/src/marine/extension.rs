@@ -52,24 +52,50 @@ fn source_dir(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
       return Some(pb);
     }
   }
-  // 2) Bundled resource (release builds).
+  // 2) Dev builds: prefer the live worktree over the bundled resource. In a debug
+  //    build `resource_dir()` is `target/debug/`, whose `marine-extension/` is a
+  //    COPY made at build time — editing the extension then relaunching a profile
+  //    would silently resync that stale snapshot over the edits, so dev changes
+  //    appear not to take effect at all. The worktree is the source of truth here.
+  if cfg!(debug_assertions) {
+    if let Some(dir) = worktree_extension_dir() {
+      return Some(dir);
+    }
+  }
+  // 3) Bundled resource (release builds).
   if let Ok(res) = app_handle.path().resource_dir() {
     let pb = res.join("marine-extension");
     if pb.join("manifest.json").exists() {
       return Some(pb);
     }
   }
-  // 3) Dev: walk up from the running exe to find `donut/marine-extension`
-  //    (exe is at donut/src-tauri/target/debug/donutbrowser).
-  if let Ok(exe) = std::env::current_exe() {
-    for ancestor in exe.ancestors() {
-      let pb = ancestor.join("marine-extension");
-      if pb.join("manifest.json").exists() {
-        return Some(pb);
-      }
-    }
-  }
-  None
+  // 4) Last resort (layouts that keep the extension beside the exe).
+  nearby_extension_dir()
+}
+
+/// The extension inside the checked-out worktree. Identified by an ancestor that
+/// holds BOTH `marine-extension/` and `src-tauri/` — that pair only exists at the
+/// repo's `donut/` root, so this never picks up `target/debug/marine-extension`
+/// (the build-time resource copy, which sits next to the dev exe).
+fn worktree_extension_dir() -> Option<PathBuf> {
+  let exe = std::env::current_exe().ok()?;
+  exe.ancestors().find_map(|ancestor| {
+    let candidate = ancestor.join("marine-extension");
+    (ancestor.join("src-tauri").is_dir() && candidate.join("manifest.json").exists())
+      .then_some(candidate)
+  })
+}
+
+/// Nearest `marine-extension/` above the running exe, whatever the layout.
+fn nearby_extension_dir() -> Option<PathBuf> {
+  let exe = std::env::current_exe().ok()?;
+  exe.ancestors().find_map(|ancestor| {
+    let candidate = ancestor.join("marine-extension");
+    candidate
+      .join("manifest.json")
+      .exists()
+      .then_some(candidate)
+  })
 }
 
 fn read_extension_version(dir: &Path) -> io::Result<String> {
@@ -197,9 +223,17 @@ pub async fn ensure_for_profile(
     _ => preferred_port,
   };
 
+  // Stamp the derived capability, never the full bearer: this file lives inside
+  // the browser profile, and the extension only needs `/v1/marine/*`.
+  let capability = if token.is_empty() {
+    String::new()
+  } else {
+    super::extension_capability_token(&token)
+  };
+
   let cfg = serde_json::json!({
     "apiBase": format!("http://127.0.0.1:{port}/v1/marine"),
-    "token": token,
+    "token": capability,
     "profileId": profile_id,
   });
   let config_json = serde_json::to_vec_pretty(&cfg).unwrap_or_default();

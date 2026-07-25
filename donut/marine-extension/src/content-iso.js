@@ -13,10 +13,18 @@
     if (/(^|\.)bilibili\.com$/.test(h)) return 'bilibili';
     if (/(^|\.)zhihu\.com$/.test(h)) return 'zhihu';
     if (/(^|\.)xiaohongshu\.com$/.test(h) || h === 'xhslink.com') return 'xiaohongshu';
+    if (/(^|\.)douyin\.com$/.test(h)) return 'douyin';
     if (/(^|\.)netflix\.com$/.test(h)) return 'netflix';
     return 'generic';
   }
-  const PLATFORM_LABEL = { youtube: 'YouTube', bilibili: 'Bilibili', zhihu: '知乎', xiaohongshu: '小红书', netflix: 'Netflix', generic: '通用页面' };
+  const PLATFORM_LABEL = { youtube: 'YouTube', bilibili: 'Bilibili', zhihu: '知乎', xiaohongshu: '小红书', douyin: '抖音', netflix: 'Netflix', generic: '通用页面' };
+  // 有评论目标适配器的平台 —— 就是 comment-targets.js 的 adapters.get 认识的那四个。
+  // 刻意小于 detectPlatform() 的全集，也小于 manifest 里那条 host 列表：
+  //   detectPlatform  ⊃ manifest host 列表 ⊃ 本表
+  //   · netflix 只有通用 textTrack 抽取，没有任何 src/platforms/ 文件；
+  //   · youtube 有 src/platforms/youtube.js（字幕）但没有评论适配器。
+  // 本表只用于判断「适配器注册表本该已经存在」，不要拿它当注入范围用。
+  const ADAPTER_PLATFORMS = { bilibili: 1, zhihu: 1, xiaohongshu: 1, douyin: 1 };
 
   // ---- 1) MAIN world 被动捕获 ----
   const captured = [];          // { id, url, body, ct, ts }
@@ -82,6 +90,7 @@
     if (platform === 'bilibili') return 'bili-comments';
     if (platform === 'zhihu') return '.Modal-content, .Comments-container, .CommentListV2';
     if (platform === 'xiaohongshu') return '.note-scroller, .comments-container';
+    if (platform === 'douyin') return '.comment-mainContent, [class*="comment-list" i], [class*="comment-header-inner-container"]';
     return null;
   }
 
@@ -280,18 +289,31 @@
     setTimeout(collect, 600);
     setTimeout(collect, 2000);
   }
+  // 一个 <video> 都没有的页面（GitHub / Gmail 之类）上，这个 observer 此前仍会在
+  // 每一批 DOM 变更里跑一次全文档 querySelectorAll('video')——React SPA 上每秒
+  // 几十次，全是空转。改用一个 live HTMLCollection：没有视频时读 length 近乎零
+  // 成本，有视频时也比重新全文档查询便宜。再合一次帧，同一批变更只处理一次。
+  const marineVideoNodes = document.getElementsByTagName('video');
+  let marineHookVideosScheduled = false;
+
   function hookVideos() {
-    document.querySelectorAll('video').forEach(v => {
-      if (v.__marineHooked) return;
+    for (let i = 0; i < marineVideoNodes.length; i++) {
+      const v = marineVideoNodes[i];
+      if (v.__marineHooked) continue;
       v.__marineHooked = true;
       const tt = v.textTracks;
-      if (!tt) return;
-      for (let i = 0; i < tt.length; i++) wireTrack(tt[i]);
+      if (!tt) continue;
+      for (let j = 0; j < tt.length; j++) wireTrack(tt[j]);
       if (tt.addEventListener) tt.addEventListener('addtrack', ev => wireTrack(ev.track));
-    });
+    }
+  }
+  function scheduleHookVideos() {
+    if (marineHookVideosScheduled || !marineVideoNodes.length) return;
+    marineHookVideosScheduled = true;
+    setTimeout(function () { marineHookVideosScheduled = false; hookVideos(); }, 0);
   }
   hookVideos();
-  new MutationObserver(hookVideos).observe(document.documentElement, { childList: true, subtree: true });
+  new MutationObserver(scheduleHookVideos).observe(document.documentElement, { childList: true, subtree: true });
 
   function trackSources() {
     return trackBuffers.map(b => ({ id: b.id, kind: 'texttrack', label: b.label + (b.lang ? '（' + b.lang + '）' : ''), count: b.cuesMap.size }))
@@ -578,6 +600,11 @@
     replyBindings: new WeakMap(),
     blurTimer: null,
     positionFrame: 0,
+    // 上一帧是否真的画了东西：用来在「无目标且无在途生成」时停掉 rAF 空转，
+    // 同时保证从「有」变「无」的那一帧仍会跑一次去收起覆盖层。
+    painted: false,
+    badgeLabel: '',
+    badgeWidth: 0,
     refreshTimer: null,
     overlay: null,
     grabCache: null,
@@ -604,7 +631,10 @@
 
   // BEGIN marine-rime-reliable-transport
   const MARINE_RIME_SEND_ATTEMPTS = 3;
-  const MARINE_RIME_SEND_ACK_TIMEOUT_MS = 1500;
+  // service worker 的 ACK 要等它把整个 context PUT 到本地 API 才回，实测 0.4~1.7s
+  // （debug 构建更慢）。超时过短会误判失败→重试，重试又可能撞上中间的 DELETE 墓碑
+  // （后端对已撤销的 contextId 一律 409），导致目标永远发布不上去。
+  const MARINE_RIME_SEND_ACK_TIMEOUT_MS = 6000;
   const MARINE_RIME_SEND_RETRY_DELAYS_MS = [60, 180];
 
   function marineRimeDelay(ms) {
@@ -894,11 +924,30 @@
     return values.size === 1 ? values.values().next().value : '';
   }
 
+  // 一趟目标解析是同步完成的，期间页面 DOM 不会变化，因此整趟可以共享三样东西：
+  // 每个 boundary 的身份、渲染边界清单、以及从捕获记录重建出的已知目标。
+  // 此前每个 boundary 的身份要被重算两遍（renderedIdentityCount 一次、
+  // containedRenderedOwnership 一次），而 resolveOpenReplyEditor 又对每个候选
+  // 重跑一整个 domTarget —— 合起来是 O(B²)，一个 150 楼的评论区点一下要几百毫秒。
+  // 可重入：嵌套调用复用最外层的 pass，最外层负责建立和拆除。
+  let marineRimePass = null;
+
+  function marineRimeWithPass(fn) {
+    if (marineRimePass) return fn();
+    marineRimePass = { identities: new WeakMap(), inventory: null, known: null };
+    try { return fn(); }
+    finally { marineRimePass = null; }
+  }
+
   function marineRimeKnownTargets() {
+    if (marineRimePass && marineRimePass.known) return marineRimePass.known;
+    let known;
     try {
       const built = marineBuildComments(detectPlatform(), commentCaptures);
-      return built && built.ok ? marineFlattenComments(built.comments) : [];
-    } catch (e) { return []; }
+      known = built && built.ok ? marineFlattenComments(built.comments) : [];
+    } catch (e) { known = []; }
+    if (marineRimePass) marineRimePass.known = known;
+    return known;
   }
 
   function marineRimeSmallText(el) {
@@ -991,6 +1040,17 @@
 
   function marineRimeDomIdentity(commentEl) {
     if (!commentEl) return { authorName: '', text: '', confidentText: false };
+    const memo = marineRimePass && marineRimePass.identities;
+    if (memo) {
+      const cached = memo.get(commentEl);
+      if (cached) return cached;
+    }
+    const identity = marineRimeComputeDomIdentity(commentEl);
+    if (memo) memo.set(commentEl, identity);
+    return identity;
+  }
+
+  function marineRimeComputeDomIdentity(commentEl) {
     const adapter = marineRimeSiteAdapter();
     if (adapter && typeof adapter.domIdentity === 'function') {
       try {
@@ -1048,6 +1108,13 @@
   }
 
   function marineRimeRenderedCommentInventory() {
+    if (marineRimePass && marineRimePass.inventory) return marineRimePass.inventory;
+    const inventory = marineRimeComputeRenderedCommentInventory();
+    if (marineRimePass) marineRimePass.inventory = inventory;
+    return inventory;
+  }
+
+  function marineRimeComputeRenderedCommentInventory() {
     const root = marineCommentSearchRoot();
     const all = marineCollectShadow(root, [], { n: 0, max: 20000 });
     const renderers = all.filter(function (el) {
@@ -1116,6 +1183,12 @@
   }
 
   function marineRimeDomTarget(commentEl, expectedAuthor) {
+    return marineRimeWithPass(function () {
+      return marineRimeResolveDomTarget(commentEl, expectedAuthor);
+    });
+  }
+
+  function marineRimeResolveDomTarget(commentEl, expectedAuthor) {
     if (!commentEl) return { id: '', authorName: '', text: '', snippet: '', parentId: '', rootId: '' };
     const id = marineRimeCommentId(commentEl);
     const known = marineRimeKnownTargets();
@@ -1466,7 +1539,15 @@
     return /(\u8bc4\u8bba|\u56de\u590d|\u53d1\u4e00\u6761\u53cb\u5584)/.test(marineRimeEditorContextLabel(editor));
   }
 
+  // pass 必须罩住整个 classify，而不只是单次 domTarget：resolveOpenReplyEditor
+  // 会对每个同名候选再调一次 domTarget，只有共享 pass 才能把 O(B²) 压回 O(B)。
   function marineRimeClassify(editor) {
+    return marineRimeWithPass(function () {
+      return marineRimeClassifyInPass(editor);
+    });
+  }
+
+  function marineRimeClassifyInPass(editor) {
     if (!marineRimeIsCommentEditor(editor)) return null;
     const directScope = marineRimeDirectScopeForEditor(editor);
     const now = Date.now();
@@ -1566,7 +1647,8 @@
       el.setAttribute('aria-hidden', 'true');
       Object.assign(el.style, {
         display: 'none', position: 'fixed', boxSizing: 'border-box', pointerEvents: 'none',
-        zIndex: '2147483646', borderRadius: '8px', transition: 'left 80ms ease, top 80ms ease, width 80ms ease, height 80ms ease',
+        // 只过渡尺寸，不过渡 left/top——滚动时经 rAF 高频重定位，位置过渡会让轮廓「尾随」评论框。
+        zIndex: '2147483646', borderRadius: '8px', transition: 'width 80ms ease, height 80ms ease',
       });
       (document.documentElement || document.body).appendChild(el);
       return el;
@@ -1580,6 +1662,7 @@
       height: '24px', width: 'auto', padding: '3px 9px', borderRadius: '999px',
       color: '#fff', background: theme.badge, font: '600 12px/18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
       letterSpacing: '.1px', whiteSpace: 'nowrap', boxShadow: '0 3px 10px rgba(0, 0, 0, .18)',
+      textShadow: '0 1px 2px rgba(0, 0, 0, .4)',
     });
     marineRimeTarget.overlay = { comment, editor, badge };
     return marineRimeTarget.overlay;
@@ -1609,29 +1692,566 @@
       overlay.comment.style.display = 'none';
       overlay.editor.style.display = 'none';
       overlay.badge.style.display = 'none';
+      marineRimeGenSync();
+      marineRimeTarget.painted = marineRimeNeedsPaint();
       return;
     }
+    marineRimeTarget.painted = true;
     const editorRect = marineRimePlaceOutline(overlay.editor, active.editor, 3);
     if (active.mode === 'reply') marineRimePlaceOutline(overlay.comment, active.commentEl, 4);
     else overlay.comment.style.display = 'none';
     if (!editorRect || overlay.editor.style.display === 'none') { overlay.badge.style.display = 'none'; return; }
     const author = active.target && active.target.authorName;
-    overlay.badge.textContent = active.mode === 'reply'
+    const badgeLabel = active.mode === 'reply'
       ? (theme.replyLabel + ' @' + (author || '\u4f5c\u8005'))
       : theme.directLabel;
+    overlay.badge.textContent = badgeLabel;
     overlay.badge.style.display = 'block';
-    const badgeWidth = overlay.badge.getBoundingClientRect().width || 120;
+    // \u91cf\u4e00\u6b21\u5c31\u591f\uff1a\u6807\u7b7e\u4e0d\u53d8\u65f6\u5bbd\u5ea6\u4e0d\u53d8\uff0c\u800c\u8fd9\u6b21\u8bfb\u53d6\u7d27\u8ddf\u5728\u4e0a\u9762\u7684\u5199\u5165\u4e4b\u540e\uff0c
+    // \u6bcf\u5e27\u90fd\u4f1a\u5f3a\u5236\u4e00\u6b21\u540c\u6b65\u5e03\u5c40\u3002\u91cf\u5230 0\uff08\u5c1a\u672a\u663e\u793a\uff09\u65f6\u4e0d\u7f13\u5b58\uff0c\u4e0b\u4e00\u5e27\u518d\u91cf\u3002
+    if (marineRimeTarget.badgeLabel !== badgeLabel || !marineRimeTarget.badgeWidth) {
+      const measured = overlay.badge.getBoundingClientRect().width;
+      if (measured > 0) {
+        marineRimeTarget.badgeWidth = measured;
+        marineRimeTarget.badgeLabel = badgeLabel;
+      }
+    }
+    const badgeWidth = marineRimeTarget.badgeWidth || 120;
     const top = editorRect.top >= 31 ? editorRect.top - 29 : Math.min(innerHeight - 26, editorRect.bottom + 5);
     overlay.badge.style.left = Math.max(4, Math.min(innerWidth - badgeWidth - 4, editorRect.left)) + 'px';
     overlay.badge.style.top = Math.max(4, top) + 'px';
+    marineRimeGenSync();
+  }
+
+  function marineRimeNeedsPaint() {
+    return !!marineRimeTarget.active || marineRimeGenBusy();
   }
 
   function marineRimeSchedulePosition() {
     if (marineRimeTarget.positionFrame) return;
+    // \u6ca1\u6709\u6d3b\u52a8\u76ee\u6807\u3001\u4e5f\u6ca1\u6709\u5728\u9014\u751f\u6210\u65f6\uff0c\u6574\u5e27\u7684\u4ea7\u51fa\u53ea\u6709\u300c\u9690\u85cf\u300d\uff0c\u800c\u4ee3\u4ef7\u662f\u591a\u6b21
+    // getBoundingClientRect \u548c\u5f3a\u5236\u540c\u6b65\u5e03\u5c40\u2014\u2014\u6eda\u52a8\u65f6\u6bcf\u5e27\u90fd\u5728\u767d\u8dd1\u3002\u4ece\u300c\u6709\u300d\u53d8
+    // \u300c\u65e0\u300d\u7684\u90a3\u4e00\u5e27\u5fc5\u987b\u771f\u7684\u6267\u884c\u4e00\u6b21\u53bb\u6536\u8d77\u8986\u76d6\u5c42\uff0c\u6240\u4ee5\u53ea\u8df3\u8fc7\u4e4b\u540e\u7684\u91cd\u590d\u5e27\u3002
+    if (!marineRimeNeedsPaint() && !marineRimeTarget.painted) return;
     marineRimeTarget.positionFrame = requestAnimationFrame(function () {
       marineRimeTarget.positionFrame = 0;
       marineRimeRender();
     });
+  }
+
+  // ---- 页面内「生成」按钮 + 本地智能体流式直接输入 ----
+  // 选中评论/回复框后浮出「生成」；点击 = 等价输入法上的「生成评论」键：让 sw 调本地
+  // Marine API 的 /generate-stream（本机 codex/claude 智能体）流式产出话术，然后**直接写进
+  // 那个输入框**——没有预览弹窗。红线不变：只写草稿，绝不自动提交页面表单。
+  //
+  // 写入方式刻意不按 delta 分块整段灌入：文本被拆成「一个字 / 一个词」，以随机间隔逐个
+  // 敲进去，接近真人打字节奏（见 marineRimeGenPump / NextUnit / NextDelay）。
+  //
+  // 生成一旦开始就快照 editor/mode/target，之后不依赖 active——点按钮会让评论框失焦，
+  // 可能导致目标被清理，但写入始终用快照。仅当切到「另一个 contextId」的目标、或输入框
+  // 失去焦点（contenteditable 的 insertText 会落到当前聚焦元素）时才中止本轮。
+  const marineRimeGen = {
+    host: null, root: null, els: null, port: null,
+    state: 'idle', // idle | preparing | streaming | typing | error
+    serial: 0,
+    contextId: '', mode: 'direct', target: null, editor: null,
+    raw: '',        // 累积的原始 delta（用于增量抽取 blocks-v1 的 text）
+    wanted: '',     // 目前已知的完整目标文本
+    typed: '',      // 已经敲进输入框的部分
+    baseline: '',   // 开始生成前输入框里的原有内容（只追加，不动它）
+    streamDone: false,
+    typeTimer: 0,
+    typingStartedAt: 0,
+    errorText: '',
+    errorTimer: 0,
+  };
+
+  function marineRimeGenActionId(mode) {
+    return mode === 'reply' ? 'marine.generate-reply' : 'marine.generate-direct';
+  }
+
+  function marineRimeGenBusy() {
+    const st = marineRimeGen.state;
+    return st === 'preparing' || st === 'streaming' || st === 'typing';
+  }
+
+  function marineRimeGenErrorLabel(code, message) {
+    const map = {
+      MARINE_NOT_CONFIGURED: 'Marine 本地服务未连接',
+      MARINE_RIME_CONTEXT_INVALID: '目标已失效，请重新点选输入框',
+      MARINE_GENERATE_TIMEOUT: '生成超时，请重试',
+      MARINE_GENERATE_CANCELLED: '生成已取消',
+      MARINE_RIME_PROMPT_TOO_LARGE: '页面内容过大，无法生成',
+      MARINE_OPENAI_NOT_CONFIGURED: '未配置 OpenAI 兼容端点',
+      MARINE_OPENAI_KEY_MISSING: '缺少 OpenAI 兼容端点密钥',
+      MARINE_SETTINGS_FAILED: '读取设置失败',
+      MARINE_GENERATE_FAILED: '生成失败，请重试',
+    };
+    return map[code] || (message ? String(message) : '生成失败，请重试');
+  }
+
+  // 从（可能未闭合的）blocks-v1 原始 JSON 里尽力抽出 blocks[0].text，供边生成边打字；
+  // 最终仍以 done 帧的 blocks 为准。
+  function marineExtractBlockText(raw) {
+    if (!raw) return null;
+    const anchor = raw.match(/"blocks"\s*:\s*\[\s*\{/);
+    const from = anchor ? anchor.index + anchor[0].length : 0;
+    const key = raw.indexOf('"text"', from);
+    if (key < 0) return null;
+    const colon = raw.indexOf(':', key + 6);
+    if (colon < 0) return null;
+    const open = raw.indexOf('"', colon + 1);
+    if (open < 0) return null;
+    let out = '';
+    for (let i = open + 1; i < raw.length; i++) {
+      const ch = raw[i];
+      if (ch === '\\') {
+        const next = raw[i + 1];
+        if (next === undefined) break;
+        if (next === 'n') { out += '\n'; i += 1; }
+        else if (next === 't') { out += '\t'; i += 1; }
+        else if (next === 'r') { out += '\r'; i += 1; }
+        else if (next === 'u') {
+          const hex = raw.slice(i + 2, i + 6);
+          if (hex.length < 4) break;
+          const code = parseInt(hex, 16);
+          if (!Number.isNaN(code)) out += String.fromCharCode(code);
+          i += 5;
+        } else { out += next; i += 1; }
+        continue;
+      }
+      if (ch === '"') return out;
+      out += ch;
+    }
+    return out;
+  }
+
+  function marineRimeGenEnsureUI() {
+    if (marineRimeGen.host) return marineRimeGen.els;
+    const host = document.createElement('div');
+    host.setAttribute('data-marine-rime-actions', '');
+    Object.assign(host.style, {
+      position: 'fixed', inset: '0', zIndex: '2147483647', pointerEvents: 'none',
+    });
+    const root = host.attachShadow ? host.attachShadow({ mode: 'closed' }) : host;
+    const theme = marineRimeTheme();
+    const style = document.createElement('style');
+    style.textContent = [
+      ':host,*{box-sizing:border-box;}',
+      '.gen,.tip{position:fixed;pointer-events:auto;font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}',
+      '.gen{display:none;align-items:center;gap:5px;height:28px;padding:0 12px;border:none;border-radius:999px;',
+      'color:#fff;background:' + theme.badge + ';box-shadow:0 3px 12px rgba(0,0,0,.22);cursor:pointer;font-weight:600;text-shadow:0 1px 2px rgba(0,0,0,.4);}',
+      '.gen:hover{filter:brightness(1.06);}',
+      '.gen:disabled{opacity:.72;cursor:default;}',
+      '.gen.pending{opacity:.72;}',
+      '.gen .dot{width:6px;height:6px;border-radius:50%;background:#fff;opacity:.9;}',
+      '.gen.busy .dot{animation:mgpulse 1s ease-in-out infinite;}',
+      '@keyframes mgpulse{0%,100%{opacity:.35;}50%{opacity:1;}}',
+      '.gen:focus-visible{outline:2px solid #fff;outline-offset:2px;box-shadow:0 0 0 4px ' + theme.ring + ';}',
+      // 只用于报错的一行提示，不再展示生成内容（内容直接进输入框）。
+      '.tip{display:none;max-width:min(360px,calc(100vw - 24px));padding:7px 11px;border-radius:9px;',
+      'background:var(--mg-bg);color:#e5484d;border:1px solid var(--mg-border);box-shadow:0 8px 26px rgba(0,0,0,.24);}',
+      ':host{--mg-bg:#fff;--mg-border:rgba(0,0,0,.12);}',
+      '@media (prefers-color-scheme:dark){:host{--mg-bg:#20242a;--mg-border:rgba(255,255,255,.14);}}',
+      '@media (prefers-reduced-motion:reduce){.gen.busy .dot{animation:none;}}',
+    ].join('');
+    root.appendChild(style);
+
+    const genBtn = document.createElement('button');
+    genBtn.className = 'gen';
+    genBtn.type = 'button';
+    genBtn.setAttribute('aria-label', '生成话术');
+    genBtn.innerHTML = '<span class="dot"></span><span class="lbl">生成</span>';
+
+    const tip = document.createElement('div');
+    tip.className = 'tip';
+    tip.setAttribute('role', 'status');
+    tip.setAttribute('aria-live', 'polite');
+
+    root.appendChild(genBtn);
+    root.appendChild(tip);
+    (document.documentElement || document.body).appendChild(host);
+
+    // 保住评论框焦点：点按钮不能让编辑框失焦，否则 execCommand 会写到别处。
+    genBtn.addEventListener('mousedown', function (event) { event.preventDefault(); });
+    genBtn.addEventListener('click', function (e) { e.preventDefault(); marineRimeGenStart(); });
+
+    marineRimeGen.host = host;
+    marineRimeGen.root = root;
+    marineRimeGen.els = { genBtn, tip, lbl: genBtn.querySelector('.lbl') };
+    return marineRimeGen.els;
+  }
+
+  function marineRimeGenRenderButton() {
+    const els = marineRimeGen.els;
+    if (!els) return;
+    const busy = marineRimeGenBusy();
+    els.genBtn.disabled = busy;
+    els.genBtn.classList.toggle('busy', busy);
+    els.lbl.textContent = marineRimeGen.state === 'preparing' ? '准备中…'
+      : busy ? '生成中…'
+      : (marineRimeGen.typed ? '重新生成' : '生成');
+    els.tip.style.display = marineRimeGen.errorText ? 'block' : 'none';
+    els.tip.textContent = marineRimeGen.errorText || '';
+  }
+
+  function marineRimeGenShowError(label) {
+    marineRimeGen.errorText = label;
+    if (marineRimeGen.errorTimer) clearTimeout(marineRimeGen.errorTimer);
+    marineRimeGen.errorTimer = setTimeout(function () {
+      marineRimeGen.errorTimer = 0;
+      marineRimeGen.errorText = '';
+      marineRimeGenRenderButton();
+      marineRimeGenSync();
+    }, 6000);
+    marineRimeGenRenderButton();
+    marineRimeGenSync();
+  }
+
+  // 右侧悬浮侧栏(panel-inject)展开时占 384px；生成 UI 定位要避开它。
+  function marineRimePanelRightInset() {
+    try {
+      const host = document.getElementById('__marine_panel_host');
+      const panel = host && host.shadowRoot && host.shadowRoot.querySelector('.m-panel');
+      if (panel && !panel.classList.contains('collapsed')) {
+        const rect = panel.getBoundingClientRect();
+        if (rect.width > 0 && rect.left < innerWidth) return Math.max(0, innerWidth - rect.left);
+      }
+    } catch (e) {}
+    return 0;
+  }
+
+  // 由 marineRimeRender 每帧调用：把「生成」按钮定位到活动编辑框右上角；
+  // 切到另一个 contextId 的目标时中止在途生成。
+  function marineRimeGenSync() {
+    const els = marineRimeGenEnsureUI();
+    const active = marineRimeTarget.active;
+
+    if (active && marineRimeGenBusy() && marineRimeGen.contextId &&
+        active.contextId !== marineRimeGen.contextId) {
+      marineRimeGenAbort('target-switched');
+    }
+
+    // 打字期间锚定到快照编辑框；空闲时锚定到当前活动编辑框。
+    const anchorEl = marineRimeGenBusy() ? marineRimeGen.editor : (active && active.editor);
+    let rect = null;
+    if (anchorEl && anchorEl.isConnected && marineVisible(anchorEl)) {
+      try { rect = anchorEl.getBoundingClientRect(); } catch (e) { rect = null; }
+    }
+    if (rect && rect.bottom > 0 && rect.top < innerHeight) {
+      // 只有真要摆按钮时才去量侧栏宽度：这一步是一次 shadow-root querySelector
+      // 加一次布局读取，此前即使按钮根本不显示也每帧都做。
+      const rightEdge = innerWidth - marineRimePanelRightInset() - 4;
+      const w = els.genBtn.getBoundingClientRect().width || 64;
+      const top = rect.top - 34 >= 4 ? rect.top - 34 : Math.min(innerHeight - 32, rect.bottom + 6);
+      els.genBtn.classList.toggle('pending', !!active && !active.publishedContext && !marineRimeGenBusy());
+      els.genBtn.style.display = 'inline-flex';
+      els.genBtn.style.left = Math.max(4, Math.min(rightEdge - w, rect.right - w)) + 'px';
+      els.genBtn.style.top = top + 'px';
+      if (marineRimeGen.errorText) {
+        const tw = els.tip.getBoundingClientRect().width || 240;
+        els.tip.style.left = Math.max(8, Math.min(rightEdge - tw, rect.right - tw)) + 'px';
+        els.tip.style.top = Math.max(8, top - 40) + 'px';
+      }
+    } else {
+      els.genBtn.style.display = 'none';
+      els.tip.style.display = 'none';
+    }
+  }
+
+  function marineRimeGenClosePort() {
+    if (marineRimeGen.port) {
+      try { marineRimeGen.port.disconnect(); } catch (e) {}
+      marineRimeGen.port = null;
+    }
+  }
+
+  function marineRimeGenStopTyping() {
+    if (marineRimeGen.typeTimer) {
+      clearTimeout(marineRimeGen.typeTimer);
+      marineRimeGen.typeTimer = 0;
+    }
+  }
+
+  /// 结束一轮生成：保留已经敲进输入框的文字（它就是草稿），只复位内部状态。
+  function marineRimeGenFinish(reason) {
+    marineRimeGenClosePort();
+    marineRimeGenStopTyping();
+    const typed = marineRimeGen.typed;
+    marineRimeGen.state = 'idle';
+    marineRimeGen.streamDone = false;
+    marineRimeGen.raw = '';
+    marineRimeGen.wanted = '';
+    if (typed && reason === 'done') {
+      // 上报本次「页内生成并写入」的文本：稍后若这条被发布，sw 会据此把账本的
+      // generation_source 标注为 'extension'（页内生成），区别于输入法/手填。
+      try { chrome.runtime.sendMessage({ __marineGenFill: true, text: typed }); } catch (e) {}
+      marineLog('ok', 'iso', '已写入生成草稿（请人工确认后手动发送）');
+    }
+    marineRimeGenRenderButton();
+    marineRimeSchedulePosition();
+  }
+
+  function marineRimeGenAbort(reason) {
+    if (!marineRimeGenBusy()) return;
+    marineRimeGenFinish(reason);
+  }
+
+  function marineRimeGenFail(label) {
+    marineRimeGenClosePort();
+    marineRimeGenStopTyping();
+    marineRimeGen.state = 'idle';
+    marineRimeGen.streamDone = false;
+    marineRimeGenShowError(label);
+  }
+
+  // ---- 拟人化打字 ----
+  // 生成是分块（delta）到达的，但绝不按块整段写入：把文本拆成「一个字 / 一个词」，
+  // 用随机间隔逐个写进输入框，接近真人的输入节奏。
+
+  function marineRimeGenEditorFocused(editor) {
+    try { return marineDeepActiveElement(document) === editor; } catch (e) { return false; }
+  }
+
+  /// 取下一个输入单元：拉丁串按词成串敲出，中文按 1~2 字（模拟输入法逐词上屏），
+  /// 并保证不劈开代理对（emoji）。
+  // 一轮打字的目标总时长。真人节奏（约 145ms/单元）在长文本上会拖到几十秒——
+  // 300 字实测 33 秒，作为工具太慢。超预算时按比例压缩间隔并成串上屏（仍是渐进
+  // 输入，不是整段灌入），短文本则完全按原节奏走。
+  const MARINE_TYPING_BUDGET_MS = 12000;
+
+  function marineRimeGenNextUnit(text, from) {
+    const first = text.charAt(from);
+    if (!first) return '';
+    if (/[\uD800-\uDBFF]/.test(first)) return text.slice(from, from + 2);
+    if (/[A-Za-z0-9]/.test(first)) {
+      let n = 1;
+      while (n < 6 && /[A-Za-z0-9]/.test(text.charAt(from + n))) n++;
+      if (Math.random() < 0.5) n = Math.min(n, 1 + Math.floor(Math.random() * 3));
+      return text.slice(from, from + n);
+    }
+    // 落后于预算时，中文一次多上几个字（像输入法整句上屏），而不是把间隔压到失真。
+    const remaining = text.length - from;
+    const behind = marineRimeGenBudgetRatio(remaining) > 1.6;
+    const step = behind ? 3 + Math.floor(Math.random() * 3) : (Math.random() < 0.3 ? 2 : 1);
+    return text.slice(from, from + step);
+  }
+
+  /// 「按当前节奏打完剩余部分所需时间 ÷ 剩余预算」。>1 表示要加速。
+  function marineRimeGenBudgetRatio(remaining) {
+    const spent = Date.now() - (marineRimeGen.typingStartedAt || Date.now());
+    const left = Math.max(400, MARINE_TYPING_BUDGET_MS - spent);
+    return (remaining * 145) / left;
+  }
+
+  function marineRimeGenNextDelay(unit, remaining) {
+    let delay = (45 + Math.random() * 70) * Math.min(unit.length, 2);
+    const last = unit.charAt(unit.length - 1);
+    if (/[，。！？；：、,.!?;:]/.test(last)) delay += 180 + Math.random() * 260;
+    if (unit.indexOf('\n') >= 0) delay += 200 + Math.random() * 300;
+    if (Math.random() < 0.04) delay += 250 + Math.random() * 450; // 偶尔「想一下」
+    const ratio = marineRimeGenBudgetRatio(remaining);
+    if (ratio > 1) delay = Math.max(20, delay / ratio); // 只加速，永不拖慢
+    return delay;
+  }
+
+  /// 往输入框追加一个单元。contenteditable 走 insertText（在光标处插入），
+  /// textarea/input 走原生 value setter 重写全量并把光标移到末尾。
+  function marineRimeGenWriteUnit(editor, unit, fullValue) {
+    const tag = (editor.tagName || '').toLowerCase();
+    if (tag === 'textarea' || tag === 'input') {
+      const proto = tag === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+      if (desc && desc.set) desc.set.call(editor, fullValue); else editor.value = fullValue;
+      try { editor.selectionStart = editor.selectionEnd = fullValue.length; } catch (e) {}
+    } else {
+      try { document.execCommand('insertText', false, unit); } catch (e) {}
+    }
+    try {
+      editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: unit }));
+    } catch (e) {
+      editor.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+  }
+
+  function marineRimeGenPump() {
+    const g = marineRimeGen;
+    g.typeTimer = 0;
+    if (g.state !== 'typing' && g.state !== 'streaming') return;
+    const editor = g.editor;
+    if (!editor || !editor.isConnected) { marineRimeGenFail('目标输入框已失效，请重新点选后再生成'); return; }
+    // contenteditable 的 insertText 落在「当前聚焦元素」上，焦点跑了就必须停手，
+    // 否则会把话术写进别人的输入框。
+    if (!marineRimeGenEditorFocused(editor)) { marineRimeGenAbort('focus-lost'); return; }
+
+    if (g.wanted.indexOf(g.typed) !== 0) {
+      // 流式抽取的前缀被最终结果修正了（少见）：一次性对齐到已知文本再继续逐字敲。
+      marineSetEditorText(editor, g.baseline + g.wanted);
+      g.typed = g.wanted;
+    }
+
+    if (g.typed.length >= g.wanted.length) {
+      if (g.streamDone) { marineRimeGenFinish('done'); return; }
+      g.typeTimer = setTimeout(marineRimeGenPump, 120); // 等更多 delta
+      return;
+    }
+
+    const unit = marineRimeGenNextUnit(g.wanted, g.typed.length);
+    if (!unit) { g.typeTimer = setTimeout(marineRimeGenPump, 120); return; }
+    g.typed += unit;
+    marineRimeGenWriteUnit(editor, unit, g.baseline + g.typed);
+    const remaining = g.wanted.length - g.typed.length;
+    g.typeTimer = setTimeout(marineRimeGenPump, marineRimeGenNextDelay(unit, remaining));
+  }
+
+  /// 开始把 wanted 敲进输入框：聚焦、把光标移到末尾，然后启动节拍器。
+  function marineRimeGenBeginTyping() {
+    const g = marineRimeGen;
+    if (g.state === 'typing') return;
+    const editor = g.editor;
+    if (!editor || !editor.isConnected) { marineRimeGenFail('目标输入框已失效，请重新点选后再生成'); return; }
+    g.state = 'typing';
+    g.typed = '';
+    g.typingStartedAt = Date.now();
+    g.baseline = marineTextOf(editor) || '';
+    try { editor.focus(); } catch (e) {}
+    const tag = (editor.tagName || '').toLowerCase();
+    if (tag !== 'textarea' && tag !== 'input') {
+      // 光标放到已有内容末尾，保证只追加、不覆盖用户已经写的东西。
+      try {
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(editor);
+        range.collapse(false);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      } catch (e) {}
+    } else {
+      try { editor.selectionStart = editor.selectionEnd = (editor.value || '').length; } catch (e) {}
+    }
+    marineRimeGenRenderButton();
+    marineRimeGenStopTyping();
+    g.typeTimer = setTimeout(marineRimeGenPump, 60);
+  }
+
+  function marineRimeGenStart() {
+    if (marineRimeGenBusy()) return;
+    const active = marineRimeTarget.active;
+    if (!active) {
+      marineRimeGenEnsureUI();
+      marineRimeGenShowError('请先点选一个评论/回复框');
+      return;
+    }
+    if (!active.publishedContext) {
+      // 上下文 PUT 是异步的（往返可能 1~2s）。刚聚焦就点「生成」时不该报错——
+      // 先进「准备中」，发布完成后自动继续。
+      marineRimeGenWaitForPublish(active);
+      return;
+    }
+    marineRimeGenLaunch({
+      contextId: active.contextId,
+      mode: active.mode,
+      editor: active.editor,
+      target: active.target,
+    });
+  }
+
+  function marineRimeGenWaitForPublish(active) {
+    marineRimeGenEnsureUI();
+    marineRimeGenClosePort();
+    const serial = ++marineRimeGen.serial;
+    marineRimeGen.state = 'preparing';
+    marineRimeGen.errorText = '';
+    marineRimeGen.contextId = active.contextId;
+    marineRimeGen.mode = active.mode;
+    marineRimeGen.editor = active.editor;
+    marineRimeGen.target = active.target;
+    marineRimeGenRenderButton();
+    marineRimeGenSync();
+    const startedAt = Date.now();
+    const tick = function () {
+      if (serial !== marineRimeGen.serial) return;
+      const current = marineRimeTarget.active;
+      if (current && current.publishedContext && current.contextId === marineRimeGen.contextId) {
+        marineRimeGenLaunch({
+          contextId: current.contextId,
+          mode: current.mode,
+          editor: current.editor,
+          target: current.target,
+        });
+        return;
+      }
+      if (Date.now() - startedAt > 12000) {
+        marineRimeGenFail('目标准备超时，请重新点选输入框再试（若持续，请检查 Marine 本地服务连接）');
+        return;
+      }
+      setTimeout(tick, 300);
+    };
+    setTimeout(tick, 300);
+  }
+
+  function marineRimeGenLaunch(spec) {
+    marineRimeGenClosePort();
+    marineRimeGenStopTyping();
+    const serial = ++marineRimeGen.serial;
+    const g = marineRimeGen;
+    g.state = 'streaming';
+    g.raw = '';
+    g.wanted = '';
+    g.typed = '';
+    g.streamDone = false;
+    g.errorText = '';
+    g.contextId = spec.contextId;
+    g.mode = spec.mode;
+    g.editor = spec.editor;
+    g.target = spec.target;
+    marineRimeGenRenderButton();
+    marineRimeGenSync();
+
+    let port;
+    try { port = chrome.runtime.connect({ name: 'marine-generate' }); }
+    catch (e) { marineRimeGenFail('扩展未连接，请重开页面'); return; }
+    g.port = port;
+    port.onMessage.addListener(function (frame) {
+      if (serial !== marineRimeGen.serial) return;
+      marineRimeGenOnFrame(frame);
+    });
+    port.onDisconnect.addListener(function () {
+      if (serial !== marineRimeGen.serial) return;
+      marineRimeGen.port = null;
+      if (marineRimeGen.state === 'streaming') marineRimeGenFail('生成连接中断，请重试');
+    });
+    try {
+      port.postMessage({
+        type: 'start',
+        contextId: spec.contextId,
+        actionId: marineRimeGenActionId(spec.mode),
+        requestId: 'gen-' + Date.now() + '-' + serial,
+      });
+    } catch (e) { marineRimeGenFail('无法发起生成'); }
+  }
+
+  function marineRimeGenOnFrame(frame) {
+    if (!frame || typeof frame !== 'object') return;
+    const g = marineRimeGen;
+    if (frame.type === 'delta') {
+      g.raw += String(frame.text || '');
+      const text = marineExtractBlockText(g.raw);
+      if (text != null && text.length > g.wanted.length) g.wanted = text;
+      // 一拿到可写内容就开始逐字敲，边生成边输入。
+      if (g.wanted && g.state === 'streaming') marineRimeGenBeginTyping();
+    } else if (frame.type === 'done') {
+      marineRimeGenClosePort();
+      const blocks = Array.isArray(frame.blocks) ? frame.blocks : [];
+      const finalText = blocks.length ? String(blocks[0].text || '') : String(g.wanted || '');
+      if (!finalText.trim()) { marineRimeGenFail('生成结果为空，请重试'); return; }
+      g.wanted = finalText;
+      g.streamDone = true;
+      if (g.state === 'streaming') marineRimeGenBeginTyping();
+      else if (!g.typeTimer) g.typeTimer = setTimeout(marineRimeGenPump, 60);
+    } else if (frame.type === 'error') {
+      marineRimeGenFail(marineRimeGenErrorLabel(frame.code, frame.message));
+    }
   }
 
   function marineRimeSend(op, contextId, context, revision, options) {
@@ -1730,11 +2350,33 @@
     const delivered = await marineRimeSend('put', info.contextId, context, revision);
     const published = marineRimeTarget.active;
     if (!delivered.applied || !published || published.contextId !== info.contextId ||
-        marineRimeTarget.revision !== revision) return;
+        marineRimeTarget.revision !== revision) {
+      // 发布没成功（如慢 PUT 触发重试、重试又撞上中间 DELETE 的墓碑 → 后端对已撤销的
+      // contextId 恒 409）。若目标仍活着且没被切走，就换一个全新 contextId 重发一次，
+      // 否则目标会永远停在「未发布」，用户点生成只会看到「尚未就绪」。
+      if (!delivered.stale && published === info && !info.publishedContext &&
+          marineRimeTarget.revision === revision) {
+        const attempts = (info.publishRetries || 0) + 1;
+        info.publishRetries = attempts;
+        if (attempts <= 2) {
+          setTimeout(function () {
+            const current = marineRimeTarget.active;
+            if (current !== info || current.publishedContext) return;
+            current.contextId = marineRimeContextId(current);
+            void marineRimePublish(current, ++marineRimeTarget.revision);
+          }, 600 * attempts);
+        }
+      }
+      return;
+    }
     published.publishedContext = context;
     published.publishedRevision = revision;
     published.publishedAt = Date.now();
     marineLog('ok', 'rime-target', '已锁定 ' + context.label + '：' + context.targetSummary);
+    // 发布成功后补一次渲染，让「生成」按钮在 publishedContext 置上后立即出现：
+    // marineRimeGenSync 只在 render 时跑，而 activate 那次 render 时 publishedContext
+    // 尚未就绪（PUT 是异步的），若不补渲染按钮要等下次滚动/交互才出现。
+    marineRimeSchedulePosition();
   }
 
   function marineRimeContextDataChanged() {
@@ -2043,6 +2685,12 @@
     document.addEventListener('focusout', marineRimeHandleFocusOut, true);
     document.addEventListener('keydown', function (event) {
       if (event && event.key === 'Escape') {
+        // 生成/打字进行中时，Esc 先停下这一轮（已敲进输入框的文字保留，它就是草稿），
+        // 不清目标，方便用户接着改或重新生成。
+        if (marineRimeGenBusy()) {
+          marineRimeGenAbort('escape');
+          return;
+        }
         marineRimeReleaseDirectScope('escape', true);
         marineRimeClearPendingReply('escape');
       }
@@ -2055,6 +2703,12 @@
     window.addEventListener('focus', function () { setTimeout(function () { marineRimeRefreshFromEvent(null); }, 0); });
     document.addEventListener('visibilitychange', function () {
       if (document.hidden) {
+        // 必须显式中止打字：pump 靠自排 setTimeout 推进，标签页隐藏后会被浏览器
+        // clamp 到 1s（重度节流后 60s），而它的两个中止条件在这里都不成立——
+        // active 已被下面清成 null（所以 contextId 比较不触发），document.activeElement
+        // 在隐藏标签页里仍等于那个输入框（所以焦点校验也通过）。不管的话就变成
+        // 僵尸循环，用户切回来只看到半截草稿。已敲进去的字保留。
+        marineRimeGenAbort('tab-hidden');
         marineRimeClearPendingReply('tab-hidden');
         marineRimeClear('tab-hidden');
       } else setTimeout(function () { marineRimeRefreshFromEvent(null); }, 0);
@@ -2291,6 +2945,16 @@
   }
 
   // 日志转发到侧边栏「调试」tab（GET_LOGS 取历史 + 实时 __marineLog 推送），无页面悬浮层
-  marineRimeStartTargetTracking();
+  //
+  // 平台适配器现在只注入到各自的站点，和本文件分属不同的 content_scripts 条目。
+  // Chrome 按 manifest 顺序注入，但跨条目顺序并不在文档契约里。本该有适配器的站点上
+  // 如果注册表还没落地，就推迟一个宏任务再启动（同批 document_idle 脚本此时必已执行
+  // 完），避免静默退回 marineRimeAdapterSupportsPage 里「只认 B 站 /video/」的兜底
+  // 分支——那会让知乎/小红书/抖音一个监听器都挂不上。其它站点保持同步启动，行为不变。
+  if (!globalThis.MarineCommentTargetAdapters && ADAPTER_PLATFORMS[detectPlatform()]) {
+    setTimeout(marineRimeStartTargetTracking, 0);
+  } else {
+    marineRimeStartTargetTracking();
+  }
   marineLog('info', 'iso', '已加载 · 平台=' + PLATFORM_LABEL[detectPlatform()] + ' · ' + location.href);
 })();

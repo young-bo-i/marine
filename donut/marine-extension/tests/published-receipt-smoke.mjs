@@ -818,6 +818,10 @@ function serviceWorkerHarness(options = {}) {
   const warnings = [];
   const infoLogs = [];
   const alarmCreated = [];
+  const alarmCleared = [];
+  // Ordered log: whether the alarm is armed is decided by the LAST operation, not
+  // by whether a create or clear ever happened.
+  const alarmOps = [];
   const alarms = eventSource();
   const scriptingCalls = [];
   const existingTabs = options.existingTabs || [];
@@ -877,7 +881,14 @@ function serviceWorkerHarness(options = {}) {
       async get() { return { focused: true }; },
     },
     alarms: {
-      create(name, alarmOptions) { alarmCreated.push({ name, options: alarmOptions }); },
+      create(name, alarmOptions) {
+        alarmCreated.push({ name, options: alarmOptions });
+        alarmOps.push({ op: "create", name });
+      },
+      clear(name) {
+        alarmCleared.push(name);
+        alarmOps.push({ op: "clear", name });
+      },
       onAlarm: alarms,
     },
   };
@@ -956,8 +967,18 @@ function serviceWorkerHarness(options = {}) {
   async function settle() {
     for (let index = 0; index < 5; index++) await new Promise((resolve) => setTimeout(resolve, 0));
   }
+  function retryAlarmArmed() {
+    for (let index = alarmOps.length - 1; index >= 0; index--) {
+      if (alarmOps[index].name === "marinePublishedReceiptRetryV1") {
+        return alarmOps[index].op === "create";
+      }
+    }
+    return false;
+  }
   return {
     alarmCreated,
+    alarmCleared,
+    retryAlarmArmed,
     alarms,
     historyCalls,
     infoLogs,
@@ -1063,7 +1084,16 @@ assert.deepEqual(JSON.parse(JSON.stringify(await swHarness.sendPublished(isoRece
 });
 assert.equal(swHarness.historyCalls.length, 1, "duplicate receipt must not trigger a second POST");
 assert.equal("marinePublishedReceiptOutboxV1" in swHarness.localState, false);
+// The retry alarm is armed while a receipt is durable-but-unsynced and torn down
+// the moment the queue drains. Leaving it armed forever woke the service worker
+// every single minute with nothing to do; never arming it would strand receipts
+// that failed to sync.
 assert.ok(swHarness.alarmCreated.some((item) => item.name === "marinePublishedReceiptRetryV1"));
+assert.equal(
+  swHarness.retryAlarmArmed(),
+  false,
+  "an empty outbox must not leave the 1-minute wakeup alarm armed",
+);
 
 const missingProfileHarness = serviceWorkerHarness({ profileId: "" });
 const missingProfileResult = await missingProfileHarness.sendPublished(isoReceipt);
@@ -1107,6 +1137,11 @@ assert.equal(persistedOutbox.items[0].profile_id, trustedProfileId);
 assert.equal(persistedOutbox.items[0].key, trustedProfileId + "|bilibili:98765");
 assert.equal(persistedOutbox.items[0].receipt.text_snapshot, "这是最终上屏的评论。");
 assert.doesNotMatch(JSON.stringify(persistedOutbox), /first-token|127\.0\.0\.1|csrf|page-controlled/);
+assert.equal(
+  failedSyncHarness.retryAlarmArmed(),
+  true,
+  "a receipt left in the outbox must leave the retry alarm armed",
+);
 
 const retryHarness = serviceWorkerHarness({
   profileId: trustedProfileId,
@@ -1122,15 +1157,79 @@ assert.equal(retryHarness.historyCalls.length, 1, "worker startup must retry the
 assert.equal(retryHarness.historyCalls[0].url, "http://127.0.0.1:20202/v1/marine/history/published");
 assert.equal(retryHarness.historyCalls[0].options.headers.Authorization, "Bearer retry-token");
 assert.equal("marinePublishedReceiptOutboxV1" in sharedOutboxState, false, "successful retry must clear the outbox");
+assert.equal(
+  retryHarness.retryAlarmArmed(),
+  false,
+  "draining the outbox on worker start must disarm the retry alarm",
+);
 
 const manifest = JSON.parse(fs.readFileSync(new URL("../manifest.json", import.meta.url), "utf8"));
 assert.ok(manifest.permissions.includes("alarms"));
-assert.deepEqual(manifest.content_scripts[0].js, ["src/publish-receipt.js", "src/publish-bridge.js"]);
-assert.equal(manifest.content_scripts[0].run_at, "document_start");
-assert.equal(manifest.content_scripts[0].world, "ISOLATED");
-assert.deepEqual(manifest.content_scripts[1].js, ["src/content-main.js"]);
-assert.equal(manifest.content_scripts[1].run_at, "document_start");
-assert.equal(manifest.content_scripts[1].world, "MAIN");
+const BILIBILI_MATCHES = ["*://*.bilibili.com/*"];
+
+// The publish-receipt bridge only ever serves Bilibili — publish-bridge.js
+// returns immediately on any other frame URL. It used to be injected into every
+// frame of every site on the web, which was pure attack surface for a provable
+// no-op. Look entries up by their js files: they are no longer index-stable.
+const receiptEntry = manifest.content_scripts.find((entry) =>
+  entry.js.includes("src/publish-receipt.js"),
+);
+assert.deepEqual(receiptEntry.js, ["src/publish-receipt.js", "src/publish-bridge.js"]);
+assert.equal(receiptEntry.run_at, "document_start");
+assert.equal(receiptEntry.world, "ISOLATED");
+assert.equal(receiptEntry.all_frames, true);
+assert.deepEqual(receiptEntry.matches, BILIBILI_MATCHES);
+
+// The MAIN world splits in two: Bilibili keeps all_frames (its player is a real
+// sub-frame), everything else drops to the top frame only — content-iso.js
+// rejects any message whose `e.source !== window`, so a sub-frame producer never
+// had a consumer. Both halves must stay pinned to the same host list, or the
+// ISOLATED bridge would land in a frame whose MAIN peer never loaded.
+const mainEntries = manifest.content_scripts.filter((entry) =>
+  entry.js.includes("src/content-main.js"),
+);
+assert.equal(mainEntries.length, 2);
+for (const entry of mainEntries) {
+  assert.deepEqual(entry.js, ["src/content-main.js"]);
+  assert.equal(entry.run_at, "document_start");
+  assert.equal(entry.world, "MAIN");
+}
+const bilibiliMain = mainEntries.find((entry) => entry.all_frames === true);
+const genericMain = mainEntries.find((entry) => entry.all_frames === false);
+assert.deepEqual(bilibiliMain.matches, BILIBILI_MATCHES);
+assert.deepEqual(bilibiliMain.matches, receiptEntry.matches);
+assert.deepEqual(genericMain.matches, ["<all_urls>"]);
+// Without exclude_matches, Bilibili top frames would parse content-main.js twice.
+assert.deepEqual(genericMain.exclude_matches, BILIBILI_MATCHES);
+
+// The sub-frame removal is only safe while content-iso.js stays top-frame-only
+// AND keeps rejecting foreign sources. Trip if either changes.
+const isoEntry = manifest.content_scripts.find((entry) =>
+  entry.js.includes("src/content-iso.js"),
+);
+assert.equal(isoEntry.all_frames, false);
+assert.match(contentIsoSource, /e\.source !== window/);
+
+// Platform adapters are their own host-scoped entry now, and Chrome injects
+// entries in manifest order — content-iso.js reads the registry those files
+// publish, so it must come after them.
+const adapterEntry = manifest.content_scripts.find((entry) =>
+  entry.js.includes("src/platforms/comment-targets.js"),
+);
+assert.ok(adapterEntry, "platform adapters must have their own content_scripts entry");
+assert.ok(
+  manifest.content_scripts.indexOf(adapterEntry) < manifest.content_scripts.indexOf(isoEntry),
+  "platform adapters must be injected before content-iso.js",
+);
+assert.equal(isoEntry.js.some((f) => f.startsWith("src/platforms/")), false);
+
+// Only `popup.html` is loaded BY a page (panel-inject iframes it). Everything
+// else — popup.css/popup.js as its own subresources, skills/* fetched by the
+// service worker — is read from an extension context and needs no exposure.
+// Listing them let any site fetch `chrome-extension://<fixed-id>/skills/...`
+// and lift the whole talk-track corpus, so keep this list minimal.
+assert.deepEqual(manifest.web_accessible_resources[0].resources, ["popup.html"]);
+assert.equal(manifest.web_accessible_resources.length, 1);
 assert.doesNotMatch(contentIsoSource, /published-comment|__marinePublishedComment/);
 assert.match(popupSource, /lastGrab\.platform === 'bilibili'/);
 assert.match(popupSource, /window\.prompt\('请确认实际发布的文字/);

@@ -1,6 +1,7 @@
 use directories::BaseDirs;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::process::Command as TokioCommand;
 
 use crate::browser::{create_browser, BrowserType};
@@ -9,6 +10,17 @@ use crate::profile::ProfileManager;
 
 const ACCEPT_TERMS_FLAG: &str = "--accept-terms-and-conditions";
 const MIN_VALID_TIMESTAMP: i64 = 1577836800; // 2020-01-01 00:00:00 UTC
+
+/// Latches the accepted verdict. `is_terms_accepted` runs on EVERY local API
+/// request (`terms_check_middleware`) and otherwise costs a `stat(2)` plus a
+/// full file read each time — the largest fixed per-request cost once the API
+/// token cache removed the Argon2 KDF.
+///
+/// Only `true` is cached, and accepting terms is a one-way transition, so this
+/// can never latch a stale answer that blocks the user: the "not accepted yet"
+/// state is re-read from disk every time, which is exactly the state where the
+/// middleware rejects the request anyway.
+static TERMS_ACCEPTED: AtomicBool = AtomicBool::new(false);
 
 pub struct WayfernTermsManager {
   base_dirs: BaseDirs,
@@ -75,6 +87,17 @@ impl WayfernTermsManager {
   }
 
   pub fn is_terms_accepted(&self) -> bool {
+    if TERMS_ACCEPTED.load(Ordering::Relaxed) {
+      return true;
+    }
+    let accepted = self.read_terms_accepted_from_disk();
+    if accepted {
+      TERMS_ACCEPTED.store(true, Ordering::Relaxed);
+    }
+    accepted
+  }
+
+  fn read_terms_accepted_from_disk(&self) -> bool {
     let license_file = self.get_license_file_path();
 
     if !license_file.exists() {

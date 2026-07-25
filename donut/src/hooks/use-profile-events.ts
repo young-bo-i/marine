@@ -2,16 +2,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useState } from "react";
 import i18n from "@/i18n";
-import type { BrowserProfile, GroupWithCount } from "@/types";
+import type { BrowserProfile } from "@/types";
 
 interface UseProfileEventsReturn {
   profiles: BrowserProfile[];
-  groups: GroupWithCount[];
   runningProfiles: Set<string>;
   isLoading: boolean;
   error: string | null;
   loadProfiles: () => Promise<void>;
-  loadGroups: () => Promise<void>;
   clearError: () => void;
 }
 
@@ -22,7 +20,6 @@ interface UseProfileEventsReturn {
  */
 export function useProfileEvents(): UseProfileEventsReturn {
   const [profiles, setProfiles] = useState<BrowserProfile[]>([]);
-  const [groups, setGroups] = useState<GroupWithCount[]>([]);
   const [runningProfiles, setRunningProfiles] = useState<Set<string>>(
     new Set(),
   );
@@ -45,19 +42,10 @@ export function useProfileEvents(): UseProfileEventsReturn {
     }
   }, []);
 
-  // Load groups from backend
-  const loadGroups = useCallback(async () => {
-    try {
-      const groupsWithCounts = await invoke<GroupWithCount[]>(
-        "get_groups_with_profile_counts",
-      );
-      setGroups(groupsWithCounts);
-      setError(null);
-    } catch (err) {
-      console.error("Failed to load groups with counts:", err);
-      setGroups([]);
-    }
-  }, []);
+  // Group state deliberately does NOT live here. `useGroupEvents` owns it and
+  // subscribes to the same `profiles-changed` event, so keeping a second copy
+  // meant every event paid for two `get_groups_with_profile_counts` round trips
+  // — and neither consumer of this hook ever read the copy.
 
   // Clear error state
   const clearError = useCallback(() => {
@@ -72,15 +60,11 @@ export function useProfileEvents(): UseProfileEventsReturn {
     const setupListeners = async () => {
       try {
         // Initial load
-        await Promise.all([loadProfiles(), loadGroups()]);
+        await loadProfiles();
 
         // Listen for profile changes (create, delete, rename, update, etc.)
         profilesUnlisten = await listen("profiles-changed", () => {
-          console.log(
-            "Received profiles-changed event, reloading profiles and groups",
-          );
           void loadProfiles();
-          void loadGroups();
         });
 
         // Listen for profile running state changes
@@ -89,6 +73,11 @@ export function useProfileEvents(): UseProfileEventsReturn {
           (event) => {
             const { id, is_running } = event.payload;
             setRunningProfiles((prev) => {
+              // Returning `prev` unchanged is what stops a no-op event from
+              // re-rendering the tree. A new Set identity propagates into
+              // runningProfileIds, which tears down and rebuilds the 1 Hz
+              // traffic-polling interval and fires an extra IPC immediately.
+              if (prev.has(id) === is_running) return prev;
               const next = new Set(prev);
               if (is_running) {
                 next.add(id);
@@ -99,8 +88,6 @@ export function useProfileEvents(): UseProfileEventsReturn {
             });
           },
         );
-
-        console.log("Profile event listeners set up successfully");
       } catch (err) {
         console.error("Failed to setup profile event listeners:", err);
         setError(
@@ -120,7 +107,7 @@ export function useProfileEvents(): UseProfileEventsReturn {
       if (profilesUnlisten) profilesUnlisten();
       if (runningUnlisten) runningUnlisten();
     };
-  }, [loadProfiles, loadGroups]);
+  }, [loadProfiles]);
 
   // Hydrate the initial runningProfiles set from the loaded list — every
   // profile that has a stored process_id is a candidate. The Rust status
@@ -128,6 +115,12 @@ export function useProfileEvents(): UseProfileEventsReturn {
   // mutate the Set incrementally instead of fan-out-polling all N profiles
   // every 30s (which was O(N) sysinfo scans and saturated the runtime for
   // users with hundreds of profiles).
+  //
+  // This effect runs after EVERY profiles reload, and a reload happens on every
+  // `profiles-changed` — including the ones the sync engine emits purely to
+  // record `last_sync`. Returning `prev` when the membership is identical is
+  // what keeps that bookkeeping from cascading into a second render pass, a new
+  // `runningProfiles` identity, and a rebuild of the 1 Hz traffic interval.
   useEffect(() => {
     setRunningProfiles((prev) => {
       const next = new Set(prev);
@@ -139,18 +132,19 @@ export function useProfileEvents(): UseProfileEventsReturn {
       for (const id of next) {
         if (!valid.has(id)) next.delete(id);
       }
+      if (next.size === prev.size && [...next].every((id) => prev.has(id))) {
+        return prev;
+      }
       return next;
     });
   }, [profiles]);
 
   return {
     profiles,
-    groups,
     runningProfiles,
     isLoading,
     error,
     loadProfiles,
-    loadGroups,
     clearError,
   };
 }

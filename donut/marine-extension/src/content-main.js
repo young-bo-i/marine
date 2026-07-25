@@ -263,6 +263,9 @@
   const ZHIHU_RE = /\/api\/v4\/(comment_v5\/|questions\/\d+\/(feeds|answers)|answers\/\d+(\/|\?|$)|articles\/\d+(\/|\?|$)|[^?]*\/(root_comment|child_comment|comments))/i;
   // 小红书：评论 comment/page + comment/sub/page；笔记详情 feed。
   const XHS_RE = /\/api\/sns\/web\/v\d+\/(comment\/(sub\/)?page|feed)/i;
+  // 抖音：评论列表 /aweme/v1/web/comment/list（一级）+ /comment/list/reply（子评论）。
+  // 抖音公开 web API；若线上路径有出入，捕获数会为 0，需按实际抓包微调此正则。
+  const DOUYIN_RE = /\/aweme\/v1\/web\/comment\/list(\/reply)?\//i;
 
   function hostnameOf(value) {
     try {
@@ -281,6 +284,8 @@
         test(/(^|\.)zhihu\.com$/i, responseHostname) && test(ZHIHU_RE, url)) return 'comment';
     if (test(/(^|\.)xiaohongshu\.com$/i, PAGE_HOSTNAME) &&
         test(/(^|\.)xiaohongshu\.com$/i, responseHostname) && test(XHS_RE, url)) return 'comment';
+    if (test(/(^|\.)douyin\.com$/i, PAGE_HOSTNAME) &&
+        test(/(^|\.)douyin\.com$/i, responseHostname) && test(DOUYIN_RE, url)) return 'comment';
     if (test(SUB_RE, url)) return 'subtitle';
     return null;
   }

@@ -362,19 +362,18 @@ fn selected_source_text<'a>(payload: &'a Value, source: &str) -> Option<&'a str>
   payload.get(section)?.get(field)?.as_str()
 }
 
-fn payload_with_selected_source(payload: &Value, source: &str, text: String) -> Option<Value> {
+fn set_selected_source(payload: &mut Value, source: &str, text: String) -> Option<()> {
   let (section, field) = match source {
     "subtitle" => ("subtitle", "text"),
     "comments" => ("comments", "agentMd"),
     "article" => ("article", "markdown"),
     _ => return None,
   };
-  let mut payload = payload.clone();
   payload
     .get_mut(section)?
     .as_object_mut()?
     .insert(field.to_string(), Value::String(text));
-  Some(payload)
+  Some(())
 }
 
 /// Build the prompt handed to a Rime-side AI connector. Marine freezes the
@@ -396,14 +395,18 @@ pub fn build_blocks_v1(payload: &Value, skill: &str) -> Result<String, &'static 
     .unwrap_or_else(|| inferred_source(payload));
   let source_text = selected_source_text(payload, source)
     .ok_or("fixed connector prompt content exceeds the 256 KiB limit")?;
+  // `char_indices()` already yields strictly increasing, unique offsets, so the
+  // list needs no sorting or deduplication.
   let mut boundaries = source_text
     .char_indices()
     .map(|(index, _)| index)
     .collect::<Vec<_>>();
   boundaries.push(source_text.len());
-  boundaries.sort_unstable();
-  boundaries.dedup();
 
+  // Clone the payload once and rewrite only the selected field per probe. This
+  // used to deep-clone the whole payload on every one of the ~log2(N) probes,
+  // copying the large sections that are not even being truncated.
+  let mut candidate_payload = payload.clone();
   let mut low = 0usize;
   let mut high = boundaries.len();
   let mut best = None;
@@ -415,7 +418,7 @@ pub fn build_blocks_v1(payload: &Value, skill: &str) -> Result<String, &'static 
       &source_text[..boundary],
       BLOCKS_V1_SOURCE_TRUNCATION_MARKER
     );
-    let candidate_payload = payload_with_selected_source(payload, source, truncated_source)
+    set_selected_source(&mut candidate_payload, source, truncated_source)
       .ok_or("fixed connector prompt content exceeds the 256 KiB limit")?;
     let candidate = build_blocks_v1_unbounded(&candidate_payload, skill);
     if candidate.len() <= MAX_BLOCKS_V1_PROMPT_BYTES {

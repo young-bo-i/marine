@@ -2367,11 +2367,7 @@ impl McpServer {
       let _ =
         ProfileManager::instance().update_profile_tags(app_handle, &profile.name, tags.clone());
       profile.tags = tags;
-      if let Ok(profiles) = ProfileManager::instance().list_profiles() {
-        let _ = crate::tag_manager::TAG_MANAGER
-          .lock()
-          .map(|manager| manager.rebuild_from_profiles(&profiles));
-      }
+      // No tag rebuild here — `update_profile_tags` -> `save_profile` already did it.
     }
 
     Ok(serde_json::json!({
@@ -2459,11 +2455,7 @@ impl McpServer {
           code: -32000,
           message: format!("Failed to update tags: {e}"),
         })?;
-      if let Ok(profiles) = pm.list_profiles() {
-        let _ = crate::tag_manager::TAG_MANAGER
-          .lock()
-          .map(|manager| manager.rebuild_from_profiles(&profiles));
-      }
+      // No tag rebuild here — `update_profile_tags` -> `save_profile` already did it.
     }
 
     if let Some(ext_group_id) = arguments.get("extension_group_id").and_then(|v| v.as_str()) {

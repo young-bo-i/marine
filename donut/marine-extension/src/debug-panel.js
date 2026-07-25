@@ -11,6 +11,31 @@ var marineDebug = (function () {
     const d = new Date();
     return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()) + '.' + pad(d.getMilliseconds(), 3);
   }
+  // 转发到侧边栏（best-effort；面板没开就静默丢弃）。
+  // 每条日志一次 sendMessage 会在面板根本没开时也把 service worker 唤醒一次，而
+  // 日志是突发式的（一次抓取就是几十条，且每个 iframe 各发一份）。合批之后 IPC
+  // 次数降一个数量级，面板侧仍是准实时（≤200ms）。
+  const FLUSH_MS = 200;
+  const FLUSH_MAX = 40;
+  let pending = [];
+  let flushTimer = null;
+
+  function flush() {
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+    if (!pending.length) return;
+    const batch = pending;
+    pending = [];
+    try {
+      chrome.runtime.sendMessage({ __marineLogBatch: batch }, function () { void chrome.runtime.lastError; });
+    } catch (err) {}
+  }
+
+  function forward(entry) {
+    pending.push(entry);
+    if (pending.length >= FLUSH_MAX) { flush(); return; }
+    if (!flushTimer) flushTimer = setTimeout(flush, FLUSH_MS);
+  }
+
   function log(level, tag, msg, data) {
     const e = {
       t: now(),
@@ -21,8 +46,7 @@ var marineDebug = (function () {
     };
     buffer.push(e);
     if (buffer.length > MAX) buffer.shift();
-    // 转发到侧边栏（best-effort；面板没开就静默丢弃）
-    try { chrome.runtime.sendMessage({ __marineLog: e }, function () { void chrome.runtime.lastError; }); } catch (err) {}
+    forward(e);
     return e;
   }
   function safeJson(v) { try { return JSON.stringify(v); } catch (e) { return String(v); } }

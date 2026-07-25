@@ -437,10 +437,8 @@ impl BrowserRunner {
           .unwrap_or(0)
       );
       self.save_process_info(&updated_profile)?;
-      // Ensure tag suggestions include any tags from this profile
-      let _ = crate::tag_manager::TAG_MANAGER.lock().map(|tm| {
-        let _ = tm.rebuild_from_profiles(&self.profile_manager.list_profiles().unwrap_or_default());
-      });
+      // No tag rebuild here: launching only stamps process info, and rescanning
+      // every profile on disk made a full scan part of every browser launch.
       log::info!(
         "Successfully saved profile with process info: {}",
         updated_profile.name
@@ -838,9 +836,7 @@ impl BrowserRunner {
           .unwrap_or(0)
       );
       self.save_process_info(&updated_profile)?;
-      let _ = crate::tag_manager::TAG_MANAGER.lock().map(|tm| {
-        let _ = tm.rebuild_from_profiles(&self.profile_manager.list_profiles().unwrap_or_default());
-      });
+      // No tag rebuild here — see the matching note on the Camoufox launch path.
       log::info!(
         "Successfully saved profile with process info: {}",
         updated_profile.name

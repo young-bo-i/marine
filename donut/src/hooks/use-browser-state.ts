@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   getBrowserDisplayName,
   getOSDisplayName,
@@ -251,14 +251,29 @@ export function useBrowserState(
     ],
   );
 
-  return {
-    isClient,
-    isSingleInstanceBrowser,
-    isAnyInstanceRunning,
-    canLaunchProfile,
-    canUseProfileForLinks,
-    canSelectProfile,
-    getLaunchTooltipContent,
-    getProfileTooltipContent,
-  };
+  // Memoized because consumers put this object in dependency arrays. Returning a
+  // bare literal gave it a new identity on every render, which silently defeated
+  // the `tableMeta` useMemo in profile-data-table.tsx.
+  return useMemo(
+    () => ({
+      isClient,
+      isSingleInstanceBrowser,
+      isAnyInstanceRunning,
+      canLaunchProfile,
+      canUseProfileForLinks,
+      canSelectProfile,
+      getLaunchTooltipContent,
+      getProfileTooltipContent,
+    }),
+    [
+      isClient,
+      isSingleInstanceBrowser,
+      isAnyInstanceRunning,
+      canLaunchProfile,
+      canUseProfileForLinks,
+      canSelectProfile,
+      getLaunchTooltipContent,
+      getProfileTooltipContent,
+    ],
+  );
 }

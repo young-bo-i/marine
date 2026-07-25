@@ -1689,6 +1689,20 @@ impl ProxyManager {
         }
       }
       if !ready {
+        // The worker process was already spawned, but returning here skips the
+        // registration below — so it would end up in `active_proxies` under no
+        // key AND without a `browser_pid`, and its own self-reap explicitly
+        // keeps running when it has no browser to watch. Periodic cleanup only
+        // removes configs whose process is already dead, so it would survive
+        // until the next app start. Stop it explicitly instead of leaking it.
+        log::warn!(
+          "Local proxy {} on 127.0.0.1:{} did not become ready; stopping the orphaned worker",
+          proxy_info.id,
+          proxy_info.local_port
+        );
+        if let Err(e) = crate::proxy_runner::stop_proxy_process(&proxy_info.id).await {
+          log::warn!("Failed to stop unready proxy worker {}: {e}", proxy_info.id);
+        }
         return Err(format!(
           "Local proxy on 127.0.0.1:{} did not become ready in time",
           proxy_info.local_port

@@ -60,3 +60,25 @@ Runtime files use Unix seconds. Browser context/status `updatedAt` accepts
 legacy seconds and current Unix milliseconds. Browser contexts expire after
 five minutes. Navigation, target removal, and explicit cancellation revoke the
 lease immediately.
+
+## Endpoint audiences (the shared context store is dual-purpose)
+
+The in-browser Marine extension can now generate **without** this input method
+installed: an in-page button runs the local connector (Codex / Claude CLI, or
+an OpenAI-compatible endpoint) via the browser host's own local API. That does
+NOT make the Rime paths dead — the same `RimeContextStore` feeds both consumers:
+
+- **Extension-facing** (full API token): `PUT`/`DELETE /rime/context` publishes
+  the lease-arbitrated comment target; `POST /generate-stream` runs the local
+  connector on it. The self-serve path.
+- **Input-method-facing** (ephemeral consumer token): `GET /rime/status` +
+  `POST /rime/prepare`. The extension no longer calls these, but Rime Buffer
+  still does — it reads the very context the extension PUT. `/generate-stream`
+  and `/rime/prepare` assemble the prompt from the **same** `context.prompt_payload()`
+  + `build_blocks_v1`, so both consumers see one authoritative prompt.
+- **Deprecated**: `POST /rime/invoke` and `/rime/invoke-stream` are permanent
+  `410 Gone` tombstones (AI execution moved into the connectors). `invokePath`
+  above still points at them only as a semantic signal for old connector builds.
+
+Whether the browser generates in-page or Rime does, neither auto-submits the
+website form — a human posts every comment.

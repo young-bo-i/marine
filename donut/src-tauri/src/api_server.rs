@@ -6,8 +6,9 @@ use crate::profile::manager::ProfileManager;
 use crate::proxy_manager::PROXY_MANAGER;
 use crate::tag_manager::TAG_MANAGER;
 use axum::{
+  body::Body,
   extract::{Extension, Path, Query, State},
-  http::{HeaderMap, StatusCode},
+  http::{header, HeaderMap, HeaderValue, StatusCode},
   middleware::{self, Next},
   response::{Json, Response},
   routing::get,
@@ -22,12 +23,16 @@ use tower_http::cors::CorsLayer;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
+use crate::marine::generate::cli::{detect_agents, AgentStatus};
+use crate::marine::generate::{generate_blocks, generate_blocks_stream, BlocksV1, GeneratedBlock};
 use crate::marine::history::{HistoryError, PostingRecord, HISTORY_MANAGER};
 use crate::marine::rime::{
   now_secs as rime_now_secs, RimeContext, RimeContextError, RimeContextMode, RimeContextStore,
   RimeInvokeRequest, RimePrepareRequest, RimePrepareResponse, RimeStatus, RimeTarget,
   RIME_PLUGIN_ID,
 };
+use crate::settings_manager::SettingsManager;
+use tokio_util::sync::CancellationToken;
 
 // API Types
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
@@ -340,6 +345,7 @@ struct BatchStopResponse {
     get_browser_versions,
     check_browser_downloaded,
     marine_generate_api,
+    marine_generate_stream,
     marine_get_provider_config,
     marine_set_provider_config,
     marine_get_identities,
@@ -387,6 +393,9 @@ struct BatchStopResponse {
     MarineGenerateRequest,
     MarineProviderConfig,
     MarineIdentity,
+    AgentStatus,
+    BlocksV1,
+    GeneratedBlock,
     MarineHistoryAppendRequest,
     MarinePublishedHistoryRequest,
     PostingRecord,
@@ -460,10 +469,24 @@ struct MarineHistoryAppendRequest {
   root_id: Option<String>,
   #[serde(default)]
   context_id: Option<String>,
+  /// Who generated the comment: `extension` / `rime` / `manual`. Optional.
+  #[serde(default)]
+  generation_source: Option<String>,
 }
 
 fn default_marine_brand_id() -> String {
   "scholay".to_string()
+}
+
+/// Bound a generation-source tag to the known set so the ledger never stores an
+/// arbitrary string. Unknown/absent → `None`.
+fn normalized_generation_source(value: Option<String>) -> Option<String> {
+  value.and_then(|raw| match raw.trim() {
+    "extension" => Some("extension".to_string()),
+    "rime" => Some("rime".to_string()),
+    "manual" => Some("manual".to_string()),
+    _ => None,
+  })
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -495,6 +518,11 @@ struct MarinePublishedHistoryRequest {
   root_id: Option<String>,
   #[serde(default)]
   context_id: Option<String>,
+  /// Who generated the comment: `extension` / `rime` / `manual` (bounded to that
+  /// set server-side). The in-browser extension sets `extension` when the post's
+  /// text matches a draft it filled via the in-page 生成 button.
+  #[serde(default)]
+  generation_source: Option<String>,
   /// Bilibili's `ctime` in Unix seconds. Observation time is used if absent.
   #[serde(default, alias = "published_at")]
   posted_at: Option<u64>,
@@ -626,14 +654,12 @@ fn normalized_published_at(value: Option<u64>, observed_at: u64) -> Result<u64, 
 }
 
 fn resolve_marine_identity(profile_id: &str) -> Result<MarineIdentity, (StatusCode, String)> {
-  let parsed_id =
-    uuid::Uuid::parse_str(profile_id).map_err(|_| history_invalid("profile_id must be a UUID"))?;
-  let profiles = ProfileManager::instance()
-    .list_profiles()
-    .map_err(history_storage_error)?;
-  profiles
-    .into_iter()
-    .find(|profile| profile.id == parsed_id)
+  // Parse up front so a malformed id is still a 400 rather than a 404.
+  uuid::Uuid::parse_str(profile_id).map_err(|_| history_invalid("profile_id must be a UUID"))?;
+  // Read one profile, not all of them: this runs on every /v1/marine/history*
+  // request and each metadata.json is tens of KB.
+  ProfileManager::instance()
+    .get_profile_by_id(profile_id)
     .map(|profile| MarineIdentity {
       id: profile.id.to_string(),
       name: profile.name,
@@ -699,6 +725,7 @@ fn manual_history_record(
     parent_id: bounded_optional(request.parent_id, "parent_id", HISTORY_MAX_ID_CHARS)?,
     root_id: bounded_optional(request.root_id, "root_id", HISTORY_MAX_ID_CHARS)?,
     context_id: bounded_optional(request.context_id, "context_id", HISTORY_MAX_ID_CHARS)?,
+    generation_source: normalized_generation_source(request.generation_source),
     confirmation_source: "manual".into(),
     status: "manual_confirmed".into(),
     posted_at: observed_at,
@@ -781,6 +808,7 @@ fn published_history_record(
     parent_id,
     root_id,
     context_id: bounded_optional(request.context_id, "context_id", HISTORY_MAX_ID_CHARS)?,
+    generation_source: normalized_generation_source(request.generation_source),
     confirmation_source: "bilibili-api".into(),
     status: "published".into(),
     posted_at: normalized_published_at(request.posted_at, observed_at)?,
@@ -797,51 +825,262 @@ fn marine_ai_execution_moved() -> (StatusCode, String) {
   )
 }
 
+/// Map a generation error's `{code}` JSON to an HTTP status. The JSON body still
+/// carries the actionable code for the frontend to translate.
+fn marine_generation_status(error: &str) -> StatusCode {
+  let code = serde_json::from_str::<serde_json::Value>(error)
+    .ok()
+    .and_then(|value| {
+      value
+        .get("code")
+        .and_then(|code| code.as_str())
+        .map(str::to_string)
+    })
+    .unwrap_or_default();
+  match code.as_str() {
+    "MARINE_RIME_PROMPT_TOO_LARGE" => StatusCode::PAYLOAD_TOO_LARGE,
+    "MARINE_OPENAI_NOT_CONFIGURED" | "MARINE_OPENAI_KEY_MISSING" | "MARINE_PROVIDER_INVALID" => {
+      StatusCode::BAD_REQUEST
+    }
+    "MARINE_GENERATE_TIMEOUT" => StatusCode::GATEWAY_TIMEOUT,
+    _ => StatusCode::BAD_GATEWAY,
+  }
+}
+
+fn marine_settings_error(error: impl std::fmt::Display) -> (StatusCode, String) {
+  (
+    StatusCode::INTERNAL_SERVER_ERROR,
+    crate::marine::err_with("MARINE_SETTINGS_FAILED", error.to_string()),
+  )
+}
+
+/// One-shot generation. Runs the user-selected local connector (Codex / Claude
+/// CLI, or OpenAI-compatible) on the pre-built skill + grab payload and returns a
+/// single `blocks-v1` block. A human still posts every comment.
 #[utoipa::path(
   post, path = "/v1/marine/generate", request_body = MarineGenerateRequest,
-  responses((status = 410, description = "AI execution moved to Rime connectors")),
+  responses(
+    (status = 200, body = BlocksV1),
+    (status = 400, description = "Provider not configured / invalid request"),
+    (status = 413, description = "Prompt exceeds the connector limit"),
+    (status = 502, description = "Local agent failed to produce a valid result"),
+    (status = 504, description = "Generation timed out")
+  ),
   security(("bearer_auth" = [])), tag = "marine"
 )]
 async fn marine_generate_api(
   Json(request): Json<MarineGenerateRequest>,
-) -> Result<StatusCode, (StatusCode, String)> {
-  let _retired_payload = (request.skill, request.payload);
-  Err(marine_ai_execution_moved())
+) -> Result<Json<BlocksV1>, (StatusCode, String)> {
+  generate_blocks(&request.skill, &request.payload)
+    .await
+    .map(Json)
+    .map_err(|error| (marine_generation_status(&error), error))
 }
 
+/// Streaming generation for the in-page button. The extension has already PUT the
+/// focused comment target as a Rime context; this resolves that lease, assembles
+/// the same server-authoritative `blocks-v1` prompt the `prepare` path builds,
+/// runs the local connector, and streams NDJSON frames:
+///   {"type":"delta","text": "<raw model chunk>"}   (incremental preview)
+///   {"type":"done","blocks":[{ "text", "title" }]} (final, authoritative)
+///   {"type":"error","code":"…"}                    (failure)
+/// The result is only ever a draft — nothing is auto-submitted to the website.
 #[utoipa::path(
-  get, path = "/v1/marine/provider-config",
-  responses((status = 410, description = "AI authorization moved to Rime connectors")),
+  post, path = "/v1/marine/generate-stream", request_body = RimeInvokeRequest,
+  responses(
+    (status = 200, description = "NDJSON stream of delta/done/error frames", content_type = "application/x-ndjson"),
+    (status = 400, description = "Invalid or stale context"),
+    (status = 404, description = "No active comment target"),
+    (status = 409, description = "Comment target changed or expired")
+  ),
   security(("bearer_auth" = [])), tag = "marine"
 )]
-async fn marine_get_provider_config() -> Result<StatusCode, (StatusCode, String)> {
-  Err(marine_ai_execution_moved())
+async fn marine_generate_stream(
+  Extension(store): Extension<RimeContextStore>,
+  Json(request): Json<RimeInvokeRequest>,
+) -> Result<Response, (StatusCode, String)> {
+  let context = store
+    .context_for_invoke(&request, rime_now_secs())
+    .map_err(rime_context_error)?;
+  let payload = context.prompt_payload();
+  let skill = context.skill.clone();
+
+  let (frames_tx, frames_rx) = mpsc::channel::<String>(32);
+  let cancellation = CancellationToken::new();
+  tokio::spawn(run_marine_generation_stream(
+    payload,
+    skill,
+    frames_tx,
+    cancellation.clone(),
+  ));
+
+  let body_stream = futures_util::stream::unfold(
+    MarineStreamState {
+      receiver: frames_rx,
+      cancellation,
+    },
+    |mut state| async move {
+      state
+        .receiver
+        .recv()
+        .await
+        .map(|line| (Ok::<String, std::convert::Infallible>(line), state))
+    },
+  );
+
+  let mut response = Response::new(Body::from_stream(body_stream));
+  response.headers_mut().insert(
+    header::CONTENT_TYPE,
+    HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
+  );
+  response
+    .headers_mut()
+    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+  response.headers_mut().insert(
+    header::X_CONTENT_TYPE_OPTIONS,
+    HeaderValue::from_static("nosniff"),
+  );
+  Ok(response)
 }
 
+struct MarineStreamState {
+  receiver: mpsc::Receiver<String>,
+  cancellation: CancellationToken,
+}
+
+impl Drop for MarineStreamState {
+  fn drop(&mut self) {
+    // Client hung up (or the stream body was dropped) → cancel the provider so we
+    // never leave a codex/claude subprocess running past the request.
+    self.cancellation.cancel();
+  }
+}
+
+fn marine_stream_frame(value: serde_json::Value) -> String {
+  let mut line = value.to_string();
+  line.push('\n');
+  line
+}
+
+/// Turn a provider error's `{code, params?}` JSON into an `{type:"error", …}`
+/// frame, defaulting to a generic failure if the string isn't the expected shape.
+fn marine_stream_error_frame(error: &str) -> serde_json::Value {
+  match serde_json::from_str::<serde_json::Value>(error) {
+    Ok(mut value) if value.is_object() => {
+      if let Some(object) = value.as_object_mut() {
+        object.insert("type".to_string(), serde_json::json!("error"));
+      }
+      value
+    }
+    _ => serde_json::json!({ "type": "error", "code": "MARINE_GENERATE_FAILED" }),
+  }
+}
+
+async fn run_marine_generation_stream(
+  payload: serde_json::Value,
+  skill: String,
+  frames: mpsc::Sender<String>,
+  cancellation: CancellationToken,
+) {
+  let (provider_tx, mut provider_rx) = mpsc::channel::<String>(32);
+  let provider_cancellation = cancellation.child_token();
+  let generation = tokio::spawn(async move {
+    generate_blocks_stream(&skill, &payload, provider_tx, provider_cancellation).await
+  });
+
+  loop {
+    tokio::select! {
+      _ = cancellation.cancelled() => {
+        // The child token is already cancelled. DETACH (drop) the JoinHandle
+        // instead of abort()ing it: an aborted task is dropped mid-await and
+        // never runs terminate_and_reap (killpg over the whole process group),
+        // orphaning the codex/claude grandchild. A detached task keeps running,
+        // observes the cancelled token, and reaps the group gracefully.
+        return;
+      }
+      delta = provider_rx.recv() => match delta {
+        Some(text) => {
+          let frame = marine_stream_frame(serde_json::json!({ "type": "delta", "text": text }));
+          if frames.send(frame).await.is_err() {
+            // Client hung up: cancel the child token and detach so the provider
+            // reaps its process group instead of being abort()ed mid-await.
+            cancellation.cancel();
+            return;
+          }
+        }
+        None => break,
+      },
+    }
+  }
+
+  let final_frame = match generation.await {
+    Ok(Ok(output)) => serde_json::json!({ "type": "done", "blocks": output.blocks }),
+    Ok(Err(error)) => marine_stream_error_frame(&error),
+    Err(_) => serde_json::json!({ "type": "error", "code": "MARINE_GENERATE_FAILED" }),
+  };
+  let _ = frames.send(marine_stream_frame(final_frame)).await;
+}
+
+/// Read the current local-connector selection (provider + model + optional
+/// OpenAI-compatible endpoint). The OpenAI API key is never returned.
+#[utoipa::path(
+  get, path = "/v1/marine/provider-config",
+  responses((status = 200, body = MarineProviderConfig)),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_get_provider_config() -> Result<Json<MarineProviderConfig>, (StatusCode, String)> {
+  let settings = SettingsManager::instance()
+    .load_settings()
+    .map_err(marine_settings_error)?;
+  Ok(Json(MarineProviderConfig {
+    provider: settings.marine_provider,
+    cli_model: settings.marine_cli_model,
+    openai_base_url: settings.marine_openai_base_url,
+    openai_model: settings.marine_openai_model,
+  }))
+}
+
+/// Persist the local-connector selection. `provider: null` restores auto-detect.
 #[utoipa::path(
   put, path = "/v1/marine/provider-config", request_body = MarineProviderConfig,
-  responses((status = 410, description = "AI authorization moved to Rime connectors")),
+  responses((status = 200, body = MarineProviderConfig), (status = 400, description = "Unknown provider")),
   security(("bearer_auth" = [])), tag = "marine"
 )]
 async fn marine_set_provider_config(
   Json(config): Json<MarineProviderConfig>,
-) -> Result<StatusCode, (StatusCode, String)> {
-  let _retired_config = (
-    config.provider,
-    config.cli_model,
-    config.openai_base_url,
-    config.openai_model,
-  );
-  Err(marine_ai_execution_moved())
+) -> Result<Json<MarineProviderConfig>, (StatusCode, String)> {
+  if let Some(provider) = config.provider.as_deref() {
+    if !matches!(provider, "codex" | "claude" | "openai") {
+      return Err((
+        StatusCode::BAD_REQUEST,
+        crate::marine::err_with(
+          "MARINE_PROVIDER_INVALID",
+          "provider must be one of codex, claude, openai",
+        ),
+      ));
+    }
+  }
+  let manager = SettingsManager::instance();
+  let mut settings = manager.load_settings().map_err(marine_settings_error)?;
+  settings.marine_provider = config.provider.clone();
+  settings.marine_cli_model = config.cli_model.clone();
+  settings.marine_openai_base_url = config.openai_base_url.clone();
+  settings.marine_openai_model = config.openai_model.clone();
+  manager
+    .save_settings(&settings)
+    .map_err(marine_settings_error)?;
+  Ok(Json(config))
 }
 
+/// Auto-detect local agents (codex / claude) with connection status, so the
+/// settings UI can show "connect your agent" cards.
 #[utoipa::path(
   get, path = "/v1/marine/agents",
-  responses((status = 410, description = "AI authorization moved to Rime connectors")),
+  responses((status = 200, description = "Local agent connection status", body = [AgentStatus])),
   security(("bearer_auth" = [])), tag = "marine"
 )]
-async fn marine_get_agents() -> Result<StatusCode, (StatusCode, String)> {
-  Err(marine_ai_execution_moved())
+async fn marine_get_agents() -> Json<Vec<AgentStatus>> {
+  Json(detect_agents())
 }
 
 #[utoipa::path(
@@ -876,12 +1115,30 @@ async fn marine_get_history(
   State(_state): State<ApiServerState>,
 ) -> Result<Json<Vec<PostingRecord>>, (StatusCode, String)> {
   let identity = resolve_marine_identity(&profile_id)?;
-  let records = HISTORY_MANAGER
-    .lock()
-    .map_err(|_| history_storage_error("history manager lock poisoned"))?
-    .list_for_profile(&identity.id)
-    .map_err(history_manager_error)?;
+  // The ledger read is blocking file I/O behind a global mutex; running it
+  // inline parks a tokio worker and serializes every other request behind it.
+  let records = spawn_history_blocking(move || {
+    HISTORY_MANAGER
+      .lock()
+      .map_err(|_| history_storage_error("history manager lock poisoned"))?
+      .list_for_profile(&identity.id)
+      .map_err(history_manager_error)
+  })
+  .await?;
   Ok(Json(records))
+}
+
+/// Run a blocking history operation off the async runtime's worker threads.
+/// Every history path ends in an `fsync`, which must never block a tokio worker.
+async fn spawn_history_blocking<T, F>(task: F) -> Result<T, (StatusCode, String)>
+where
+  F: FnOnce() -> Result<T, (StatusCode, String)> + Send + 'static,
+  T: Send + 'static,
+{
+  match tokio::task::spawn_blocking(task).await {
+    Ok(result) => result,
+    Err(e) => Err(history_storage_error(format!("history task failed: {e}"))),
+  }
 }
 
 #[utoipa::path(
@@ -896,11 +1153,17 @@ async fn marine_append_history(
   let identity = resolve_marine_identity(&req.profile_id)?;
   let record = manual_history_record(req, &identity, crate::proxy_manager::now_secs())
     .map_err(history_invalid)?;
-  HISTORY_MANAGER
-    .lock()
-    .map_err(|_| history_storage_error("history manager lock poisoned"))?
-    .append(record)
-    .map_err(history_manager_error)?;
+  // Appending fsyncs before it returns — the 200 means "durable", and the
+  // extension's outbox depends on that. Keep the fsync, just move it off the
+  // async worker threads.
+  spawn_history_blocking(move || {
+    HISTORY_MANAGER
+      .lock()
+      .map_err(|_| history_storage_error("history manager lock poisoned"))?
+      .append(record)
+      .map_err(history_manager_error)
+  })
+  .await?;
   Ok(StatusCode::OK)
 }
 
@@ -916,11 +1179,16 @@ async fn marine_append_published_history(
   let identity = resolve_marine_identity(&req.profile_id)?;
   let record = published_history_record(req, &identity, crate::proxy_manager::now_secs())
     .map_err(history_invalid)?;
-  let outcome = HISTORY_MANAGER
-    .lock()
-    .map_err(|_| history_storage_error("history manager lock poisoned"))?
-    .append(record)
-    .map_err(history_manager_error)?;
+  // Same durability contract as the manual append: this 200 is the extension's
+  // acknowledgement that the receipt is on disk (sw.js pauses its outbox on 5xx).
+  let outcome = spawn_history_blocking(move || {
+    HISTORY_MANAGER
+      .lock()
+      .map_err(|_| history_storage_error("history manager lock poisoned"))?
+      .append(record)
+      .map_err(history_manager_error)
+  })
+  .await?;
   Ok(Json(outcome.record().clone()))
 }
 
@@ -1180,6 +1448,7 @@ impl ApiServer {
       .routes(routes!(check_browser_downloaded))
       .routes(routes!(get_wayfern_token, refresh_wayfern_token))
       .routes(routes!(marine_generate_api))
+      .routes(routes!(marine_generate_stream))
       .routes(routes!(
         marine_get_provider_config,
         marine_set_provider_config
@@ -1356,12 +1625,48 @@ async fn auth_middleware(
   // length via timing. `ConstantTimeEq` on equal-length byte slices; differing
   // lengths simply compare unequal.
   if !constant_time_token_matches(token, &stored_token) {
+    // The in-browser extension is stamped with a capability derived from the
+    // bearer (see `marine::extension_capability_token`). It unlocks the Marine
+    // namespace it owns and nothing else, so a page that manages to drive the
+    // extension still cannot launch profiles or read proxy/VPN credentials.
+    if is_marine_namespace_path(&path)
+      && constant_time_token_matches(
+        token,
+        &crate::marine::extension_capability_token(&stored_token),
+      )
+    {
+      return Ok(next.run(request).await);
+    }
     log::warn!("[api] Rejected {path}: token mismatch");
     return Err(StatusCode::UNAUTHORIZED);
   }
 
   // Token is valid, continue with the request
   Ok(next.run(request).await)
+}
+
+// Marine local-API endpoints have three distinct audiences — do not confuse
+// "unused by the extension" with "dead":
+//
+//   • Extension-facing (FULL api token): PUT/DELETE /rime/context (publish the
+//     focused comment target as a lease-arbitrated context) and POST
+//     /generate-stream (run the local connector on that context). This is the
+//     self-serve path that works with NO input method installed.
+//   • Input-method-facing (EPHEMERAL rime consumer token): GET /rime/status +
+//     POST /rime/prepare. The extension no longer calls these, but the Rime
+//     Buffer IME still does (it reads the same shared RimeContextStore the
+//     extension PUT into). Live second consumer — NOT dead code.
+//   • Deprecated tombstones: POST /rime/invoke + /rime/invoke-stream return 410
+//     (AI execution moved into the connectors). Kept as a semantic migration
+//     signal for any in-the-wild connector still pinned to the old invokePath.
+//
+// `is_rime_consumer_path` = paths the ephemeral consumer token may reach (the
+// IME surface). `is_rime_api_path` = rime paths exempt from the Wayfern-terms
+// gate. The FULL api token passes on every path regardless of these sets.
+/// Everything the in-browser extension legitimately drives — and nothing else.
+/// Deliberately excludes `/v1/profiles`, `/v1/proxies`, `/v1/vpns`, `/v1/browsers`.
+fn is_marine_namespace_path(path: &str) -> bool {
+  path.starts_with("/v1/marine/")
 }
 
 fn is_rime_consumer_path(path: &str) -> bool {
@@ -1426,15 +1731,20 @@ async fn request_logging_middleware(request: axum::extract::Request, next: Next)
 
 /// Chokepoint for the future per-hour automation request limit. The limit
 /// (`requests_per_hour`, default 100) is already plumbed through entitlements;
-/// this middleware is intentionally inert today — it resolves the limit but
-/// never blocks. To enforce, count authenticated requests per rolling hour and
-/// return `StatusCode::TOO_MANY_REQUESTS` once the limit (when > 0) is exceeded.
+/// this middleware is intentionally inert today — it never blocks.
+///
+/// It must also not *read* the limit while inert. `requests_per_hour()` locks
+/// the global `CLOUD_AUTH` state, and that same lock is held across a blocking
+/// `fs::write` in `store_auth_state` during the periodic cloud refresh — so
+/// resolving a value we then discard made every local API request serialize
+/// behind a disk write. To enforce, count authenticated requests per rolling
+/// hour (reading the limit once and caching it, not per request) and return
+/// `StatusCode::TOO_MANY_REQUESTS` once the limit (when > 0) is exceeded.
 async fn rate_limit_middleware(
   request: axum::extract::Request,
   next: Next,
 ) -> Result<Response, StatusCode> {
-  let _requests_per_hour = crate::cloud_auth::CLOUD_AUTH.requests_per_hour().await;
-  // TODO(rate-limit): enforce `_requests_per_hour` for automation routes.
+  // TODO(rate-limit): enforce `CLOUD_AUTH.requests_per_hour()` for automation routes.
   Ok(next.run(request).await)
 }
 
@@ -1722,12 +2032,8 @@ async fn create_profile(
         profile.tags = tags.clone();
       }
 
-      // Update tag manager with new tags
-      if let Ok(profiles) = profile_manager.list_profiles() {
-        let _ = crate::tag_manager::TAG_MANAGER
-          .lock()
-          .map(|manager| manager.rebuild_from_profiles(&profiles));
-      }
+      // No tag rebuild here: `update_profile_tags` saves the profile, and
+      // `save_profile` rebuilds whenever the tag set actually moved.
 
       Ok(Json(ApiProfileResponse {
         profile: ApiProfile {
@@ -1888,12 +2194,7 @@ async fn update_profile(
       return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Update tag manager with new tags from all profiles
-    if let Ok(profiles) = profile_manager.list_profiles() {
-      let _ = crate::tag_manager::TAG_MANAGER
-        .lock()
-        .map(|manager| manager.rebuild_from_profiles(&profiles));
-    }
+    // No tag rebuild here — `update_profile_tags` -> `save_profile` already did it.
   }
 
   if let Some(extension_group_id) = request.extension_group_id {
@@ -3242,6 +3543,7 @@ mod tests {
       parent_id: Some("0".into()),
       root_id: Some("0".into()),
       context_id: None,
+      generation_source: None,
       posted_at: Some(1_700_000_000),
     }
   }
@@ -3304,6 +3606,30 @@ mod tests {
     let record = published_history_record(request, &test_marine_identity(), 1_800_000_000).unwrap();
     assert_eq!(record.kind, "reply");
     assert_eq!(record.target_comment_id.as_deref(), Some("34"));
+  }
+
+  #[test]
+  fn published_history_records_and_bounds_the_generation_source() {
+    // Known source flows through.
+    let mut request = test_published_history_request();
+    request.generation_source = Some("extension".into());
+    let record = published_history_record(request, &test_marine_identity(), 1_800_000_000).unwrap();
+    assert_eq!(record.generation_source.as_deref(), Some("extension"));
+
+    // Absent stays absent.
+    let record = published_history_record(
+      test_published_history_request(),
+      &test_marine_identity(),
+      1_800_000_000,
+    )
+    .unwrap();
+    assert_eq!(record.generation_source, None);
+
+    // Unknown/arbitrary values are dropped, never stored verbatim.
+    let mut request = test_published_history_request();
+    request.generation_source = Some("<script>".into());
+    let record = published_history_record(request, &test_marine_identity(), 1_800_000_000).unwrap();
+    assert_eq!(record.generation_source, None);
   }
 
   #[test]
@@ -3413,6 +3739,50 @@ mod tests {
     assert!(constant_time_token_matches("capability", "capability"));
     assert!(!constant_time_token_matches("capability", "capabilitx"));
     assert!(!constant_time_token_matches("short", "longer"));
+  }
+
+  /// The extension capability must unlock the Marine namespace and nothing else,
+  /// and must not be reversible into the bearer it was derived from.
+  #[test]
+  fn extension_capability_is_scoped_and_one_way() {
+    let bearer = "full-api-bearer-token-value";
+    let capability = crate::marine::extension_capability_token(bearer);
+
+    assert_ne!(capability, bearer);
+    assert!(!capability.contains(bearer));
+    assert!(!bearer.contains(&capability));
+    // Deterministic (survives restarts) and bound to this exact bearer.
+    assert_eq!(
+      capability,
+      crate::marine::extension_capability_token(bearer)
+    );
+    assert_ne!(
+      capability,
+      crate::marine::extension_capability_token("another-bearer")
+    );
+
+    for allowed in [
+      "/v1/marine/rime/context",
+      "/v1/marine/generate-stream",
+      "/v1/marine/history/published",
+      "/v1/marine/identities",
+      "/v1/marine/agents",
+      "/v1/marine/provider-config",
+    ] {
+      assert!(is_marine_namespace_path(allowed), "{allowed}");
+    }
+    for denied in [
+      "/v1/profiles",
+      "/v1/profiles/abc/run",
+      "/v1/profiles/abc/kill",
+      "/v1/proxies",
+      "/v1/vpns/abc/export",
+      "/v1/browsers/download",
+      "/v1/groups",
+      "/v1/marine",
+    ] {
+      assert!(!is_marine_namespace_path(denied), "{denied}");
+    }
   }
 
   #[test]
@@ -3548,43 +3918,26 @@ mod tests {
     }
   }
 
+  // Backend AI execution is restored (extension-self-serve): /agents now reports
+  // local connector status instead of 410. /rime/invoke{,-stream} stay 410 — the
+  // in-page button uses /v1/marine/generate-stream, not the old Rime push path.
   #[tokio::test]
-  async fn legacy_marine_ai_routes_are_gone() {
-    let app = Router::new()
-      .route("/generate", axum::routing::post(marine_generate_api))
-      .route(
-        "/provider-config",
-        get(marine_get_provider_config).put(marine_set_provider_config),
+  async fn marine_agents_route_is_live() {
+    let app = Router::new().route("/agents", get(marine_get_agents));
+    let response = app
+      .oneshot(
+        Request::builder()
+          .method("GET")
+          .uri("/agents")
+          .body(Body::empty())
+          .unwrap(),
       )
-      .route("/agents", get(marine_get_agents));
-
-    for (method, path, body) in [
-      (
-        "POST",
-        "/generate",
-        serde_json::json!({"skill": "legacy", "payload": {}}),
-      ),
-      ("GET", "/provider-config", serde_json::Value::Null),
-      ("PUT", "/provider-config", serde_json::json!({})),
-      ("GET", "/agents", serde_json::Value::Null),
-    ] {
-      let mut request = Request::builder().method(method).uri(path);
-      let body = if body.is_null() {
-        Body::empty()
-      } else {
-        request = request.header(header::CONTENT_TYPE, "application/json");
-        Body::from(serde_json::to_vec(&body).unwrap())
-      };
-      let response = app
-        .clone()
-        .oneshot(request.body(body).unwrap())
-        .await
-        .unwrap();
-      assert_eq!(response.status(), StatusCode::GONE, "{method} {path}");
-      let bytes = response.into_body().collect().await.unwrap().to_bytes();
-      let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-      assert_eq!(body["code"], "MARINE_AI_MOVED_TO_RIME");
-    }
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(body.is_array(), "agents should return a JSON array");
   }
 
   #[test]

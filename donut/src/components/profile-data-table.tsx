@@ -92,6 +92,7 @@ import {
 import { formatRelativeTime } from "@/lib/flag-utils";
 import { cn } from "@/lib/utils";
 import type {
+  BandwidthDataPoint,
   BrowserProfile,
   ExtensionGroup,
   LocationItem,
@@ -112,6 +113,11 @@ import { ProxyCheckButton } from "./proxy-check-button";
 import { TrafficDetailsDialog } from "./traffic-details-dialog";
 import { Input } from "./ui/input";
 import { RippleButton } from "./ui/ripple";
+
+// Shared empty array so a profile with no bandwidth samples yet keeps a stable
+// `data` identity across the 1 Hz traffic poll (a fresh `[]` would invalidate
+// BandwidthMiniChart's memo every second for no reason).
+const EMPTY_BANDWIDTH: BandwidthDataPoint[] = [];
 
 declare module "@tanstack/react-table" {
   interface ColumnMeta<TData extends RowData, TValue> {
@@ -2707,18 +2713,19 @@ export function ProfilesDataTable({
           // When profile is running, show bandwidth chart instead of proxy selector
           if (isRunning && meta.trafficSnapshots) {
             const snapshot = meta.trafficSnapshots[profile.id];
-            const bandwidthData = snapshot?.recent_bandwidth
-              ? [...snapshot.recent_bandwidth]
-              : [];
             const currentBandwidth =
               (snapshot?.current_bytes_sent ?? 0) +
               (snapshot?.current_bytes_received ?? 0);
 
+            // The key must not encode anything that changes with the 1 Hz traffic
+            // poll. It used to include `last_update`, so every poll unmounted and
+            // remounted the whole Recharts subtree (re-running its memo and
+            // re-attaching a ResizeObserver) instead of just updating it.
             return (
               <div className="min-w-0 overflow-hidden">
                 <BandwidthMiniChart
-                  key={`${profile.id}-${snapshot?.last_update ?? 0}-${bandwidthData.length}`}
-                  data={bandwidthData}
+                  key={profile.id}
+                  data={snapshot?.recent_bandwidth ?? EMPTY_BANDWIDTH}
                   currentBandwidth={currentBandwidth}
                   onClick={() => meta.onOpenTrafficDialog?.(profile.id)}
                 />

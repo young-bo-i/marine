@@ -169,6 +169,21 @@ opt-level = 0
 # Split debuginfo on macOS for faster linking (ignored on other platforms)
 split-debuginfo = "unpacked"
 
+# Optimize DEPENDENCIES in dev builds while keeping this crate at opt-level 0.
+# Unoptimized crypto/hashing makes a dev build behave nothing like release and
+# sends debugging down false trails: measured here, Argon2id goes 231.8 ms →
+# 11.9 ms (release 11.0 ms) and blake3 2.03 µs → 126 ns. Dependencies rebuild
+# rarely, so this costs one slower cold build and leaves incremental edits (and
+# the debugging experience for our own code) untouched.
+#
+# It does NOT fix serde: `Serialize` derives and the `serde_json::Serializer`
+# monomorphize into THIS crate, which stays at opt-level 0. Measured on a 1.5 MiB
+# payload, serialization is 34.9 ms here vs 0.74 ms in release — so any JSON cost
+# you profile in a dev build (manifest saves, list_profiles, history rewrites) is
+# still overstated by ~47x. Profile JSON work in a release build.
+[profile.dev.package."*"]
+opt-level = 3
+
 # Tuned for FAST CI/tester builds, not a maximally-shrunk binary: lto=false drops
 # the serial (uncacheable) link-time pass, codegen-units=16 parallelizes codegen.
 # For a public "distribution" release, build with a stricter profile (lto=true,

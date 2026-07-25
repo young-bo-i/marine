@@ -822,15 +822,127 @@
     theme: freezeTheme('#ff2442', 'rgba(255, 36, 66, .055)', 'rgba(255, 36, 66, .18)', '小红书'),
   });
 
+  // ---- 抖音（douyin.com）----
+  // 目前可靠支持「直评」：输入框靠 hint 文本识别，投放目标 = 当前视频（aweme_id）。
+  // 视频 aweme_id 来自 URL：详情页 /video/<id>，或搜索/精选页的 modal_id 查询参数。
+  // 单条评论的 DOM 结构（class）尚未确定，故评论边界/回复目标暂 fail-closed（只直评）。
+  const DOUYIN_EDITOR_HINT_RE = /留下你的精彩评论|说点什么|发一条友善的评论|善语结善缘|平等表达/;
+
+  function douyinVideoId(locationLike) {
+    const loc = locationLike || {};
+    const pathMatch = String(loc.pathname || '').match(/\/(?:video|note|discover|share\/video)\/(\d{6,25})(?:\/|$)/);
+    if (pathMatch && stableId(pathMatch[1])) return stableId(pathMatch[1]);
+    const modal = String(loc.search || '').match(/[?&]modal_id=(\d{6,25})(?:&|$)/);
+    return modal ? stableId(modal[1]) : '';
+  }
+
+  // 抖音评论框识别用多信号（结构未定，尽量兜住）：
+  //   1) 提示文本在编辑框自身或祖先的 placeholder/aria-label/data-placeholder 属性里；
+  //   2) 提示文本在编辑框附近的非编辑元素里（占位层）——安全读取，排除编辑框自身内容；
+  //   3) 可编辑元素位于评论相关容器内（class/data-e2e 含 comment），即视为评论输入框。
+  function douyinHintNearEditor(editor) {
+    for (let container = asElement(editor && editor.parentElement), depth = 0;
+         container && depth < 6; depth++, container = asElement(container.parentElement)) {
+      const chunks = textOutsideEditor(container, editor);
+      for (const text of chunks) { if (DOUYIN_EDITOR_HINT_RE.test(text)) return true; }
+      // 到评论区容器就停，别读太远。
+      if (safeMatches(container, '[class*="comment" i],[data-e2e*="comment" i]')) break;
+    }
+    return false;
+  }
+
+  function isDouyinCommentEditor(editor) {
+    if (!isEditableElement(editor)) return false;
+    // 主判据：抖音评论框 = DraftJS 富文本(.public-DraftEditor-content)挂在评论输入容器里。
+    // .comment-input-container / .comment-input-inner-container 是语义 class（非混淆哈希），稳定可靠。
+    if (safeClosest(editor, '.comment-input-container,.comment-input-inner-container,[class*="comment-input" i]')) {
+      return true;
+    }
+    // 兜底：提示文本在属性里，或在编辑框附近的占位元素里。
+    if (DOUYIN_EDITOR_HINT_RE.test(editorAttributeLabel(editor))) return true;
+    return douyinHintNearEditor(editor);
+  }
+
+  function douyinScope(locationLike, documentLike) {
+    const id = douyinVideoId(locationLike);
+    if (!id) return null;
+    const doc = documentLike || root.document || null;
+    // 视频文案/作者：抖音 DOM 无稳定 class，尽力取（data-e2e 优先），拿不到用清洗后的页面标题兜底。
+    let title = elementText(safeQuery(doc,
+      '[data-e2e="video-desc"],[data-e2e="feed-active-video-desc"],[data-e2e="detail-video-desc"],.video-info-detail .title'), 300);
+    const authorName = elementText(safeQuery(doc,
+      '[data-e2e="video-author-name"],[data-e2e="feed-active-video-author-name"],.account-name,.author-card-user-name'), 120);
+    if (!title) {
+      title = normalizeText(String(doc && doc.title || '').replace(/\s*[-_|]\s*抖音(?:搜索|短视频)?\s*$/i, ''), 300);
+    }
+    return { id: id, kind: 'video', title: title, authorName: authorName, element: (doc && doc.documentElement) || null };
+  }
+
+  const douyin = Object.freeze({
+    supportsPage: function (locationLike) {
+      return hostMatches(locationLike, 'douyin.com');
+    },
+    // 评论采集/展示的搜索根：评论区容器（含头部「全部评论(n)」）。
+    commentSearchRoot: function (documentLike) {
+      return safeQuery(documentLike,
+        '[data-e2e="comment-list"],.comment-mainContent,[class*="comment-list" i],' +
+        '[class*="commentList" i],[class*="comment-header-inner-container"]') || null;
+    },
+    // 单条评论 DOM 结构未定：暂不认边界（fail-closed），仅支持直评，绝不误建回复目标。
+    isCommentBoundary: function () { return false; },
+    commentId: function () { return ''; },
+    domIdentity: function () { return null; },
+    isReplyThread: function () { return false; },
+
+    isCommentEditor: function (editor) {
+      return isDouyinCommentEditor(editor);
+    },
+    editorContextLabel: function (editor) {
+      if (!isDouyinCommentEditor(editor)) return '';
+      const attributed = editorAttributeLabel(editor);
+      return /^(?:正在)?回复(?:给)?\s*/.test(attributed) ? attributed : '';
+    },
+
+    // 抖音的评论输入框是常驻底部编辑器（同小红书模式）：失焦不代表目标结束，
+    // 否则用户一点「生成」按钮/滚动就把刚建立的目标清掉。仅在编辑框真的消失、
+    // 被隐藏，或已经换了另一个视频时才判定关闭。
+    persistentTargetIsOpen: function (info) {
+      const editor = asElement(info && info.editor);
+      if (!editor || !editor.isConnected || !isDouyinCommentEditor(editor)) return false;
+      if (elementIsExplicitlyHidden(editor, null)) return false;
+      const scopeId = info.directScope && info.directScope.id;
+      const currentId = douyinVideoId(root.location || null);
+      if (scopeId && currentId && scopeId !== currentId) return false;
+      return true;
+    },
+
+    directScopeFromEventPath: function (path) {
+      const values = Array.isArray(path) ? path : [];
+      if (!values.some(function (value) { return isDouyinCommentEditor(value); })) return null;
+      return douyinScope(root.location || null, root.document || null);
+    },
+    directScopeForEditor: function (editor, previousScope, locationLike, documentLike) {
+      if (!isDouyinCommentEditor(editor)) return null;
+      const current = douyinScope(locationLike, documentLike);
+      if (current) return current;
+      const previous = rememberedScope(previousScope, 'video', documentLike);
+      return previous && previous.id === douyinVideoId(locationLike) ? previous : null;
+    },
+
+    theme: freezeTheme('#fe2c55', 'rgba(254, 44, 85, .055)', 'rgba(254, 44, 85, .18)', '抖音'),
+  });
+
   const adapters = {
     bilibili,
     zhihu,
     xiaohongshu,
+    douyin,
     get: function (platform) {
       const key = String(platform || '').toLowerCase();
       if (key === 'bilibili') return bilibili;
       if (key === 'zhihu') return zhihu;
       if (key === 'xiaohongshu') return xiaohongshu;
+      if (key === 'douyin') return douyin;
       return null;
     },
   };

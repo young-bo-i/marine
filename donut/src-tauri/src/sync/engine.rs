@@ -165,25 +165,69 @@ fn merge_profile_metadata_lww(local: &BrowserProfile, remote: &BrowserProfile) -
 /// uncommitted data (e.g. cookies, login data). Since WAL files are
 /// excluded from sync, we must checkpoint them into the main database
 /// files before generating the manifest to avoid data loss.
-fn checkpoint_sqlite_wal_files(profile_dir: &Path) {
-  fn find_wal_files(dir: &Path, wal_files: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-      return;
+/// Is `relative` a directory whose entire subtree the manifest excludes?
+///
+/// The exclude list mixes subtree patterns (`**/Cache/**`) with file patterns
+/// (`**/*-wal`), so it can only be consulted for directory pruning here — WAL
+/// files are themselves excluded from sync, which is the very reason this walk
+/// exists. Probing a synthetic child makes a subtree pattern match the directory
+/// that holds it; a file pattern cannot match the synthetic name, so a directory
+/// is never pruned on account of one.
+fn is_excluded_subtree(globset: &globset::GlobSet, relative: &str) -> bool {
+  globset.is_match(relative) || globset.is_match(format!("{relative}/*"))
+}
+
+fn find_wal_files(
+  dir: &Path,
+  base_dir: &Path,
+  globset: Option<&globset::GlobSet>,
+  wal_files: &mut Vec<PathBuf>,
+) {
+  let Ok(entries) = fs::read_dir(dir) else {
+    return;
+  };
+  for entry in entries.flatten() {
+    let path = entry.path();
+
+    // Use the dirent's own file type where the platform provides it: calling
+    // `path.is_dir()` costs an extra stat(2) for every single entry.
+    let is_dir = match entry.file_type() {
+      Ok(file_type) if !file_type.is_symlink() => file_type.is_dir(),
+      _ => path.is_dir(),
     };
-    for entry in entries.flatten() {
-      let path = entry.path();
-      if path.is_dir() {
-        find_wal_files(&path, wal_files);
-      } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        if name.ends_with("-wal") {
-          wal_files.push(path);
+
+    if is_dir {
+      // Prune whatever the manifest excludes. Most of a Chromium profile's
+      // entries live under excluded cache trees holding no database we would
+      // ever sync, which made this the largest traversal of a sync cycle —
+      // several times bigger than the one that does the real work.
+      if let Some(globset) = globset {
+        if let Ok(relative) = path.strip_prefix(base_dir) {
+          if is_excluded_subtree(globset, &relative.to_string_lossy().replace('\\', "/")) {
+            continue;
+          }
         }
+      }
+      find_wal_files(&path, base_dir, globset, wal_files);
+    } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+      if name.ends_with("-wal") {
+        wal_files.push(path);
       }
     }
   }
+}
+
+fn checkpoint_sqlite_wal_files(profile_dir: &Path) {
+  let globset = match super::manifest::default_exclude_globset() {
+    Ok(globset) => Some(globset),
+    Err(e) => {
+      log::warn!("Failed to build exclude globset for WAL checkpointing, walking everything: {e}");
+      None
+    }
+  };
 
   let mut wal_files = Vec::new();
-  find_wal_files(profile_dir, &mut wal_files);
+  find_wal_files(profile_dir, profile_dir, globset.as_ref(), &mut wal_files);
 
   for wal_path in &wal_files {
     // Only checkpoint non-empty WAL files
@@ -320,8 +364,14 @@ impl SyncProgressTracker {
     self.maybe_emit();
   }
 
-  fn record_failure(&self) {
+  /// Count a file that will not transfer. `bytes` is its planned size: it is
+  /// added to `completed_bytes` so the byte counter still converges on
+  /// `total_bytes` once every file is accounted for. Leaving it out made the
+  /// byte total permanently short whenever anything failed, which is a
+  /// "transfer is still running" signal to any consumer watching bytes.
+  fn record_failure(&self, bytes: u64) {
     self.completed_files.fetch_add(1, Ordering::Relaxed);
+    self.completed_bytes.fetch_add(bytes, Ordering::Relaxed);
     self.failed_count.fetch_add(1, Ordering::Relaxed);
     self.maybe_emit();
   }
@@ -447,13 +497,8 @@ impl SyncEngine {
   /// older self-hosted servers that don't surface metadata). Legacy objects with
   /// neither resolve to 0, so any real local edit (`updated_at` > 0) wins.
   async fn remote_updated_at(&self, stat: &StatResponse, remote_key: &str) -> u64 {
-    if let Some(meta) = &stat.metadata {
-      if let Some(v) = meta
-        .get(UPDATED_AT_META_KEY)
-        .and_then(|s| s.parse::<u64>().ok())
-      {
-        return v;
-      }
+    if let Some(v) = Self::remote_updated_at_from_stat(stat) {
+      return v;
     }
     // Fallback: read updated_at from the (small) JSON body.
     if let Ok(presign) = self.client.presign_download(remote_key).await {
@@ -468,6 +513,18 @@ impl SyncEngine {
       }
     }
     0
+  }
+
+  /// The HEAD-only half of [`Self::remote_updated_at`]. Returns `None` when the
+  /// server didn't surface object metadata, so a caller that is about to fetch
+  /// the body anyway can skip the fallback body-GET instead of paying for the
+  /// same download twice.
+  fn remote_updated_at_from_stat(stat: &StatResponse) -> Option<u64> {
+    stat
+      .metadata
+      .as_ref()?
+      .get(UPDATED_AT_META_KEY)
+      .and_then(|s| s.parse::<u64>().ok())
   }
 
   /// Upload a small config JSON blob (proxy/vpn/group/extension/extension-group/
@@ -635,8 +692,12 @@ impl SyncEngine {
       has_local_state
     );
 
-    // Save the hash cache for future runs
-    hash_cache.save(&cache_path)?;
+    // Save the hash cache for future runs — but only when `generate_manifest`
+    // actually rehashed something. An idle cycle would otherwise rewrite a
+    // byte-identical file (tens of KB) for every profile, every time.
+    if hash_cache.is_dirty() {
+      hash_cache.save(&cache_path)?;
+    }
 
     // Try to download remote manifest
     let remote_manifest_key = format!("{}profiles/{}/manifest.json", key_prefix, profile_id);
@@ -1062,6 +1123,12 @@ impl SyncEngine {
       ));
     }
 
+    self.fetch_profile_metadata(key).await
+  }
+
+  /// The body half of [`Self::download_profile_metadata`], without the existence
+  /// HEAD — for callers that already hold a `stat` for this key.
+  async fn fetch_profile_metadata(&self, key: &str) -> SyncResult<BrowserProfile> {
     let presign = self.client.presign_download(key).await?;
     let raw = self.client.download_bytes(&presign.url).await?;
     let data = encryption::maybe_unseal_after_download(&raw)
@@ -1346,7 +1413,7 @@ impl SyncEngine {
           Err(e) => {
             let msg = format!("Failed to read {}: {}", file_path.display(), e);
             log::warn!("{}", msg);
-            tracker.record_failure();
+            tracker.record_failure(file_size);
             return Err((relative_path, msg, critical));
           }
         };
@@ -1357,7 +1424,7 @@ impl SyncEngine {
             Err(e) => {
               let msg = format!("Failed to encrypt {}: {}", file_path.display(), e);
               log::warn!("{}", msg);
-              tracker.record_failure();
+              tracker.record_failure(file_size);
               return Err((relative_path, msg, critical));
             }
           }
@@ -1434,7 +1501,7 @@ impl SyncEngine {
           relative_path, MAX_FILE_RETRIES, last_err
         );
         log::warn!("{}", msg);
-        tracker.record_failure();
+        tracker.record_failure(file_size);
         Err((relative_path, msg, critical))
       }));
     }
@@ -1688,7 +1755,7 @@ impl SyncEngine {
                   Err(e) => {
                     let msg = format!("Failed to decrypt {}: {}", relative_path, e);
                     log::warn!("{}", msg);
-                    tracker.record_failure();
+                    tracker.record_failure(file_size);
                     return Err((relative_path, msg, critical));
                   }
                 }
@@ -1702,7 +1769,7 @@ impl SyncEngine {
               if let Err(e) = fs::write(&file_path, &write_data) {
                 let msg = format!("Failed to write {}: {}", file_path.display(), e);
                 log::warn!("{}", msg);
-                tracker.record_failure();
+                tracker.record_failure(file_size);
                 return Err((relative_path, msg, critical));
               }
 
@@ -1744,7 +1811,7 @@ impl SyncEngine {
           relative_path, MAX_FILE_RETRIES, last_err
         );
         log::warn!("{}", msg);
-        tracker.record_failure();
+        tracker.record_failure(file_size);
         Err((relative_path, msg, critical))
       }));
     }
@@ -2662,7 +2729,14 @@ impl SyncEngine {
     }
 
     let metadata_presign = self.client.presign_download(&metadata_key).await?;
-    let metadata_data = self.client.download_bytes(&metadata_presign.url).await?;
+    let metadata_raw = self.client.download_bytes(&metadata_presign.url).await?;
+    // Config blobs are sealed whenever an E2E password is set (independently of
+    // the profile's own SyncMode), so this MUST unseal before parsing — exactly
+    // like `download_profile_metadata` does. Without it, every profile on an
+    // E2E-enabled account failed to parse here and was silently skipped, so a
+    // fresh machine could never pull any profile back.
+    let metadata_data = encryption::maybe_unseal_after_download(&metadata_raw)
+      .map_err(|e| SyncError::InvalidData(format!("Failed to unseal profile metadata: {e}")))?;
     let mut profile: BrowserProfile = serde_json::from_slice(&metadata_data)
       .map_err(|e| SyncError::SerializationError(format!("Failed to parse metadata: {e}")))?;
 
@@ -3046,10 +3120,7 @@ impl SyncEngine {
           // copy. Tombstones must delete remote-originated changes, never the
           // sender's own data. (Caused mass local deletion in v0.24.x.)
           let still_sync_enabled = profile_manager
-            .list_profiles()
-            .unwrap_or_default()
-            .iter()
-            .find(|p| p.id.to_string() == *pid)
+            .get_profile_by_id(pid)
             .is_some_and(|p| p.is_sync_enabled());
           if !still_sync_enabled {
             log::info!(
@@ -3072,12 +3143,16 @@ impl SyncEngine {
     // Refresh metadata for local cross-OS profiles (propagate renames, tags, notes from originating device)
     let profile_manager = ProfileManager::instance();
     // Collect cross-OS profiles before async operations to avoid holding non-Send Result across await
-    let cross_os_profiles: Vec<(String, SyncMode, Option<String>)> = profile_manager
+    let cross_os_profiles: Vec<(BrowserProfile, SyncMode, Option<String>)> = profile_manager
       .list_profiles()
       .unwrap_or_default()
-      .iter()
+      .into_iter()
       .filter(|p| p.is_cross_os() && p.is_sync_enabled())
-      .map(|p| (p.id.to_string(), p.sync_mode, p.created_by_id.clone()))
+      .map(|p| {
+        let sync_mode = p.sync_mode;
+        let created_by_id = p.created_by_id.clone();
+        (p, sync_mode, created_by_id)
+      })
       .collect();
 
     if !cross_os_profiles.is_empty() {
@@ -3087,7 +3162,8 @@ impl SyncEngine {
         None
       };
 
-      for (pid, sync_mode, created_by_id) in &cross_os_profiles {
+      for (local_profile, sync_mode, created_by_id) in &cross_os_profiles {
+        let pid = local_profile.id.to_string();
         let kp = if created_by_id.is_some() {
           team_prefix.as_deref().unwrap_or("")
         } else {
@@ -3095,36 +3171,53 @@ impl SyncEngine {
         };
         let metadata_key = format!("{}profiles/{}/metadata.json", kp, pid);
         match self.client.stat(&metadata_key).await {
-          Ok(stat) if stat.exists => match self.client.presign_download(&metadata_key).await {
-            Ok(presign) => match self.client.download_bytes(&presign.url).await {
-              Ok(data) => {
-                if let Ok(mut remote_profile) = serde_json::from_slice::<BrowserProfile>(&data) {
-                  remote_profile.sync_mode = *sync_mode;
-                  remote_profile.last_sync = Some(
-                    std::time::SystemTime::now()
-                      .duration_since(std::time::UNIX_EPOCH)
-                      .unwrap()
-                      .as_secs(),
-                  );
-                  if let Err(e) = profile_manager.save_profile(&remote_profile) {
-                    log::warn!("Failed to refresh cross-OS profile {} metadata: {}", pid, e);
-                  } else {
-                    log::debug!("Refreshed cross-OS profile {} metadata", pid);
-                  }
+          Ok(stat) if stat.exists => {
+            // Same `updated_at` last-write-wins rule as every other config
+            // entity. This used to overwrite the local profile unconditionally,
+            // so a rename/tag edit made on THIS machine was rolled back by a
+            // staler remote copy on the next sync.
+            //
+            // Only the HEAD-metadata timestamp may short-circuit here. On legacy
+            // objects that carry no metadata, resolving `updated_at` would cost a
+            // full body GET of its own, so fetch the body once and compare after
+            // parsing rather than downloading the same object twice.
+            let local_updated = local_profile.updated_at.unwrap_or(0);
+            if let Some(remote_updated) = Self::remote_updated_at_from_stat(&stat) {
+              if remote_updated <= local_updated {
+                log::debug!(
+                  "Cross-OS profile {pid} metadata is current (remote {remote_updated} <= local {local_updated})"
+                );
+                continue;
+              }
+            }
+            // `fetch_profile_metadata` unseals first — the raw body is an
+            // encrypted envelope whenever an E2E password is set, which the old
+            // inline `from_slice` silently failed to parse (and then skipped).
+            match self.fetch_profile_metadata(&metadata_key).await {
+              Ok(remote_meta) => {
+                if remote_meta.updated_at.unwrap_or(0) <= local_updated {
+                  log::debug!("Cross-OS profile {pid} metadata is current (body timestamp)");
+                  continue;
+                }
+                let mut merged = merge_profile_metadata_lww(local_profile, &remote_meta);
+                merged.sync_mode = *sync_mode;
+                merged.last_sync = Some(
+                  std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                );
+                if let Err(e) = profile_manager.save_profile(&merged) {
+                  log::warn!("Failed to refresh cross-OS profile {pid} metadata: {e}");
+                } else {
+                  log::debug!("Refreshed cross-OS profile {pid} metadata");
                 }
               }
               Err(e) => {
-                log::warn!(
-                  "Failed to download cross-OS profile {} metadata: {}",
-                  pid,
-                  e
-                );
+                log::warn!("Failed to download cross-OS profile {pid} metadata: {e}");
               }
-            },
-            Err(e) => {
-              log::warn!("Failed to presign cross-OS profile {} metadata: {}", pid, e);
             }
-          },
+          }
           _ => {}
         }
       }
@@ -3730,10 +3823,21 @@ pub async fn trigger_sync_for_profile(
     .find(|p| p.id == profile_uuid)
     .ok_or_else(|| format!("Profile with ID '{profile_id}' not found"))?;
 
-  engine
-    .sync_profile(&app_handle, &profile)
-    .await
-    .map_err(|e| format!("Sync failed: {e}"))?;
+  // Unlike the scheduler path, nothing downstream of this call emits a terminal
+  // status. `sync_profile` may already have emitted `syncing` (and a progress
+  // toast) before failing, so surface the failure here or the UI keeps spinning.
+  // Callers include the E2E key rollover, which re-syncs every profile at once.
+  if let Err(e) = engine.sync_profile(&app_handle, &profile).await {
+    let _ = events::emit(
+      "profile-sync-status",
+      serde_json::json!({
+        "profile_id": profile_id,
+        "status": "error",
+        "error": e.to_string()
+      }),
+    );
+    return Err(format!("Sync failed: {e}"));
+  }
 
   Ok(())
 }
@@ -4410,6 +4514,48 @@ pub async fn rollover_encryption_for_all_entities(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// The exclude list contains BOTH `**/Cache/**` and `**/*-wal`. Pruning must
+  /// therefore apply to directories only: applying it to files would skip every
+  /// WAL file, i.e. everything this walk is looking for.
+  #[test]
+  fn wal_walk_prunes_excluded_dirs_but_never_excluded_files() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let root = temp_dir.path();
+
+    fs::create_dir_all(root.join("Default/Cache/Cache_Data")).unwrap();
+    fs::create_dir_all(root.join("Default/Local Storage")).unwrap();
+    fs::write(root.join("Default/Cookies-wal"), b"x").unwrap();
+    fs::write(root.join("Default/Local Storage/leveldb.db-wal"), b"x").unwrap();
+    fs::write(root.join("Default/Cache/Cache_Data/index-wal"), b"x").unwrap();
+
+    let globset = super::super::manifest::default_exclude_globset().unwrap();
+    let mut found = Vec::new();
+    find_wal_files(root, root, Some(&globset), &mut found);
+
+    let names: Vec<String> = found
+      .iter()
+      .map(|p| {
+        p.strip_prefix(root)
+          .unwrap()
+          .to_string_lossy()
+          .replace('\\', "/")
+      })
+      .collect();
+
+    assert!(
+      names.contains(&"Default/Cookies-wal".to_string()),
+      "a WAL file next to a synced database must still be found: {names:?}"
+    );
+    assert!(
+      names.contains(&"Default/Local Storage/leveldb.db-wal".to_string()),
+      "a WAL file in a synced subdirectory must still be found: {names:?}"
+    );
+    assert!(
+      !names.iter().any(|n| n.starts_with("Default/Cache/")),
+      "the excluded cache subtree must not be walked at all: {names:?}"
+    );
+  }
 
   #[test]
   fn test_checkpoint_sqlite_wal_files() {

@@ -400,9 +400,14 @@ impl SyncScheduler {
 
     // Sync all profiles in parallel
     let mut sync_set = tokio::task::JoinSet::new();
+    let mut unfinished: std::collections::HashSet<String> = std::collections::HashSet::new();
     for profile_id in to_sync {
       let app = app_handle.clone();
       let in_flight = self.in_flight_profiles.clone();
+      // Each task reports its own id back on normal completion, so whatever is
+      // still unaccounted for after the join loop panicked and can be given a
+      // terminal status (a spinner that never resolves is worse than an error).
+      unfinished.insert(profile_id.clone());
       sync_set.spawn(async move {
         log::info!("Executing queued sync for profile {}", profile_id);
         let _ = events::emit(
@@ -413,19 +418,28 @@ impl SyncScheduler {
           }),
         );
 
-        let profile_to_sync = {
-          let profile_manager = ProfileManager::instance();
-          profile_manager.list_profiles().ok().and_then(|profiles| {
-            profiles
-              .into_iter()
-              .find(|p| p.id.to_string() == profile_id && p.is_sync_enabled())
-          })
-        };
+        // Read just this profile. This runs inside a per-profile task of a
+        // concurrent fan-out, so listing every profile to find one made the
+        // whole sweep quadratic in the number of profiles.
+        let profile_to_sync = ProfileManager::instance()
+          .get_profile_by_id(&profile_id)
+          .filter(|p| p.is_sync_enabled());
 
         let Some(profile) = profile_to_sync else {
+          // `syncing` was already emitted above. Returning without a terminal
+          // event leaves the row spinning forever — which is exactly what
+          // happens after sync is turned off for a profile: the delete echoes
+          // back, queues one last sync, and finds nothing to do here.
+          let _ = events::emit(
+            "profile-sync-status",
+            serde_json::json!({
+              "profile_id": profile_id,
+              "status": "synced"
+            }),
+          );
           let mut inf = in_flight.lock().await;
           inf.remove(&profile_id);
-          return;
+          return profile_id;
         };
 
         let result = match SyncEngine::create_from_settings(&app).await {
@@ -464,16 +478,40 @@ impl SyncScheduler {
             );
           }
         }
+        profile_id
       });
     }
 
     // Wait for all parallel syncs to finish (only if we actually spawned any)
     if !sync_set.is_empty() {
       while let Some(result) = sync_set.join_next().await {
-        if let Err(e) = result {
-          log::error!("Profile sync task panicked: {e}");
+        match result {
+          Ok(profile_id) => {
+            unfinished.remove(&profile_id);
+          }
+          Err(e) => log::error!("Profile sync task panicked: {e}"),
         }
       }
+    }
+
+    // Anything still listed here never reported back: its task panicked (a
+    // `.lock().unwrap()` on a poisoned mutex, a `SystemTime` unwrap, …). It
+    // already emitted `syncing`, so without this the profile row would spin
+    // forever and its in-flight guard would block every later sync of it.
+    for profile_id in unfinished {
+      log::error!("Profile {profile_id} sync task ended without a terminal status");
+      {
+        let mut inf = self.in_flight_profiles.lock().await;
+        inf.remove(&profile_id);
+      }
+      let _ = events::emit(
+        "profile-sync-status",
+        serde_json::json!({
+          "profile_id": profile_id,
+          "status": "error",
+          "error": "sync task ended unexpectedly"
+        }),
+      );
     }
   }
 

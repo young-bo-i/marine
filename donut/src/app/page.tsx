@@ -1271,11 +1271,49 @@ export default function Home() {
     [t],
   );
 
+  // Read the latest profiles/t inside the sync listeners WITHOUT making them a
+  // dependency: syncing writes `last_sync`, which emits `profiles-changed` →
+  // `loadProfiles()` → a new `profiles` array. If the listener effect depended on
+  // that, every sync would tear the listeners down and re-`await listen(...)`,
+  // and a terminal `profile-sync-status` landing in that async gap would be lost —
+  // leaving the 100%-complete progress toast (duration: Infinity) spinning forever.
+  const syncProfilesRef = useRef(profiles);
+  const syncTranslateRef = useRef(t);
+  useEffect(() => {
+    syncProfilesRef.current = profiles;
+    syncTranslateRef.current = t;
+  }, [profiles, t]);
+
   useEffect(() => {
     let disposed = false;
     let unlistenStatus: (() => void) | undefined;
     let unlistenProgress: (() => void) | undefined;
     const profilesWithTransfer = new Set<string>();
+    // Safety net: a progress stream that reaches 100% but never gets its terminal
+    // status must not leave a spinner up forever.
+    const completionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    const clearCompletionTimer = (profileId: string) => {
+      const timer = completionTimers.get(profileId);
+      if (timer) {
+        clearTimeout(timer);
+        completionTimers.delete(profileId);
+      }
+    };
+    // Tauri's unlisten is async and rejects if the same handle is unlistened
+    // twice (its internal listeners[eventId] is already gone). Null each handle
+    // after one call (idempotent) and swallow sync throw + async reject.
+    const teardown = () => {
+      const status = unlistenStatus;
+      const progress = unlistenProgress;
+      unlistenStatus = undefined;
+      unlistenProgress = undefined;
+      void Promise.resolve()
+        .then(() => status?.())
+        .catch(() => {});
+      void Promise.resolve()
+        .then(() => progress?.())
+        .catch(() => {});
+    };
     void (async () => {
       try {
         unlistenStatus = await listen<{
@@ -1286,23 +1324,33 @@ export default function Home() {
         }>("profile-sync-status", (event) => {
           const { profile_id, status, error, profile_name } = event.payload;
           const toastId = `sync-${profile_id}`;
-          const profile = profiles.find((p) => p.id === profile_id);
+          const translate = syncTranslateRef.current;
+          const profile = syncProfilesRef.current.find(
+            (p) => p.id === profile_id,
+          );
           const name =
-            profile_name || profile?.name || t("common.labels.unknownProfile");
+            profile_name ||
+            profile?.name ||
+            translate("common.labels.unknownProfile");
 
           if (status === "synced") {
+            clearCompletionTimer(profile_id);
             dismissToast(toastId);
             if (profilesWithTransfer.has(profile_id)) {
               profilesWithTransfer.delete(profile_id);
-              showSuccessToast(t("sync.toast.profileSynced", { name }));
+              showSuccessToast(translate("sync.toast.profileSynced", { name }));
             }
           } else if (status === "error") {
+            clearCompletionTimer(profile_id);
             dismissToast(toastId);
             profilesWithTransfer.delete(profile_id);
             showErrorToast(
               error
-                ? t("sync.toast.profileSyncFailedWithError", { name, error })
-                : t("sync.toast.profileSyncFailed", { name }),
+                ? translate("sync.toast.profileSyncFailedWithError", {
+                    name,
+                    error,
+                  })
+                : translate("sync.toast.profileSyncFailed", { name }),
             );
           }
         });
@@ -1321,11 +1369,14 @@ export default function Home() {
         }>("profile-sync-progress", (event) => {
           const payload = event.payload;
           const toastId = `sync-${payload.profile_id}`;
-          const profile = profiles.find((p) => p.id === payload.profile_id);
+          const translate = syncTranslateRef.current;
+          const profile = syncProfilesRef.current.find(
+            (p) => p.id === payload.profile_id,
+          );
           const name =
             payload.profile_name ||
             profile?.name ||
-            t("common.labels.unknownProfile");
+            translate("common.labels.unknownProfile");
 
           if (
             payload.phase === "started" ||
@@ -1347,26 +1398,66 @@ export default function Home() {
               },
               { id: toastId, profileId: payload.profile_id },
             );
+
+            // The transfer stream only reports started/uploading/downloading —
+            // the toast is dismissed by the terminal `profile-sync-status`. If
+            // that never arrives (or a later phase of the same run never emits
+            // one), a 100%-complete toast would spin forever. Once the byte/file
+            // counters say the transfer is done, arm a grace timer that closes it.
+            const totalFiles = payload.total_files ?? 0;
+            // Completion is judged on the FILE counter only — the same counter the
+            // toast renders as "100%". Bytes must not gate this: the backend counts
+            // a failed transfer (and a vanished/skipped file) in `completed_files`
+            // but adds no bytes, so any single failure leaves `completed_bytes`
+            // permanently short and would keep this safety net from ever arming.
+            const transferComplete =
+              totalFiles > 0 && (payload.completed_files ?? 0) >= totalFiles;
+            if (transferComplete) {
+              if (!completionTimers.has(payload.profile_id)) {
+                const profileId = payload.profile_id;
+                completionTimers.set(
+                  profileId,
+                  setTimeout(() => {
+                    completionTimers.delete(profileId);
+                    dismissToast(`sync-${profileId}`);
+                    if (profilesWithTransfer.delete(profileId)) {
+                      showSuccessToast(
+                        syncTranslateRef.current("sync.toast.profileSynced", {
+                          name,
+                        }),
+                      );
+                    }
+                  }, 8000),
+                );
+              }
+            } else {
+              clearCompletionTimer(payload.profile_id);
+            }
           }
         });
         // If the effect was torn down while we were awaiting the listeners,
-        // unlisten immediately — the cleanup below already ran and would have
-        // missed these handles. (Tauri unlisten is safe to call more than once.)
-        if (disposed) {
-          unlistenStatus?.();
-          unlistenProgress?.();
-        }
+        // unlisten immediately — the cleanup already ran with no handles yet.
+        if (disposed) teardown();
       } catch (error) {
         console.error("Failed to listen for sync events:", error);
       }
     })();
     return () => {
       disposed = true;
-      if (unlistenStatus) unlistenStatus();
-      if (unlistenProgress) unlistenProgress();
+      for (const timer of completionTimers.values()) clearTimeout(timer);
+      completionTimers.clear();
+      teardown();
     };
-  }, [profiles, t]);
+    // Registered once for the app's lifetime — see syncProfilesRef above for why
+    // `profiles`/`t` must not be dependencies here.
+  }, []);
 
+  // URL listeners + the periodic update check. This is deliberately SEPARATE
+  // from the profile-dependent work below: it used to share an effect whose deps
+  // included `profiles.length`, so every profile add/remove tore down and
+  // recreated the 30-minute interval. With enough profile churn the update check
+  // could never reach 30 minutes and simply never ran — a functional bug, not
+  // just wasted work. Nothing in here depends on profiles.
   useEffect(() => {
     // Listen for URL open events. Guard against the effect tearing down (or
     // re-running) before the async listener setup resolves: if that happens,
@@ -1392,6 +1483,16 @@ export default function Home() {
       30 * 60 * 1000,
     );
 
+    return () => {
+      disposed = true;
+      clearInterval(updateInterval);
+      cleanup?.();
+    };
+  }, [checkForUpdates, listenForUrlEvents, checkCurrentUrl]);
+
+  // Profile-dependent one-shots. `profiles.length` is a number, so this only
+  // re-runs when the profile COUNT changes, not on every `profiles-changed`.
+  useEffect(() => {
     // Check for missing binaries after initial profile load
     if (!profilesLoading && profiles.length > 0) {
       void checkMissingBinaries();
@@ -1403,20 +1504,7 @@ export default function Home() {
         console.error("Failed to auto-download browsers:", err);
       });
     }
-
-    return () => {
-      disposed = true;
-      clearInterval(updateInterval);
-      cleanup?.();
-    };
-  }, [
-    checkForUpdates,
-    listenForUrlEvents,
-    checkCurrentUrl,
-    checkMissingBinaries,
-    profilesLoading,
-    profiles.length,
-  ]);
+  }, [checkMissingBinaries, profilesLoading, profiles.length]);
 
   // E2E encryption listeners — surface password-required prompts and rollover
   // progress so the user isn't left guessing whether sealing finished.
@@ -1427,6 +1515,29 @@ export default function Home() {
     let unlistenProgress: (() => void) | undefined;
     let unlistenCompleted: (() => void) | undefined;
     let unlistenWayfernBlocked: (() => void) | undefined;
+
+    // Tauri unlisten is async and rejects on a double call; null each handle
+    // after one call and swallow sync throw + async reject so the async-setup
+    // and cleanup paths can't crash when this effect re-runs.
+    const teardown = () => {
+      const handles = [
+        unlistenRequired,
+        unlistenStarted,
+        unlistenProgress,
+        unlistenCompleted,
+        unlistenWayfernBlocked,
+      ];
+      unlistenRequired = undefined;
+      unlistenStarted = undefined;
+      unlistenProgress = undefined;
+      unlistenCompleted = undefined;
+      unlistenWayfernBlocked = undefined;
+      for (const handle of handles) {
+        void Promise.resolve()
+          .then(() => handle?.())
+          .catch(() => {});
+      }
+    };
 
     void (async () => {
       unlistenRequired = await listen(
@@ -1499,60 +1610,55 @@ export default function Home() {
         });
       });
 
-      // If the effect was torn down mid-setup, the cleanup below already ran
-      // before these handles existed — unlisten them now so nothing leaks.
-      if (disposed) {
-        unlistenRequired?.();
-        unlistenStarted?.();
-        unlistenProgress?.();
-        unlistenCompleted?.();
-        unlistenWayfernBlocked?.();
-      }
+      // If the effect was torn down mid-setup, the cleanup already ran before
+      // these handles existed — unlisten them now so nothing leaks.
+      if (disposed) teardown();
     })();
 
     return () => {
       disposed = true;
-      unlistenRequired?.();
-      unlistenStarted?.();
-      unlistenProgress?.();
-      unlistenCompleted?.();
-      unlistenWayfernBlocked?.();
+      teardown();
     };
   }, [t]);
 
   // Show warning for non-wayfern/camoufox profiles (support ending March 15, 2026)
-  useEffect(() => {
-    if (profiles.length === 0) return;
-
-    const unsupportedProfiles = profiles.filter(
-      (p) => p.browser !== "wayfern" && p.browser !== "camoufox",
-    );
-
-    if (unsupportedProfiles.length > 0) {
-      const unsupportedNames = unsupportedProfiles
+  //
+  // Keyed on the unsupported NAMES rather than the `profiles` array. Depending on
+  // `profiles` re-issued this toast on every `profiles-changed` — including the
+  // ones the sync engine emits purely to stamp `last_sync` — and because it
+  // reuses a fixed toast id, each re-issue re-armed the 15-second timer instead
+  // of stacking. The warning effectively never dismissed itself.
+  const unsupportedProfileNames = useMemo(
+    () =>
+      profiles
+        .filter((p) => p.browser !== "wayfern" && p.browser !== "camoufox")
         .map((p) => p.name)
-        .join(", ");
+        .join(", "),
+    [profiles],
+  );
 
-      showToast({
-        id: "browser-support-ending-warning",
-        type: "error",
-        title: t("browserSupport.endingSoonTitle"),
-        description: t("browserSupport.endingSoonDescription", {
-          profiles: unsupportedNames,
-        }),
-        duration: 15000,
-        action: {
-          label: t("common.buttons.learnMore"),
-          onClick: () => {
-            const event = new CustomEvent("url-open-request", {
-              detail: "https://github.com/zhom/donutbrowser/discussions",
-            });
-            window.dispatchEvent(event);
-          },
+  useEffect(() => {
+    if (!unsupportedProfileNames) return;
+
+    showToast({
+      id: "browser-support-ending-warning",
+      type: "error",
+      title: t("browserSupport.endingSoonTitle"),
+      description: t("browserSupport.endingSoonDescription", {
+        profiles: unsupportedProfileNames,
+      }),
+      duration: 15000,
+      action: {
+        label: t("common.buttons.learnMore"),
+        onClick: () => {
+          const event = new CustomEvent("url-open-request", {
+            detail: "https://github.com/zhom/donutbrowser/discussions",
+          });
+          window.dispatchEvent(event);
         },
-      });
-    }
-  }, [profiles, t]);
+      },
+    });
+  }, [unsupportedProfileNames, t]);
 
   // Re-check Wayfern terms when a browser download completes
   useEffect(() => {

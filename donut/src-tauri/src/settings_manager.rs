@@ -1,12 +1,40 @@
 use serde::{Deserialize, Serialize};
 use std::fs::{self, create_dir_all};
 use std::path::PathBuf;
+use std::sync::RwLock;
 
 use aes_gcm::{
   aead::{Aead, AeadCore, KeyInit, OsRng},
   Aes256Gcm, Key, Nonce,
 };
 use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
+
+/// Decrypted API token, cached in memory.
+///
+/// `get_api_token` reads `api_token.dat` and runs a full Argon2id KDF (m=19 MiB,
+/// t=2) plus AES-GCM decrypt. The REST auth middleware calls it on **every**
+/// authenticated request, on a Tokio worker with no `spawn_blocking` — measured
+/// at 226–296 ms per call in a dev build and ~12.7 ms in release, which dominated
+/// local API latency and turned a slow PUT into client-side retry storms.
+///
+/// The ciphertext only ever changes through `store_api_token` / `remove_api_token`,
+/// so caching the plaintext is safe as long as both invalidate. Editing the file
+/// out from under a running app is not supported (it never was — the extension is
+/// stamped with the token at profile launch).
+///
+/// Outer `None` = not loaded yet; `Some(None)` = confirmed absent.
+static API_TOKEN_CACHE: RwLock<Option<Option<String>>> = RwLock::new(None);
+
+fn cached_api_token() -> Option<Option<String>> {
+  API_TOKEN_CACHE
+    .read()
+    .unwrap_or_else(|e| e.into_inner())
+    .clone()
+}
+
+fn set_cached_api_token(value: Option<String>) {
+  *API_TOKEN_CACHE.write().unwrap_or_else(|e| e.into_inner()) = Some(value);
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TableSortingSettings {
@@ -282,6 +310,7 @@ impl SettingsManager {
     file_data.extend_from_slice(&ciphertext);
 
     std::fs::write(token_file, file_data)?;
+    set_cached_api_token(Some(token.to_string()));
     Ok(())
   }
 
@@ -289,6 +318,23 @@ impl SettingsManager {
     &self,
     _app_handle: &tauri::AppHandle,
   ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    // Serve from cache when possible: the miss path below is an Argon2id KDF and
+    // this runs per authenticated API request. See API_TOKEN_CACHE.
+    if let Some(cached) = cached_api_token() {
+      return Ok(cached);
+    }
+
+    // Every `Ok(None)` below is a deterministic verdict about the bytes on disk
+    // (absent, malformed, or undecryptable), so it is cached exactly like a
+    // successful read. Only genuinely transient failures propagate as `Err` and
+    // stay uncached. Without this, an undecryptable file re-ran the full Argon2
+    // KDF on every single API request — the exact cost the cache exists to kill.
+    let token = self.read_api_token_from_disk()?;
+    set_cached_api_token(token.clone());
+    Ok(token)
+  }
+
+  fn read_api_token_from_disk(&self) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let token_file = self.get_settings_dir().join("api_token.dat");
 
     if !token_file.exists() {
@@ -323,8 +369,14 @@ impl SettingsManager {
       return Ok(None);
     }
     let salt_bytes = &file_data[offset..offset + salt_len];
-    let salt_str = std::str::from_utf8(salt_bytes).map_err(|_| "Invalid salt encoding")?;
-    let salt = SaltString::from_b64(salt_str).map_err(|_| "Invalid salt format")?;
+    let Ok(salt_str) = std::str::from_utf8(salt_bytes) else {
+      log::warn!("API token file has a non-UTF-8 salt; treating the token as absent");
+      return Ok(None);
+    };
+    let Ok(salt) = SaltString::from_b64(salt_str) else {
+      log::warn!("API token file has a malformed salt; treating the token as absent");
+      return Ok(None);
+    };
     offset += salt_len;
 
     // Read nonce (12 bytes)
@@ -369,15 +421,19 @@ impl SettingsManager {
     let key = Key::<Aes256Gcm>::from(key_bytes);
     let cipher = Aes256Gcm::new(&key);
 
-    // Decrypt the token
-    let plaintext = cipher
-      .decrypt(&nonce, ciphertext)
-      .map_err(|_| "Decryption failed")?;
+    // A decrypt failure here is deterministic, not transient: the vault password
+    // is a compile-time constant, so a binary built with a different one can
+    // never decrypt this file. Reporting "absent" (and caching it) lets the
+    // callers that already regenerate a token do so, instead of every request
+    // paying a full Argon2 KDF only to fail.
+    let Ok(plaintext) = cipher.decrypt(&nonce, ciphertext) else {
+      log::warn!(
+        "API token file could not be decrypted (built with a different vault password?); treating it as absent"
+      );
+      return Ok(None);
+    };
 
-    match String::from_utf8(plaintext) {
-      Ok(token) => Ok(Some(token)),
-      Err(_) => Ok(None),
-    }
+    Ok(String::from_utf8(plaintext).ok())
   }
 
   pub async fn remove_api_token(
@@ -389,6 +445,7 @@ impl SettingsManager {
     if token_file.exists() {
       std::fs::remove_file(token_file)?;
     }
+    set_cached_api_token(None);
 
     Ok(())
   }

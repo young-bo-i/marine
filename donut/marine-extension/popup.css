@@ -142,26 +142,6 @@ button:disabled { opacity: .5; cursor: default; box-shadow: none; }
 .status.ok { color: var(--has-fg); }
 .status.error { color: var(--danger); }
 
-/* Generated 话术 draft cards — Pencil "assistant" cards */
-.replies { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
-.reply-card {
-  border: 1px solid var(--border); border-radius: 14px; padding: 11px 12px;
-  background: var(--card); box-shadow: var(--shadow-sm);
-}
-.reply-head { font-size: 11px; color: var(--muted); font-weight: 500; margin-bottom: 6px; }
-.reply-text { font-size: 13px; color: var(--ink); line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
-.reply-actions { margin-top: 9px; display: flex; flex-wrap: wrap; gap: 6px; }
-/* small pill buttons: gray by default, green for apply/fill/posted (Pencil approve=green) */
-.reply-copy {
-  font-size: 11px; font-weight: 500; padding: 3px 10px; border-radius: 8px;
-  border: 1px solid var(--border-strong); background: var(--surface); color: var(--muted); cursor: pointer;
-}
-.reply-copy:hover { background: var(--action-hover); color: var(--ink); }
-.reply-fill, .reply-post { background: rgba(34,197,94,.16); border-color: transparent; color: var(--has-fg); }
-.reply-fill:hover, .reply-post:hover { background: rgba(34,197,94,.26); color: var(--has-fg); }
-.reply-post.done { background: var(--has-bg); color: var(--has-fg); }
-.reply-auto-note { margin-left: auto; align-self: center; font-size: 10px; color: var(--has-fg); }
-
 .hint { margin-top: 11px; padding: 9px 11px; font-size: 12px; line-height: 1.6; background: var(--danger-bg); border-radius: 8px; color: var(--danger); }
 .link { border: none; background: none; padding: 0; color: var(--accent); cursor: pointer; font-size: 12px; text-decoration: underline; }
 .hidden { display: none !important; }
@@ -181,39 +161,6 @@ button:disabled { opacity: .5; cursor: default; box-shadow: none; }
 .note code { background: var(--surface); padding: 1px 5px; border-radius: 4px; font-size: 10px; font-family: "Roboto Mono", ui-monospace, Menlo, monospace; }
 .mini-label { display: block; font-size: 11px; color: var(--faint); margin: 9px 0 4px; }
 .cfg-btn { width: 100%; margin-top: 10px; }
-
-/* Engine / local-agent cards (Pencil "connect your agent") */
-.agent-grid { display: flex; flex-direction: column; gap: 8px; margin: 8px 0 0; }
-.agent-card {
-  display: flex; flex-direction: column; gap: 7px; width: 100%; text-align: left; font: inherit;
-  padding: 11px 12px; background: var(--card); color: var(--ink);
-  border: 1px solid var(--border); border-radius: 12px; cursor: pointer; box-shadow: var(--shadow-xs);
-  transition: border-color .15s, background .15s, box-shadow .15s;
-}
-.agent-card:hover { border-color: var(--border-strong); background: var(--surface); }
-.agent-card.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
-.agent-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.agent-name { font-size: 13px; font-weight: 600; color: var(--ink); }
-.agent-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex-shrink: 0; }
-.agent-dot.ok { background: var(--has-fg); }
-.agent-dot.warn { background: #f59e0b; }
-.agent-dot.off { background: var(--faint); }
-.agent-dot.custom { background: var(--muted); }
-.agent-status {
-  display: inline-flex; align-items: center; align-self: flex-start;
-  font-size: 11px; font-weight: 500; padding: 2px 8px; border-radius: 6px;
-  color: var(--muted); border: 1px solid var(--border-strong); background: transparent;
-}
-.agent-status.ok { color: var(--has-fg); background: var(--has-bg); border-color: transparent; }
-.agent-status.warn { color: #f59e0b; border-color: color-mix(in srgb, #f59e0b 40%, transparent); }
-.agent-status.off { color: var(--faint); }
-.agent-status.custom { color: var(--muted); }
-.agent-use {
-  display: none; align-self: flex-start; font-size: 10px; font-weight: 500;
-  padding: 1px 8px; border-radius: 6px; background: var(--accent); color: #fff;
-}
-.agent-card.active .agent-use { display: inline-block; }
-.agent-cfg { margin-top: 10px; }
 
 /* Connection status + collapsible manual (debug) config */
 .conn-status {
@@ -281,15 +228,3 @@ button:disabled { opacity: .5; cursor: default; box-shadow: none; }
 .switch { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; font-size: 13px; color: var(--ink); }
 .brand-pill { display: inline-flex; align-items: center; gap: 7px; padding: 4px 11px; border-radius: 8px; background: var(--surface); color: var(--ink); font-weight: 500; }
 .brand-pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--has-fg); }
-.upload { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 16px; border: 1.5px dashed var(--border-strong); border-radius: 10px; background: var(--surface); color: var(--muted); cursor: pointer; text-align: center; }
-.upload:hover { border-color: var(--ring); }
-.upload svg { width: 22px; height: 22px; }
-.upload-t { font-size: 13px; font-weight: 500; }
-.upload-sub { font-size: 11px; color: var(--faint); }
-.skill-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
-.skill-empty { font-size: 11px; color: var(--faint); padding: 4px 2px; }
-.skill-item { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); }
-.skill-item .sk-name { flex: 1; min-width: 0; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
-.skill-item .sk-size { font-size: 10px; color: var(--faint); }
-.skill-item .sk-del { border: none; background: none; color: var(--faint); cursor: pointer; font-size: 14px; padding: 0 2px; }
-.skill-item .sk-del:hover { color: var(--danger); }

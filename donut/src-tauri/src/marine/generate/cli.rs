@@ -505,10 +505,16 @@ async fn run_claude_stream(
   command
     .arg("-p")
     .args(["--output-format", "stream-json"])
+    // `--print --output-format=stream-json` is rejected without `--verbose`
+    // ("requires --verbose"), and `--safe-mode` is not a Claude Code option at
+    // all ("unknown option") — either one made every Claude generation fail with
+    // a generic error. The isolation posture is carried by the flags below
+    // (`--tools ""`, empty strict MCP config, no slash commands, no session
+    // persistence), which are verified to work on the installed CLI.
+    .arg("--verbose")
     .arg("--include-partial-messages")
     .arg("--no-session-persistence")
     .arg("--disable-slash-commands")
-    .arg("--safe-mode")
     .arg("--strict-mcp-config")
     .args(["--mcp-config", r#"{"mcpServers":{}}"#])
     .args(["--tools", ""])

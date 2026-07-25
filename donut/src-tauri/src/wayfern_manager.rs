@@ -647,12 +647,12 @@ impl WayfernManager {
       };
 
       if key_path.exists() {
-        let key_text = std::fs::read_to_string(&key_path).unwrap_or_default();
-        log::info!(
-          "Pre-launch: os_crypt_key present ({} bytes, content: '{}')",
-          key_text.len(),
-          key_text.trim()
-        );
+        // Log the size only. This file's contents are the passphrase os_crypt
+        // derives the profile's cookie-encryption key from, so writing it to
+        // DonutBrowser.log would hand every cookie in the profile to anyone who
+        // reads a log bundle (users routinely attach these to bug reports).
+        let key_len = std::fs::metadata(&key_path).map(|m| m.len()).unwrap_or(0);
+        log::info!("Pre-launch: os_crypt_key present ({key_len} bytes)");
       } else {
         log::warn!("Pre-launch: os_crypt_key NOT FOUND");
       }
@@ -860,9 +860,45 @@ impl WayfernManager {
     let process_id = child.id();
     drop(child);
 
-    self.wait_for_cdp_ready(port).await?;
+    // The browser is already running at this point but nothing has registered it
+    // yet: `process_id` is not persisted and no instance entry exists. Bailing
+    // out with `?` here used to leave a fully-provisioned Chromium running that
+    // the UI reported as "failed to launch" — and because the fingerprint is
+    // applied further down, that orphan browsed with its REAL fingerprint. A
+    // later launch would then adopt it as a `recovered_*` instance. Kill it.
+    let kill_orphan = |reason: &str| {
+      if let Some(pid) = process_id {
+        log::warn!("Wayfern launch failed after spawn ({reason}); terminating orphan PID {pid}");
+        #[cfg(unix)]
+        {
+          use nix::sys::signal::{kill, Signal};
+          use nix::unistd::Pid;
+          let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        }
+        #[cfg(windows)]
+        {
+          use std::os::windows::process::CommandExt;
+          const CREATE_NO_WINDOW: u32 = 0x08000000;
+          let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        }
+      }
+    };
 
-    let targets = self.get_cdp_targets(port).await?;
+    if let Err(e) = self.wait_for_cdp_ready(port).await {
+      kill_orphan("CDP never became ready");
+      return Err(e);
+    }
+
+    let targets = match self.get_cdp_targets(port).await {
+      Ok(targets) => targets,
+      Err(e) => {
+        kill_orphan("could not read CDP targets");
+        return Err(e);
+      }
+    };
     log::info!("Found {} CDP targets", targets.len());
 
     let page_targets: Vec<_> = targets.iter().filter(|t| t.target_type == "page").collect();

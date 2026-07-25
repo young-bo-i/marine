@@ -26,6 +26,26 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
   fs::rename(&tmp, path)
 }
 
+/// The `tags` array of an already-stored profile, without deserializing the rest
+/// of it — a `metadata.json` is tens of KB because `wayfern_config.fingerprint`
+/// alone is ~48 KB, and `save_profile` only needs to know whether the tag set
+/// moved.
+///
+/// `None` means "unknown" (absent, unreadable or unparsable file), which the
+/// caller must treat as "assume changed" so a corrupt file still heals on the
+/// next save, exactly as it did when the rebuild was unconditional.
+fn stored_tags(metadata_file: &Path) -> Option<Vec<String>> {
+  #[derive(serde::Deserialize)]
+  struct TagsOnly {
+    #[serde(default)]
+    tags: Vec<String>,
+  }
+  let content = fs::read_to_string(metadata_file).ok()?;
+  serde_json::from_str::<TagsOnly>(&content)
+    .ok()
+    .map(|parsed| parsed.tags)
+}
+
 pub struct ProfileManager {
   camoufox_manager: &'static crate::camoufox_manager::CamoufoxManager,
   wayfern_manager: &'static crate::wayfern_manager::WayfernManager,
@@ -461,15 +481,75 @@ impl ProfileManager {
     // Ensure the UUID directory exists
     create_dir_all(&profile_uuid_dir)?;
 
+    // Read the previous tag set BEFORE overwriting the file.
+    let previous_tags = stored_tags(&profile_file);
+
     let json = serde_json::to_string_pretty(profile)?;
     atomic_write(&profile_file, json.as_bytes())?;
 
-    // Update tag suggestions after any save
-    let _ = crate::tag_manager::TAG_MANAGER.lock().map(|tm| {
-      let _ = tm.rebuild_from_profiles(&self.list_profiles().unwrap_or_default());
-    });
+    // Rebuilding tag suggestions rescans every profile on disk, so doing it after
+    // ANY save made save_profile O(P) — and every caller that saves in a loop or
+    // fans out concurrently O(P^2), all of it serialized on this std mutex. The
+    // tag set can only move when this profile's `tags` moved, so gate on that.
+    // A missing/corrupt previous file counts as "changed" to preserve the old
+    // heal-on-any-save behaviour. Profile DELETION shrinks the set with no save
+    // behind it and still rebuilds explicitly in `delete_profile`.
+    let tags_changed = previous_tags
+      .map(|previous| previous != profile.tags)
+      .unwrap_or(true);
+    if tags_changed {
+      let _ = crate::tag_manager::TAG_MANAGER.lock().map(|tm| {
+        let _ = tm.rebuild_from_profiles(&self.list_profiles().unwrap_or_default());
+      });
+    }
 
     Ok(())
+  }
+
+  /// Read one profile out of its UUID directory. Shared by `list_profiles` and
+  /// `get_profile_by_id` so the `host_os` backfill lives in exactly one place.
+  /// Returns `None` (with a warning) for anything unreadable, which is what makes
+  /// one corrupt profile skippable instead of fatal.
+  fn read_profile_dir(path: &Path) -> Option<BrowserProfile> {
+    let metadata_file = path.join("metadata.json");
+    if !metadata_file.exists() {
+      return None;
+    }
+
+    let content = match fs::read_to_string(&metadata_file) {
+      Ok(c) => c,
+      Err(e) => {
+        log::warn!(
+          "Skipping profile at {}: failed to read metadata.json: {e}",
+          path.display()
+        );
+        return None;
+      }
+    };
+    let mut profile: BrowserProfile = match serde_json::from_str(&content) {
+      Ok(p) => p,
+      Err(e) => {
+        log::warn!(
+          "Skipping profile at {}: invalid metadata.json: {e}",
+          path.display()
+        );
+        return None;
+      }
+    };
+
+    // Backfill host_os from browser config for profiles created before
+    // the field existed (or synced without it).
+    if profile.host_os.is_none() {
+      let inferred_os = profile.resolved_os().map(str::to_string);
+      if let Some(os) = inferred_os {
+        profile.host_os = Some(os);
+        if let Ok(json) = serde_json::to_string_pretty(&profile) {
+          let _ = atomic_write(&metadata_file, json.as_bytes());
+        }
+      }
+    }
+
+    Some(profile)
   }
 
   pub fn list_profiles(&self) -> Result<Vec<BrowserProfile>, Box<dyn std::error::Error>> {
@@ -485,47 +565,30 @@ impl ProfileManager {
 
       // Look for UUID directories containing metadata.json
       if path.is_dir() {
-        let metadata_file = path.join("metadata.json");
-        if metadata_file.exists() {
-          let content = match fs::read_to_string(&metadata_file) {
-            Ok(c) => c,
-            Err(e) => {
-              log::warn!(
-                "Skipping profile at {}: failed to read metadata.json: {e}",
-                path.display()
-              );
-              continue;
-            }
-          };
-          let mut profile: BrowserProfile = match serde_json::from_str(&content) {
-            Ok(p) => p,
-            Err(e) => {
-              log::warn!(
-                "Skipping profile at {}: invalid metadata.json: {e}",
-                path.display()
-              );
-              continue;
-            }
-          };
-
-          // Backfill host_os from browser config for profiles created before
-          // the field existed (or synced without it).
-          if profile.host_os.is_none() {
-            let inferred_os = profile.resolved_os().map(str::to_string);
-            if let Some(os) = inferred_os {
-              profile.host_os = Some(os);
-              if let Ok(json) = serde_json::to_string_pretty(&profile) {
-                let _ = atomic_write(&metadata_file, json.as_bytes());
-              }
-            }
-          }
-
+        if let Some(profile) = Self::read_profile_dir(&path) {
           profiles.push(profile);
         }
       }
     }
 
     Ok(profiles)
+  }
+
+  /// Read a single profile by id. The directory name IS the UUID at every
+  /// construction site, so "list every profile and `.find()` one" is pure waste —
+  /// each `metadata.json` is tens of KB and callers do this inside loops and
+  /// per-request handlers.
+  ///
+  /// The id is canonicalized through `Uuid` before it is joined onto a path, so a
+  /// caller-supplied string can neither traverse out of the profiles directory nor
+  /// miss the on-disk name through casing.
+  pub fn get_profile_by_id(&self, profile_id: &str) -> Option<BrowserProfile> {
+    let parsed = uuid::Uuid::parse_str(profile_id).ok()?;
+    let path = self.get_profiles_dir().join(parsed.to_string());
+    if !path.is_dir() {
+      return None;
+    }
+    Self::read_profile_dir(&path)
   }
 
   pub fn rename_profile(
@@ -560,10 +623,8 @@ impl ProfileManager {
 
     crate::sync::queue_profile_sync_if_eligible(&profile);
 
-    // Keep tag suggestions up to date after name change (rebuild from all profiles)
-    let _ = crate::tag_manager::TAG_MANAGER.lock().map(|tm| {
-      let _ = tm.rebuild_from_profiles(&self.list_profiles().unwrap_or_default());
-    });
+    // No tag rebuild here: a rename touches only `name` and `updated_at`, so the
+    // tag set cannot have moved. `save_profile` rebuilds when it actually does.
 
     // Emit profile rename event
     if let Err(e) = events::emit_empty("profiles-changed") {
@@ -782,10 +843,8 @@ impl ProfileManager {
       }
     }
 
-    // Rebuild tag suggestions after group changes just in case
-    let _ = crate::tag_manager::TAG_MANAGER.lock().map(|tm| {
-      let _ = tm.rebuild_from_profiles(&self.list_profiles().unwrap_or_default());
-    });
+    // No tag rebuild here: group assignment touches only `group_id` and
+    // `updated_at`. `save_profile` rebuilds when the tag set actually moves.
 
     // Emit profile group assignment event
     if let Err(e) = events::emit_empty("profiles-changed") {
@@ -825,10 +884,9 @@ impl ProfileManager {
 
     crate::sync::queue_profile_sync_if_eligible(&profile);
 
-    // Update global tag suggestions from all profiles
-    let _ = crate::tag_manager::TAG_MANAGER.lock().map(|tm| {
-      let _ = tm.rebuild_from_profiles(&self.list_profiles().unwrap_or_default());
-    });
+    // No rebuild here: this is THE path that changes tags, so the `save_profile`
+    // above always rebuilds. Keeping a second one would make the one legitimate
+    // rebuild path scan every profile twice.
 
     // Emit profile tags update event
     if let Err(e) = events::emit_empty("profiles-changed") {
@@ -2086,22 +2144,192 @@ mod tests {
 
   use tempfile::TempDir;
 
-  fn create_test_profile_manager() -> (&'static ProfileManager, TempDir) {
+  /// Keeps the temp directory AND the `app_dirs` override alive for the whole
+  /// test. Named `_temp_dir` at the call sites, so its shape is what matters.
+  struct TestEnv {
+    _temp_dir: TempDir,
+    _data_guard: crate::app_dirs::TestDirGuard,
+  }
+
+  impl TestEnv {
+    fn path(&self) -> &Path {
+      self._temp_dir.path()
+    }
+  }
+
+  fn create_test_profile_manager() -> (&'static ProfileManager, TestEnv) {
     let temp_dir = TempDir::new().unwrap();
 
-    // Mock the base directories by setting environment variables
-    unsafe {
-      std::env::set_var("HOME", temp_dir.path());
-    }
+    // NOT `set_var("HOME", ...)`: `app_dirs` caches `BaseDirs` in a `OnceLock`
+    // (app_dirs.rs:5-10), so once any test in this binary has resolved a real
+    // path, HOME is never consulted again — and every later test wrote straight
+    // into the developer's actual application-support directory. Anything that
+    // asserted on shared state (tags.json) then saw the real machine's data.
+    //
+    // `set_test_data_dir` is the thread-local override built for this. It is
+    // per-thread, so tests stay isolated without serializing them, and it unsets
+    // itself on drop. The "Marine" component keeps the path shaped like the real
+    // one for assertions that check it.
+    let data_guard = crate::app_dirs::set_test_data_dir(temp_dir.path().join("Marine"));
 
     let profile_manager = ProfileManager::instance();
-    (profile_manager, temp_dir)
+    (
+      profile_manager,
+      TestEnv {
+        _temp_dir: temp_dir,
+        _data_guard: data_guard,
+      },
+    )
   }
 
   #[test]
   fn test_profile_manager_creation() {
     let (_manager, _temp_dir) = create_test_profile_manager();
     // If we get here without panicking, the test passes
+  }
+
+  fn tagged_test_profile(name: &str, tags: &[&str]) -> BrowserProfile {
+    BrowserProfile {
+      id: uuid::Uuid::new_v4(),
+      name: name.to_string(),
+      browser: "wayfern".to_string(),
+      version: "1.0.0".to_string(),
+      proxy_id: None,
+      vpn_id: None,
+      launch_hook: None,
+      launch_url: None,
+      process_id: None,
+      last_launch: None,
+      release_type: "stable".to_string(),
+      camoufox_config: None,
+      wayfern_config: None,
+      group_id: None,
+      tags: tags.iter().map(|t| t.to_string()).collect(),
+      note: None,
+      sync_mode: SyncMode::Disabled,
+      encryption_salt: None,
+      last_sync: None,
+      host_os: Some(get_host_os()),
+      ephemeral: false,
+      extension_group_id: None,
+      brand_id: None,
+      proxy_bypass_rules: Vec::new(),
+      created_by_id: None,
+      created_by_email: None,
+      dns_blocklist: None,
+      password_protected: false,
+      created_at: Some(0),
+      updated_at: Some(0),
+      default_bookmarks_seeded: false,
+    }
+  }
+
+  /// `save_profile` used to rescan every profile on disk after ANY save, which
+  /// made it O(P) and every loop/fan-out over it O(P^2). The rebuild is now gated
+  /// on the tag set actually moving. Deleting `tags.json` between saves makes the
+  /// rebuild directly observable: only a save that changes tags recreates it.
+  #[test]
+  fn save_profile_rebuilds_tags_only_when_the_tag_set_moves() {
+    let (manager, _temp_dir) = create_test_profile_manager();
+    let tags_file = crate::app_dirs::data_subdir().join("tags.json");
+
+    let mut profile = tagged_test_profile("tagged", &["alpha", "beta"]);
+    manager.save_profile(&profile).unwrap();
+    assert!(
+      tags_file.exists(),
+      "the first save of a profile must build the tag suggestions"
+    );
+
+    // A save that leaves `tags` alone (the overwhelmingly common case: last_sync
+    // stamps, PID writes, proxy/group edits) must not rebuild.
+    fs::remove_file(&tags_file).unwrap();
+    profile.last_sync = Some(1_700_000_000);
+    manager.save_profile(&profile).unwrap();
+    assert!(
+      !tags_file.exists(),
+      "a save that does not change tags must not rescan every profile"
+    );
+
+    // Growing the set must rebuild...
+    profile.tags.push("gamma".to_string());
+    manager.save_profile(&profile).unwrap();
+    let after_growth = crate::tag_manager::TAG_MANAGER
+      .lock()
+      .unwrap()
+      .get_all_tags()
+      .unwrap();
+    assert_eq!(after_growth, vec!["alpha", "beta", "gamma"]);
+
+    // ...and so must shrinking it. This is the case an additive-only index
+    // would have silently missed.
+    profile.tags.retain(|t| t != "beta");
+    manager.save_profile(&profile).unwrap();
+    let after_shrink = crate::tag_manager::TAG_MANAGER
+      .lock()
+      .unwrap()
+      .get_all_tags()
+      .unwrap();
+    assert_eq!(after_shrink, vec!["alpha", "gamma"]);
+  }
+
+  /// Renaming and group assignment had their own full rebuilds, deleted because
+  /// neither can move the tag set. Pin that the suggestions survive a rename via
+  /// the `save_profile` those paths already perform.
+  #[test]
+  fn renaming_a_tagged_profile_keeps_its_tag_suggestions() {
+    let (manager, _temp_dir) = create_test_profile_manager();
+
+    let profile = tagged_test_profile("before", &["keepme"]);
+    manager.save_profile(&profile).unwrap();
+
+    let mut renamed = profile.clone();
+    renamed.name = "after".to_string();
+    manager.save_profile(&renamed).unwrap();
+
+    let tags = crate::tag_manager::TAG_MANAGER
+      .lock()
+      .unwrap()
+      .get_all_tags()
+      .unwrap();
+    assert_eq!(
+      tags,
+      vec!["keepme"],
+      "a rename must not drop tag suggestions"
+    );
+  }
+
+  /// `get_profile_by_id` replaced "list every profile and .find() one" at the
+  /// hot call sites. It must agree with `list_profiles` and must refuse to be
+  /// walked out of the profiles directory.
+  #[test]
+  fn get_profile_by_id_matches_list_profiles_and_rejects_traversal() {
+    let (manager, _temp_dir) = create_test_profile_manager();
+
+    let profile = tagged_test_profile("byid", &["x"]);
+    manager.save_profile(&profile).unwrap();
+    let id = profile.id.to_string();
+
+    let direct = manager
+      .get_profile_by_id(&id)
+      .expect("profile must be found");
+    let listed = manager
+      .list_profiles()
+      .unwrap()
+      .into_iter()
+      .find(|p| p.id == profile.id)
+      .expect("profile must be listed");
+    assert_eq!(direct.id, listed.id);
+    assert_eq!(direct.name, listed.name);
+    assert_eq!(direct.tags, listed.tags);
+
+    assert!(manager.get_profile_by_id("not-a-uuid").is_none());
+    assert!(manager.get_profile_by_id("../../etc").is_none());
+    assert!(manager
+      .get_profile_by_id(&uuid::Uuid::new_v4().to_string())
+      .is_none());
+    // The on-disk directory is the canonical lowercase UUID; an uppercase id
+    // must still resolve rather than silently miss.
+    assert!(manager.get_profile_by_id(&id.to_uppercase()).is_some());
   }
 
   #[test]

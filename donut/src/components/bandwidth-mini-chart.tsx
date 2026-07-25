@@ -33,13 +33,19 @@ export function BandwidthMiniChart({
     const now = Math.floor(Date.now() / 1000);
     const result: { time: number; bandwidth: number }[] = [];
 
+    // Index by timestamp first: scanning `data` per second was O(60 × data) on
+    // every traffic poll, once per running profile.
+    const byTimestamp = new Map<number, number>();
+    for (const d of data) {
+      byTimestamp.set(d.timestamp, d.bytes_sent + d.bytes_received);
+    }
+
     // Get the last 60 seconds
     for (let i = 59; i >= 0; i--) {
       const targetTime = now - i;
-      const point = data.find((d) => d.timestamp === targetTime);
       result.push({
         time: targetTime,
-        bandwidth: point ? point.bytes_sent + point.bytes_received : 0,
+        bandwidth: byTimestamp.get(targetTime) ?? 0,
       });
     }
 

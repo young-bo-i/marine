@@ -99,7 +99,16 @@
       <div id="sample-status" class="note" style="margin-top:6px">未导入补充范文（当前只用原版母稿）。</div>
 
       <div class="field-label cfg-gap">AI 模型连接器</div>
-      <div class="note" style="margin-top:0">模型执行与订阅授权已移到 RimeBuffer。请在输入法的「连接器 › AI 模型」中切换 Codex CLI、Claude Code CLI 或通用 Open API；Marine 只提供页面背景、话术与发布记录。</div>
+      <div class="note" style="margin-top:0">选中评论/回复框后，页面会浮出「生成」按钮：用本机已登录的智能体（Codex / Claude）直接生成话术并填入草稿框，<strong>绝不自动发送</strong>。下面选择用哪个连接器（无需安装输入法）。</div>
+      <div class="brand-row" style="margin-top:8px">
+        <select id="cfg-connector" class="cfg-input brand-select">
+          <option value="">自动（优先 Codex，其次 Claude）</option>
+          <option value="codex">Codex CLI（ChatGPT 订阅）</option>
+          <option value="claude">Claude Code CLI</option>
+        </select>
+        <button id="cfg-connector-save" class="cta-2 brand-mini-btn">保存</button>
+      </div>
+      <div id="cfg-connector-status" class="note" style="margin-top:6px">正在检测本机智能体…</div>
     </section>
 
     <!-- 调试 -->

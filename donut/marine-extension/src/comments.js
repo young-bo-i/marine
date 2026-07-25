@@ -416,6 +416,79 @@ function marineBuildXhsComments(captures) {
   };
 }
 
+// 抖音评论：按抖音公开 web API（/aweme/v1/web/comment/list[/reply]）的响应结构解析。
+// reply_id='0' 表示一级评论，否则指向其所属一级评论的 cid；reply_to_reply_id 指向被回复的具体子评论。
+function marineNormDouyin(c) {
+  if (!c || typeof c !== 'object') return null;
+  const id = String(c.cid || c.comment_id || c.id || '').trim();
+  if (!id) return null;
+  const user = c.user || {};
+  return {
+    id: id,
+    parentId: null,
+    rootId: null,
+    author: { name: String(user.nickname || user.name || '').trim() },
+    text: String(c.text || c.content || '').trim(),
+    likeCount: Number(c.digg_count || c.like_count || 0) || 0,
+    replyCount: Number(c.reply_comment_total || c.reply_total || 0) || 0,
+    children: [],
+  };
+}
+
+function marineBuildDouyinComments(captures) {
+  const roots = new Map();
+  const seen = new Set();
+  const orphanReplies = [];
+  for (const cap of captures || []) {
+    let j;
+    try { j = JSON.parse(cap.body); } catch (e) { continue; }
+    const list = (j && (j.comments || (j.data && j.data.comments))) || [];
+    if (!Array.isArray(list)) continue;
+    const isReplyList = /\/comment\/list\/reply\//.test(cap.url || '');
+    for (const c of list) {
+      const node = marineNormDouyin(c);
+      if (!node || seen.has(node.id)) continue;
+      seen.add(node.id);
+      const replyId = String(c.reply_id || '0');
+      const replyToReply = String(c.reply_to_reply_id || '0');
+      if (isReplyList || (replyId && replyId !== '0')) {
+        node.rootId = replyId && replyId !== '0' ? replyId : null;
+        node.parentId = replyToReply && replyToReply !== '0' ? replyToReply : node.rootId;
+        orphanReplies.push(node);
+      } else {
+        roots.set(node.id, node);
+        for (const rc of (c.reply_comment || [])) {
+          const rn = marineNormDouyin(rc);
+          if (rn && !seen.has(rn.id)) {
+            seen.add(rn.id);
+            rn.rootId = node.id;
+            const rtr = String(rc.reply_to_reply_id || '0');
+            rn.parentId = rtr !== '0' ? rtr : node.id;
+            node.children.push(rn);
+          }
+        }
+      }
+    }
+  }
+  for (const s of orphanReplies) {
+    const root = s.rootId && roots.get(s.rootId);
+    if (root) root.children.push(s);
+    else {
+      const key = s.rootId || s.id;
+      if (!roots.has(key)) roots.set(key, { id: key, parentId: null, rootId: null, author: { name: '' }, text: '（根评论未捕获）', likeCount: 0, replyCount: 0, children: [] });
+      roots.get(key).children.push(s);
+    }
+  }
+  const tree = Array.from(roots.values());
+  tree.sort((a, b) => (b.likeCount || 0) - (a.likeCount || 0));
+  let subs = 0;
+  for (const r of tree) subs += r.children.length;
+  return {
+    comments: tree,
+    stats: { count: tree.length + subs, roots: tree.length, subs, maxDepth: subs ? 2 : (tree.length ? 1 : 0) },
+  };
+}
+
 // 正文提取：知乎/小红书的「内容」在结构化数据里（feed 响应 / js-initialData），
 // 比通用 DOM 提取干净准确。返回 Markdown 字符串（拿不到则空串，交给通用提取兜底）。
 function marineExtractNoteText(platform, captures, opts) {
@@ -522,6 +595,20 @@ function marineExtractNoteText(platform, captures, opts) {
         const q = ents.questions[k];
         if (q && (q.title || q.detail)) return '# ' + (q.title || '') + '\n\n' + marineZhihuStrip(q.detail || q.excerpt || '');
       }
+    } else if (platform === 'douyin') {
+      // 抖音视频文案：DOM 无稳定结构，尽力取 data-e2e 描述/作者；拿不到返回空串，交给通用提取兜底。
+      const descEl = document.querySelector(
+        '[data-e2e="video-desc"],[data-e2e="feed-active-video-desc"],[data-e2e="detail-video-desc"]');
+      const authorEl = document.querySelector(
+        '[data-e2e="video-author-name"],[data-e2e="feed-active-video-author-name"],.account-name');
+      const desc = String(descEl && (descEl.innerText || descEl.textContent) || '').replace(/\s+/g, ' ').trim();
+      const author = String(authorEl && (authorEl.innerText || authorEl.textContent) || '').trim();
+      if (desc) {
+        const parts = ['# ' + (directScope.title || desc.slice(0, 60))];
+        if (author) parts.push('> 作者：' + author);
+        parts.push('\n' + desc);
+        return parts.join('\n');
+      }
     }
   } catch (e) {}
   return '';
@@ -549,6 +636,17 @@ function marineBuildComments(platform, captures) {
     }
     built.ok = built.stats.count > 0;
     if (!built.ok) built.error = '未解析出回答/评论。请在页面向下滚动几下让回答加载，或展开某条回答的评论后再试。';
+    return built;
+  }
+  if (platform === 'douyin') {
+    if (!captures || !captures.length) {
+      return { ok: false, stats: { count: 0 }, error: '尚未捕获到抖音评论。请在视频评论区向下滚动几下让评论加载后再试。' };
+    }
+    let built;
+    try { built = marineBuildDouyinComments(captures); }
+    catch (e) { return { ok: false, stats: { count: 0 }, error: '抖音评论解析出错（结构可能已变）：' + (e && e.message || e) }; }
+    built.ok = built.stats.count > 0;
+    if (!built.ok) built.error = '捕获到响应但未解析出评论（结构可能已变）。';
     return built;
   }
   if (!captures || !captures.length) {

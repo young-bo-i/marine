@@ -2,7 +2,6 @@
 importScripts('scholay-skill.js');
 chrome.runtime.onInstalled.addListener(() => {
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
-  marineEnsurePublishedReceiptAlarm();
   void marineRetryPublishedOutbox('installed');
   void marineEnsurePublishedCaptureForExistingTabs('installed');
 });
@@ -24,6 +23,10 @@ const marineLatestRevisions = new Map();
 const marineTabSources = new Map();
 const marineRetiredSources = new Map();
 const marineDeferredPuts = new Map();
+// 每 tab 近期「页内生成并填入」的草稿文本（来自 content-iso 的 __marineGenFill）。
+// 稍后若该草稿被发布，发帖回执按文本匹配把账本 generation_source 标为 'extension'。
+const marineGenFills = new Map(); // tabId -> { text, at }
+const marineGenFillTtlMs = 10 * 60 * 1000;
 const marineSessionStateKey = 'marineRimeLeaseStateV1';
 const marineRimeMaxRequestBytes = 1_850_000;
 const marineRimeMaxSkillBytes = 200_000;
@@ -38,6 +41,7 @@ const marinePublishedOutboxStorageKey = 'marinePublishedReceiptOutboxV1';
 const marinePublishedRetryAlarm = 'marinePublishedReceiptRetryV1';
 const marinePublishedReceiptRecent = new Map();
 let marinePublishedOutboxQueue = Promise.resolve();
+let marineLastOutboxRunAt = 0;
 const marinePublishedBootstrapInFlight = new Map();
 const marinePublishedMainInjectionQueues = new Map();
 let marinePersistTimer = null;
@@ -435,6 +439,39 @@ async function marineEnsurePublishedCaptureForExistingTabs(reason) {
   return { reason, scanned: (tabs || []).length, injected };
 }
 
+// ---- 生成来源标注（页内生成 → 账本 generation_source='extension'）----
+function marineNormalizeCommentText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function marineGenerationSourceValue(value) {
+  const v = String(value || '').trim();
+  return v === 'extension' || v === 'rime' || v === 'manual' ? v : null;
+}
+
+// content-iso 页内生成并填入时上报文本，按 tab 记下（用于稍后发帖回执的来源判定）。
+function marineRecordGenFill(tabId, text) {
+  if (tabId == null) return;
+  const normalized = marineNormalizeCommentText(text);
+  if (normalized.length < 4) return;
+  marineGenFills.set(tabId, { text: normalized, at: Date.now() });
+}
+
+// 一条发帖回执是否来自本 tab 近期的页内生成：归一后完全相等，或较长一方包含较短一方
+// （容忍用户发布前的小改动 / 平台加尾巴）。仅在可靠匹配时才认定为 'extension'。
+function marineGenFillMatchesPost(tabId, postedText) {
+  if (tabId == null) return false;
+  const fill = marineGenFills.get(tabId);
+  if (!fill) return false;
+  if (Date.now() - fill.at >= marineGenFillTtlMs) { marineGenFills.delete(tabId); return false; }
+  const posted = marineNormalizeCommentText(postedText);
+  if (!posted) return false;
+  if (posted === fill.text) return true;
+  const long = posted.length >= fill.text.length ? posted : fill.text;
+  const short = posted.length >= fill.text.length ? fill.text : posted;
+  return short.length >= 8 && long.indexOf(short) !== -1;
+}
+
 function marineSanitizePublishedReceipt(value) {
   if (!value || value.schema_version !== 1 || value.platform !== 'bilibili') return null;
   const platformCommentId = marinePublishedPositiveId(value.platform_comment_id);
@@ -465,6 +502,7 @@ function marineSanitizePublishedReceipt(value) {
     parent_id: parentId || null,
     root_id: rootId || null,
     context_id: marinePublishedString(value.context_id, 128) || null,
+    generation_source: marineGenerationSourceValue(value.generation_source),
   };
 }
 
@@ -526,14 +564,18 @@ async function marineLoadPublishedOutbox() {
   return { state: { version: 1, items }, dirty };
 }
 
+// 持久化是唯一的落地口，因此也是重试 alarm 生命周期的唯一真相来源：
+// 队列非空才需要每分钟唤醒，空了必须撤掉。
 async function marineSavePublishedOutbox(state) {
   if (!state.items.length) {
     await chrome.storage.local.remove(marinePublishedOutboxStorageKey);
+    marineClearPublishedReceiptAlarm();
     return;
   }
   const bytes = marineUtf8Bytes(JSON.stringify(state));
   if (bytes > marinePublishedOutboxMaxBytes) throw new Error('Marine 发布待同步队列超过本地存储上限');
   await chrome.storage.local.set({ [marinePublishedOutboxStorageKey]: state });
+  marineEnsurePublishedReceiptAlarm();
 }
 
 async function marineSyncPublishedEntry(entry, config) {
@@ -575,6 +617,12 @@ async function marineAcceptPublishedReceipt(receipt, sender) {
   if (!marineTrustedPublishedSender(sender)) throw new Error('无效的 Bilibili 发布回执来源');
   const sanitized = marineSanitizePublishedReceipt(receipt);
   if (!sanitized) throw new Error('无效的 Bilibili 发布回执');
+  // 生成来源：若本 tab 近期有一次页内生成填入、且文本与这条发帖匹配，标为 'extension'
+  // （在持久化前设好，随 outbox 一起落地并 POST 到 /history/published）。
+  if (!sanitized.generation_source &&
+      marineGenFillMatchesPost(sender && sender.tab && sender.tab.id, sanitized.text_snapshot)) {
+    sanitized.generation_source = 'extension';
+  }
   const config = await marineResolveConfig();
   const profileId = marinePublishedString(config.profileId, 128).trim();
   if (!profileId) throw new Error('未选择 Marine 发布身份');
@@ -603,8 +651,8 @@ async function marineAcceptPublishedReceipt(receipt, sender) {
     }
     // Persistence is the acknowledgement boundary: never contact Marine until
     // this exact profile+event receipt is durable in chrome.storage.local.
+    // (Saving a non-empty queue also arms the retry alarm.)
     await marineSavePublishedOutbox(state);
-    marineEnsurePublishedReceiptAlarm();
 
     try {
       await marineSyncPublishedEntry(entry, config);
@@ -630,13 +678,28 @@ function marineEnsurePublishedReceiptAlarm() {
   } catch (e) {}
 }
 
+// 这个 alarm 此前从不撤销：即使待同步队列早已清空，它仍每分钟把 sw 冷启一次，
+// 顶层随之重跑一遍重试和全量注入清扫——一整天上千次唤醒，全程无事可做。
+function marineClearPublishedReceiptAlarm() {
+  const alarms = chrome.alarms;
+  if (!alarms || typeof alarms.clear !== 'function') return;
+  try {
+    const result = alarms.clear(marinePublishedRetryAlarm);
+    if (result && result.catch) void result.catch(() => {});
+  } catch (e) {}
+}
+
 function marineRetryPublishedOutbox(reason) {
+  // 同步打点（而不是在任务体里）：alarm 冷启 sw 时，顶层的 worker-start 重试
+  // 会先入队，随后 onAlarm 才触发；没有这个时间戳，同一次唤醒会重试两遍。
+  marineLastOutboxRunAt = Date.now();
   return marineQueuePublishedOutbox(async () => {
     marinePrunePublishedRecent(Date.now());
     const loaded = await marineLoadPublishedOutbox();
     const state = loaded.state;
     if (!state.items.length) {
       if (loaded.dirty) await marineSavePublishedOutbox(state);
+      else marineClearPublishedReceiptAlarm();
       return { synced: 0, pending: 0 };
     }
     const config = await marineResolveConfig();
@@ -659,6 +722,7 @@ function marineRetryPublishedOutbox(reason) {
       }
     }
     if (changed) await marineSavePublishedOutbox(state);
+    else if (state.items.length) marineEnsurePublishedReceiptAlarm();
     if (synced) console.info('[Marine] 已从待同步队列补写 ' + synced + ' 条发布记录（' + reason + '）');
     return { synced, pending: state.items.length };
   });
@@ -837,7 +901,122 @@ function marineClearTrackedTab(tabId, options = {}) {
   });
 }
 
+// ---- sw 保活（仅在有长任务在跑时）----
+// MV3 的 service worker 约 30 秒无事件就被回收。流式生成期间，本机智能体可能几十秒
+// 才吐出第一帧，中间没有任何事件——此前是那个每分钟的重试 alarm 意外充当了保活，
+// 所以撤掉 alarm 必须同时补上显式保活，否则会把隐性问题变成显性的「生成中断」。
+// 调用任意扩展 API 都会重置空闲计时器，这里用最廉价的一个。
+let marineKeepaliveHolders = 0;
+let marineKeepaliveTimer = null;
+
+function marineAcquireKeepalive() {
+  marineKeepaliveHolders += 1;
+  if (marineKeepaliveTimer) return;
+  marineKeepaliveTimer = setInterval(() => {
+    try {
+      const result = chrome.runtime.getPlatformInfo();
+      if (result && result.catch) void result.catch(() => {});
+    } catch (e) {}
+  }, 20000);
+}
+
+function marineReleaseKeepalive() {
+  marineKeepaliveHolders = Math.max(0, marineKeepaliveHolders - 1);
+  if (marineKeepaliveHolders > 0 || !marineKeepaliveTimer) return;
+  clearInterval(marineKeepaliveTimer);
+  marineKeepaliveTimer = null;
+}
+
+// ---- 页面内「生成」按钮：本地智能体流式生成 ----
+// content-iso 建立一条长连接端口 'marine-generate'，sw 调本地 Marine API 的
+// /generate-stream（本机 codex/claude 智能体）拉 NDJSON 帧并原样转发回页面。
+// 上下文（评论目标 + 话术）此前已由聚焦流程 PUT 到本地 API，这里只按 contextId 触发
+// 生成，绝不发布/提交——结果只作草稿预览，由用户确认后填入。
+async function marineRunGenerateStream(req, post, setController) {
+  const config = await marineResolveConfig();
+  if (!config.apiBase || !config.token) {
+    post({ type: 'error', code: 'MARINE_NOT_CONFIGURED' });
+    return;
+  }
+  const contextId = String((req && req.contextId) || '').trim();
+  const actionId = String((req && req.actionId) || '').trim();
+  const requestId = String((req && req.requestId) || ('gen-' + Date.now())).trim();
+  if (!contextId || !actionId) {
+    post({ type: 'error', code: 'MARINE_RIME_CONTEXT_INVALID' });
+    return;
+  }
+  const controller = new AbortController();
+  setController(controller);
+  const timeout = setTimeout(() => controller.abort(), 245000);
+  marineAcquireKeepalive();
+  try {
+    const response = await fetch(config.apiBase + '/generate-stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + config.token },
+      body: JSON.stringify({ requestId, actionId, contextId }),
+      signal: controller.signal,
+    });
+    if (!response.ok || !response.body) {
+      let code = 'MARINE_GENERATE_FAILED';
+      try { const parsed = JSON.parse(await response.text()); if (parsed && parsed.code) code = parsed.code; }
+      catch (e) {}
+      post({ type: 'error', code, status: response.status });
+      return;
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (!line) continue;
+        let frame; try { frame = JSON.parse(line); } catch (e) { continue; }
+        post(frame);
+      }
+    }
+    const tail = buffer.trim();
+    if (tail) { try { post(JSON.parse(tail)); } catch (e) {} }
+  } finally {
+    clearTimeout(timeout);
+    marineReleaseKeepalive();
+  }
+}
+
+if (chrome.runtime.onConnect && chrome.runtime.onConnect.addListener) {
+chrome.runtime.onConnect.addListener((port) => {
+  if (!port || port.name !== 'marine-generate') return;
+  let controller = null;
+  let closed = false;
+  const post = (frame) => {
+    if (closed) return;
+    try { port.postMessage(frame); } catch (e) {}
+  };
+  port.onDisconnect.addListener(() => {
+    closed = true;
+    if (controller) { try { controller.abort(); } catch (e) {} }
+  });
+  port.onMessage.addListener((msg) => {
+    if (!msg || msg.type !== 'start') return;
+    // 若端口在 marineRunGenerateStream 里 await（如解析配置）期间就断开，此时才拿到
+    // controller，必须立刻 abort——否则 fetch 会照常发出，本机智能体生成成孤儿、取消失效。
+    marineRunGenerateStream(msg, post, (c) => { controller = c; if (closed) { try { c.abort(); } catch (e) {} } })
+      .catch(error => post({ type: 'error', code: 'MARINE_GENERATE_FAILED', message: String(error && error.message || error) }))
+      .finally(() => { if (!closed) { try { port.disconnect(); } catch (e) {} } });
+  });
+});
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg && msg.__marineGenFill) {
+    // content-iso 报告一次「页内生成并填入」的草稿文本，按 tab 记下供发帖回执来源判定。
+    marineRecordGenFill(sender && sender.tab && sender.tab.id, msg.text);
+    return; // 无需回应
+  }
   if (msg && msg.__marineGetTabId) {
     sendResponse({ tabId: sender.tab && sender.tab.id });
     return true;
@@ -1024,23 +1203,26 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   }
 });
 chrome.tabs.onRemoved.addListener(tabId => {
+  marineGenFills.delete(tabId);
   void marineStateReady.then(() => marineClearTrackedTab(tabId, { retireSource: true, removed: true }));
 });
 
 if (chrome.runtime.onStartup) {
   chrome.runtime.onStartup.addListener(() => {
-    marineEnsurePublishedReceiptAlarm();
     void marineRetryPublishedOutbox('browser-startup');
     void marineEnsurePublishedCaptureForExistingTabs('browser-startup');
   });
 }
 if (chrome.alarms && chrome.alarms.onAlarm) {
   chrome.alarms.onAlarm.addListener(alarm => {
-    if (alarm && alarm.name === marinePublishedRetryAlarm) {
-      void marineRetryPublishedOutbox('alarm');
-    }
+    if (!alarm || alarm.name !== marinePublishedRetryAlarm) return;
+    // 若这次 alarm 正是把 sw 冷启起来的那次，顶层的 worker-start 重试已经入队，
+    // 这里再来一遍只是重复 load + resolveConfig。
+    if (Date.now() - marineLastOutboxRunAt < 5000) return;
+    void marineRetryPublishedOutbox('alarm');
   });
 }
-marineEnsurePublishedReceiptAlarm();
+// 不再无条件建 alarm：由 marineSavePublishedOutbox 按队列是否为空来建/撤，
+// 而这次 worker-start 重试本身就会把空队列对应的残留 alarm 清掉。
 void marineRetryPublishedOutbox('worker-start');
 void marineEnsurePublishedCaptureForExistingTabs('worker-start');
