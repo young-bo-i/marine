@@ -25,11 +25,53 @@ pub struct BrowserRunner {
   /// transient empty moment (e.g. between closing one window and opening the
   /// next) never triggers a false stop.
   zero_window_ticks: std::sync::Mutex<std::collections::HashMap<String, u8>>,
+  /// One async mutex per profile id, held for the WHOLE of
+  /// `kill_browser_process`. Teardown is NOT idempotent — its completion path
+  /// is documented as corruption-prone on a double run (see
+  /// `profile/password.rs`) — and two overlapping runs escalate a graceful
+  /// SIGTERM into a force-kill-by-profile-path. Until now the only automatic
+  /// caller was the single poller task, so single-caller-ness WAS the safety;
+  /// the CDP watcher can now wake that poller sooner, so the invariant has to
+  /// be made explicit. The map holds only Arcs; the std guard is dropped before
+  /// awaiting the inner mutex.
+  teardown_locks:
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+  /// Profile ids whose launch has spawned a browser but not yet registered it.
+  /// The launch path spawns the process long before it inserts the instance
+  /// (a CDP-ready wait of up to 60s sits in between). No teardown may run in
+  /// that window: the force-kill matches by PROFILE PATH and would kill the
+  /// browser currently being launched.
+  launching: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Consecutive zero-window observations required before the reaper tears down a
 /// windowed Wayfern/Camoufox instance whose process is alive but has no windows.
 const ZERO_WINDOW_REAP_THRESHOLD: u8 = 2;
+
+/// What caused a `check_browser_status` call, which decides how much
+/// corroboration the zero-window reaper demands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StatusTrigger {
+  /// 5s sweep / launch path / any ad-hoc caller: unchanged 2-sample debounce.
+  Poll,
+  /// The CDP watcher observed the page-target set drain and stay empty for the
+  /// full grace window. One independent `/json` zero is then enough.
+  PushConfirmedZero,
+}
+
+/// RAII marker for "a launch for this profile has spawned a process".
+/// Drop-based so an early `?` return in the launch path cannot leak it.
+pub struct LaunchInFlight {
+  profile_id: String,
+}
+
+impl Drop for LaunchInFlight {
+  fn drop(&mut self) {
+    if let Ok(mut set) = BrowserRunner::instance().launching.lock() {
+      set.remove(&self.profile_id);
+    }
+  }
+}
 
 impl BrowserRunner {
   fn new() -> Self {
@@ -40,7 +82,37 @@ impl BrowserRunner {
       camoufox_manager: CamoufoxManager::instance(),
       wayfern_manager: WayfernManager::instance(),
       zero_window_ticks: std::sync::Mutex::new(std::collections::HashMap::new()),
+      teardown_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+      launching: std::sync::Mutex::new(std::collections::HashSet::new()),
     }
+  }
+
+  /// Acquire the per-profile teardown lock. The registry guard (std) is dropped
+  /// before the `.await`, so no std Mutex is ever held across an await.
+  async fn teardown_guard(&self, profile_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = {
+      let mut map = self.teardown_locks.lock().unwrap();
+      map
+        .entry(profile_id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+    };
+    lock.lock_owned().await
+  }
+
+  fn mark_launching(&self, profile_id: &str) -> LaunchInFlight {
+    self
+      .launching
+      .lock()
+      .unwrap()
+      .insert(profile_id.to_string());
+    LaunchInFlight {
+      profile_id: profile_id.to_string(),
+    }
+  }
+
+  fn launch_in_flight(&self, profile_id: &str) -> bool {
+    self.launching.lock().unwrap().contains(profile_id)
   }
 
   pub fn instance() -> &'static BrowserRunner {
@@ -765,6 +837,13 @@ impl BrowserRunner {
         );
       }
 
+      // Drop-guard covering the whole spawn -> register -> persist window that
+      // the launch path leaves unregistered (a CDP-ready wait of up to 60s sits
+      // in the middle). Deliberately NOT the teardown mutex: taking that here
+      // would self-deadlock via launch_or_open_url -> check_browser_status ->
+      // kill_browser_process.
+      let _launching = self.mark_launching(&updated_profile.id.to_string());
+
       // Get proxy URL from config
       let proxy_url = wayfern_config.proxy.as_deref();
 
@@ -1170,6 +1249,17 @@ impl BrowserRunner {
     app_handle: tauri::AppHandle,
     profile: &BrowserProfile,
   ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    self
+      .check_browser_status_with(app_handle, profile, StatusTrigger::Poll)
+      .await
+  }
+
+  pub async fn check_browser_status_with(
+    &self,
+    app_handle: tauri::AppHandle,
+    profile: &BrowserProfile,
+    trigger: StatusTrigger,
+  ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let profile_id = profile.id.to_string();
 
     // Base observation. Its `Ok(false)` path already cleared process_id and
@@ -1252,6 +1342,17 @@ impl BrowserRunner {
       // Zero windows: process alive but windowless (user closed the last
       // window). Debounce, then reap on the threshold.
       Some(_) => {
+        // A push-confirmed zero means the CDP watcher already saw the
+        // page-target set drain and stay empty for the full grace window.
+        // Combined with the fresh `/json` count above that is TWO independent
+        // observations over TWO transports ~1s apart — strictly more evidence
+        // than the two samples of the same HTTP endpoint 5s apart that the poll
+        // path uses, so the second sample would only add latency.
+        let threshold = match trigger {
+          StatusTrigger::Poll => ZERO_WINDOW_REAP_THRESHOLD,
+          StatusTrigger::PushConfirmedZero => 1,
+        };
+
         // Compute the decision under the lock, then DROP the guard before any
         // await so the std Mutex is never held across `kill_browser_process`
         // (which re-enters the manager locks).
@@ -1259,7 +1360,7 @@ impl BrowserRunner {
           let mut ticks = self.zero_window_ticks.lock().unwrap();
           let counter = ticks.entry(profile_id.clone()).or_insert(0);
           *counter = counter.saturating_add(1);
-          if *counter >= ZERO_WINDOW_REAP_THRESHOLD {
+          if *counter >= threshold {
             *counter = 0;
             true
           } else {
@@ -1272,10 +1373,20 @@ impl BrowserRunner {
         }
 
         log::info!(
-          "Zero-window reaper firing for profile {} (ID: {}): process alive but no CDP page targets — tearing down",
+          "Zero-window reaper firing for profile {} (ID: {}) [trigger={trigger:?}]: process alive but no CDP page targets — tearing down",
           profile.name,
           profile.id
         );
+
+        // Capture the launch generation we decided against. If this teardown
+        // queues behind the per-profile lock and a relaunch lands meanwhile,
+        // the guard in `kill_browser_process_with_epoch` aborts instead of
+        // force-killing the NEW browser by profile path.
+        let expect_epoch = if profile.browser == "wayfern" {
+          self.wayfern_manager.instance_epoch(&profile_path_str).await
+        } else {
+          None
+        };
         // Note: `kill_browser_process` stops the proxy worker BEFORE it verifies
         // the force-kill, so on the rare force-kill failure it returns Err with
         // the proxy already stopped while we keep reporting the profile
@@ -1283,7 +1394,10 @@ impl BrowserRunner {
         // reaper path the window is already closed (idle/windowless) so the
         // real-world impact is minimal, and reordering the shared teardown is
         // out of scope + higher risk.
-        match self.kill_browser_process(app_handle.clone(), profile).await {
+        match self
+          .kill_browser_process_with_epoch(app_handle.clone(), profile, expect_epoch)
+          .await
+        {
           Ok(()) => Ok(false),
           Err(e) => {
             // Teardown could not be verified — do NOT report stopped, so we
@@ -1307,6 +1421,59 @@ impl BrowserRunner {
     app_handle: tauri::AppHandle,
     profile: &BrowserProfile,
   ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    self
+      .kill_browser_process_with_epoch(app_handle, profile, None)
+      .await
+  }
+
+  /// `expect_epoch`: `Some(e)` only from the zero-window reaper — abort if the
+  /// instance registered for this profile is no longer launch `e`. User-driven
+  /// stops pass `None`: they must kill whatever is running right now.
+  async fn kill_browser_process_with_epoch(
+    &self,
+    app_handle: tauri::AppHandle,
+    profile: &BrowserProfile,
+    expect_epoch: Option<u64>,
+  ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let profile_id_str = profile.id.to_string();
+
+    // Exactly one teardown per profile at a time. Acquired at exactly ONE depth
+    // — never from the launch path — because tokio::sync::Mutex is not
+    // reentrant and `launch_or_open_url` reaches `check_browser_status` -> here.
+    let _teardown = self.teardown_guard(&profile_id_str).await;
+
+    if self.launch_in_flight(&profile_id_str) {
+      log::info!("Skipping teardown for profile {profile_id_str}: a launch is in flight");
+      return Ok(());
+    }
+
+    if let Some(expected) = expect_epoch {
+      let profiles_dir = self.profile_manager.get_profiles_dir();
+      let ppath = crate::ephemeral_dirs::get_effective_profile_path(profile, &profiles_dir);
+      match self
+        .wayfern_manager
+        .instance_epoch(&ppath.to_string_lossy())
+        .await
+      {
+        // Already torn down while we waited for the lock (user Stop, or the
+        // other reap). Running the whole teardown again risks the documented
+        // double re-encryption on the completion path.
+        None => {
+          log::info!("Abandoning stale reap for profile {profile_id_str}: instance already gone");
+          return Ok(());
+        }
+        // Epoch 0 = a `recovered_*` entry a concurrent `check_wayfern_status`
+        // inserted mid-teardown. Not a relaunch.
+        Some(current) if current != 0 && current != expected => {
+          log::info!(
+            "Abandoning stale reap for profile {profile_id_str}: launch epoch {expected} -> {current}"
+          );
+          return Ok(());
+        }
+        _ => {}
+      }
+    }
+
     // Handle Camoufox profiles using CamoufoxManager
     if profile.browser == "camoufox" {
       // Search by profile path to find the running Camoufox instance
@@ -2824,4 +2991,98 @@ pub async fn open_url_with_profile(
 // Global singleton instance
 lazy_static::lazy_static! {
   static ref BROWSER_RUNNER: BrowserRunner = BrowserRunner::new();
+}
+
+#[cfg(test)]
+mod concurrency_guard_tests {
+  use super::*;
+  use std::sync::atomic::{AtomicUsize, Ordering};
+  use std::sync::Arc;
+
+  // `BrowserRunner` is a process-wide lazy_static, so `teardown_locks` and
+  // `launching` are shared by every test in this binary. Each test therefore
+  // uses profile ids unique to itself instead of serializing the whole suite.
+
+  /// Teardown is not idempotent and its force-kill matches by PROFILE PATH, so
+  /// two overlapping runs for one profile can escalate into killing a browser
+  /// that a relaunch just started. The guard must serialize per profile.
+  #[tokio::test]
+  async fn teardown_guard_serializes_the_same_profile() {
+    let runner = BrowserRunner::instance();
+    let inside = Arc::new(AtomicUsize::new(0));
+    let max_seen = Arc::new(AtomicUsize::new(0));
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+      let inside = inside.clone();
+      let max_seen = max_seen.clone();
+      tasks.push(tokio::spawn(async move {
+        let _g = BrowserRunner::instance()
+          .teardown_guard("guard-test-same-profile")
+          .await;
+        let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+        max_seen.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        inside.fetch_sub(1, Ordering::SeqCst);
+      }));
+    }
+    for t in tasks {
+      t.await.unwrap();
+    }
+    let _ = runner;
+    assert_eq!(
+      max_seen.load(Ordering::SeqCst),
+      1,
+      "two teardowns ran concurrently for one profile"
+    );
+  }
+
+  /// Different profiles must not block each other — otherwise closing one
+  /// browser would stall every other profile's teardown.
+  #[tokio::test]
+  async fn teardown_guard_admits_different_profiles_concurrently() {
+    let a = BrowserRunner::instance()
+      .teardown_guard("guard-test-distinct-a")
+      .await;
+    // Would deadlock (or time out) if the lock were global rather than per id.
+    let b = tokio::time::timeout(
+      std::time::Duration::from_secs(2),
+      BrowserRunner::instance().teardown_guard("guard-test-distinct-b"),
+    )
+    .await
+    .expect("a second profile must not be blocked by the first");
+    drop((a, b));
+  }
+
+  /// The launch window between spawning the process and registering the
+  /// instance is long (a CDP-ready wait sits in it). A teardown there would
+  /// kill the browser being launched, so the marker must be set — and it must
+  /// clear on drop even when the launch bails out early with `?`.
+  #[test]
+  fn launch_marker_is_set_and_cleared_on_drop_including_early_return() {
+    let runner = BrowserRunner::instance();
+    let id = "guard-test-launch-marker";
+    assert!(!runner.launch_in_flight(id));
+
+    {
+      let _marker = runner.mark_launching(id);
+      assert!(
+        runner.launch_in_flight(id),
+        "marker must cover the launch window"
+      );
+    }
+    assert!(!runner.launch_in_flight(id), "marker must clear on drop");
+
+    // Simulate the early-`?`-return shape: the guard is dropped by unwinding
+    // out of the scope, not by an explicit clear call.
+    fn bail(runner: &BrowserRunner, id: &str) -> Result<(), ()> {
+      let _marker = runner.mark_launching(id);
+      Err(())
+    }
+    let _ = bail(runner, id);
+    assert!(
+      !runner.launch_in_flight(id),
+      "an early return must not leak the launch marker"
+    );
+  }
 }

@@ -34,6 +34,9 @@ const zhihuArticleUrl = "https://zhuanlan.zhihu.com/p/9001";
 // 只能靠「编辑器自己所属的那张卡」来解析。文章卡在列表里是 `.ArticleItem`，
 // 不是专栏页的 `.Post-content` —— 这正是截图里识别不到的那种。
 const zhihuListUrl = "https://www.zhihu.com/search?q=fixture";
+// 2026 起的搜索页：卡片不再带 data-zop（实测同一个搜索页当天从 12 个变成 0 个），
+// 身份只剩标题链接的 href。这是用户截图里那种页面。
+const zhihuHrefListUrl = "https://www.zhihu.com/search?q=hreffixture";
 
 const zhihuInitialData = JSON.stringify({
   initialState: {
@@ -72,6 +75,30 @@ const sharedFixtureStyle = `
   .fixture-comment{margin-top:20px;padding:16px;border:1px solid #ddd;border-radius:8px}.fixture-author{font-weight:650}
   .fixture-placeholder{margin:6px 0;color:#777}#fixture-outside{display:block;margin:24px auto}
 `;
+
+const zhihuHrefListFixtureHtml = `<!doctype html>
+<html><head><meta charset="utf-8"><title>搜索 - 知乎</title><style>${sharedFixtureStyle}</style></head>
+<body>
+  <div class="ContentItem AnswerItem fixture-card" itemprop="answer">
+    <h2 class="ContentItem-title"><a href="/question/7001/answer/7002">列表里的回答标题</a></h2>
+    <div class="RichContent"><p>这是无 data-zop 的回答卡 7002。</p></div>
+  </div>
+  <div class="ContentItem ArticleItem fixture-card" itemprop="article">
+    <h2 class="ContentItem-title"><a href="//zhuanlan.zhihu.com/p/7003?zpf=x">列表里的文章标题</a></h2>
+    <div class="RichContent"><p>这是无 data-zop 的文章卡 7003 的正文。</p></div>
+    <div class="Comments-container">
+      <div class="InputLike Editable">
+        <div id="zh-href-placeholder" class="public-DraftEditorPlaceholder-root fixture-placeholder">理性发言，友善互动</div>
+        <div id="zh-href-editor" class="public-DraftEditor-content" role="textbox" contenteditable="true"></div>
+      </div>
+    </div>
+  </div>
+  <div class="ContentItem AnswerItem fixture-card" itemprop="answer">
+    <h2 class="ContentItem-title"><a href="/question/7004/answer/7005">干扰回答标题</a></h2>
+    <div class="RichContent"><p>这是无 data-zop 的回答卡 7005，不能被串到。</p></div>
+  </div>
+  <button id="fixture-outside" type="button">离开评论框</button>
+</body></html>`;
 
 const zhihuListFixtureHtml = `<!doctype html>
 <html><head><meta charset="utf-8"><title>搜索 - 知乎</title><style>${sharedFixtureStyle}</style></head>
@@ -522,7 +549,9 @@ async function main() {
     });
     client.on("Fetch.requestPaused", async (event) => {
       const url = event.request.url;
-      const body = url.startsWith(zhihuListUrl)
+      const body = url.startsWith(zhihuHrefListUrl)
+        ? zhihuHrefListFixtureHtml
+        : url.startsWith(zhihuListUrl)
         ? zhihuListFixtureHtml
         : url.startsWith(zhihuArticleUrl)
         ? zhihuArticleFixtureHtml
@@ -544,6 +573,10 @@ async function main() {
       patterns: [
         {
           urlPattern: "https://www.zhihu.com/question/1*",
+          resourceType: "Document",
+        },
+        {
+          urlPattern: "https://www.zhihu.com/search?q=hreffixture*",
           resourceType: "Document",
         },
         {
@@ -738,6 +771,39 @@ async function main() {
     assert.doesNotMatch(
       zhihuListDirect.body.payload.article.markdown,
       /回答 5003/,
+    );
+
+    // 无 data-zop 的搜索列表页：作用域只能从卡片标题链接的 href 解析。
+    await navigateFixture(client, zhihuHrefListUrl);
+    await delay(500);
+    checkpoint = apiCalls.length;
+    await clickSelector(client, "#zh-href-editor");
+    const zhihuHrefDirect = await waitFor(
+      () =>
+        apiCalls
+          .slice(checkpoint)
+          .find(
+            (call) =>
+              call.method === "PUT" &&
+              call.body?.mode === "direct" &&
+              call.body?.platform === "zhihu",
+          ),
+      "无 data-zop 的知乎搜索卡 direct target was not published",
+    );
+    assert.equal(zhihuHrefDirect.authOk, true);
+    assert.equal(zhihuHrefDirect.body.target, null);
+    // 卡片里没有可靠的作者元素，所以摘要不带 @作者，但必须锁定 7003 这篇文章。
+    assert.equal(
+      zhihuHrefDirect.body.targetSummary,
+      "直评文章 · 列表里的文章标题",
+    );
+    assert.match(
+      zhihuHrefDirect.body.payload.article.markdown,
+      /文章卡 7003 的正文/,
+    );
+    assert.doesNotMatch(
+      zhihuHrefDirect.body.payload.article.markdown,
+      /回答卡 700[25]/,
     );
 
     await navigateFixture(client, xhsUrl);

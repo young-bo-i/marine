@@ -65,6 +65,13 @@ pub struct WayfernLaunchResult {
   pub used_fingerprint: Option<String>,
 }
 
+/// Monotonic per-LAUNCH generation. A teardown decided against generation N
+/// aborts if the registered generation has moved, which is exactly "the profile
+/// was relaunched while I was working". This matters because the force-kill
+/// matches by PROFILE PATH, not PID, so a late teardown would otherwise kill
+/// the freshly launched browser.
+static LAUNCH_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 struct WayfernInstance {
   id: String,
   process_id: Option<u32>,
@@ -78,6 +85,20 @@ struct WayfernInstance {
   /// `None` = unknown (e.g. a `recovered_<pid>` instance discovered by system
   /// scan after a GUI restart) — treated like headless for reaping (never reap).
   windowed: Option<bool>,
+  /// `0` = a `recovered_*` entry adopted by system scan, which is explicitly
+  /// NOT a launch we performed and must never invalidate a pending reap.
+  launch_epoch: u64,
+  /// Cancels the push-based CDP close watcher for THIS launch. Dropping the
+  /// instance cancels it, so no watcher can outlive its launch or report on a
+  /// stale instance. Only ever `Some` for `windowed: Some(true)`.
+  ///
+  /// Never read on purpose — it exists solely for its `Drop`. Storing it here
+  /// rather than in a side registry is what makes every instance-removal site
+  /// (the launch-time dedupe `retain`, `stop_wayfern`, the dead-pid sweep and
+  /// the cleanup pass) cancel the watcher for free, with no extra bookkeeping
+  /// to forget.
+  #[allow(dead_code)]
+  watcher: Option<crate::cdp_watcher::WatcherHandle>,
 }
 
 struct WayfernManagerInner {
@@ -1055,6 +1076,16 @@ impl WayfernManager {
     }
 
     let id = uuid::Uuid::new_v4().to_string();
+    let launch_epoch = LAUNCH_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    // Event-driven close detection, gated identically to the zero-window
+    // reaper: only positively-known WINDOWED launches. `!headless` is exactly
+    // the condition that produces `windowed: Some(true)` below, and
+    // `recovered_*` instances never come through this path.
+    let watcher = if headless {
+      None
+    } else {
+      Some(crate::cdp_watcher::spawn(profile.id.to_string(), port))
+    };
     let instance = WayfernInstance {
       id: id.clone(),
       process_id,
@@ -1064,6 +1095,8 @@ impl WayfernManager {
       // Positively known windowed-ness from the launch options, so the
       // zero-window reaper only fires for GUI launches, never headless ones.
       windowed: Some(!headless),
+      launch_epoch,
+      watcher,
     };
 
     let mut inner = self.inner.lock().await;
@@ -1221,6 +1254,28 @@ impl WayfernManager {
   /// `Some(true)` = known windowed (eligible for the zero-window reaper),
   /// `Some(false)` = known headless, `None` = unknown (recovered instance) or
   /// no tracked instance. Only `Some(true)` should enable reaping.
+  /// Launch generation of the tracked instance for this profile path, using the
+  /// SAME canonicalized lookup as `get_cdp_port` / `is_instance_windowed`.
+  /// `Some(0)` = a recovered instance; `None` = nothing tracked.
+  pub async fn instance_epoch(&self, profile_path: &str) -> Option<u64> {
+    let inner = self.inner.lock().await;
+    let target_path = std::path::Path::new(profile_path)
+      .canonicalize()
+      .unwrap_or_else(|_| std::path::Path::new(profile_path).to_path_buf());
+
+    for instance in inner.instances.values() {
+      if let Some(path) = &instance.profile_path {
+        let instance_path = std::path::Path::new(path)
+          .canonicalize()
+          .unwrap_or_else(|_| std::path::Path::new(path).to_path_buf());
+        if instance_path == target_path {
+          return Some(instance.launch_epoch);
+        }
+      }
+    }
+    None
+  }
+
   pub async fn is_instance_windowed(&self, profile_path: &str) -> Option<bool> {
     let inner = self.inner.lock().await;
     let target_path = std::path::Path::new(profile_path)
@@ -1318,6 +1373,8 @@ impl WayfernManager {
           // whether it was launched windowed or headless, so leave it unknown
           // and never reap it on zero windows.
           windowed: None,
+          launch_epoch: 0, // not a launch we performed
+          watcher: None,   // recovered instances stay on the 5s poller
         },
       );
 

@@ -28,6 +28,7 @@ mod browser_runner;
 mod browser_version_manager;
 pub mod camoufox;
 mod camoufox_manager;
+mod cdp_watcher;
 mod default_browser;
 pub mod dns_blocklist;
 mod downloaded_browsers_registry;
@@ -2027,6 +2028,7 @@ pub fn run() {
       // full process-table scans via sysinfo. Once any profile is running
       // we switch to the fast interval (5s) for responsive UI updates.
       let app_handle_status = app.handle().clone();
+      let mut nudge_rx = crate::cdp_watcher::init_channel();
       tauri::async_runtime::spawn(async move {
         const FAST_INTERVAL_SECS: u64 = 5;
         const IDLE_INTERVAL_SECS: u64 = 30;
@@ -2037,9 +2039,35 @@ pub fn run() {
         let mut last_running_states: std::collections::HashMap<String, bool> =
           std::collections::HashMap::new();
         let mut current_interval_secs = FAST_INTERVAL_SECS;
+        // Profiles the CDP watcher confirmed windowless since the last sweep.
+        let mut confirmed_zero: std::collections::HashSet<String> =
+          std::collections::HashSet::new();
 
         loop {
-          interval.tick().await;
+          // Event-driven wake from the CDP watcher, or the periodic tick as the
+          // safety net. `Interval::tick` is cancel-safe, so losing the select
+          // race never drops a tick. A nudge only makes this loop run SOONER —
+          // every check below is unchanged and still gates the teardown.
+          tokio::select! {
+            _ = interval.tick() => {}
+            Some(first) = nudge_rx.recv() => {
+              // Coalesce: one sweep serves every nudge queued right now, so a
+              // sleep/wake storm across N profiles costs one pass, not N.
+              let mut next = Some(first);
+              while let Some(n) = next {
+                if n.kind == crate::cdp_watcher::NudgeKind::ZeroWindowsConfirmed {
+                  confirmed_zero.insert(n.profile_id.clone());
+                  // The watcher only exists for a live WINDOWED instance, so the
+                  // browser WAS running. Without this seed, a launch+close
+                  // inside one tick gives false -> false, no transition, and the
+                  // team-lock release plus scheduler.mark_profile_stopped below
+                  // are skipped.
+                  last_running_states.entry(n.profile_id).or_insert(true);
+                }
+                next = nudge_rx.try_recv().ok();
+              }
+            }
+          }
 
           let runner = crate::browser_runner::BrowserRunner::instance();
           let profiles = match runner.profile_manager.list_profiles() {
@@ -2091,9 +2119,16 @@ pub fn run() {
             .collect();
 
           for profile in profiles_to_check {
-            // Check browser status and track changes
+            // Check browser status and track changes. A push-confirmed zero
+            // lets the reaper accept its own fresh /json zero instead of
+            // waiting 5s for a second identical sample.
+            let trigger = if confirmed_zero.remove(&profile.id.to_string()) {
+              crate::browser_runner::StatusTrigger::PushConfirmedZero
+            } else {
+              crate::browser_runner::StatusTrigger::Poll
+            };
             match runner
-              .check_browser_status(app_handle_status.clone(), &profile)
+              .check_browser_status_with(app_handle_status.clone(), &profile, trigger)
               .await
             {
               Ok(is_running) => {
@@ -2176,6 +2211,10 @@ pub fn run() {
               }
             }
           }
+
+          // A confirmation is only good for the sweep it woke. Anything left
+          // belongs to a profile that is no longer being checked.
+          confirmed_zero.clear();
         }
       });
 

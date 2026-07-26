@@ -297,6 +297,50 @@
     });
   }
 
+  // 2026 起的搜索/信息流卡片不再带 data-zop（实测同一个搜索页当天就从 12 个变成 0 个），
+  // 身份只能从标题链接的 href 取：
+  //   <div class="ContentItem ArticleItem" itemprop="article">
+  //     <h2 class="ContentItem-title"><a href="//zhuanlan.zhihu.com/p/1976741216004563767?zpf=...">
+  // 卡片选择器**不参与** uniqueZhihuScope 的全局唯一性判断 —— 那条路径必须继续只认
+  // data-zop，否则回答页上一堆 .ContentItem 会让「文档里恰好一个」失效，把现在好用的
+  // 回答页也弄坏。这里只用于「编辑器自己所属的那张卡」，由 closest 保证无歧义。
+  const ZHIHU_CARD_SELECTOR = '.ContentItem,.SearchResult-Card,.List-item';
+
+  function zhihuIdFromHref(href) {
+    const value = String(href || '');
+    const answer = value.match(/\/question\/\d+\/answer\/(\d+)/);
+    if (answer) return { kind: 'answer', id: stableId(answer[1]) };
+    const article = value.match(/\/p\/(\d+)/);
+    if (article) return { kind: 'article', id: stableId(article[1]) };
+    return null;
+  }
+
+  function zhihuCardScope(value) {
+    const element = safeClosest(value, ZHIHU_CARD_SELECTOR);
+    if (!element) return null;
+    const link = safeQuery(element, '.ContentItem-title a[href],h2 a[href]');
+    if (!link) return null;
+    const parsed = zhihuIdFromHref(safeAttribute(link, 'href'));
+    if (!parsed || !parsed.id) return null;
+    const title = elementText(link, 300);
+    if (!title) return null;
+    return {
+      id: parsed.id,
+      kind: parsed.kind,
+      title,
+      // 卡片里没有可靠的作者元素（.AuthorInfo/[itemprop=author] 实测都不存在，
+      // 而 a[href*="/people/"] 有 33 个、绝大多数是评论者）。宁可留空，
+      // 也不要把别人的名字当成作者写进提示词。
+      authorName: '',
+      element,
+    };
+  }
+
+  // 统一入口：优先 data-zop（回答页/专栏页/老版列表），退回卡片 href。
+  function zhihuScopeOf(value) {
+    return zhihuAnswerScope(value) || zhihuCardScope(value);
+  }
+
   function zhihuAnswerScope(value) {
     const element = safeMatches(value, ZHIHU_SCOPE_SELECTOR)
       ? asElement(value)
@@ -331,8 +375,8 @@
     });
     if (!control) return null;
     for (const value of values) {
-      const scope = zhihuAnswerScope(value);
-      if (scope && safeClosest(control, ZHIHU_SCOPE_SELECTOR) === scope.element) {
+      const scope = zhihuScopeOf(value);
+      if (scope && safeClosest(control, ZHIHU_SCOPE_SELECTOR + ',' + ZHIHU_CARD_SELECTOR) === scope.element) {
         scope.selectedAt = Date.now();
         return scope;
       }
@@ -527,14 +571,14 @@
 
     directScopeForEditor: function (editor, previousScope, locationLike, documentLike) {
       if (!isZhihuCommentEditor(editor)) return null;
-      const owned = zhihuAnswerScope(editor);
+      const owned = zhihuScopeOf(editor);
       if (owned) return bindZhihuScope(owned, editor);
 
       // 作用域可能是回答，也可能是专栏文章；两者的 kind 不同但机制完全一致。
       const previous = rememberedScope(previousScope, 'answer', documentLike) ||
         rememberedScope(previousScope, 'article', documentLike);
       if (previous && !previous.invalidated) {
-        const live = zhihuAnswerScope(previous.element);
+        const live = zhihuScopeOf(previous.element);
         const modal = safeClosest(editor, '.Modal-content');
         const sameModal = !!modal && previous.boundModal === modal && modal.isConnected;
         const freshSelection = !previous.boundModal && Number(previous.selectedAt) > 0 &&
