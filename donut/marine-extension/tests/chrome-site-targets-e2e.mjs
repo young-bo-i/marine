@@ -30,6 +30,10 @@ const xhsUrl = `https://www.xiaohongshu.com/explore/${xhsNoteId}`;
 // 于是文章页一个作用域都解析不出来，直评目标建不起来（搜索点进去的结果
 // 大量是专栏，用户看到的就是「知乎识别不了」）。
 const zhihuArticleUrl = "https://zhuanlan.zhihu.com/p/9001";
+// 知乎搜索列表页：一页里有多张卡片（回答卡 + 文章卡），作用域不唯一，
+// 只能靠「编辑器自己所属的那张卡」来解析。文章卡在列表里是 `.ArticleItem`，
+// 不是专栏页的 `.Post-content` —— 这正是截图里识别不到的那种。
+const zhihuListUrl = "https://www.zhihu.com/search?q=fixture";
 
 const zhihuInitialData = JSON.stringify({
   initialState: {
@@ -68,6 +72,27 @@ const sharedFixtureStyle = `
   .fixture-comment{margin-top:20px;padding:16px;border:1px solid #ddd;border-radius:8px}.fixture-author{font-weight:650}
   .fixture-placeholder{margin:6px 0;color:#777}#fixture-outside{display:block;margin:24px auto}
 `;
+
+const zhihuListFixtureHtml = `<!doctype html>
+<html><head><meta charset="utf-8"><title>搜索 - 知乎</title><style>${sharedFixtureStyle}</style></head>
+<body>
+  <div class="ContentItem AnswerItem fixture-card" data-zop='{"type":"answer","itemId":"5001","title":"列表里的回答","authorName":"列表回答作者"}'>
+    <div class="RichContent"><p>这是列表里的回答 5001。</p></div>
+  </div>
+  <div class="ContentItem ArticleItem fixture-card" data-zop='{"type":"article","itemId":"5002","title":"列表里的文章","authorName":"列表文章作者"}'>
+    <div class="RichContent"><p>这是列表里的文章 5002 的正文。</p></div>
+    <div class="Comments-container">
+      <div class="InputLike Editable">
+        <div id="zh-list-placeholder" class="public-DraftEditorPlaceholder-root fixture-placeholder">理性发言，友善互动</div>
+        <div id="zh-list-editor" class="public-DraftEditor-content" role="textbox" contenteditable="true"></div>
+      </div>
+    </div>
+  </div>
+  <div class="ContentItem AnswerItem fixture-card" data-zop='{"type":"answer","itemId":"5003","title":"另一个回答","authorName":"干扰项作者"}'>
+    <div class="RichContent"><p>这是列表里的回答 5003，不能被串到。</p></div>
+  </div>
+  <button id="fixture-outside" type="button">离开评论框</button>
+</body></html>`;
 
 const zhihuArticleFixtureHtml = `<!doctype html>
 <html><head><meta charset="utf-8"><title>专栏文章标题 - 知乎</title><style>${sharedFixtureStyle}</style></head>
@@ -497,7 +522,9 @@ async function main() {
     });
     client.on("Fetch.requestPaused", async (event) => {
       const url = event.request.url;
-      const body = url.startsWith(zhihuArticleUrl)
+      const body = url.startsWith(zhihuListUrl)
+        ? zhihuListFixtureHtml
+        : url.startsWith(zhihuArticleUrl)
         ? zhihuArticleFixtureHtml
         : url.startsWith(zhihuUrl)
           ? zhihuFixtureHtml
@@ -517,6 +544,10 @@ async function main() {
       patterns: [
         {
           urlPattern: "https://www.zhihu.com/question/1*",
+          resourceType: "Document",
+        },
+        {
+          urlPattern: "https://www.zhihu.com/search?q=fixture*",
           resourceType: "Document",
         },
         {
@@ -672,6 +703,41 @@ async function main() {
     assert.match(
       zhihuArticleDirect.body.payload.article.markdown,
       /专栏文章 9001 的正文/,
+    );
+
+    // 列表页：三张卡片 → uniqueZhihuScope 必然放弃（作用域不唯一），
+    // 只能由编辑器所属的那张 `.ArticleItem[data-zop]` 解析出来。
+    // 修复前这一段必然失败：列表里的文章卡匹配不上任何作用域选择器。
+    await navigateFixture(client, zhihuListUrl);
+    await delay(500);
+    checkpoint = apiCalls.length;
+    await clickSelector(client, "#zh-list-editor");
+    const zhihuListDirect = await waitFor(
+      () =>
+        apiCalls
+          .slice(checkpoint)
+          .find(
+            (call) =>
+              call.method === "PUT" &&
+              call.body?.mode === "direct" &&
+              call.body?.platform === "zhihu",
+          ),
+      "知乎列表页文章卡 direct target was not published",
+    );
+    assert.equal(zhihuListDirect.authOk, true);
+    assert.equal(zhihuListDirect.body.target, null);
+    // 必须锁定编辑器所属的 5002，绝不能串到相邻的 5001 / 5003。
+    assert.equal(
+      zhihuListDirect.body.targetSummary,
+      "直评文章 @列表文章作者 · 列表里的文章",
+    );
+    assert.match(
+      zhihuListDirect.body.payload.article.markdown,
+      /列表里的文章 5002 的正文/,
+    );
+    assert.doesNotMatch(
+      zhihuListDirect.body.payload.article.markdown,
+      /回答 5003/,
     );
 
     await navigateFixture(client, xhsUrl);

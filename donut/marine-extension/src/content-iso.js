@@ -201,7 +201,7 @@
     try {
       const noteMd = marineExtractNoteText(platform, commentCaptures, opts);
       if (noteMd && noteMd.trim()) textRes = { ok: true, chars: noteMd.length, markdown: noteMd };
-      else textRes = marineExtractStructuredText();
+      else textRes = marineExtractStructuredText(opts.scope);
     } catch (e) { textRes = null; }
     if (textRes && textRes.ok) out.text = { status: 'has', chars: textRes.chars, md: textRes.markdown };
 
@@ -2279,8 +2279,16 @@
       (directScope ? directScope.kind + ':' + directScope.id : 'page');
     const cached = marineRimeTarget.grabCache;
     if (cached && cached.key === key && Date.now() - cached.at < 30000) return cached.value;
+    // `directScope` 是脱敏后要上行的那份（只有 id/kind/title/authorName）。
+    // `scope` 额外带上作用域元素，只在本地用于把正文抽取收窄到这一块，绝不外发。
+    const scopeElement = (info && info.directScope && info.directScope.element) || null;
     const value = await Promise.race([
-      marineGrabAll({ directScope }),
+      marineGrabAll({
+        directScope,
+        scope: scopeElement
+          ? { element: scopeElement, title: directScope && directScope.title }
+          : null,
+      }),
       new Promise(function (_, reject) {
         setTimeout(function () { reject(new Error('抓取上下文超时')); }, 8000);
       }),

@@ -4,13 +4,19 @@
 (function (root) {
   'use strict';
 
-  // 知乎把「内容作用域」的元信息统一放在 data-zop 里，回答和专栏文章是同一套 JSON
-  // （{authorName,itemId,title,type}），只是挂载点和 type 不同：
-  //   回答  <div class="AnswerItem"  data-zop='{..."type":"answer"}'>
-  //   文章  <div class="Post-content" data-zop='{..."type":"article"}'>
-  // 以前只认前者，于是专栏文章页一个作用域都找不到，uniqueZhihuScope 返回 null，
-  // 直评目标建不起来——从搜索点进去的结果大量是专栏，表现就是「知乎识别不了」。
-  const ZHIHU_SCOPE_SELECTOR = '.AnswerItem[data-zop],.Post-content[data-zop]';
+  // 知乎把「内容作用域」的元信息统一放在 data-zop 里，回答和专栏文章共用同一套 JSON
+  // （{authorName,itemId,title,type}），只是挂载点和 type 不同。实测四种形态：
+  //   列表页回答卡  <div class="ContentItem AnswerItem"  data-zop='{..."type":"answer"}'>
+  //   列表页文章卡  <div class="ContentItem ArticleItem" data-zop='{..."type":"article"}'>
+  //   专栏文章页    <div class="Post-content"            data-zop='{..."type":"article"}'>
+  //   老版/夹具     <div class="AnswerItem"              data-zop='{..."type":"answer"}'>
+  // 以前只认 `.AnswerItem[data-zop]`，于是文章一律解析不出作用域：独立专栏页 0 个
+  // 作用域，列表页里的文章卡也匹配不上——搜索结果里文章占比很高，用户看到的就是
+  // 「搜出来的知乎识别不了」，而直接点开的回答页（恰好一个 AnswerItem）正常。
+  // `.ContentItem[data-zop]` 是列表卡片的公共父类，单列 Answer/Article 是为了兼容
+  // 不带 ContentItem 的老结构；同一元素被多个分支命中不影响 closest 的结果。
+  const ZHIHU_SCOPE_SELECTOR = '.AnswerItem[data-zop],.ArticleItem[data-zop],' +
+    '.ContentItem[data-zop],.Post-content[data-zop]';
   const ZHIHU_SCOPE_TYPES = { answer: 'answer', article: 'article' };
   const ZHIHU_COMMENT_SELECTOR = '.CommentItemV2[data-id],.CommentItem[data-id]';
   const XHS_COMMENT_SELECTOR = '.comment-item[id^="comment-"]';

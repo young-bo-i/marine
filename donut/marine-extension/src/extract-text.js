@@ -126,11 +126,27 @@ function marineDomToMarkdown(root) {
   return blocks.join('\n\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
-function marineExtractStructuredText() {
-  const root = marinePickContentRoot();
-  marineLog('info', 'text', '正文容器：' + root.tagName.toLowerCase() + (root.id ? '#' + root.id : ''));
-  const body = marineDomToMarkdown(root);
-  const title = (document.querySelector('h1') && document.querySelector('h1').textContent.trim())
+// `scope`（可选）= { element, title }：投放目标所属的那一块内容。
+// 列表页（知乎搜索/首页信息流）上一页有几十张卡片，通用的 marinePickContentRoot()
+// 会把整页都当成「正文」，于是发给 AI 的上下文里混着一堆无关帖子——检测通了但生成
+// 的评论可能对着错的内容。有作用域时就以它为根，标题也用作用域自己的标题。
+// 作用域元素文本过短（懒加载/折叠）时退回全局挑选，避免抓到空正文。
+function marineExtractStructuredText(scope) {
+  const scopeEl = scope && scope.element;
+  // 先按作用域抽，抽出来是空的（懒加载/折叠/结构不符）才退回全局挑选。
+  // 用「结果是否为空」判断，而不是猜一个字数阈值——短帖子同样需要被收窄。
+  let root = (scopeEl && scopeEl.isConnected) ? scopeEl : null;
+  let body = root ? marineDomToMarkdown(root) : '';
+  const scopeUsed = !!body.trim();
+  if (!scopeUsed) {
+    root = marinePickContentRoot();
+    body = marineDomToMarkdown(root);
+  }
+  marineLog('info', 'text', '正文容器：' + root.tagName.toLowerCase() + (root.id ? '#' + root.id : '') +
+    (scopeUsed ? '（按投放作用域收窄）' : ''));
+  const scopeTitle = scopeUsed ? String((scope && scope.title) || '').trim() : '';
+  const title = scopeTitle
+    || (document.querySelector('h1') && document.querySelector('h1').textContent.trim())
     || document.title || '';
   const markdown = (title ? '# ' + title.trim() + '\n\n' : '') +
     '> 来源：' + location.href + '\n\n' + body;
