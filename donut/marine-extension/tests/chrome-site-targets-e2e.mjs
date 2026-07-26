@@ -25,6 +25,11 @@ const xhsNoteId = "abcdef1234567890abcdef12";
 const xhsCommentId = "0123456789abcdef01234567";
 const zhihuUrl = "https://www.zhihu.com/question/1";
 const xhsUrl = `https://www.xiaohongshu.com/explore/${xhsNoteId}`;
+// 知乎专栏文章页。回答页和文章页共用同一套 data-zop 元信息，只是挂载点是
+// `.Post-content` 且 type=article —— 以前只认 `.AnswerItem[data-zop]`，
+// 于是文章页一个作用域都解析不出来，直评目标建不起来（搜索点进去的结果
+// 大量是专栏，用户看到的就是「知乎识别不了」）。
+const zhihuArticleUrl = "https://zhuanlan.zhihu.com/p/9001";
 
 const zhihuInitialData = JSON.stringify({
   initialState: {
@@ -63,6 +68,28 @@ const sharedFixtureStyle = `
   .fixture-comment{margin-top:20px;padding:16px;border:1px solid #ddd;border-radius:8px}.fixture-author{font-weight:650}
   .fixture-placeholder{margin:6px 0;color:#777}#fixture-outside{display:block;margin:24px auto}
 `;
+
+const zhihuArticleFixtureHtml = `<!doctype html>
+<html><head><meta charset="utf-8"><title>专栏文章标题 - 知乎</title><style>${sharedFixtureStyle}</style></head>
+<body>
+  <article class="Post-Main">
+    <h1 class="Post-Title">专栏文章标题</h1>
+    <div class="Post-content" data-zop='{"type":"article","itemId":"9001","title":"专栏文章标题","authorName":"专栏作者"}'>
+      <div class="RichText"><p>这是专栏文章 9001 的正文。</p></div>
+    </div>
+  </article>
+  <div class="Comments-container">
+    <div class="InputLike Editable">
+      <div id="zh-article-placeholder" class="public-DraftEditorPlaceholder-root fixture-placeholder">理性发言，友善互动</div>
+      <div id="zh-article-editor" class="public-DraftEditor-content" role="textbox" contenteditable="true"></div>
+    </div>
+    <div class="fixture-comment" data-id="zh-article-comment-7">
+      <a class="fixture-author" href="/people/zh-article-commenter">专栏评论者</a>
+      <div class="CommentContent"><p>专栏评论正文</p></div>
+    </div>
+  </div>
+  <button id="fixture-outside" type="button">离开评论框</button>
+</body></html>`;
 
 const zhihuFixtureHtml = `<!doctype html>
 <html><head><meta charset="utf-8"><title>Fixture 问题标题 - 知乎</title><style>${sharedFixtureStyle}</style></head>
@@ -470,7 +497,11 @@ async function main() {
     });
     client.on("Fetch.requestPaused", async (event) => {
       const url = event.request.url;
-      const body = url.startsWith(zhihuUrl) ? zhihuFixtureHtml : xhsFixtureHtml;
+      const body = url.startsWith(zhihuArticleUrl)
+        ? zhihuArticleFixtureHtml
+        : url.startsWith(zhihuUrl)
+          ? zhihuFixtureHtml
+          : xhsFixtureHtml;
       await client.send("Fetch.fulfillRequest", {
         requestId: event.requestId,
         responseCode: 200,
@@ -486,6 +517,10 @@ async function main() {
       patterns: [
         {
           urlPattern: "https://www.zhihu.com/question/1*",
+          resourceType: "Document",
+        },
+        {
+          urlPattern: "https://zhuanlan.zhihu.com/p/9001*",
           resourceType: "Document",
         },
         {
@@ -608,6 +643,36 @@ async function main() {
       /回答 101 的精确正文/,
     );
     await clickSelector(client, "#fixture-outside");
+
+    // 专栏文章页：作用域来自 `.Post-content[data-zop]`（type=article）。
+    // 这一段在修复前必然失败——文章页解析不出任何作用域，direct 目标发不出去。
+    await navigateFixture(client, zhihuArticleUrl);
+    await delay(500);
+    checkpoint = apiCalls.length;
+    await clickSelector(client, "#zh-article-editor");
+    const zhihuArticleDirect = await waitFor(
+      () =>
+        apiCalls
+          .slice(checkpoint)
+          .find(
+            (call) =>
+              call.method === "PUT" &&
+              call.body?.mode === "direct" &&
+              call.body?.platform === "zhihu",
+          ),
+      "知乎专栏文章 direct target was not published",
+    );
+    assert.equal(zhihuArticleDirect.authOk, true);
+    assert.equal(zhihuArticleDirect.body.actionId, "marine.generate-direct");
+    assert.equal(zhihuArticleDirect.body.target, null);
+    assert.equal(
+      zhihuArticleDirect.body.targetSummary,
+      "直评文章 @专栏作者 · 专栏文章标题",
+    );
+    assert.match(
+      zhihuArticleDirect.body.payload.article.markdown,
+      /专栏文章 9001 的正文/,
+    );
 
     await navigateFixture(client, xhsUrl);
     await delay(500);

@@ -19,7 +19,6 @@ export interface BrowserProfile {
   proxy_id?: string; // Reference to stored proxy
   vpn_id?: string; // Reference to stored VPN config
   launch_hook?: string;
-  launch_url?: string;
   process_id?: number;
   last_launch?: number;
   release_type: string; // "stable" or "nightly"

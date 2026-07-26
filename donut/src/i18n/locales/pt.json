@@ -369,10 +369,6 @@
       "label": "URL do hook de inicialização",
       "placeholder": "https://example.com/hooks/profile-launch"
     },
-    "launchUrl": {
-      "label": "URL de inicialização",
-      "placeholder": "https://www.bilibili.com"
-    },
     "version": {
       "fetching": "Buscando versões disponíveis...",
       "fetchError": "Falha ao buscar versões do navegador. Por favor, verifique sua conexão com a internet e tente novamente.",

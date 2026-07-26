@@ -369,10 +369,6 @@
       "label": "Launch Hook URL",
       "placeholder": "https://example.com/hooks/profile-launch"
     },
-    "launchUrl": {
-      "label": "Launch URL",
-      "placeholder": "https://www.bilibili.com"
-    },
     "version": {
       "fetching": "Fetching available versions...",
       "fetchError": "Failed to fetch browser versions. Please check your internet connection and try again.",

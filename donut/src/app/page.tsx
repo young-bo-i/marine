@@ -833,7 +833,6 @@ export default function Home() {
       ephemeral?: boolean;
       dnsBlocklist?: string;
       launchHook?: string;
-      launchUrl?: string;
       password?: string;
     }) => {
       try {
@@ -856,7 +855,6 @@ export default function Home() {
             ephemeral: profileData.ephemeral,
             dnsBlocklist: profileData.dnsBlocklist,
             launchHook: profileData.launchHook,
-            launchUrl: profileData.launchUrl,
           },
         );
 

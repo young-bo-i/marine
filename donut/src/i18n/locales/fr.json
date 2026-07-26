@@ -369,10 +369,6 @@
       "label": "URL du hook de lancement",
       "placeholder": "https://example.com/hooks/profile-launch"
     },
-    "launchUrl": {
-      "label": "URL de lancement",
-      "placeholder": "https://www.bilibili.com"
-    },
     "version": {
       "fetching": "Récupération des versions disponibles...",
       "fetchError": "Échec de la récupération des versions du navigateur. Veuillez vérifier votre connexion Internet et réessayer.",

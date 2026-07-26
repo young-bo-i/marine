@@ -33,9 +33,6 @@ pub struct BrowserProfile {
   pub vpn_id: Option<String>, // Reference to stored VPN config
   #[serde(default)]
   pub launch_hook: Option<String>,
-  /// Marine: URL the browser auto-opens on launch (per-profile). `None` = blank.
-  #[serde(default)]
-  pub launch_url: Option<String>,
   #[serde(default)]
   pub process_id: Option<u32>,
   #[serde(default)]

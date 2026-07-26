@@ -128,7 +128,7 @@ struct TransferOutcome {
 ///
 /// The old version hand-picked six fields (name/tags/note/proxy/vpn/group) but
 /// still adopted `remote.updated_at`, so any OTHER synced field
-/// (`launch_hook`, `launch_url`, `proxy_bypass_rules`, `dns_blocklist`,
+/// (`launch_hook`, `proxy_bypass_rules`, `dns_blocklist`,
 /// `extension_group_id`, `brand_id`, fingerprint configs, …) could never
 /// converge: the losing device's stale value survived AND its `updated_at` now
 /// equalled remote, freezing the merge forever. Adopting the whole body fixes

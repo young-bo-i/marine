@@ -2296,6 +2296,11 @@
       if (scope && scope.kind === 'answer') {
         summary = '直评回答' + (scope.authorName ? ' @' + scope.authorName : '') +
           ' \u00b7 ' + (scope.title || scope.id);
+      } else if (scope && scope.kind === 'article') {
+        // 知乎专栏文章：与回答共用同一套 data-zop 元信息，只是 type=article。
+        // 没有这一支就会掉进通用兜底，白白丢掉文章标题和作者。
+        summary = '直评文章' + (scope.authorName ? ' @' + scope.authorName : '') +
+          ' \u00b7 ' + (scope.title || scope.id);
       } else if (scope && scope.kind === 'note') {
         summary = '直评笔记 \u00b7 ' + (scope.title || scope.id);
       } else summary = '直评 \u00b7 ' + (document.title || location.href);

@@ -775,7 +775,7 @@ impl BrowserRunner {
           &updated_profile,
           &profile_path_str,
           &wayfern_config,
-          url.as_deref().or(updated_profile.launch_url.as_deref()),
+          url.as_deref(),
           proxy_url,
           profile.ephemeral,
           &extension_paths,

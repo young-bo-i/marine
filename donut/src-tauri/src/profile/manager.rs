@@ -90,22 +90,6 @@ impl ProfileManager {
     }
   }
 
-  /// Normalize the per-profile launch URL the browser opens on start: trim,
-  /// treat empty as None, and prepend `https://` when no scheme is given so a
-  /// bare host like `bilibili.com` becomes a real URL rather than a search.
-  fn normalize_launch_url(launch_url: Option<String>) -> Option<String> {
-    let raw = launch_url?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-      return None;
-    }
-    if trimmed.contains("://") {
-      Some(trimmed.to_string())
-    } else {
-      Some(format!("https://{trimmed}"))
-    }
-  }
-
   #[allow(clippy::too_many_arguments)]
   pub async fn create_profile_with_group(
     &self,
@@ -122,14 +106,12 @@ impl ProfileManager {
     ephemeral: bool,
     dns_blocklist: Option<String>,
     launch_hook: Option<String>,
-    launch_url: Option<String>,
   ) -> Result<BrowserProfile, Box<dyn std::error::Error>> {
     if proxy_id.is_some() && vpn_id.is_some() {
       return Err("Cannot set both proxy_id and vpn_id".into());
     }
 
     let launch_hook = Self::normalize_launch_hook(launch_hook)?;
-    let launch_url = Self::normalize_launch_url(launch_url);
 
     // Sync cloud proxy credentials if the profile uses a cloud or cloud-derived proxy
     if let Some(ref pid) = proxy_id {
@@ -218,7 +200,6 @@ impl ProfileManager {
           proxy_id: proxy_id.clone(),
           vpn_id: None,
           launch_hook: launch_hook.clone(),
-          launch_url: launch_url.clone(),
           process_id: None,
           last_launch: None,
           release_type: release_type.to_string(),
@@ -325,7 +306,6 @@ impl ProfileManager {
           proxy_id: proxy_id.clone(),
           vpn_id: None,
           launch_hook: launch_hook.clone(),
-          launch_url: launch_url.clone(),
           process_id: None,
           last_launch: None,
           release_type: release_type.to_string(),
@@ -399,7 +379,6 @@ impl ProfileManager {
       proxy_id: proxy_id.clone(),
       vpn_id: vpn_id.clone(),
       launch_hook,
-      launch_url,
       process_id: None,
       last_launch: None,
       release_type: release_type.to_string(),
@@ -1141,7 +1120,6 @@ impl ProfileManager {
       proxy_id: source.proxy_id,
       vpn_id: source.vpn_id,
       launch_hook: source.launch_hook,
-      launch_url: source.launch_url,
       process_id: None,
       last_launch: None,
       release_type: source.release_type,
@@ -2197,7 +2175,6 @@ mod tests {
       proxy_id: None,
       vpn_id: None,
       launch_hook: None,
-      launch_url: None,
       process_id: None,
       last_launch: None,
       release_type: "stable".to_string(),
@@ -2565,7 +2542,6 @@ pub async fn create_browser_profile_with_group(
   ephemeral: bool,
   dns_blocklist: Option<String>,
   launch_hook: Option<String>,
-  launch_url: Option<String>,
 ) -> Result<BrowserProfile, String> {
   let profile_manager = ProfileManager::instance();
   profile_manager
@@ -2583,7 +2559,6 @@ pub async fn create_browser_profile_with_group(
       ephemeral,
       dns_blocklist,
       launch_hook,
-      launch_url,
     )
     .await
     .map_err(|e| format!("Failed to create profile: {e}"))
@@ -2744,7 +2719,6 @@ pub async fn create_browser_profile_new(
   ephemeral: Option<bool>,
   dns_blocklist: Option<String>,
   launch_hook: Option<String>,
-  launch_url: Option<String>,
 ) -> Result<BrowserProfile, String> {
   let fingerprint_os = camoufox_config
     .as_ref()
@@ -2778,7 +2752,6 @@ pub async fn create_browser_profile_new(
     ephemeral.unwrap_or(false),
     dns_blocklist,
     launch_hook,
-    launch_url,
   )
   .await
 }

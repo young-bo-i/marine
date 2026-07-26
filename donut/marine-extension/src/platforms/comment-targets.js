@@ -4,7 +4,14 @@
 (function (root) {
   'use strict';
 
-  const ZHIHU_ANSWER_SELECTOR = '.AnswerItem[data-zop]';
+  // 知乎把「内容作用域」的元信息统一放在 data-zop 里，回答和专栏文章是同一套 JSON
+  // （{authorName,itemId,title,type}），只是挂载点和 type 不同：
+  //   回答  <div class="AnswerItem"  data-zop='{..."type":"answer"}'>
+  //   文章  <div class="Post-content" data-zop='{..."type":"article"}'>
+  // 以前只认前者，于是专栏文章页一个作用域都找不到，uniqueZhihuScope 返回 null，
+  // 直评目标建不起来——从搜索点进去的结果大量是专栏，表现就是「知乎识别不了」。
+  const ZHIHU_SCOPE_SELECTOR = '.AnswerItem[data-zop],.Post-content[data-zop]';
+  const ZHIHU_SCOPE_TYPES = { answer: 'answer', article: 'article' };
   const ZHIHU_COMMENT_SELECTOR = '.CommentItemV2[data-id],.CommentItem[data-id]';
   const XHS_COMMENT_SELECTOR = '.comment-item[id^="comment-"]';
   const XHS_NOTE_ROOT_SELECTOR = [
@@ -285,21 +292,24 @@
   }
 
   function zhihuAnswerScope(value) {
-    const element = safeMatches(value, ZHIHU_ANSWER_SELECTOR)
+    const element = safeMatches(value, ZHIHU_SCOPE_SELECTOR)
       ? asElement(value)
-      : safeClosest(value, ZHIHU_ANSWER_SELECTOR);
+      : safeClosest(value, ZHIHU_SCOPE_SELECTOR);
     if (!element) return null;
     const encoded = safeAttribute(element, 'data-zop');
     if (!encoded || encoded.length > 8192) return null;
     let data;
     try { data = JSON.parse(encoded); } catch (error) { return null; }
     if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
-    if (data.type && String(data.type).toLowerCase() !== 'answer') return null;
+    // 缺省仍按 answer 处理（老标记里 type 可能不存在）；除 answer/article 外一律拒绝，
+    // 不要把 question/column 之类的容器误当成投放作用域。
+    const kind = data.type ? ZHIHU_SCOPE_TYPES[String(data.type).toLowerCase()] : 'answer';
+    if (!kind) return null;
     const id = stableId(data.itemId);
     if (!id) return null;
     return {
       id,
-      kind: 'answer',
+      kind,
       title: normalizeText(data.title, 300),
       authorName: normalizeText(data.authorName, 120),
       element,
@@ -316,7 +326,7 @@
     if (!control) return null;
     for (const value of values) {
       const scope = zhihuAnswerScope(value);
-      if (scope && safeClosest(control, ZHIHU_ANSWER_SELECTOR) === scope.element) {
+      if (scope && safeClosest(control, ZHIHU_SCOPE_SELECTOR) === scope.element) {
         scope.selectedAt = Date.now();
         return scope;
       }
@@ -340,7 +350,7 @@
   function uniqueZhihuScope(documentLike) {
     const scopes = [];
     const seen = new Set();
-    for (const element of safeQueryAll(documentLike, ZHIHU_ANSWER_SELECTOR, 500)) {
+    for (const element of safeQueryAll(documentLike, ZHIHU_SCOPE_SELECTOR, 500)) {
       const scope = zhihuAnswerScope(element);
       if (!scope || seen.has(scope.id)) continue;
       seen.add(scope.id);
@@ -514,7 +524,9 @@
       const owned = zhihuAnswerScope(editor);
       if (owned) return bindZhihuScope(owned, editor);
 
-      const previous = rememberedScope(previousScope, 'answer', documentLike);
+      // 作用域可能是回答，也可能是专栏文章；两者的 kind 不同但机制完全一致。
+      const previous = rememberedScope(previousScope, 'answer', documentLike) ||
+        rememberedScope(previousScope, 'article', documentLike);
       if (previous && !previous.invalidated) {
         const live = zhihuAnswerScope(previous.element);
         const modal = safeClosest(editor, '.Modal-content');
@@ -529,9 +541,10 @@
       }
 
       // A portal modal has no structural link back to its AnswerItem. Without
-      // an explicit recent click, only a document containing one answer is
+      // an explicit recent click, only a document containing one scope is
       // unambiguous; a route answer id alone is not enough when more answers
-      // are rendered on the same page.
+      // are rendered on the same page. A 专栏 article page has exactly one
+      // `.Post-content[data-zop]`, so it resolves here.
       return bindZhihuScope(uniqueZhihuScope(documentLike), editor);
     },
 

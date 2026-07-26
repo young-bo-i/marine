@@ -369,10 +369,6 @@
       "label": "起動フックURL",
       "placeholder": "https://example.com/hooks/profile-launch"
     },
-    "launchUrl": {
-      "label": "起動 URL",
-      "placeholder": "https://www.bilibili.com"
-    },
     "version": {
       "fetching": "利用可能なバージョンを取得中...",
       "fetchError": "ブラウザバージョンの取得に失敗しました。インターネット接続を確認して再試行してください。",

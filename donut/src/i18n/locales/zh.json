@@ -369,10 +369,6 @@
       "label": "启动钩子 URL",
       "placeholder": "https://example.com/hooks/profile-launch"
     },
-    "launchUrl": {
-      "label": "启动网址",
-      "placeholder": "https://www.bilibili.com"
-    },
     "version": {
       "fetching": "正在获取可用版本...",
       "fetchError": "获取浏览器版本失败。请检查您的网络连接并重试。",

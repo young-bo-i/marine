@@ -369,10 +369,6 @@
       "label": "실행 후크 URL",
       "placeholder": "https://example.com/hooks/profile-launch"
     },
-    "launchUrl": {
-      "label": "실행 URL",
-      "placeholder": "https://www.bilibili.com"
-    },
     "version": {
       "fetching": "사용 가능한 버전을 가져오는 중...",
       "fetchError": "브라우저 버전을 가져오지 못했습니다. 인터넷 연결을 확인하고 다시 시도하세요.",

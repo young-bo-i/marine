@@ -369,10 +369,6 @@
       "label": "URL Hook khởi chạy",
       "placeholder": "https://example.com/hooks/profile-launch"
     },
-    "launchUrl": {
-      "label": "URL khởi chạy",
-      "placeholder": "https://www.bilibili.com"
-    },
     "version": {
       "fetching": "Đang lấy danh sách phiên bản...",
       "fetchError": "Không thể lấy danh sách phiên bản trình duyệt. Vui lòng kiểm tra kết nối mạng và thử lại.",

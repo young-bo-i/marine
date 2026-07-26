@@ -369,10 +369,6 @@
       "label": "URL хука запуска",
       "placeholder": "https://example.com/hooks/profile-launch"
     },
-    "launchUrl": {
-      "label": "URL запуска",
-      "placeholder": "https://www.bilibili.com"
-    },
     "version": {
       "fetching": "Получение доступных версий...",
       "fetchError": "Не удалось получить версии браузера. Проверьте интернет-соединение и попробуйте снова.",

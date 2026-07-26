@@ -84,7 +84,6 @@ interface CreateProfileDialogProps {
     ephemeral?: boolean;
     dnsBlocklist?: string;
     launchHook?: string;
-    launchUrl?: string;
     password?: string;
   }) => Promise<void>;
   selectedGroupId?: string;
@@ -128,7 +127,6 @@ export function CreateProfileDialog({
   const [proxyPopoverOpen, setProxyPopoverOpen] = useState(false);
   const [dnsBlocklist, setDnsBlocklist] = useState<string>("");
   const [launchHook, setLaunchHook] = useState("");
-  const [launchUrl, setLaunchUrl] = useState("");
 
   // Wayfern anti-detect states
   const [wayfernConfig, setWayfernConfig] = useState<WayfernConfig>(() => ({
@@ -148,7 +146,6 @@ export function CreateProfileDialog({
     setProfileName("");
     setSelectedProxyId(undefined);
     setLaunchHook("");
-    setLaunchUrl("");
   };
 
   // Handle back button
@@ -429,7 +426,6 @@ export function CreateProfileDialog({
           ephemeral,
           dnsBlocklist: dnsBlocklist || undefined,
           launchHook: launchHook.trim() || undefined,
-          launchUrl: launchUrl.trim() || undefined,
           password: passwordToSet,
         });
       } else {
@@ -458,7 +454,6 @@ export function CreateProfileDialog({
               : undefined,
           dnsBlocklist: dnsBlocklist || undefined,
           launchHook: launchHook.trim() || undefined,
-          launchUrl: launchUrl.trim() || undefined,
           password: passwordToSet,
         });
       }
@@ -483,7 +478,6 @@ export function CreateProfileDialog({
     setSelectedBrowser("wayfern");
     setSelectedProxyId(undefined);
     setLaunchHook("");
-    setLaunchUrl("");
     setReleaseTypes({});
     setIsLoadingReleaseTypes(false);
     setReleaseTypesError(null);
@@ -1187,23 +1181,6 @@ export function CreateProfileDialog({
                           />
                         </div>
 
-                        <div className="space-y-2">
-                          <Label htmlFor="launch-url">
-                            {t("createProfile.launchUrl.label")}
-                          </Label>
-                          <Input
-                            id="launch-url"
-                            value={launchUrl}
-                            onChange={(e) => {
-                              setLaunchUrl(e.target.value);
-                            }}
-                            placeholder={t(
-                              "createProfile.launchUrl.placeholder",
-                            )}
-                            disabled={isCreating}
-                          />
-                        </div>
-
                         {/* DNS Blocklist */}
                         <div className="space-y-2">
                           <Label>{t("dnsBlocklist.title")}</Label>
@@ -1566,23 +1543,6 @@ export function CreateProfileDialog({
                             }}
                             placeholder={t(
                               "createProfile.launchHook.placeholder",
-                            )}
-                            disabled={isCreating}
-                          />
-                        </div>
-
-                        <div className="space-y-2">
-                          <Label htmlFor="launch-url-regular">
-                            {t("createProfile.launchUrl.label")}
-                          </Label>
-                          <Input
-                            id="launch-url-regular"
-                            value={launchUrl}
-                            onChange={(e) => {
-                              setLaunchUrl(e.target.value);
-                            }}
-                            placeholder={t(
-                              "createProfile.launchUrl.placeholder",
                             )}
                             disabled={isCreating}
                           />
