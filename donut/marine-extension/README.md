@@ -17,7 +17,7 @@
 pnpm dev:marine-extension-bridge
 ```
 
-它会打印一组 `apiBase/token`，并为 Rime 写入仅本次进程有效的 `MarineDev/etinput-runtime.json`。把这两项填进扩展侧栏的“手动配置”，重新加载扩展页面即可。开发桥只返回固定调试草稿；可用 `MARINE_DEV_DRAFT="你的测试文字"` 自定义。它不会向网页输入或发布，按 `Ctrl-C` 会清理自己拥有的 runtime 文件。真实智能体生成仍在发布前用 Marine 桌面端联调。
+它会打印一组 `apiBase/token`，并为 Rime 写入仅本次进程有效的 `MarineDev/etinput-runtime.json`。点浏览器工具栏上的 Marine 图标打开侧边栏（图标未固定时先点右上角的拼图图标 → Marine），把这两项填进“手动配置”，重新加载扩展页面即可。开发桥只返回固定调试草稿；可用 `MARINE_DEV_DRAFT="你的测试文字"` 自定义。它不会向网页输入或发布，按 `Ctrl-C` 会清理自己拥有的 runtime 文件。真实智能体生成仍在发布前用 Marine 桌面端联调。
 
 连接真实 Marine 本地 API 时，独立 Chrome 还需要在同一配置区选择一个 Marine 身份。这个选择只决定发布记录归入哪个本地身份，不会切换网站账号。
 

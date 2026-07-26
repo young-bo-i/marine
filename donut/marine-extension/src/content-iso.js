@@ -1908,19 +1908,6 @@
     marineRimeGenSync();
   }
 
-  // 右侧悬浮侧栏(panel-inject)展开时占 384px；生成 UI 定位要避开它。
-  function marineRimePanelRightInset() {
-    try {
-      const host = document.getElementById('__marine_panel_host');
-      const panel = host && host.shadowRoot && host.shadowRoot.querySelector('.m-panel');
-      if (panel && !panel.classList.contains('collapsed')) {
-        const rect = panel.getBoundingClientRect();
-        if (rect.width > 0 && rect.left < innerWidth) return Math.max(0, innerWidth - rect.left);
-      }
-    } catch (e) {}
-    return 0;
-  }
-
   // 由 marineRimeRender 每帧调用：把「生成」按钮定位到活动编辑框右上角；
   // 切到另一个 contextId 的目标时中止在途生成。
   function marineRimeGenSync() {
@@ -1939,9 +1926,7 @@
       try { rect = anchorEl.getBoundingClientRect(); } catch (e) { rect = null; }
     }
     if (rect && rect.bottom > 0 && rect.top < innerHeight) {
-      // 只有真要摆按钮时才去量侧栏宽度：这一步是一次 shadow-root querySelector
-      // 加一次布局读取，此前即使按钮根本不显示也每帧都做。
-      const rightEdge = innerWidth - marineRimePanelRightInset() - 4;
+      const rightEdge = innerWidth - 4;
       const w = els.genBtn.getBoundingClientRect().width || 64;
       const top = rect.top - 34 >= 4 ? rect.top - 34 : Math.min(innerHeight - 32, rect.bottom + 6);
       els.genBtn.classList.toggle('pending', !!active && !active.publishedContext && !marineRimeGenBusy());

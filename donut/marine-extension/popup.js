@@ -3,13 +3,6 @@
 // 选中评论/回复框后点页内浮出的「生成」按钮，结果只填草稿，绝不自动发送。
 const $ = sel => document.querySelector(sel);
 
-// 嵌入模式：作为注入网页的悬浮侧栏（panel-inject.js）加载时，URL 带 ?tabId=<宿主标签页>，
-// 面板绑定该标签页，不做跨标签重对准。无此参数则是原生侧边栏模式（沿用旧逻辑）。
-const EMBEDDED_TAB_ID = (() => {
-  const v = new URLSearchParams(location.search).get('tabId');
-  return v != null && v !== '' ? Number(v) : null;
-})();
-
 let activeTabId = null;
 let lastGrab = null;   // 最近一次抓取结果（含三块内容 + 合并 bundle）
 let grabGen = 0;       // 抓取代次：切页/重抓时作废在途请求，避免旧结果覆盖
@@ -462,13 +455,9 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
 // ---- 对准当前标签页（侧边栏常驻，切 tab / 刷新要重对准并重置）----
 let myWindowId = null;
 async function attach(reset) {
-  if (EMBEDDED_TAB_ID != null) {
-    activeTabId = EMBEDDED_TAB_ID;   // 悬浮侧栏：绑定宿主标签页
-  } else {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab) return;
-    activeTabId = tab.id;
-  }
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab) return;
+  activeTabId = tab.id;
   lastGrab = null;
   resetChips('pending');
   $('#btn-copy').disabled = true;
@@ -490,7 +479,13 @@ async function attach(reset) {
   grab();   // 自动抓取（被动，不滚动页面）
 }
 // 切标签 → 重对准并自动抓；页内导航(换视频)/整页加载完成 → 重抓（导航时清旧评论）
-chrome.tabs.onActivated.addListener(info => { if (EMBEDDED_TAB_ID == null && info.windowId === myWindowId) attach(false); });
+// `myWindowId` is best-effort (see init): if it could not be resolved, fall back
+// to re-attaching on ANY activation rather than never. This is now the ONLY
+// tab-tracking path — the injected panel used to pin itself to its host tab —
+// so failing closed here would silently freeze the panel on one tab.
+chrome.tabs.onActivated.addListener(info => {
+  if (myWindowId == null || info.windowId === myWindowId) attach(false);
+});
 chrome.tabs.onUpdated.addListener((tabId, ci) => {
   if (tabId !== activeTabId) return;
   if (ci.url) attach(true);
@@ -499,9 +494,7 @@ chrome.tabs.onUpdated.addListener((tabId, ci) => {
 
 // ---- 初始化（一次性）----
 (async function init() {
-  if (EMBEDDED_TAB_ID == null) {
-    try { const w = await chrome.windows.getCurrent(); myWindowId = w.id; } catch (e) {}
-  }
+  try { const w = await chrome.windows.getCurrent(); myWindowId = w.id; } catch (e) {}
   await resolveConfig();          // 解析 runtime-config / 手填连接
   await attach();
 
@@ -538,7 +531,8 @@ $('#dbg-clear').addEventListener('click', async () => {
   const b = $('#dbg-log'); if (b) b.innerHTML = '';
   try { await send('CLEAR_LOGS'); } catch (e) {}
 });
-// 多级导出：剪贴板 → execCommand → 下载文件（注入式悬浮侧栏里剪贴板会被 iframe 权限策略挡）。
+// 多级导出：剪贴板 → execCommand → 下载文件。原因曾是注入式悬浮侧栏的 iframe 权限策略
+// 会挡掉剪贴板；那个面板已移除，但侧边栏失焦时 navigator.clipboard 仍会被拒，兜底照旧。
 async function exportSnapshotText(text, filename) {
   try { await navigator.clipboard.writeText(text); return 'clipboard'; } catch (e) {}
   try {

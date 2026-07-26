@@ -594,7 +594,7 @@ async function main() {
     assert.equal(publishedCall.body.parent_id, "42");
     assert.equal(JSON.stringify(publishedCall.body).includes("private-token"), false);
     await evaluate(client, "window.fixtureRestorePublishedIntrinsics(); true");
-    // Let extension content scripts and the injected panel settle first.  A
+    // Let extension content scripts settle first.  A
     // headless Chrome window can emit an initial blur while those targets are
     // being created; force a fresh focus transition afterwards.
     await delay(500);
@@ -614,8 +614,22 @@ async function main() {
     assert.equal(directPut.body.target, null);
     assert.equal(directPut.body.updatedAt > 1_000_000_000_000, true);
     assert.equal(directPut.contextId.includes("fixture-profile"), false);
-    assert.deepEqual(Object.keys(directPut.body.payload), ["context", "article"]);
-    assert.equal(directPut.body.payload.context.source, "article");
+    // `comments`, not `article`, and that is the DOCUMENTED priority: for
+    // bilibili `rime-context.js` picks subtitle → comments → article, and this
+    // fixture has no subtitle while the publish step above (line ~585) has
+    // already put one captured comment in the buffer.
+    //
+    // This assertion used to expect `article`, which was an artifact of the
+    // injected floating panel: that panel kept a popup alive on every page, and
+    // its `attach(reset=true)` sent `RESET_COMMENTS` — the ONLY sender of that
+    // message — wiping the capture buffer somewhere between the publish and this
+    // PUT. So the old source depended on panel timing rather than on the stated
+    // rule. With the panel gone the choice is deterministic. The `article` path
+    // stays covered by chrome-site-targets-e2e.mjs, which asserts
+    // `payload.article.markdown` for the zhihu answer/article cases.
+    assert.deepEqual(Object.keys(directPut.body.payload), ["context", "comments"]);
+    assert.equal(directPut.body.payload.context.source, "comments");
+    assert.match(directPut.body.payload.comments.agentMd, /真实发布回执测试/);
     assert.equal(directPut.body.payload.context.mode, "direct");
     assert.equal(directPut.body.payload.context.platform, "bilibili");
     assert.equal(directPut.body.payload.context.url, "https://www.bilibili.com/video/BVFIXTURE");
@@ -839,20 +853,6 @@ async function main() {
         const response = await fetch(`http://127.0.0.1:${debugPort}/json/list`);
         const list = await response.json();
         console.error("CDP targets:", JSON.stringify(list.map(({ type, url }) => ({ type, url }))));
-        const popup = list.find((target) =>
-          target.type === "iframe" && String(target.url || "").includes("popup.html?tabId="));
-        if (popup?.webSocketDebuggerUrl) {
-          const popupClient = new CDPClient(popup.webSocketDebuggerUrl);
-          try {
-            await popupClient.open();
-            await popupClient.send("Runtime.enable");
-            const diagnostics = await evaluate(popupClient,
-              "send('GET_RIME_DIAGNOSTICS').then((result) => result && result.events)");
-            console.error("Rime diagnostics:", JSON.stringify((diagnostics || []).slice(-30)));
-          } finally {
-            popupClient.close();
-          }
-        }
       } catch {}
     }
     if (chromeStderr.trim()) console.error(chromeStderr.trim());

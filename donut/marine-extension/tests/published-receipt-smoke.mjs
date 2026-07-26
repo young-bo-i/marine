@@ -1223,13 +1223,25 @@ assert.ok(
 );
 assert.equal(isoEntry.js.some((f) => f.startsWith("src/platforms/")), false);
 
-// Only `popup.html` is loaded BY a page (panel-inject iframes it). Everything
-// else — popup.css/popup.js as its own subresources, skills/* fetched by the
-// service worker — is read from an extension context and needs no exposure.
-// Listing them let any site fetch `chrome-extension://<fixed-id>/skills/...`
-// and lift the whole talk-track corpus, so keep this list minimal.
-assert.deepEqual(manifest.web_accessible_resources[0].resources, ["popup.html"]);
-assert.equal(manifest.web_accessible_resources.length, 1);
+// NOTHING is web-accessible any more. `popup.html` was exposed for exactly one
+// reason — the injected floating panel iframed it FROM the page — and that panel
+// is gone. The native side panel loads popup.html from an extension context, so
+// no exposure is needed. Keep this at zero: anything listed here can be fetched
+// by ANY site off a fixed extension id, which for `skills/*` would hand over the
+// whole talk-track corpus.
+assert.equal(
+  manifest.web_accessible_resources,
+  undefined,
+  "web_accessible_resources must stay absent — nothing should be page-reachable",
+);
+// And no content script may reintroduce the panel.
+assert.equal(
+  manifest.content_scripts.some((entry) =>
+    entry.js.some((file) => file.includes("panel-inject")),
+  ),
+  false,
+  "the injected floating panel must not come back",
+);
 assert.doesNotMatch(contentIsoSource, /published-comment|__marinePublishedComment/);
 assert.match(popupSource, /lastGrab\.platform === 'bilibili'/);
 assert.match(popupSource, /window\.prompt\('请确认实际发布的文字/);

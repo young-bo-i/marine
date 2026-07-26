@@ -1017,10 +1017,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     marineRecordGenFill(sender && sender.tab && sender.tab.id, msg.text);
     return; // 无需回应
   }
-  if (msg && msg.__marineGetTabId) {
-    sendResponse({ tabId: sender.tab && sender.tab.id });
-    return true;
-  }
   if (msg && msg.__marinePublishedComment) {
     void marineAcceptPublishedReceipt(msg.receipt, sender)
       .then(sendResponse)
