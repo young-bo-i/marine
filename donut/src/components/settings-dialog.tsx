@@ -156,7 +156,7 @@ export function SettingsDialog({
   // Encryption is available to everyone except team members who aren't owners
   const canUseEncryption =
     cloudUser == null ||
-    cloudUser.plan !== "team" ||
+    cloudUser.teamId == null ||
     cloudUser.teamRole === "owner";
   const {
     currentLanguage,
@@ -1003,7 +1003,7 @@ export function SettingsDialog({
 
               {!canUseEncryption ? (
                 <p className="text-sm text-muted-foreground">
-                  {t("settings.encryption.requiresProOrOwner")}
+                  {t("settings.encryption.requiresTeamOwner")}
                 </p>
               ) : hasE2ePassword ? (
                 <div className="space-y-3">

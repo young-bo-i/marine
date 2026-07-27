@@ -418,10 +418,8 @@ impl SyncProgressTracker {
 
 /// Check if sync is configured (cloud or self-hosted)
 pub fn is_sync_configured() -> bool {
-  // Cloud backup is a plan capability. Every paid plan (incl. the future
-  // "starter" tier) grants it, but gating on the capability — not just "is paid"
-  // — keeps this correct if a plan without cloud backup is ever added.
-  if crate::cloud_auth::CLOUD_AUTH.can_use_cloud_backup_sync() {
+  // A cloud session is itself a sync configuration.
+  if crate::cloud_auth::CLOUD_AUTH.is_logged_in_sync() {
     return true;
   }
   let manager = SettingsManager::instance();

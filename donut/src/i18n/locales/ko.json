@@ -165,7 +165,6 @@
       "passwordSaved": "암호화 비밀번호가 설정되었습니다",
       "passwordMismatch": "비밀번호가 일치하지 않습니다",
       "passwordTooShort": "비밀번호는 8자 이상이어야 합니다",
-      "requiresProOrOwner": "프로필 암호화는 Pro 사용자 및 팀 소유자만 사용할 수 있습니다.",
       "validatePassword": "확인",
       "validateDialog": {
         "title": "암호화 비밀번호 확인",
@@ -173,16 +172,8 @@
         "submit": "확인",
         "matchToast": "비밀번호가 일치합니다",
         "mismatchToast": "비밀번호가 일치하지 않습니다"
-      }
-    },
-    "commercial": {
-      "title": "상업용 라이선스",
-      "trialActive": "체험판: {{days}}일 {{hours}}시간 남음",
-      "trialActiveDescription": "체험 기간 동안 상업적 사용은 무료입니다. 체험이 종료되면 모든 기능은 계속 작동합니다 — 개인 사용은 무료로 유지되며 상업적 사용만 라이선스가 필요합니다.",
-      "trialExpired": "체험판이 만료되었습니다",
-      "trialExpiredDescription": "개인 사용은 무료로 유지됩니다. 상업적 사용에는 라이선스가 필요합니다.",
-      "subscriptionActive": "구독 중 — {{plan}} 플랜",
-      "subscriptionActiveDescription": "Marine 구독이 활성 상태입니다. 플랜 기간 동안 상업적 사용이 라이선스됩니다."
+      },
+      "requiresTeamOwner": "프로필 암호화는 팀 소유자만 변경할 수 있습니다."
     },
     "advanced": {
       "title": "고급",
@@ -271,7 +262,6 @@
       "stopLeader": "이 프로필과 모든 팔로워 중지",
       "stopFollower": "{{leaderName}}의 작업을 따르는 중",
       "desyncedTooltip": "{{url}}에서 동기화 실패",
-      "paidFeature": "동기화는 유료 기능입니다",
       "wayfernOnly": "Wayfern 프로필만 동기화할 수 있습니다",
       "selectFollowers": "팔로워 프로필 선택",
       "selectFollowersDesc": "리더 프로필의 작업을 미러링할 프로필을 선택하세요. 중지된 Wayfern 프로필만 선택할 수 있습니다.",
@@ -308,8 +298,7 @@
       "assignExtensionGroup": "확장 프로그램 그룹 할당",
       "copyCookies": "쿠키 복사",
       "runSelected": "선택 실행",
-      "stopSelected": "선택 중지",
-      "proRequired": "대량 실행/중지하려면 Pro 플랜이 필요합니다"
+      "stopSelected": "선택 중지"
     },
     "passwordProtectedBadge": "비밀번호 보호됨",
     "launchHook": {
@@ -646,7 +635,6 @@
       "verifyAndLogin": "확인 및 로그인",
       "loggingIn": "로그인 중...",
       "connected": "연결됨",
-      "plan": "플랜",
       "profiles": "프로필",
       "profileUsage": "{{used}} / {{limit}}",
       "manageAccount": "계정 관리",
@@ -892,8 +880,7 @@
       "selectFile": "파일 선택",
       "preview": "{{count}}개 쿠키 발견",
       "success": "{{imported}}개 쿠키를 가져왔습니다 ({{replaced}}개 교체됨)",
-      "error": "쿠키 가져오기 실패",
-      "proFeature": "쿠키 가져오기는 Pro 기능입니다"
+      "error": "쿠키 가져오기 실패"
     },
     "export": {
       "title": "쿠키 내보내기",
@@ -1101,7 +1088,6 @@
     "productSub": "제품 보조",
     "brand": "브랜드",
     "brandVersion": "브랜드 버전",
-    "proFeature": "이것은 Pro 기능입니다",
     "generateFingerprint": "핑거프린트 생성",
     "refreshFingerprint": "핑거프린트 새로 고침",
     "canvasNoiseSeedPlaceholder": "캔버스 핑거프린트의 시드 문자열 입력",
@@ -1242,9 +1228,7 @@
       "cannotWhileRunning": "비밀번호를 변경하기 전에 프로필을 중지하세요."
     },
     "fingerprint": {
-      "notSupported": "핑거프린트 편집은 Camoufox 및 Wayfern 프로필에서만 사용할 수 있습니다.",
-      "lockedTitle": "핑거프린트 보기 및 편집은 Pro 기능입니다",
-      "lockedDescription": "핑거프린트 보호는 모든 요금제에 포함되어 있습니다. 프로필의 핑거프린트 값을 보고 편집하려면 활성 유료 요금제가 필요합니다."
+      "notSupported": "핑거프린트 편집은 Camoufox 및 Wayfern 프로필에서만 사용할 수 있습니다."
     },
     "syncStatusValue": {
       "waiting": "대기 중",
@@ -1261,7 +1245,6 @@
     "extensionsTab": "확장 프로그램",
     "groupsTab": "그룹",
     "managedNotice": "여기서 관리되는 확장 프로그램은 실행 시 프로필에 수동으로 설치된 확장 프로그램을 대체합니다.",
-    "proRequired": "확장 프로그램 관리는 Pro 기능입니다",
     "empty": "아직 업로드된 확장 프로그램이 없습니다.",
     "noGroups": "아직 생성된 확장 프로그램 그룹이 없습니다.",
     "createGroup": "그룹 생성",
@@ -1321,14 +1304,6 @@
       "groupsDescription": "{{count}}개의 확장 프로그램 그룹을 삭제하시겠습니까? {{names}}",
       "confirmButton": "삭제"
     }
-  },
-  "pro": {
-    "badge": "PRO",
-    "fingerprintLocked": "핑거프린트 편집은 Pro 기능입니다",
-    "cookieCopyLocked": "쿠키 복사는 Pro 기능입니다",
-    "cookieImportLocked": "쿠키 가져오기는 Pro 기능입니다",
-    "cookieExportLocked": "쿠키 내보내기는 Pro 기능입니다",
-    "cookieManagementLocked": "쿠키 관리는 Pro 기능입니다"
   },
   "dnsBlocklist": {
     "title": "DNS 차단 목록",
@@ -1596,14 +1571,6 @@
     "acceptFailed": "약관 동의 실패",
     "tryAgain": "다시 시도하세요"
   },
-  "commercialTrial": {
-    "title": "상업용 체험판 만료됨",
-    "description": "2주 상업용 체험판 기간이 종료되었습니다.",
-    "body": "Marine를 비즈니스 용도로 사용하는 경우 계속 사용하려면 상업용 라이선스를 구매해야 합니다. 개인 용도로는 계속 무료로 사용할 수 있습니다.",
-    "understandButton": "이해했습니다",
-    "failed": "확인 저장 실패",
-    "tryAgain": "다시 시도하세요"
-  },
   "permissionDialog": {
     "titleMicrophone": "마이크 액세스가 필요합니다",
     "titleCamera": "카메라 액세스가 필요합니다",
@@ -1864,7 +1831,6 @@
     "cookieDbLocked": "쿠키를 읽을 수 없습니다 — 데이터베이스가 잠겨 있습니다. 브라우저를 닫고 다시 시도하세요.",
     "cookieDbUnavailable": "쿠키를 읽을 수 없습니다 — 쿠키 저장소를 사용할 수 없습니다.",
     "selfHostedRequiresLogout": "자체 호스팅 서버를 구성하기 전에 Marine 계정에서 로그아웃하세요.",
-    "fingerprintRequiresPro": "핑거프린트를 보거나 편집하려면 활성 유료 요금제가 필요합니다. 보호 기능은 모든 요금제에 포함되어 있습니다.",
     "proxyNotWorking": "선택한 프록시가 작동하지 않아 프로필이 생성되지 않았습니다.",
     "proxyPaymentRequired": "선택한 프록시는 결제가 필요합니다(402). 구독이 만료되었을 수 있어 프로필이 생성되지 않았습니다.",
     "vpnNotWorking": "선택한 VPN이 작동하지 않아 프로필이 생성되지 않았습니다.",
@@ -1879,7 +1845,8 @@
     "marineGenerateFailed": "생성에 실패했습니다. {{detail}}",
     "marineGenerateTimeout": "생성 시간이 초과되었습니다.",
     "marineFillFailed": "답글창에 입력할 수 없습니다. {{detail}}",
-    "marineMarkPostedFailed": "게시됨으로 표시할 수 없습니다. {{detail}}"
+    "marineMarkPostedFailed": "게시됨으로 표시할 수 없습니다. {{detail}}",
+    "teamOwnerOnly": "암호화 비밀번호는 팀 소유자만 변경할 수 있습니다."
   },
   "rail": {
     "profiles": "프로필",
@@ -1939,15 +1906,11 @@
     "loggedOut": "로그아웃됨",
     "signedOut": "로그아웃됨",
     "signedOutDescription": "클라우드 동기화, 암호화된 프로필 및 팀 기능을 사용하려면 로그인하세요.",
-    "plan": "플랜: {{plan}} · {{period}}",
     "refresh": "새로 고침",
     "logout": "로그아웃",
     "signIn": "로그인",
     "fields": {
-      "plan": "플랜",
-      "status": "상태",
       "teamRole": "팀 역할",
-      "period": "결제 기간",
       "device": "기기"
     },
     "tabs": {
@@ -1963,9 +1926,7 @@
       "testConnection": "연결 테스트",
       "disconnect": "연결 해제"
     },
-    "deviceOrdinal": "{{count}}대 중 {{ordinal}}번째",
-    "automationPrimaryOnly": "브라우저 자동화는 기본 기기(기기 1)에서만 실행됩니다. 여기서 사용하려면 해당 기기에서 로그아웃하세요.",
-    "automationActiveHere": "이 기기에서 브라우저 자동화가 활성화되어 있습니다."
+    "deviceOrdinal": "{{count}}대 중 {{ordinal}}번째"
   },
   "shortcutsPage": {
     "title": "키보드 단축키",
@@ -2083,15 +2044,8 @@
       "body": "Marine는 오픈 소스이며 무료로 사용할 수 있습니다.",
       "agree": "이해했습니다",
       "personalTitle": "개인 사용",
-      "personalDesc": "영구적으로 무료입니다.",
-      "commercialTitle": "상업적 사용",
-      "trialBadge": "2주 무료",
-      "commercialDesc": "2주간의 평가 기간 동안 무료입니다. 이후에는 유료 요금제가 필요하며, 이를 통해 프로젝트가 유지되고 발전할 수 있습니다."
+      "personalDesc": "영구적으로 무료입니다."
     }
-  },
-  "wayfernBlocked": {
-    "title": "브라우저 자동화가 일시 중지됨",
-    "description": "보통 여러 기기에서 동시에 로그인하여 계정의 Pro 브라우저 기능이 일시적으로 제한되었습니다. 다른 기기에서 로그아웃한 후 프로필을 다시 실행하면 복원됩니다."
   },
   "camoufoxDeprecation": {
     "title": "Camoufox 지원이 종료됩니다",

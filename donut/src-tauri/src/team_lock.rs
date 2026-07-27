@@ -584,7 +584,7 @@ impl ProfileLockManager {
 }
 
 /// Acquire the cross-device profile lock before a launch. Cloud mode uses the
-/// cloud lock API (paid feature, unchanged); self-hosted token-mode sync uses
+/// cloud lock API; self-hosted token-mode sync uses
 /// the donut-sync server's `/v1/locks/*`. Called from EVERY launch entry point
 /// (GUI, MCP, API), so a profile open on one device cannot be opened on
 /// another — the concurrent-use pattern that produced sync conflicts and eaten
@@ -596,8 +596,8 @@ pub async fn acquire_team_lock_if_needed(
     return Ok(());
   }
 
-  // Cloud path (unchanged): requires a paid subscription.
-  if CLOUD_AUTH.has_active_paid_subscription().await {
+  // Cloud path: used whenever this device has a cloud session.
+  if CLOUD_AUTH.is_logged_in().await {
     // Ensure lock manager is connected
     if !PROFILE_LOCK.is_connected().await {
       PROFILE_LOCK.connect().await;
@@ -616,17 +616,15 @@ pub async fn acquire_team_lock_if_needed(
     return PROFILE_LOCK.acquire_lock(&profile.id.to_string()).await;
   }
 
-  // Self-hosted path: the server-side acquire is authoritative (it atomically
-  // checks-and-takes), so no local pre-check is needed.
-  if !CLOUD_AUTH.is_logged_in().await {
-    if let Some(cfg) = self_hosted_config() {
-      if !PROFILE_LOCK.is_connected().await {
-        PROFILE_LOCK.connect().await;
-      }
-      return PROFILE_LOCK
-        .acquire_lock_self_hosted(&cfg, &profile.id.to_string())
-        .await;
+  // Self-hosted path (no cloud session): the server-side acquire is
+  // authoritative (it atomically checks-and-takes), so no local pre-check.
+  if let Some(cfg) = self_hosted_config() {
+    if !PROFILE_LOCK.is_connected().await {
+      PROFILE_LOCK.connect().await;
     }
+    return PROFILE_LOCK
+      .acquire_lock_self_hosted(&cfg, &profile.id.to_string())
+      .await;
   }
 
   Ok(())
@@ -639,19 +637,17 @@ pub async fn release_team_lock_if_needed(profile: &crate::profile::BrowserProfil
     return;
   }
 
-  if CLOUD_AUTH.has_active_paid_subscription().await {
+  if CLOUD_AUTH.is_logged_in().await {
     if let Err(e) = PROFILE_LOCK.release_lock(&profile.id.to_string()).await {
       log::warn!("Failed to release profile lock for {}: {e}", profile.id);
     }
     return;
   }
 
-  if !CLOUD_AUTH.is_logged_in().await {
-    if let Some(cfg) = self_hosted_config() {
-      PROFILE_LOCK
-        .release_lock_self_hosted(&cfg, &profile.id.to_string())
-        .await;
-    }
+  if let Some(cfg) = self_hosted_config() {
+    PROFILE_LOCK
+      .release_lock_self_hosted(&cfg, &profile.id.to_string())
+      .await;
   }
 }
 

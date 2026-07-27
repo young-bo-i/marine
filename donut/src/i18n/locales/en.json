@@ -165,7 +165,6 @@
       "passwordSaved": "Encryption password set",
       "passwordMismatch": "Passwords do not match",
       "passwordTooShort": "Password must be at least 8 characters",
-      "requiresProOrOwner": "Profile encryption is available for Pro users and team owners.",
       "validatePassword": "Validate",
       "validateDialog": {
         "title": "Validate Encryption Password",
@@ -173,16 +172,8 @@
         "submit": "Validate",
         "matchToast": "Password is correct",
         "mismatchToast": "Password does not match"
-      }
-    },
-    "commercial": {
-      "title": "Commercial License",
-      "trialActive": "Trial: {{days}} days, {{hours}} hours remaining",
-      "trialActiveDescription": "Commercial use is free during the trial. When it ends, all features keep working — personal use stays free, only commercial use will require a license.",
-      "trialExpired": "Trial expired",
-      "trialExpiredDescription": "Personal use remains free. Commercial use requires a license.",
-      "subscriptionActive": "Subscribed — {{plan}} plan",
-      "subscriptionActiveDescription": "Your Marine subscription is active. Commercial use is licensed for the duration of your plan."
+      },
+      "requiresTeamOwner": "Only the team owner can change profile encryption."
     },
     "advanced": {
       "title": "Advanced",
@@ -271,7 +262,6 @@
       "stopLeader": "Stop this profile and all its followers",
       "stopFollower": "Following actions of {{leaderName}}",
       "desyncedTooltip": "Synchronization failed at {{url}}",
-      "paidFeature": "Synchronizer is a paid feature",
       "wayfernOnly": "Only Wayfern profiles can be synchronized",
       "selectFollowers": "Select Follower Profiles",
       "selectFollowersDesc": "Choose profiles that will mirror the actions of the leader profile. Only stopped Wayfern profiles can be selected.",
@@ -308,8 +298,7 @@
       "assignExtensionGroup": "Assign Extension Group",
       "copyCookies": "Copy Cookies",
       "runSelected": "Run selected",
-      "stopSelected": "Stop selected",
-      "proRequired": "Pro plan required for bulk run/stop"
+      "stopSelected": "Stop selected"
     },
     "passwordProtectedBadge": "Password Protected",
     "launchHook": {
@@ -646,7 +635,6 @@
       "verifyAndLogin": "Verify & Log In",
       "loggingIn": "Logging in...",
       "connected": "Connected",
-      "plan": "Plan",
       "profiles": "Profiles",
       "profileUsage": "{{used}} / {{limit}}",
       "manageAccount": "Manage Account",
@@ -892,8 +880,7 @@
       "selectFile": "Choose File",
       "preview": "{{count}} cookies found",
       "success": "Successfully imported {{imported}} cookies ({{replaced}} replaced)",
-      "error": "Failed to import cookies",
-      "proFeature": "Cookie import is a Pro feature"
+      "error": "Failed to import cookies"
     },
     "export": {
       "title": "Export Cookies",
@@ -1101,7 +1088,6 @@
     "productSub": "Product Sub",
     "brand": "Brand",
     "brandVersion": "Brand Version",
-    "proFeature": "This is a Pro feature",
     "generateFingerprint": "Generate Fingerprint",
     "refreshFingerprint": "Refresh Fingerprint",
     "canvasNoiseSeedPlaceholder": "Enter a seed string for canvas fingerprint",
@@ -1242,9 +1228,7 @@
       "cannotWhileRunning": "Stop the profile before changing its password."
     },
     "fingerprint": {
-      "notSupported": "Fingerprint editing is only available for Camoufox and Wayfern profiles.",
-      "lockedTitle": "Viewing & editing the fingerprint is a Pro feature",
-      "lockedDescription": "Fingerprint protection is included on every plan. Viewing and editing a profile's fingerprint values is what requires an active paid plan."
+      "notSupported": "Fingerprint editing is only available for Camoufox and Wayfern profiles."
     },
     "syncStatusValue": {
       "waiting": "Waiting",
@@ -1261,7 +1245,6 @@
     "extensionsTab": "Extensions",
     "groupsTab": "Groups",
     "managedNotice": "Extensions managed here will replace any manually installed extensions in profiles when launched.",
-    "proRequired": "Extension management is a Pro feature",
     "empty": "No extensions uploaded yet.",
     "noGroups": "No extension groups created yet.",
     "createGroup": "Create Group",
@@ -1321,14 +1304,6 @@
       "groupsDescription": "Delete {{count}} extension groups? {{names}}",
       "confirmButton": "Delete"
     }
-  },
-  "pro": {
-    "badge": "PRO",
-    "fingerprintLocked": "Fingerprint editing is a Pro feature",
-    "cookieCopyLocked": "Cookie copying is a Pro feature",
-    "cookieImportLocked": "Cookie import is a Pro feature",
-    "cookieExportLocked": "Cookie export is a Pro feature",
-    "cookieManagementLocked": "Cookie management is a Pro feature"
   },
   "dnsBlocklist": {
     "title": "DNS Blocklist",
@@ -1596,14 +1571,6 @@
     "acceptFailed": "Failed to accept terms",
     "tryAgain": "Please try again"
   },
-  "commercialTrial": {
-    "title": "Commercial Trial Expired",
-    "description": "Your 2-week commercial trial period has ended.",
-    "body": "If you are using Marine for business purposes, you need to purchase a commercial license to continue. You can still use it for personal use for free.",
-    "understandButton": "I Understand",
-    "failed": "Failed to save acknowledgment",
-    "tryAgain": "Please try again"
-  },
   "permissionDialog": {
     "titleMicrophone": "Microphone Access Required",
     "titleCamera": "Camera Access Required",
@@ -1864,7 +1831,6 @@
     "cookieDbLocked": "Could not read cookies — the database is locked. Close the browser and try again.",
     "cookieDbUnavailable": "Could not read cookies — the cookie store is unavailable.",
     "selfHostedRequiresLogout": "Sign out of your Marine account before configuring a self-hosted server.",
-    "fingerprintRequiresPro": "Viewing or editing the fingerprint requires an active paid plan. Protection is included on all plans.",
     "proxyNotWorking": "The selected proxy isn't working, so the profile wasn't created.",
     "proxyPaymentRequired": "The selected proxy requires payment (402) — its subscription may have expired — so the profile wasn't created.",
     "vpnNotWorking": "The selected VPN isn't working, so the profile wasn't created.",
@@ -1879,7 +1845,8 @@
     "marineGenerateFailed": "Generation failed. {{detail}}",
     "marineGenerateTimeout": "Generation timed out.",
     "marineFillFailed": "Couldn't fill the reply box. {{detail}}",
-    "marineMarkPostedFailed": "Couldn't mark as posted. {{detail}}"
+    "marineMarkPostedFailed": "Couldn't mark as posted. {{detail}}",
+    "teamOwnerOnly": "Only the team owner can change the encryption password."
   },
   "rail": {
     "profiles": "Profiles",
@@ -1939,15 +1906,11 @@
     "loggedOut": "Logged out",
     "signedOut": "Signed out",
     "signedOutDescription": "Sign in to enable cloud sync, encrypted profiles, and team features.",
-    "plan": "Plan: {{plan}} · {{period}}",
     "refresh": "Refresh",
     "logout": "Sign out",
     "signIn": "Sign in",
     "fields": {
-      "plan": "Plan",
-      "status": "Status",
       "teamRole": "Team role",
-      "period": "Billing period",
       "device": "Device"
     },
     "tabs": {
@@ -1963,9 +1926,7 @@
       "testConnection": "Test connection",
       "disconnect": "Disconnect"
     },
-    "deviceOrdinal": "{{ordinal}} of {{count}}",
-    "automationPrimaryOnly": "Browser automation runs only on your primary device (Device 1). Sign out there to use it here.",
-    "automationActiveHere": "Browser automation is active on this device."
+    "deviceOrdinal": "{{ordinal}} of {{count}}"
   },
   "shortcutsPage": {
     "title": "Keyboard shortcuts",
@@ -2083,15 +2044,8 @@
       "body": "Marine is open source and free to use.",
       "agree": "I understand",
       "personalTitle": "Personal use",
-      "personalDesc": "Free forever.",
-      "commercialTitle": "Commercial use",
-      "trialBadge": "2 weeks free",
-      "commercialDesc": "Free for a 2-week evaluation. After that, a paid plan keeps the project maintained and thriving."
+      "personalDesc": "Free forever."
     }
-  },
-  "wayfernBlocked": {
-    "title": "Browser automation paused",
-    "description": "Your account was temporarily restricted from Pro browser features, usually from signing in on multiple devices at once. Sign out of other devices, then relaunch the profile to restore it."
   },
   "camoufoxDeprecation": {
     "title": "Camoufox support is ending",

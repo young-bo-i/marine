@@ -360,13 +360,14 @@ pub async fn delete_e2e_password() -> Result<(), String> {
   remove_e2e_password()
 }
 
-/// On Team plans, only the team owner is allowed to flip the E2E password
-/// state — otherwise members could lock each other out by changing the key.
+/// Inside a shared team, only the owner may flip the E2E password state —
+/// otherwise members could lock each other out by changing the key. This keys
+/// on actual team membership, not on a plan name.
 async fn enforce_team_owner_for_encryption_change() -> Result<(), String> {
   use crate::cloud_auth::CLOUD_AUTH;
   if let Some(state) = CLOUD_AUTH.get_user().await {
-    if state.user.plan == "team" && state.user.team_role.as_deref() != Some("owner") {
-      return Err("TEAM_OWNER_ONLY".to_string());
+    if state.user.team_id.is_some() && state.user.team_role.as_deref() != Some("owner") {
+      return Err(serde_json::json!({ "code": "TEAM_OWNER_ONLY" }).to_string());
     }
   }
   Ok(())

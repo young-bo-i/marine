@@ -5,7 +5,6 @@ import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   LuArrowRight,
-  LuBriefcase,
   LuCookie,
   LuFolders,
   LuGithub,
@@ -228,20 +227,6 @@ export function WelcomeDialog({
                     </dt>
                     <dd className="text-sm text-pretty text-muted-foreground">
                       {t("welcome.license.personalDesc")}
-                    </dd>
-                  </div>
-                </div>
-                <div className="flex items-start gap-3 rounded-lg border p-4">
-                  <LuBriefcase className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-                  <div className="flex flex-col gap-0.5 text-left">
-                    <dt className="flex items-center gap-2 text-sm font-medium text-foreground">
-                      {t("welcome.license.commercialTitle")}
-                      <span className="rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
-                        {t("welcome.license.trialBadge")}
-                      </span>
-                    </dt>
-                    <dd className="text-sm text-pretty text-muted-foreground">
-                      {t("welcome.license.commercialDesc")}
                     </dd>
                   </div>
                 </div>

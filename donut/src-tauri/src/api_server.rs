@@ -1470,9 +1470,6 @@ impl ApiServer {
 
     let v1_routes = v1_routes
       .layer(Extension(RimeContextStore::default()))
-      // Inert chokepoint (innermost → runs after auth) for the future per-hour
-      // automation request limit. See rate_limit_middleware.
-      .layer(middleware::from_fn(rate_limit_middleware))
       .layer(middleware::from_fn_with_state(
         state.clone(),
         auth_middleware,
@@ -1729,25 +1726,6 @@ async fn request_logging_middleware(request: axum::extract::Request, next: Next)
   response
 }
 
-/// Chokepoint for the future per-hour automation request limit. The limit
-/// (`requests_per_hour`, default 100) is already plumbed through entitlements;
-/// this middleware is intentionally inert today — it never blocks.
-///
-/// It must also not *read* the limit while inert. `requests_per_hour()` locks
-/// the global `CLOUD_AUTH` state, and that same lock is held across a blocking
-/// `fs::write` in `store_auth_state` during the periodic cloud refresh — so
-/// resolving a value we then discard made every local API request serialize
-/// behind a disk write. To enforce, count authenticated requests per rolling
-/// hour (reading the limit once and caching it, not per request) and return
-/// `StatusCode::TOO_MANY_REQUESTS` once the limit (when > 0) is exceeded.
-async fn rate_limit_middleware(
-  request: axum::extract::Request,
-  next: Next,
-) -> Result<Response, StatusCode> {
-  // TODO(rate-limit): enforce `CLOUD_AUTH.requests_per_hour()` for automation routes.
-  Ok(next.run(request).await)
-}
-
 // Global API server instance
 lazy_static! {
   pub static ref API_SERVER: Arc<Mutex<ApiServer>> = Arc::new(Mutex::new(ApiServer::new()));
@@ -1787,7 +1765,7 @@ pub async fn get_api_server_status() -> Result<Option<u16>, String> {
 /// Serialize a browser config (camoufox/wayfern) to JSON for an API response.
 /// Viewing a profile's fingerprint is available to every API caller; only
 /// editing it (via `update_profile`) and launching/killing profiles
-/// programmatically require an active paid plan.
+/// programmatically are always available.
 fn config_to_api_value<T: serde::Serialize>(config: Option<&T>) -> Option<serde_json::Value> {
   serde_json::to_value(config?).ok()
 }
@@ -2153,14 +2131,6 @@ async fn update_profile(
   }
 
   if let Some(camoufox_config) = request.camoufox_config {
-    // Editing a profile's fingerprint config is part of the cross-OS fingerprint
-    // capability (GUI, API, MCP). Viewing it is free; mutating it is not.
-    if !crate::cloud_auth::CLOUD_AUTH
-      .can_use_cross_os_fingerprints()
-      .await
-    {
-      return Err(StatusCode::PAYMENT_REQUIRED);
-    }
     let config: Result<CamoufoxConfig, _> = serde_json::from_value(camoufox_config);
     match config {
       Ok(config) => {
@@ -2973,13 +2943,6 @@ async fn run_profile(
   State(state): State<ApiServerState>,
   Json(request): Json<RunProfileRequest>,
 ) -> Result<Json<RunProfileResponse>, StatusCode> {
-  if !crate::cloud_auth::CLOUD_AUTH
-    .can_use_browser_automation()
-    .await
-  {
-    return Err(StatusCode::PAYMENT_REQUIRED);
-  }
-
   let headless = request.headless.unwrap_or(false);
   let url = request.url;
 
@@ -3059,13 +3022,6 @@ async fn open_url_in_profile(
   State(state): State<ApiServerState>,
   Json(request): Json<OpenUrlRequest>,
 ) -> Result<StatusCode, StatusCode> {
-  if !crate::cloud_auth::CLOUD_AUTH
-    .can_use_browser_automation()
-    .await
-  {
-    return Err(StatusCode::PAYMENT_REQUIRED);
-  }
-
   let browser_runner = crate::browser_runner::BrowserRunner::instance();
 
   browser_runner
@@ -3086,7 +3042,6 @@ async fn open_url_in_profile(
   responses(
     (status = 204, description = "Browser process killed successfully"),
     (status = 401, description = "Unauthorized"),
-    (status = 402, description = "Active paid plan required"),
     (status = 404, description = "Profile not found"),
     (status = 500, description = "Internal server error")
   ),
@@ -3099,15 +3054,6 @@ async fn kill_profile(
   Path(id): Path<String>,
   State(state): State<ApiServerState>,
 ) -> Result<StatusCode, StatusCode> {
-  // Programmatically launching and stopping profiles is a paid feature; the
-  // run/open-url handlers gate the same way.
-  if !crate::cloud_auth::CLOUD_AUTH
-    .can_use_browser_automation()
-    .await
-  {
-    return Err(StatusCode::PAYMENT_REQUIRED);
-  }
-
   let profile_manager = ProfileManager::instance();
   let profiles = profile_manager
     .list_profiles()
@@ -3139,7 +3085,6 @@ async fn kill_profile(
   responses(
     (status = 200, description = "Batch launch completed; inspect per-profile results", body = BatchRunResponse),
     (status = 401, description = "Unauthorized"),
-    (status = 402, description = "Active paid plan with browser automation required"),
     (status = 500, description = "Internal server error")
   ),
   security(
@@ -3151,13 +3096,6 @@ async fn batch_run_profiles(
   State(state): State<ApiServerState>,
   Json(request): Json<BatchRunRequest>,
 ) -> Result<Json<BatchRunResponse>, StatusCode> {
-  if !crate::cloud_auth::CLOUD_AUTH
-    .can_use_browser_automation()
-    .await
-  {
-    return Err(StatusCode::PAYMENT_REQUIRED);
-  }
-
   let headless = request.headless.unwrap_or(false);
   let profile_manager = ProfileManager::instance();
   let profiles = profile_manager
@@ -3234,7 +3172,6 @@ async fn batch_run_profiles(
   responses(
     (status = 200, description = "Batch stop completed; inspect per-profile results", body = BatchStopResponse),
     (status = 401, description = "Unauthorized"),
-    (status = 402, description = "Active paid plan with browser automation required"),
     (status = 500, description = "Internal server error")
   ),
   security(
@@ -3246,13 +3183,6 @@ async fn batch_stop_profiles(
   State(state): State<ApiServerState>,
   Json(request): Json<BatchStopRequest>,
 ) -> Result<Json<BatchStopResponse>, StatusCode> {
-  if !crate::cloud_auth::CLOUD_AUTH
-    .can_use_browser_automation()
-    .await
-  {
-    return Err(StatusCode::PAYMENT_REQUIRED);
-  }
-
   let profile_manager = ProfileManager::instance();
   let profiles = profile_manager
     .list_profiles()

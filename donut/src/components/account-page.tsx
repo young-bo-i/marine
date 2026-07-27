@@ -25,7 +25,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useCloudAuth } from "@/hooks/use-cloud-auth";
 import { translateBackendError } from "@/lib/backend-errors";
-import { getEntitlements } from "@/lib/entitlements";
 import { showErrorToast, showSuccessToast } from "@/lib/toast-utils";
 import { cn } from "@/lib/utils";
 import type { SyncSettings } from "@/types";
@@ -241,17 +240,9 @@ export function AccountPage({
                   </div>
                   <div className="min-w-0 flex-1">
                     {isLoggedIn && user ? (
-                      <>
-                        <h2 className="truncate text-base font-semibold">
-                          {user.email}
-                        </h2>
-                        <p className="mt-0.5 text-xs text-muted-foreground">
-                          {t("account.plan", {
-                            plan: user.plan,
-                            period: user.planPeriod ?? "—",
-                          })}
-                        </p>
-                      </>
+                      <h2 className="truncate text-base font-semibold">
+                        {user.email}
+                      </h2>
                     ) : (
                       <>
                         <h2 className="text-base font-semibold">
@@ -267,34 +258,12 @@ export function AccountPage({
 
                 {isLoggedIn && user && (
                   <div className="grid grid-cols-2 gap-2 text-xs">
-                    <div className="rounded-md border border-border bg-muted/40 px-3 py-2">
-                      <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
-                        {t("account.fields.plan")}
-                      </p>
-                      <p className="mt-0.5 font-medium uppercase">
-                        {user.plan}
-                      </p>
-                    </div>
-                    <div className="rounded-md border border-border bg-muted/40 px-3 py-2">
-                      <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
-                        {t("account.fields.status")}
-                      </p>
-                      <p className="mt-0.5">{user.subscriptionStatus ?? "—"}</p>
-                    </div>
                     {user.teamRole && (
                       <div className="rounded-md border border-border bg-muted/40 px-3 py-2">
                         <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
                           {t("account.fields.teamRole")}
                         </p>
                         <p className="mt-0.5">{user.teamRole}</p>
-                      </div>
-                    )}
-                    {user.planPeriod && (
-                      <div className="rounded-md border border-border bg-muted/40 px-3 py-2">
-                        <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
-                          {t("account.fields.period")}
-                        </p>
-                        <p className="mt-0.5">{user.planPeriod}</p>
                       </div>
                     )}
                     {typeof user.deviceOrdinal === "number" && (
@@ -312,24 +281,6 @@ export function AccountPage({
                     )}
                   </div>
                 )}
-
-                {isLoggedIn &&
-                  user &&
-                  getEntitlements(user).browserAutomation &&
-                  user.isPrimaryDevice === false && (
-                    <p className="text-xs text-warning">
-                      {t("account.automationPrimaryOnly")}
-                    </p>
-                  )}
-                {isLoggedIn &&
-                  user &&
-                  getEntitlements(user).browserAutomation &&
-                  user.isPrimaryDevice === true &&
-                  (user.deviceCount ?? 1) > 1 && (
-                    <p className="text-xs text-success">
-                      {t("account.automationActiveHere")}
-                    </p>
-                  )}
 
                 <div className="mt-2 flex flex-wrap gap-2">
                   {isLoggedIn ? (

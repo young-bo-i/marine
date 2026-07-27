@@ -47,7 +47,6 @@ import { WayfernTermsDialog } from "@/components/wayfern-terms-dialog";
 import { WelcomeDialog } from "@/components/welcome-dialog";
 import { WindowResizeWarningDialog } from "@/components/window-resize-warning-dialog";
 import { useAppUpdateNotifications } from "@/hooks/use-app-update-notifications";
-import { useCloudAuth } from "@/hooks/use-cloud-auth";
 import { useGroupEvents } from "@/hooks/use-group-events";
 import type { PermissionType } from "@/hooks/use-permissions";
 import { usePermissions } from "@/hooks/use-permissions";
@@ -59,7 +58,6 @@ import { useVersionUpdater } from "@/hooks/use-version-updater";
 import { useVpnEvents } from "@/hooks/use-vpn-events";
 import { useWayfernTerms } from "@/hooks/use-wayfern-terms";
 import { translateBackendError } from "@/lib/backend-errors";
-import { getEntitlements } from "@/lib/entitlements";
 import {
   ONBOARDING_TOUR_FINISHED_EVENT,
   setOnboardingActive,
@@ -77,12 +75,7 @@ import {
   showSyncProgressToast,
   showToast,
 } from "@/lib/toast-utils";
-import type {
-  BrowserProfile,
-  CamoufoxConfig,
-  SyncSettings,
-  WayfernConfig,
-} from "@/types";
+import type { BrowserProfile, CamoufoxConfig, WayfernConfig } from "@/types";
 
 type BrowserTypeString = "camoufox" | "wayfern";
 
@@ -218,31 +211,6 @@ export default function Home() {
     isLoading: termsLoading,
     checkTerms,
   } = useWayfernTerms();
-
-  // Cloud auth for cross-OS unlock
-  const { user: cloudUser } = useCloudAuth();
-  const crossOsUnlocked = getEntitlements(cloudUser).crossOsFingerprints;
-  // Bulk run/stop is a paid (browser automation) feature, matching the
-  // /v1/profiles/batch/run API gate. Free/starter users see the bulk Run/Stop
-  // actions disabled with a Pro badge.
-  const automationUnlocked = getEntitlements(cloudUser).browserAutomation;
-
-  const [selfHostedSyncConfigured, setSelfHostedSyncConfigured] =
-    useState(false);
-
-  const checkSelfHostedSync = useCallback(async () => {
-    try {
-      const settings = await invoke<SyncSettings>("get_sync_settings");
-      const hasConfig = Boolean(
-        settings.sync_server_url && settings.sync_token,
-      );
-      setSelfHostedSyncConfigured(hasConfig && !cloudUser);
-    } catch {
-      setSelfHostedSyncConfigured(false);
-    }
-  }, [cloudUser]);
-
-  const syncUnlocked = crossOsUnlocked || selfHostedSyncConfigured;
 
   const [currentPage, setCurrentPage] = useState<AppPage>("profiles");
   const [accountDialogOpen, setAccountDialogOpen] = useState(false);
@@ -1512,7 +1480,6 @@ export default function Home() {
     let unlistenStarted: (() => void) | undefined;
     let unlistenProgress: (() => void) | undefined;
     let unlistenCompleted: (() => void) | undefined;
-    let unlistenWayfernBlocked: (() => void) | undefined;
 
     // Tauri unlisten is async and rejects on a double call; null each handle
     // after one call and swallow sync throw + async reject so the async-setup
@@ -1523,13 +1490,11 @@ export default function Home() {
         unlistenStarted,
         unlistenProgress,
         unlistenCompleted,
-        unlistenWayfernBlocked,
       ];
       unlistenRequired = undefined;
       unlistenStarted = undefined;
       unlistenProgress = undefined;
       unlistenCompleted = undefined;
-      unlistenWayfernBlocked = undefined;
       for (const handle of handles) {
         void Promise.resolve()
           .then(() => handle?.())
@@ -1595,16 +1560,6 @@ export default function Home() {
           title: t("encryption.rollover.completedTitle"),
           description: t("encryption.rollover.completedDescription"),
           duration: 5000,
-        });
-      });
-
-      unlistenWayfernBlocked = await listen("wayfern-paid-blocked", () => {
-        showToast({
-          id: "wayfern-paid-blocked",
-          type: "error",
-          title: t("wayfernBlocked.title"),
-          description: t("wayfernBlocked.description"),
-          duration: 15000,
         });
       });
 
@@ -1685,11 +1640,6 @@ export default function Home() {
       checkAllPermissions();
     }
   }, [isInitialized, firstRunOnboarding, checkAllPermissions]);
-
-  // Check self-hosted sync config on mount and when cloud user changes
-  useEffect(() => {
-    void checkSelfHostedSync();
-  }, [checkSelfHostedSync]);
 
   // Filter data by selected group and search query
   const filteredProfiles = useMemo(() => {
@@ -1785,15 +1735,12 @@ export default function Home() {
                 onBulkCopyCookies={handleBulkCopyCookies}
                 onBulkRun={handleBulkRun}
                 onBulkStop={handleBulkStop}
-                bulkActionsUnlocked={automationUnlocked}
                 onBulkExtensionGroupAssignment={
                   handleBulkExtensionGroupAssignment
                 }
                 onAssignExtensionGroup={handleAssignExtensionGroup}
                 onOpenProfileSyncDialog={handleOpenProfileSyncDialog}
                 onToggleProfileSync={handleToggleProfileSync}
-                crossOsUnlocked={crossOsUnlocked}
-                syncUnlocked={syncUnlocked}
                 getProfileSyncInfo={getProfileSyncInfo}
                 onLaunchWithSync={(profile) => {
                   setSyncLeaderProfile(profile);
@@ -1868,7 +1815,6 @@ export default function Home() {
                 setExtensionManagementDialogOpen(false);
                 setCurrentPage("profiles");
               }}
-              limitedMode={false}
               subPage={currentPage === "extensions"}
               initialTab={extensionManagementInitialTab}
             />
@@ -1881,7 +1827,6 @@ export default function Home() {
                 setImportProfileDialogOpen(false);
                 setCurrentPage("profiles");
               }}
-              crossOsUnlocked={crossOsUnlocked}
               subPage={currentPage === "import"}
             />
           )}
@@ -1911,7 +1856,6 @@ export default function Home() {
         }}
         onCreateProfile={handleCreateProfile}
         selectedGroupId={selectedGroupId}
-        crossOsUnlocked={crossOsUnlocked}
       />
 
       <CommandPalette
@@ -2030,7 +1974,6 @@ export default function Home() {
             ? runningProfiles.has(currentProfileForCamoufoxConfig.id)
             : false
         }
-        crossOsUnlocked={crossOsUnlocked}
       />
 
       <GroupAssignmentDialog
@@ -2153,7 +2096,6 @@ export default function Home() {
         isOpen={syncConfigDialogOpen}
         onClose={(loginOccurred) => {
           setSyncConfigDialogOpen(false);
-          void checkSelfHostedSync();
           if (loginOccurred) {
             setSyncAllDialogOpen(true);
           }

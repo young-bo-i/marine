@@ -476,18 +476,6 @@ pub async fn import_browser_profile(
     return Err(serde_json::json!({ "code": "CAMOUFOX_IMPORT_DEPRECATED" }).to_string());
   }
 
-  let fingerprint_os = camoufox_config
-    .as_ref()
-    .and_then(|c| c.os.as_deref())
-    .or_else(|| wayfern_config.as_ref().and_then(|c| c.os.as_deref()));
-
-  if !crate::cloud_auth::CLOUD_AUTH
-    .is_fingerprint_os_allowed(fingerprint_os)
-    .await
-  {
-    return Err("Fingerprint OS spoofing requires an active Pro subscription".to_string());
-  }
-
   let importer = ProfileImporter::instance();
   importer
     .import_profile(

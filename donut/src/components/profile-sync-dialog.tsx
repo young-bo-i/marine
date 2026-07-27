@@ -17,7 +17,6 @@ import {
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { useCloudAuth } from "@/hooks/use-cloud-auth";
-import { getEntitlements } from "@/lib/entitlements";
 import { showErrorToast, showSuccessToast } from "@/lib/toast-utils";
 import type { BrowserProfile, SyncMode, SyncSettings } from "@/types";
 import { isSyncEnabled } from "@/types";
@@ -37,11 +36,12 @@ export function ProfileSyncDialog({
 }: ProfileSyncDialogProps) {
   const { t } = useTranslation();
   const { user: cloudUser } = useCloudAuth();
-  const isCloudSyncEligible = getEntitlements(cloudUser).cloudBackup;
+  // Cloud sync is available whenever this device has a cloud session.
+  const isCloudSyncEligible = cloudUser != null;
   // Encryption available to everyone except team members who aren't owners
   const canUseEncryption =
     cloudUser == null ||
-    cloudUser.plan !== "team" ||
+    cloudUser.teamId == null ||
     cloudUser.teamRole === "owner";
   const [isSaving, setIsSaving] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
@@ -100,7 +100,7 @@ export function ProfileSyncDialog({
       }
 
       if (newMode === "Encrypted" && !canUseEncryption) {
-        showErrorToast(t("settings.encryption.requiresProOrOwner"));
+        showErrorToast(t("settings.encryption.requiresTeamOwner"));
         return;
       }
 
@@ -258,7 +258,7 @@ export function ProfileSyncDialog({
                         <p className="text-sm text-muted-foreground">
                           {canUseEncryption
                             ? t("sync.mode.encryptedDescription")
-                            : t("settings.encryption.requiresProOrOwner")}
+                            : t("settings.encryption.requiresTeamOwner")}
                         </p>
                       </Label>
                     </div>

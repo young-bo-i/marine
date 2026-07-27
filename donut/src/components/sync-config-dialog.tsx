@@ -17,7 +17,6 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { ProBadge } from "@/components/ui/pro-badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Tooltip,
@@ -273,15 +272,6 @@ export function SyncConfigDialog({
               </div>
               <div className="flex justify-between">
                 <span className="text-muted-foreground">
-                  {t("sync.cloud.plan")}
-                </span>
-                <span className="capitalize">
-                  {user.plan}
-                  {user.planPeriod ? ` (${user.planPeriod})` : ""}
-                </span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">
                   {t("sync.cloud.profiles")}
                 </span>
                 <span>
@@ -347,7 +337,6 @@ export function SyncConfigDialog({
               >
                 <span className="flex items-center gap-2">
                   {t("sync.cloud.tabLabel")}
-                  {cloudBlocked && <ProBadge />}
                 </span>
               </TabsTrigger>
               <TabsTrigger
@@ -357,7 +346,6 @@ export function SyncConfigDialog({
               >
                 <span className="flex items-center gap-2">
                   {t("sync.cloud.selfHostedTabLabel")}
-                  {selfHostedBlocked && <ProBadge />}
                 </span>
               </TabsTrigger>
             </TabsList>

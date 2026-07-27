@@ -87,7 +87,6 @@ interface CreateProfileDialogProps {
     password?: string;
   }) => Promise<void>;
   selectedGroupId?: string;
-  crossOsUnlocked?: boolean;
 }
 
 interface BrowserOption {
@@ -107,7 +106,6 @@ export function CreateProfileDialog({
   onClose,
   onCreateProfile,
   selectedGroupId,
-  crossOsUnlocked = false,
 }: CreateProfileDialogProps) {
   const { t } = useTranslation();
   const proxyListboxIdAntiDetect = useId();
@@ -900,8 +898,6 @@ export function CreateProfileDialog({
                               config={wayfernConfig}
                               onConfigChange={updateWayfernConfig}
                               isCreating
-                              crossOsUnlocked={crossOsUnlocked}
-                              limitedMode={!crossOsUnlocked}
                               profileVersion={
                                 getCreatableVersion("wayfern")?.version
                               }

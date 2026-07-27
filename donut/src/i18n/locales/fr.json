@@ -165,7 +165,6 @@
       "passwordSaved": "Mot de passe de chiffrement défini",
       "passwordMismatch": "Les mots de passe ne correspondent pas",
       "passwordTooShort": "Le mot de passe doit contenir au moins 8 caractères",
-      "requiresProOrOwner": "Le chiffrement des profils est disponible pour les utilisateurs Pro et les propriétaires d'équipe.",
       "validatePassword": "Valider",
       "validateDialog": {
         "title": "Valider le mot de passe de chiffrement",
@@ -173,16 +172,8 @@
         "submit": "Valider",
         "matchToast": "Le mot de passe est correct",
         "mismatchToast": "Le mot de passe ne correspond pas"
-      }
-    },
-    "commercial": {
-      "title": "Licence commerciale",
-      "trialActive": "Essai: {{days}} jours, {{hours}} heures restantes",
-      "trialActiveDescription": "L'utilisation commerciale est gratuite pendant l'essai. À l'expiration, toutes les fonctionnalités continuent de fonctionner — l'utilisation personnelle reste gratuite, seule l'utilisation commerciale nécessitera une licence.",
-      "trialExpired": "Essai expiré",
-      "trialExpiredDescription": "L'utilisation personnelle reste gratuite. L'utilisation commerciale nécessite une licence.",
-      "subscriptionActive": "Abonné — formule {{plan}}",
-      "subscriptionActiveDescription": "Votre abonnement Marine est actif. L'usage commercial est licencié pendant toute la durée de votre formule."
+      },
+      "requiresTeamOwner": "Seul le propriétaire de l'équipe peut modifier le chiffrement des profils."
     },
     "advanced": {
       "title": "Avancé",
@@ -271,7 +262,6 @@
       "stopLeader": "Arrêter ce profil et tous ses suiveurs",
       "stopFollower": "Suit les actions de {{leaderName}}",
       "desyncedTooltip": "La synchronisation a échoué à {{url}}",
-      "paidFeature": "Le synchroniseur est une fonctionnalité payante",
       "wayfernOnly": "Seuls les profils Wayfern peuvent être synchronisés",
       "selectFollowers": "Sélectionner les profils suiveurs",
       "selectFollowersDesc": "Choisissez les profils qui reproduiront les actions du profil leader. Seuls les profils Wayfern arrêtés peuvent être sélectionnés.",
@@ -308,8 +298,7 @@
       "assignExtensionGroup": "Assigner un groupe d’extensions",
       "copyCookies": "Copier les cookies",
       "runSelected": "Lancer la sélection",
-      "stopSelected": "Arrêter la sélection",
-      "proRequired": "Plan Pro requis pour le lancement/arrêt groupé"
+      "stopSelected": "Arrêter la sélection"
     },
     "passwordProtectedBadge": "Protégé par mot de passe",
     "launchHook": {
@@ -646,7 +635,6 @@
       "verifyAndLogin": "Vérifier et Se Connecter",
       "loggingIn": "Connexion en cours...",
       "connected": "Connecté",
-      "plan": "Forfait",
       "profiles": "Profils",
       "profileUsage": "{{used}} / {{limit}}",
       "manageAccount": "Gérer le Compte",
@@ -892,8 +880,7 @@
       "selectFile": "Choisir un Fichier",
       "preview": "{{count}} cookies trouvés",
       "success": "{{imported}} cookies importés avec succès ({{replaced}} remplacés)",
-      "error": "Échec de l'importation des cookies",
-      "proFeature": "L'importation de cookies est une fonctionnalité Pro"
+      "error": "Échec de l'importation des cookies"
     },
     "export": {
       "title": "Exporter les Cookies",
@@ -1101,7 +1088,6 @@
     "productSub": "Produit Sub",
     "brand": "Marque",
     "brandVersion": "Version de la marque",
-    "proFeature": "Ceci est une fonctionnalité Pro",
     "generateFingerprint": "Générer l'empreinte",
     "refreshFingerprint": "Actualiser l'empreinte",
     "canvasNoiseSeedPlaceholder": "Entrez une graine pour l'empreinte canvas",
@@ -1242,9 +1228,7 @@
       "cannotWhileRunning": "Arrêtez le profil avant de modifier son mot de passe."
     },
     "fingerprint": {
-      "notSupported": "L’édition des empreintes n’est disponible que pour les profils Camoufox et Wayfern.",
-      "lockedTitle": "Afficher et modifier l'empreinte est une fonctionnalité Pro",
-      "lockedDescription": "La protection contre le fingerprinting est incluse dans tous les forfaits. C'est l'affichage et la modification des valeurs de l'empreinte d'un profil qui nécessitent un forfait payant actif."
+      "notSupported": "L’édition des empreintes n’est disponible que pour les profils Camoufox et Wayfern."
     },
     "syncStatusValue": {
       "waiting": "En attente",
@@ -1261,7 +1245,6 @@
     "extensionsTab": "Extensions",
     "groupsTab": "Groupes",
     "managedNotice": "Les extensions gérées ici remplaceront toutes les extensions installées manuellement dans les profils lors du lancement.",
-    "proRequired": "La gestion des extensions est une fonctionnalité Pro",
     "empty": "Aucune extension téléchargée pour l'instant.",
     "noGroups": "Aucun groupe d'extensions créé pour l'instant.",
     "createGroup": "Créer un Groupe",
@@ -1321,14 +1304,6 @@
       "groupsDescription": "Supprimer {{count}} groupes d'extensions ? {{names}}",
       "confirmButton": "Supprimer"
     }
-  },
-  "pro": {
-    "badge": "PRO",
-    "fingerprintLocked": "La modification d'empreinte est une fonctionnalité Pro",
-    "cookieCopyLocked": "La copie de cookies est une fonctionnalité Pro",
-    "cookieImportLocked": "L'importation de cookies est une fonctionnalité Pro",
-    "cookieExportLocked": "L'exportation de cookies est une fonctionnalité Pro",
-    "cookieManagementLocked": "La gestion des cookies est une fonctionnalité Pro"
   },
   "dnsBlocklist": {
     "title": "Liste de blocage DNS",
@@ -1596,14 +1571,6 @@
     "acceptFailed": "Échec de l'acceptation des conditions",
     "tryAgain": "Veuillez réessayer"
   },
-  "commercialTrial": {
-    "title": "Période d'essai commerciale expirée",
-    "description": "Votre période d'essai commercial de 2 semaines est terminée.",
-    "body": "Si vous utilisez Marine à des fins professionnelles, vous devez acheter une licence commerciale pour continuer. Vous pouvez toujours l'utiliser gratuitement à des fins personnelles.",
-    "understandButton": "J'ai compris",
-    "failed": "Échec de l'enregistrement de la confirmation",
-    "tryAgain": "Veuillez réessayer"
-  },
   "permissionDialog": {
     "titleMicrophone": "Accès au microphone requis",
     "titleCamera": "Accès à la caméra requis",
@@ -1864,7 +1831,6 @@
     "cookieDbLocked": "Impossible de lire les cookies — la base de données est verrouillée. Fermez le navigateur et réessayez.",
     "cookieDbUnavailable": "Impossible de lire les cookies — le magasin de cookies est indisponible.",
     "selfHostedRequiresLogout": "Déconnectez-vous de votre compte Marine avant de configurer un serveur auto-hébergé.",
-    "fingerprintRequiresPro": "Afficher ou modifier l'empreinte nécessite un forfait payant actif. La protection est incluse dans tous les forfaits.",
     "proxyNotWorking": "Le proxy sélectionné ne fonctionne pas, le profil n'a donc pas été créé.",
     "proxyPaymentRequired": "Le proxy sélectionné requiert un paiement (402) — son abonnement a peut-être expiré — le profil n'a donc pas été créé.",
     "vpnNotWorking": "Le VPN sélectionné ne fonctionne pas, le profil n'a donc pas été créé.",
@@ -1879,7 +1845,8 @@
     "marineGenerateFailed": "Échec de la génération. {{detail}}",
     "marineGenerateTimeout": "La génération a expiré.",
     "marineFillFailed": "Impossible de remplir la réponse. {{detail}}",
-    "marineMarkPostedFailed": "Impossible de marquer comme publié. {{detail}}"
+    "marineMarkPostedFailed": "Impossible de marquer comme publié. {{detail}}",
+    "teamOwnerOnly": "Seul le propriétaire de l'équipe peut modifier le mot de passe de chiffrement."
   },
   "rail": {
     "profiles": "Profils",
@@ -1939,15 +1906,11 @@
     "loggedOut": "Déconnecté",
     "signedOut": "Déconnecté",
     "signedOutDescription": "Connectez-vous pour activer la synchronisation cloud, les profils chiffrés et les fonctionnalités d’équipe.",
-    "plan": "Plan : {{plan}} · {{period}}",
     "refresh": "Actualiser",
     "logout": "Se déconnecter",
     "signIn": "Se connecter",
     "fields": {
-      "plan": "Plan",
-      "status": "Statut",
       "teamRole": "Rôle d’équipe",
-      "period": "Période",
       "device": "Appareil"
     },
     "tabs": {
@@ -1963,9 +1926,7 @@
       "testConnection": "Tester la connexion",
       "disconnect": "Déconnecter"
     },
-    "deviceOrdinal": "{{ordinal}} sur {{count}}",
-    "automationPrimaryOnly": "L'automatisation du navigateur ne fonctionne que sur votre appareil principal (Appareil 1). Déconnectez-vous là-bas pour l'utiliser ici.",
-    "automationActiveHere": "L'automatisation du navigateur est active sur cet appareil."
+    "deviceOrdinal": "{{ordinal}} sur {{count}}"
   },
   "shortcutsPage": {
     "title": "Raccourcis clavier",
@@ -2083,15 +2044,8 @@
       "body": "Marine est open source et gratuit.",
       "agree": "J'ai compris",
       "personalTitle": "Usage personnel",
-      "personalDesc": "Gratuit à vie.",
-      "commercialTitle": "Usage commercial",
-      "trialBadge": "2 semaines gratuites",
-      "commercialDesc": "Gratuit pendant une évaluation de 2 semaines. Ensuite, un forfait payant permet de maintenir et de faire prospérer le projet."
+      "personalDesc": "Gratuit à vie."
     }
-  },
-  "wayfernBlocked": {
-    "title": "Automatisation du navigateur en pause",
-    "description": "Votre compte a été temporairement privé des fonctionnalités Pro du navigateur, généralement à cause d'une connexion sur plusieurs appareils à la fois. Déconnectez-vous des autres appareils, puis relancez le profil pour la rétablir."
   },
   "camoufoxDeprecation": {
     "title": "La prise en charge de Camoufox prend fin",

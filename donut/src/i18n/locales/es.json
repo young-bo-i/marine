@@ -165,7 +165,6 @@
       "passwordSaved": "Contraseña de cifrado establecida",
       "passwordMismatch": "Las contraseñas no coinciden",
       "passwordTooShort": "La contraseña debe tener al menos 8 caracteres",
-      "requiresProOrOwner": "El cifrado de perfiles está disponible para usuarios Pro y propietarios de equipos.",
       "validatePassword": "Validar",
       "validateDialog": {
         "title": "Validar contraseña de cifrado",
@@ -173,16 +172,8 @@
         "submit": "Validar",
         "matchToast": "La contraseña es correcta",
         "mismatchToast": "La contraseña no coincide"
-      }
-    },
-    "commercial": {
-      "title": "Licencia Comercial",
-      "trialActive": "Prueba: {{days}} días, {{hours}} horas restantes",
-      "trialActiveDescription": "El uso comercial es gratuito durante la prueba. Al finalizar, todas las funciones siguen funcionando — el uso personal sigue siendo gratuito, solo el uso comercial requerirá una licencia.",
-      "trialExpired": "Prueba expirada",
-      "trialExpiredDescription": "El uso personal sigue siendo gratuito. El uso comercial requiere una licencia.",
-      "subscriptionActive": "Suscrito — plan {{plan}}",
-      "subscriptionActiveDescription": "Tu suscripción a Marine está activa. El uso comercial está autorizado mientras tu plan esté vigente."
+      },
+      "requiresTeamOwner": "Solo el propietario del equipo puede cambiar el cifrado de perfiles."
     },
     "advanced": {
       "title": "Avanzado",
@@ -271,7 +262,6 @@
       "stopLeader": "Detener este perfil y todos sus seguidores",
       "stopFollower": "Siguiendo las acciones de {{leaderName}}",
       "desyncedTooltip": "La sincronización falló en {{url}}",
-      "paidFeature": "El sincronizador es una función de pago",
       "wayfernOnly": "Solo los perfiles Wayfern pueden sincronizarse",
       "selectFollowers": "Seleccionar perfiles seguidores",
       "selectFollowersDesc": "Elige los perfiles que replicarán las acciones del perfil líder. Solo se pueden seleccionar perfiles Wayfern detenidos.",
@@ -308,8 +298,7 @@
       "assignExtensionGroup": "Asignar grupo de extensiones",
       "copyCookies": "Copiar cookies",
       "runSelected": "Ejecutar seleccionados",
-      "stopSelected": "Detener seleccionados",
-      "proRequired": "Se requiere el plan Pro para ejecución/parada masiva"
+      "stopSelected": "Detener seleccionados"
     },
     "passwordProtectedBadge": "Protegido por Contraseña",
     "launchHook": {
@@ -646,7 +635,6 @@
       "verifyAndLogin": "Verificar e Iniciar Sesión",
       "loggingIn": "Iniciando sesión...",
       "connected": "Conectado",
-      "plan": "Plan",
       "profiles": "Perfiles",
       "profileUsage": "{{used}} / {{limit}}",
       "manageAccount": "Administrar Cuenta",
@@ -892,8 +880,7 @@
       "selectFile": "Elegir Archivo",
       "preview": "{{count}} cookies encontradas",
       "success": "Se importaron {{imported}} cookies exitosamente ({{replaced}} reemplazadas)",
-      "error": "Error al importar cookies",
-      "proFeature": "La importación de cookies es una función Pro"
+      "error": "Error al importar cookies"
     },
     "export": {
       "title": "Exportar Cookies",
@@ -1101,7 +1088,6 @@
     "productSub": "Producto Sub",
     "brand": "Marca",
     "brandVersion": "Versión de marca",
-    "proFeature": "Esta es una función Pro",
     "generateFingerprint": "Generar Huella Digital",
     "refreshFingerprint": "Actualizar Huella Digital",
     "canvasNoiseSeedPlaceholder": "Introduce una semilla para la huella digital del canvas",
@@ -1242,9 +1228,7 @@
       "cannotWhileRunning": "Detén el perfil antes de cambiar su contraseña."
     },
     "fingerprint": {
-      "notSupported": "La edición de huellas digitales solo está disponible para perfiles Camoufox y Wayfern.",
-      "lockedTitle": "Ver y editar la huella digital es una función Pro",
-      "lockedDescription": "La protección de huella digital está incluida en todos los planes. Ver y editar los valores de la huella digital de un perfil es lo que requiere un plan de pago activo."
+      "notSupported": "La edición de huellas digitales solo está disponible para perfiles Camoufox y Wayfern."
     },
     "syncStatusValue": {
       "waiting": "Esperando",
@@ -1261,7 +1245,6 @@
     "extensionsTab": "Extensiones",
     "groupsTab": "Grupos",
     "managedNotice": "Las extensiones administradas aquí reemplazarán cualquier extensión instalada manualmente en los perfiles al iniciarlos.",
-    "proRequired": "La gestión de extensiones es una función Pro",
     "empty": "No se han subido extensiones aún.",
     "noGroups": "No se han creado grupos de extensiones aún.",
     "createGroup": "Crear Grupo",
@@ -1321,14 +1304,6 @@
       "groupsDescription": "¿Eliminar {{count}} grupos de extensiones? {{names}}",
       "confirmButton": "Eliminar"
     }
-  },
-  "pro": {
-    "badge": "PRO",
-    "fingerprintLocked": "La edición de huellas digitales es una función Pro",
-    "cookieCopyLocked": "La copia de cookies es una función Pro",
-    "cookieImportLocked": "La importación de cookies es una función Pro",
-    "cookieExportLocked": "La exportación de cookies es una función Pro",
-    "cookieManagementLocked": "La gestión de cookies es una función Pro"
   },
   "dnsBlocklist": {
     "title": "Lista de bloqueo DNS",
@@ -1596,14 +1571,6 @@
     "acceptFailed": "Error al aceptar los términos",
     "tryAgain": "Por favor, inténtalo de nuevo"
   },
-  "commercialTrial": {
-    "title": "Periodo de prueba comercial expirado",
-    "description": "Tu periodo de prueba comercial de 2 semanas ha terminado.",
-    "body": "Si usas Marine con fines comerciales, debes adquirir una licencia comercial para continuar. Puedes seguir usándolo de forma personal gratis.",
-    "understandButton": "Entendido",
-    "failed": "Error al guardar el reconocimiento",
-    "tryAgain": "Por favor, inténtalo de nuevo"
-  },
   "permissionDialog": {
     "titleMicrophone": "Se requiere acceso al micrófono",
     "titleCamera": "Se requiere acceso a la cámara",
@@ -1864,7 +1831,6 @@
     "cookieDbLocked": "No se pudieron leer las cookies — la base de datos está bloqueada. Cierra el navegador e inténtalo de nuevo.",
     "cookieDbUnavailable": "No se pudieron leer las cookies — el almacén de cookies no está disponible.",
     "selfHostedRequiresLogout": "Cierra sesión en tu cuenta de Marine antes de configurar un servidor autoalojado.",
-    "fingerprintRequiresPro": "Ver o editar la huella digital requiere un plan de pago activo. La protección está incluida en todos los planes.",
     "proxyNotWorking": "El proxy seleccionado no funciona, por lo que no se creó el perfil.",
     "proxyPaymentRequired": "El proxy seleccionado requiere pago (402) —su suscripción puede haber vencido— por lo que no se creó el perfil.",
     "vpnNotWorking": "La VPN seleccionada no funciona, por lo que no se creó el perfil.",
@@ -1879,7 +1845,8 @@
     "marineGenerateFailed": "Falló la generación. {{detail}}",
     "marineGenerateTimeout": "La generación agotó el tiempo.",
     "marineFillFailed": "No se pudo rellenar la respuesta. {{detail}}",
-    "marineMarkPostedFailed": "No se pudo marcar como publicado. {{detail}}"
+    "marineMarkPostedFailed": "No se pudo marcar como publicado. {{detail}}",
+    "teamOwnerOnly": "Solo el propietario del equipo puede cambiar la contraseña de cifrado."
   },
   "rail": {
     "profiles": "Perfiles",
@@ -1939,15 +1906,11 @@
     "loggedOut": "Sesión cerrada",
     "signedOut": "Sin sesión",
     "signedOutDescription": "Inicia sesión para activar la sincronización en la nube, perfiles cifrados y funciones de equipo.",
-    "plan": "Plan: {{plan}} · {{period}}",
     "refresh": "Actualizar",
     "logout": "Cerrar sesión",
     "signIn": "Iniciar sesión",
     "fields": {
-      "plan": "Plan",
-      "status": "Estado",
       "teamRole": "Rol en el equipo",
-      "period": "Período",
       "device": "Dispositivo"
     },
     "tabs": {
@@ -1963,9 +1926,7 @@
       "testConnection": "Probar conexión",
       "disconnect": "Desconectar"
     },
-    "deviceOrdinal": "{{ordinal}} de {{count}}",
-    "automationPrimaryOnly": "La automatización del navegador solo funciona en tu dispositivo principal (Dispositivo 1). Cierra sesión allí para usarla aquí.",
-    "automationActiveHere": "La automatización del navegador está activa en este dispositivo."
+    "deviceOrdinal": "{{ordinal}} de {{count}}"
   },
   "shortcutsPage": {
     "title": "Atajos de teclado",
@@ -2083,15 +2044,8 @@
       "body": "Marine es de código abierto y de uso gratuito.",
       "agree": "Entendido",
       "personalTitle": "Uso personal",
-      "personalDesc": "Gratis para siempre.",
-      "commercialTitle": "Uso comercial",
-      "trialBadge": "2 semanas gratis",
-      "commercialDesc": "Gratis durante una evaluación de 2 semanas. Después, un plan de pago mantiene el proyecto en buen estado y próspero."
+      "personalDesc": "Gratis para siempre."
     }
-  },
-  "wayfernBlocked": {
-    "title": "Automatización del navegador en pausa",
-    "description": "Tu cuenta fue restringida temporalmente de las funciones Pro del navegador, normalmente por iniciar sesión en varios dispositivos a la vez. Cierra sesión en los demás dispositivos y vuelve a iniciar el perfil para restaurarla."
   },
   "camoufoxDeprecation": {
     "title": "El soporte para Camoufox está terminando",

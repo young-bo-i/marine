@@ -62,7 +62,6 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { ProBadge } from "@/components/ui/pro-badge";
 import {
   Table,
   TableBody,
@@ -228,8 +227,6 @@ interface TableMeta {
   syncStatuses: Record<string, { status: string; error?: string }>;
   onOpenProfileSyncDialog?: (profile: BrowserProfile) => void;
   onToggleProfileSync?: (profile: BrowserProfile) => void;
-  crossOsUnlocked?: boolean;
-  syncUnlocked?: boolean;
 
   // Country proxy creation (inline in proxy dropdown)
   countries: LocationItem[];
@@ -1149,13 +1146,10 @@ interface ProfilesDataTableProps {
   onBulkCopyCookies?: () => void;
   onBulkRun?: () => void;
   onBulkStop?: () => void;
-  bulkActionsUnlocked?: boolean;
   onBulkExtensionGroupAssignment?: () => void;
   onAssignExtensionGroup?: (profileIds: string[]) => void;
   onOpenProfileSyncDialog?: (profile: BrowserProfile) => void;
   onToggleProfileSync?: (profile: BrowserProfile) => void;
-  crossOsUnlocked?: boolean;
-  syncUnlocked?: boolean;
   getProfileSyncInfo?: (profileId: string) =>
     | {
         session: SyncSessionInfo;
@@ -1197,13 +1191,10 @@ export function ProfilesDataTable({
   onBulkCopyCookies,
   onBulkRun,
   onBulkStop,
-  bulkActionsUnlocked = false,
   onBulkExtensionGroupAssignment,
   onAssignExtensionGroup,
   onOpenProfileSyncDialog,
   onToggleProfileSync,
-  crossOsUnlocked = false,
-  syncUnlocked = false,
   getProfileSyncInfo,
   onLaunchWithSync,
   onSetPassword,
@@ -1973,8 +1964,6 @@ export function ProfilesDataTable({
       syncStatuses,
       onOpenProfileSyncDialog,
       onToggleProfileSync,
-      crossOsUnlocked,
-      syncUnlocked,
 
       // Country proxy creation
       countries,
@@ -2042,8 +2031,6 @@ export function ProfilesDataTable({
       syncStatuses,
       onOpenProfileSyncDialog,
       onToggleProfileSync,
-      crossOsUnlocked,
-      syncUnlocked,
       countries,
       loadCountries,
       handleCreateCountryProxy,
@@ -3302,7 +3289,6 @@ export function ProfilesDataTable({
                 setProfileForInfoDialog(null);
                 setProfileToDelete(profile);
               }}
-              crossOsUnlocked={crossOsUnlocked}
               isRunning={infoIsRunning}
               isDisabled={infoIsDisabled}
               isCrossOs={infoIsCrossOs}
@@ -3315,39 +3301,23 @@ export function ProfilesDataTable({
         {onBulkRun && (
           <span className="relative inline-flex">
             <DataTableActionBarAction
-              tooltip={
-                bulkActionsUnlocked
-                  ? t("profiles.actionBar.runSelected")
-                  : t("profiles.actionBar.proRequired")
-              }
-              onClick={bulkActionsUnlocked ? onBulkRun : undefined}
-              disabled={!bulkActionsUnlocked}
+              tooltip={t("profiles.actionBar.runSelected")}
+              onClick={onBulkRun}
               size="icon"
             >
               <LuPlay className="fill-current" />
             </DataTableActionBarAction>
-            {!bulkActionsUnlocked && (
-              <ProBadge className="pointer-events-none absolute -top-2 -right-2" />
-            )}
           </span>
         )}
         {onBulkStop && (
           <span className="relative inline-flex">
             <DataTableActionBarAction
-              tooltip={
-                bulkActionsUnlocked
-                  ? t("profiles.actionBar.stopSelected")
-                  : t("profiles.actionBar.proRequired")
-              }
-              onClick={bulkActionsUnlocked ? onBulkStop : undefined}
-              disabled={!bulkActionsUnlocked}
+              tooltip={t("profiles.actionBar.stopSelected")}
+              onClick={onBulkStop}
               size="icon"
             >
               <LuSquare className="fill-current" />
             </DataTableActionBarAction>
-            {!bulkActionsUnlocked && (
-              <ProBadge className="pointer-events-none absolute -top-2 -right-2" />
-            )}
           </span>
         )}
         {onBulkGroupAssignment && (

@@ -21,16 +21,11 @@ use crate::sync;
 pub const CLOUD_API_URL: &str = "https://api.donutbrowser.com";
 pub const CLOUD_SYNC_URL: &str = "https://sync.donutbrowser.com";
 
-/// Default per-hour cap on local automation API / MCP requests. Mirrors the
-/// backend's DEFAULT_REQUESTS_PER_HOUR. Not enforced yet — see the inert
-/// rate-limit chokepoints in api_server / mcp_server.
-const DEFAULT_REQUESTS_PER_HOUR: i64 = 100;
-
-/// Capability + limit set the account is entitled to, derived from its plan.
-/// Mirrors `apps/backend/src/plans/entitlements.ts`. Features are gated on these
-/// flags instead of a single "is paid?" boolean, so a plan like the future
-/// "starter" tier (cross-OS fingerprints + cloud backup, no automation) is just
-/// data here.
+/// Capability + limit set reported to the UI.
+///
+/// This build has no plan tiers: every capability is granted unconditionally and
+/// the limits are unbounded. The struct is kept because it is part of the
+/// `CloudUser` wire shape the frontend consumes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entitlements {
   #[serde(default)]
@@ -49,45 +44,19 @@ pub struct Entitlements {
   pub requests_per_hour: i64,
 }
 
-/// Local fallback mirror of the backend plan -> capability matrix, used only when
-/// the server hasn't sent an entitlements object (older cached state / backend).
-fn derive_entitlements(
-  plan: &str,
-  plan_period: Option<&str>,
-  subscription_status: &str,
-  profile_limit: i64,
-) -> Entitlements {
-  let active =
-    plan != "free" && (subscription_status == "active" || plan_period == Some("lifetime"));
-  if !active {
-    return Entitlements {
-      active: false,
-      browser_automation: false,
-      cross_os_fingerprints: false,
-      cloud_backup: false,
-      team_collaboration: false,
-      profile_limit: 0,
-      requests_per_hour: 0,
-    };
-  }
-  // pro and any unrecognized paid plan -> pro-level (never team).
-  let (browser_automation, cross_os_fingerprints, cloud_backup, team_collaboration) = match plan {
-    "starter" => (false, true, true, false),
-    "team" | "enterprise" => (true, true, true, true),
-    _ => (true, true, true, false),
-  };
-  Entitlements {
-    active,
-    browser_automation,
-    cross_os_fingerprints,
-    cloud_backup,
-    team_collaboration,
-    profile_limit,
-    requests_per_hour: if browser_automation {
-      DEFAULT_REQUESTS_PER_HOUR
-    } else {
-      0
-    },
+impl Entitlements {
+  /// Every capability granted, no limits. Whatever the server reports about a
+  /// plan is ignored — this build does not gate features on one.
+  pub fn unlocked() -> Self {
+    Self {
+      active: true,
+      browser_automation: true,
+      cross_os_fingerprints: true,
+      cloud_backup: true,
+      team_collaboration: true,
+      profile_limit: i64::MAX,
+      requests_per_hour: i64::MAX,
+    }
   }
 }
 
@@ -126,25 +95,17 @@ pub struct CloudUser {
   pub device_count: Option<i64>,
   #[serde(rename = "isPrimaryDevice", default)]
   pub is_primary_device: Option<bool>,
-  /// Capability/limit set derived from the plan by the backend. `default` (None)
-  /// keeps older login/state payloads deserializing; resolve via `entitlements()`.
+  /// Capability/limit set as reported by the backend. Retained so login/state
+  /// payloads keep deserializing; it is NOT consulted — see `entitlements()`.
   #[serde(default)]
   pub entitlements: Option<Entitlements>,
 }
 
 impl CloudUser {
-  /// Authoritative entitlements: the server-sent set when present, else derived
-  /// locally from the plan fields (keeps older cached state / backends working).
+  /// Always the fully-unlocked set. The server-sent plan and entitlements are
+  /// deliberately ignored: this build ships every feature to every user.
   pub fn entitlements(&self) -> Entitlements {
-    if let Some(e) = &self.entitlements {
-      return e.clone();
-    }
-    derive_entitlements(
-      &self.plan,
-      self.plan_period.as_deref(),
-      &self.subscription_status,
-      self.profile_limit,
-    )
+    Entitlements::unlocked()
   }
 }
 
@@ -748,86 +709,18 @@ impl CloudAuthManager {
     state.is_some()
   }
 
-  /// Resolve this session's entitlements (server-sent or locally derived).
-  pub async fn entitlements(&self) -> Option<Entitlements> {
-    let state = self.state.lock().await;
-    state.as_ref().map(|auth| auth.user.entitlements())
-  }
-
-  /// Account is in a paid/active state. Used for the "any active plan" gates
-  /// (sync token, wayfern token); per-feature access uses the capability helpers.
-  pub async fn has_active_paid_subscription(&self) -> bool {
-    self.entitlements().await.map(|e| e.active).unwrap_or(false)
-  }
-
-  /// Non-async version that uses try_lock, defaults to false if lock can't be acquired.
-  pub fn has_active_paid_subscription_sync(&self) -> bool {
+  /// Non-async `is_logged_in` for callers that cannot await (uses `try_lock`;
+  /// reports "not logged in" when the lock is contended, matching the previous
+  /// conservative behaviour of the sync-path checks).
+  pub fn is_logged_in_sync(&self) -> bool {
     match self.state.try_lock() {
-      Ok(state) => state
-        .as_ref()
-        .map(|auth| auth.user.entitlements().active)
-        .unwrap_or(false),
+      Ok(state) => state.is_some(),
       Err(_) => false,
     }
   }
 
-  /// Launch/drive profiles programmatically (local API + MCP automation).
-  pub async fn can_use_browser_automation(&self) -> bool {
-    self
-      .entitlements()
-      .await
-      .map(|e| e.browser_automation)
-      .unwrap_or(false)
-  }
-
-  /// Edit fingerprints / use a non-native OS fingerprint.
-  pub async fn can_use_cross_os_fingerprints(&self) -> bool {
-    self
-      .entitlements()
-      .await
-      .map(|e| e.cross_os_fingerprints)
-      .unwrap_or(false)
-  }
-
-  /// Cloud profile sync / backup (async).
-  pub async fn can_use_cloud_backup(&self) -> bool {
-    self
-      .entitlements()
-      .await
-      .map(|e| e.cloud_backup)
-      .unwrap_or(false)
-  }
-
-  /// Cloud profile sync / backup (non-async, try_lock; false if unavailable).
-  pub fn can_use_cloud_backup_sync(&self) -> bool {
-    match self.state.try_lock() {
-      Ok(state) => state
-        .as_ref()
-        .map(|auth| auth.user.entitlements().cloud_backup)
-        .unwrap_or(false),
-      Err(_) => false,
-    }
-  }
-
-  /// Per-hour cap on automation requests (0 when automation is unavailable).
-  /// Carried for the future local rate limiter; read by the inert chokepoints.
-  pub async fn requests_per_hour(&self) -> i64 {
-    self
-      .entitlements()
-      .await
-      .map(|e| e.requests_per_hour)
-      .unwrap_or(0)
-  }
-
-  pub async fn is_fingerprint_os_allowed(&self, fingerprint_os: Option<&str>) -> bool {
-    let host_os = crate::profile::types::get_host_os();
-    match fingerprint_os {
-      None => true,
-      Some(os) if os == host_os => true,
-      Some(_) => self.can_use_cross_os_fingerprints().await,
-    }
-  }
-
+  /// Whether this session belongs to a team. Not a paywall — team lock APIs
+  /// operate on a server-side team that either exists for this account or not.
   pub async fn is_on_team_plan(&self) -> bool {
     if let Some(state) = self.get_user().await {
       return state.user.team_id.is_some();
@@ -1143,9 +1036,11 @@ impl CloudAuthManager {
       .await
   }
 
-  /// Request a wayfern token from the cloud API. Only succeeds for paid users.
+  /// Request a wayfern token from the cloud API. Requires a cloud session —
+  /// the token is issued by api.donutbrowser.com, so there is nothing to ask
+  /// for when this device is not logged in.
   pub async fn request_wayfern_token(&self) -> Result<(), String> {
-    if !self.has_active_paid_subscription().await {
+    if !self.is_logged_in().await {
       self.clear_wayfern_token().await;
       return Ok(());
     }
@@ -1189,22 +1084,18 @@ impl CloudAuthManager {
     let token = match result {
       Ok(token) => token,
       Err(e) => {
-        // The backend returns 403 (ForbiddenException) for paid-feature blocks:
-        // token-reuse throttle, "active subscription required", and the
-        // primary-device restriction (see donutbrowser-infra wayfern.service.ts).
-        // This is distinct from a 401 (dead access token) — the session is still
-        // valid, the user is just temporarily/conditionally not entitled. So we
-        // do NOT invalidate the session. Instead: drop the stale wayfern token so
-        // no browser launches half-authenticated, re-fetch the profile so the
-        // cached plan reflects the backend's real state (it may have changed),
-        // and signal the UI so the user learns why automation stopped working.
+        // The backend returns 403 (ForbiddenException) when it declines to issue
+        // a token (token-reuse throttle, primary-device restriction, …). That is
+        // enforced server-side at api.donutbrowser.com and nothing local can
+        // change it. It is distinct from a 401 (dead access token) — the session
+        // is still valid — so we do NOT invalidate it. Drop the stale token so no
+        // browser launches half-authenticated, and re-fetch the profile.
         if e.contains("(403") || e.contains("Forbidden") {
-          log::warn!("Wayfern token blocked by backend (403): {e}");
+          log::warn!("Wayfern token declined by backend (403): {e}");
           self.clear_wayfern_token().await;
           if let Err(fetch_err) = self.fetch_profile().await {
             log::warn!("Profile re-fetch after wayfern block failed: {fetch_err}");
           }
-          let _ = crate::events::emit_empty("wayfern-paid-blocked");
         }
         return Err(e);
       }
@@ -1284,12 +1175,8 @@ impl CloudAuthManager {
       // Refresh wayfern token every 10 hours (60 iterations of 10-minute loop)
       if wayfern_refresh_counter >= 60 {
         wayfern_refresh_counter = 0;
-        if CLOUD_AUTH.has_active_paid_subscription().await {
-          if let Err(e) = CLOUD_AUTH.request_wayfern_token().await {
-            log::warn!("Failed to refresh wayfern token: {e}");
-          }
-        } else {
-          CLOUD_AUTH.clear_wayfern_token().await;
+        if let Err(e) = CLOUD_AUTH.request_wayfern_token().await {
+          log::warn!("Failed to refresh wayfern token: {e}");
         }
       }
 
@@ -1344,26 +1231,18 @@ pub async fn cloud_exchange_device_code(
 ) -> Result<CloudAuthState, String> {
   let mut state = CLOUD_AUTH.exchange_device_code(&code).await?;
 
-  let has_subscription = CLOUD_AUTH.has_active_paid_subscription().await;
-  log::info!(
-    "Post-login: plan={}, has_active_subscription={}",
-    state.user.plan,
-    has_subscription
-  );
+  log::info!("Post-login: plan={}", state.user.plan);
 
   // Pre-fetch sync token so sync can start immediately
-  if has_subscription {
-    log::info!("Pre-fetching sync token...");
-    match CLOUD_AUTH.get_or_refresh_sync_token().await {
-      Ok(Some(_)) => log::info!("Sync token pre-fetched successfully"),
-      Ok(None) => log::warn!("Sync token not available despite active subscription"),
-      Err(e) => log::error!("Failed to pre-fetch sync token after login: {e}"),
-    }
+  log::info!("Pre-fetching sync token...");
+  match CLOUD_AUTH.get_or_refresh_sync_token().await {
+    Ok(Some(_)) => log::info!("Sync token pre-fetched successfully"),
+    Ok(None) => log::warn!("Sync token not available"),
+    Err(e) => log::error!("Failed to pre-fetch sync token after login: {e}"),
+  }
 
-    // Request wayfern token for paid users
-    if let Err(e) = CLOUD_AUTH.request_wayfern_token().await {
-      log::warn!("Failed to request wayfern token after login: {e}");
-    }
+  if let Err(e) = CLOUD_AUTH.request_wayfern_token().await {
+    log::warn!("Failed to request wayfern token after login: {e}");
   }
 
   // Sync cloud proxy after login
@@ -1417,11 +1296,6 @@ pub async fn cloud_logout(app_handle: tauri::AppHandle) -> Result<(), String> {
 
   let _ = crate::events::emit_empty("cloud-auth-changed");
   Ok(())
-}
-
-#[tauri::command]
-pub async fn cloud_has_active_subscription() -> Result<bool, String> {
-  Ok(CLOUD_AUTH.has_active_paid_subscription().await)
 }
 
 #[tauri::command]

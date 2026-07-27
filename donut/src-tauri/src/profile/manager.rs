@@ -2720,18 +2720,6 @@ pub async fn create_browser_profile_new(
   dns_blocklist: Option<String>,
   launch_hook: Option<String>,
 ) -> Result<BrowserProfile, String> {
-  let fingerprint_os = camoufox_config
-    .as_ref()
-    .and_then(|c| c.os.as_deref())
-    .or_else(|| wayfern_config.as_ref().and_then(|c| c.os.as_deref()));
-
-  if !crate::cloud_auth::CLOUD_AUTH
-    .is_fingerprint_os_allowed(fingerprint_os)
-    .await
-  {
-    return Err("Fingerprint OS spoofing requires an active Pro subscription".to_string());
-  }
-
   // A dead/unreachable proxy or VPN (or a 402 from an expired proxy
   // subscription) cancels creation with a translatable error.
   crate::validate_profile_network(proxy_id.as_deref(), vpn_id.as_deref()).await?;
@@ -2762,21 +2750,6 @@ pub async fn update_camoufox_config(
   profile_id: String,
   config: CamoufoxConfig,
 ) -> Result<(), String> {
-  if config.fingerprint.is_some()
-    && !crate::cloud_auth::CLOUD_AUTH
-      .can_use_cross_os_fingerprints()
-      .await
-  {
-    return Err(serde_json::json!({ "code": "FINGERPRINT_REQUIRES_PRO" }).to_string());
-  }
-
-  if !crate::cloud_auth::CLOUD_AUTH
-    .is_fingerprint_os_allowed(config.os.as_deref())
-    .await
-  {
-    return Err("Fingerprint OS spoofing requires an active Pro subscription".to_string());
-  }
-
   let profile_manager = ProfileManager::instance();
   profile_manager
     .update_camoufox_config(app_handle, &profile_id, config)
@@ -2790,21 +2763,6 @@ pub async fn update_wayfern_config(
   profile_id: String,
   config: WayfernConfig,
 ) -> Result<(), String> {
-  if config.fingerprint.is_some()
-    && !crate::cloud_auth::CLOUD_AUTH
-      .can_use_cross_os_fingerprints()
-      .await
-  {
-    return Err(serde_json::json!({ "code": "FINGERPRINT_REQUIRES_PRO" }).to_string());
-  }
-
-  if !crate::cloud_auth::CLOUD_AUTH
-    .is_fingerprint_os_allowed(config.os.as_deref())
-    .await
-  {
-    return Err("Fingerprint OS spoofing requires an active Pro subscription".to_string());
-  }
-
   let profile_manager = ProfileManager::instance();
   profile_manager
     .update_wayfern_config(app_handle, &profile_id, config)

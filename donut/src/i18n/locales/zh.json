@@ -165,7 +165,6 @@
       "passwordSaved": "加密密码已设置",
       "passwordMismatch": "密码不匹配",
       "passwordTooShort": "密码必须至少8个字符",
-      "requiresProOrOwner": "配置文件加密仅适用于Pro用户和团队所有者。",
       "validatePassword": "验证",
       "validateDialog": {
         "title": "验证加密密码",
@@ -173,16 +172,8 @@
         "submit": "验证",
         "matchToast": "密码正确",
         "mismatchToast": "密码不匹配"
-      }
-    },
-    "commercial": {
-      "title": "商业许可",
-      "trialActive": "试用期：剩余 {{days}} 天 {{hours}} 小时",
-      "trialActiveDescription": "试用期内商业使用免费。试用期结束后，所有功能继续正常使用 — 个人使用仍然免费，只有商业使用需要许可证。",
-      "trialExpired": "试用期已过期",
-      "trialExpiredDescription": "个人使用仍然免费。商业使用需要许可证。",
-      "subscriptionActive": "已订阅 — {{plan}} 方案",
-      "subscriptionActiveDescription": "您的 Marine 订阅已激活。在订阅有效期内允许商业使用。"
+      },
+      "requiresTeamOwner": "只有团队所有者才能更改配置文件加密。"
     },
     "advanced": {
       "title": "高级",
@@ -271,7 +262,6 @@
       "stopLeader": "停止此配置文件及其所有跟随者",
       "stopFollower": "正在跟随 {{leaderName}} 的操作",
       "desyncedTooltip": "在 {{url}} 同步失败",
-      "paidFeature": "同步器是付费功能",
       "wayfernOnly": "只有 Wayfern 配置文件可以同步",
       "selectFollowers": "选择跟随者配置文件",
       "selectFollowersDesc": "选择将复制领导者配置文件操作的配置文件。只能选择已停止的 Wayfern 配置文件。",
@@ -308,8 +298,7 @@
       "assignExtensionGroup": "分配扩展分组",
       "copyCookies": "复制 Cookie",
       "runSelected": "运行所选",
-      "stopSelected": "停止所选",
-      "proRequired": "批量运行/停止需要 Pro 套餐"
+      "stopSelected": "停止所选"
     },
     "passwordProtectedBadge": "密码保护",
     "launchHook": {
@@ -646,7 +635,6 @@
       "verifyAndLogin": "验证并登录",
       "loggingIn": "登录中...",
       "connected": "已连接",
-      "plan": "套餐",
       "profiles": "配置文件",
       "profileUsage": "{{used}} / {{limit}}",
       "manageAccount": "管理账户",
@@ -892,8 +880,7 @@
       "selectFile": "选择文件",
       "preview": "找到 {{count}} 个 Cookies",
       "success": "成功导入 {{imported}} 个 Cookies（替换了 {{replaced}} 个）",
-      "error": "导入 Cookies 失败",
-      "proFeature": "导入 Cookies 是 Pro 功能"
+      "error": "导入 Cookies 失败"
     },
     "export": {
       "title": "导出 Cookies",
@@ -1101,7 +1088,6 @@
     "productSub": "产品子版本",
     "brand": "品牌",
     "brandVersion": "品牌版本",
-    "proFeature": "这是 Pro 功能",
     "generateFingerprint": "生成指纹",
     "refreshFingerprint": "刷新指纹",
     "canvasNoiseSeedPlaceholder": "输入用于 canvas 指纹的种子字符串",
@@ -1242,9 +1228,7 @@
       "cannotWhileRunning": "更改密码前请先停止此配置文件。"
     },
     "fingerprint": {
-      "notSupported": "指纹编辑仅适用于 Camoufox 和 Wayfern 配置文件。",
-      "lockedTitle": "查看和编辑指纹是 Pro 功能",
-      "lockedDescription": "所有方案都包含指纹保护。查看和编辑配置文件的指纹数值才需要有效的付费方案。"
+      "notSupported": "指纹编辑仅适用于 Camoufox 和 Wayfern 配置文件。"
     },
     "syncStatusValue": {
       "waiting": "等待中",
@@ -1261,7 +1245,6 @@
     "extensionsTab": "扩展程序",
     "groupsTab": "分组",
     "managedNotice": "此处管理的扩展程序将在启动时替换配置文件中手动安装的所有扩展程序。",
-    "proRequired": "扩展程序管理是 Pro 功能",
     "empty": "尚未上传任何扩展程序。",
     "noGroups": "尚未创建任何扩展程序组。",
     "createGroup": "创建分组",
@@ -1321,14 +1304,6 @@
       "groupsDescription": "删除 {{count}} 个扩展组？{{names}}",
       "confirmButton": "删除"
     }
-  },
-  "pro": {
-    "badge": "PRO",
-    "fingerprintLocked": "指纹编辑是 Pro 功能",
-    "cookieCopyLocked": "Cookie 复制是 Pro 功能",
-    "cookieImportLocked": "Cookie 导入是 Pro 功能",
-    "cookieExportLocked": "Cookie 导出是 Pro 功能",
-    "cookieManagementLocked": "Cookie 管理是 Pro 功能"
   },
   "dnsBlocklist": {
     "title": "DNS 拦截列表",
@@ -1596,14 +1571,6 @@
     "acceptFailed": "接受条款失败",
     "tryAgain": "请重试"
   },
-  "commercialTrial": {
-    "title": "商业试用期已过期",
-    "description": "你的 2 周商业试用期已结束。",
-    "body": "如果你将 Marine 用于商业目的,需要购买商业许可证才能继续。你仍然可以免费用于个人用途。",
-    "understandButton": "我明白了",
-    "failed": "保存确认失败",
-    "tryAgain": "请重试"
-  },
   "permissionDialog": {
     "titleMicrophone": "需要麦克风访问权限",
     "titleCamera": "需要摄像头访问权限",
@@ -1864,7 +1831,6 @@
     "cookieDbLocked": "无法读取 Cookie — 数据库已锁定。请关闭浏览器后重试。",
     "cookieDbUnavailable": "无法读取 Cookie — Cookie 存储不可用。",
     "selfHostedRequiresLogout": "在配置自托管服务器之前请先退出 Marine 账户。",
-    "fingerprintRequiresPro": "查看或编辑指纹需要有效的付费方案。所有方案均包含指纹保护。",
     "proxyNotWorking": "所选代理无法使用，因此未创建配置文件。",
     "proxyPaymentRequired": "所选代理需要付费（402），其订阅可能已过期，因此未创建配置文件。",
     "vpnNotWorking": "所选 VPN 无法使用，因此未创建配置文件。",
@@ -1879,7 +1845,8 @@
     "marineGenerateFailed": "生成失败。{{detail}}",
     "marineGenerateTimeout": "生成超时。",
     "marineFillFailed": "无法填入回复框。{{detail}}",
-    "marineMarkPostedFailed": "无法标记为已发布。{{detail}}"
+    "marineMarkPostedFailed": "无法标记为已发布。{{detail}}",
+    "teamOwnerOnly": "只有团队所有者才能更改加密密码。"
   },
   "rail": {
     "profiles": "配置文件",
@@ -1939,15 +1906,11 @@
     "loggedOut": "已退出",
     "signedOut": "未登录",
     "signedOutDescription": "登录以启用云同步、加密配置文件和团队功能。",
-    "plan": "套餐：{{plan}} · {{period}}",
     "refresh": "刷新",
     "logout": "退出",
     "signIn": "登录",
     "fields": {
-      "plan": "套餐",
-      "status": "状态",
       "teamRole": "团队角色",
-      "period": "计费周期",
       "device": "设备"
     },
     "tabs": {
@@ -1963,9 +1926,7 @@
       "testConnection": "测试连接",
       "disconnect": "断开连接"
     },
-    "deviceOrdinal": "第 {{ordinal}} 台，共 {{count}} 台",
-    "automationPrimaryOnly": "浏览器自动化仅在您的主设备（设备 1）上运行。请在该设备上退出登录，才能在此设备上使用。",
-    "automationActiveHere": "浏览器自动化已在此设备上启用。"
+    "deviceOrdinal": "第 {{ordinal}} 台，共 {{count}} 台"
   },
   "shortcutsPage": {
     "title": "键盘快捷键",
@@ -2083,15 +2044,8 @@
       "body": "Marine 是开源软件，可免费使用。",
       "agree": "我知道了",
       "personalTitle": "个人使用",
-      "personalDesc": "永久免费。",
-      "commercialTitle": "商业使用",
-      "trialBadge": "2 周免费",
-      "commercialDesc": "在 2 周评估期内免费。之后需要付费方案，这有助于本项目的持续维护与发展。"
+      "personalDesc": "永久免费。"
     }
-  },
-  "wayfernBlocked": {
-    "title": "浏览器自动化已暂停",
-    "description": "您的账户暂时被限制使用 Pro 浏览器功能，通常是因为同时在多台设备上登录。请退出其他设备的登录，然后重新启动配置文件即可恢复。"
   },
   "camoufoxDeprecation": {
     "title": "Camoufox 支持即将结束",

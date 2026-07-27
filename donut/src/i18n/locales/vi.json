@@ -165,7 +165,6 @@
       "passwordSaved": "Đã thiết lập mật khẩu mã hóa",
       "passwordMismatch": "Mật khẩu không khớp",
       "passwordTooShort": "Mật khẩu phải có ít nhất 8 ký tự",
-      "requiresProOrOwner": "Mã hóa hồ sơ chỉ dành cho người dùng Pro và chủ nhóm.",
       "validatePassword": "Xác thực",
       "validateDialog": {
         "title": "Xác thực mật khẩu mã hóa",
@@ -173,16 +172,8 @@
         "submit": "Xác thực",
         "matchToast": "Mật khẩu chính xác",
         "mismatchToast": "Mật khẩu không khớp"
-      }
-    },
-    "commercial": {
-      "title": "Giấy phép thương mại",
-      "trialActive": "Dùng thử: còn {{days}} ngày, {{hours}} giờ",
-      "trialActiveDescription": "Sử dụng thương mại miễn phí trong thời gian dùng thử. Khi hết hạn, tất cả tính năng vẫn hoạt động — sử dụng cá nhân miễn phí, chỉ sử dụng thương mại mới cần giấy phép.",
-      "trialExpired": "Đã hết hạn dùng thử",
-      "trialExpiredDescription": "Sử dụng cá nhân vẫn miễn phí. Sử dụng thương mại cần giấy phép.",
-      "subscriptionActive": "Đã đăng ký — gói {{plan}}",
-      "subscriptionActiveDescription": "Đăng ký Marine của bạn đang hoạt động. Sử dụng thương mại được cấp phép trong thời hạn gói."
+      },
+      "requiresTeamOwner": "Chỉ chủ sở hữu nhóm mới có thể thay đổi mã hóa hồ sơ."
     },
     "advanced": {
       "title": "Nâng cao",
@@ -271,7 +262,6 @@
       "stopLeader": "Dừng hồ sơ này và tất cả hồ sơ đi theo",
       "stopFollower": "Đang đi theo hành động của {{leaderName}}",
       "desyncedTooltip": "Đồng bộ thất bại tại {{url}}",
-      "paidFeature": "Trình đồng bộ là tính năng trả phí",
       "wayfernOnly": "Chỉ hồ sơ Wayfern mới có thể đồng bộ",
       "selectFollowers": "Chọn hồ sơ đi theo",
       "selectFollowersDesc": "Chọn các hồ sơ sẽ phản chiếu hành động của hồ sơ dẫn đầu. Chỉ hồ sơ Wayfern đã dừng mới có thể chọn.",
@@ -308,8 +298,7 @@
       "assignExtensionGroup": "Gán nhóm tiện ích",
       "copyCookies": "Sao chép Cookie",
       "runSelected": "Chạy mục đã chọn",
-      "stopSelected": "Dừng mục đã chọn",
-      "proRequired": "Cần gói Pro để chạy/dừng hàng loạt"
+      "stopSelected": "Dừng mục đã chọn"
     },
     "passwordProtectedBadge": "Được bảo vệ bằng mật khẩu",
     "launchHook": {
@@ -646,7 +635,6 @@
       "verifyAndLogin": "Xác minh và đăng nhập",
       "loggingIn": "Đang đăng nhập...",
       "connected": "Đã kết nối",
-      "plan": "Gói",
       "profiles": "Profile",
       "profileUsage": "{{used}} / {{limit}}",
       "manageAccount": "Quản lý tài khoản",
@@ -892,8 +880,7 @@
       "selectFile": "Chọn tệp",
       "preview": "Tìm thấy {{count}} cookie",
       "success": "Đã nhập thành công {{imported}} cookie (đã thay thế {{replaced}})",
-      "error": "Nhập cookie thất bại",
-      "proFeature": "Nhập cookie là tính năng Pro"
+      "error": "Nhập cookie thất bại"
     },
     "export": {
       "title": "Xuất cookie",
@@ -1101,7 +1088,6 @@
     "productSub": "Phụ phẩm",
     "brand": "Thương hiệu",
     "brandVersion": "Phiên bản thương hiệu",
-    "proFeature": "Đây là tính năng Pro",
     "generateFingerprint": "Tạo vân tay",
     "refreshFingerprint": "Làm mới vân tay",
     "canvasNoiseSeedPlaceholder": "Nhập chuỗi hạt giống cho vân tay canvas",
@@ -1242,9 +1228,7 @@
       "cannotWhileRunning": "Dừng profile trước khi thay đổi mật khẩu."
     },
     "fingerprint": {
-      "notSupported": "Chỉnh sửa vân tay chỉ khả dụng cho profile Camoufox và Wayfern.",
-      "lockedTitle": "Xem và chỉnh sửa vân tay là tính năng Pro",
-      "lockedDescription": "Bảo vệ vân tay được bao gồm trong mọi gói. Việc xem và chỉnh sửa các giá trị vân tay của profile mới là phần yêu cầu gói trả phí đang hoạt động."
+      "notSupported": "Chỉnh sửa vân tay chỉ khả dụng cho profile Camoufox và Wayfern."
     },
     "syncStatusValue": {
       "waiting": "Đang chờ",
@@ -1261,7 +1245,6 @@
     "extensionsTab": "Tiện ích",
     "groupsTab": "Nhóm",
     "managedNotice": "Tiện ích được quản lý tại đây sẽ thay thế bất kỳ tiện ích nào được cài đặt thủ công trong profile khi khởi chạy.",
-    "proRequired": "Quản lý tiện ích là tính năng Pro",
     "empty": "Chưa tải lên tiện ích nào.",
     "noGroups": "Chưa tạo nhóm tiện ích nào.",
     "createGroup": "Tạo nhóm",
@@ -1321,14 +1304,6 @@
       "groupsDescription": "Xóa {{count}} nhóm tiện ích? {{names}}",
       "confirmButton": "Xóa"
     }
-  },
-  "pro": {
-    "badge": "PRO",
-    "fingerprintLocked": "Chỉnh sửa vân tay là tính năng Pro",
-    "cookieCopyLocked": "Sao chép cookie là tính năng Pro",
-    "cookieImportLocked": "Nhập cookie là tính năng Pro",
-    "cookieExportLocked": "Xuất cookie là tính năng Pro",
-    "cookieManagementLocked": "Quản lý cookie là tính năng Pro"
   },
   "dnsBlocklist": {
     "title": "Danh sách chặn DNS",
@@ -1596,14 +1571,6 @@
     "acceptFailed": "Chấp nhận điều khoản thất bại",
     "tryAgain": "Vui lòng thử lại"
   },
-  "commercialTrial": {
-    "title": "Thời gian dùng thử thương mại đã hết",
-    "description": "Thời gian dùng thử thương mại 2 tuần của bạn đã kết thúc.",
-    "body": "Nếu bạn sử dụng Marine cho mục đích thương mại, bạn cần mua giấy phép thương mại để tiếp tục. Bạn vẫn có thể sử dụng miễn phí cho mục đích cá nhân.",
-    "understandButton": "Tôi hiểu",
-    "failed": "Lưu xác nhận thất bại",
-    "tryAgain": "Vui lòng thử lại"
-  },
   "permissionDialog": {
     "titleMicrophone": "Yêu cầu quyền truy cập micro",
     "titleCamera": "Yêu cầu quyền truy cập camera",
@@ -1864,7 +1831,6 @@
     "cookieDbLocked": "Không thể đọc cookie — cơ sở dữ liệu bị khóa. Đóng trình duyệt và thử lại.",
     "cookieDbUnavailable": "Không thể đọc cookie — kho cookie không khả dụng.",
     "selfHostedRequiresLogout": "Đăng xuất khỏi tài khoản Marine trước khi cấu hình máy chủ tự lưu trữ.",
-    "fingerprintRequiresPro": "Xem hoặc chỉnh sửa vân tay yêu cầu gói trả phí đang hoạt động. Tính năng bảo vệ được bao gồm trong mọi gói.",
     "proxyNotWorking": "Proxy đã chọn không hoạt động, nên profile chưa được tạo.",
     "proxyPaymentRequired": "Proxy đã chọn yêu cầu thanh toán (402) — gói đăng ký của nó có thể đã hết hạn — nên profile chưa được tạo.",
     "vpnNotWorking": "VPN đã chọn không hoạt động, nên profile chưa được tạo.",
@@ -1879,7 +1845,8 @@
     "marineGenerateFailed": "Tạo thất bại. {{detail}}",
     "marineGenerateTimeout": "Tạo đã hết thời gian chờ.",
     "marineFillFailed": "Không thể điền vào ô trả lời. {{detail}}",
-    "marineMarkPostedFailed": "Không thể đánh dấu đã đăng. {{detail}}"
+    "marineMarkPostedFailed": "Không thể đánh dấu đã đăng. {{detail}}",
+    "teamOwnerOnly": "Chỉ chủ sở hữu nhóm mới có thể thay đổi mật khẩu mã hóa."
   },
   "rail": {
     "profiles": "Profile",
@@ -1939,15 +1906,11 @@
     "loggedOut": "Đã đăng xuất",
     "signedOut": "Đã đăng xuất",
     "signedOutDescription": "Đăng nhập để bật đồng bộ đám mây, profile mã hóa và tính năng nhóm.",
-    "plan": "Gói: {{plan}} · {{period}}",
     "refresh": "Làm mới",
     "logout": "Đăng xuất",
     "signIn": "Đăng nhập",
     "fields": {
-      "plan": "Gói",
-      "status": "Trạng thái",
       "teamRole": "Vai trò nhóm",
-      "period": "Chu kỳ thanh toán",
       "device": "Thiết bị"
     },
     "tabs": {
@@ -1963,9 +1926,7 @@
       "testConnection": "Kiểm tra kết nối",
       "disconnect": "Ngắt kết nối"
     },
-    "deviceOrdinal": "{{ordinal}} trên {{count}}",
-    "automationPrimaryOnly": "Tự động hóa trình duyệt chỉ chạy trên thiết bị chính của bạn (Thiết bị 1). Đăng xuất ở đó để sử dụng tại đây.",
-    "automationActiveHere": "Tự động hóa trình duyệt đang hoạt động trên thiết bị này."
+    "deviceOrdinal": "{{ordinal}} trên {{count}}"
   },
   "shortcutsPage": {
     "title": "Phím tắt",
@@ -2083,15 +2044,8 @@
       "body": "Marine là mã nguồn mở và miễn phí sử dụng.",
       "agree": "Tôi hiểu",
       "personalTitle": "Sử dụng cá nhân",
-      "personalDesc": "Miễn phí vĩnh viễn.",
-      "commercialTitle": "Sử dụng thương mại",
-      "trialBadge": "2 tuần miễn phí",
-      "commercialDesc": "Miễn phí dùng thử 2 tuần. Sau đó, gói trả phí giúp dự án được duy trì và phát triển."
+      "personalDesc": "Miễn phí vĩnh viễn."
     }
-  },
-  "wayfernBlocked": {
-    "title": "Tự động hóa trình duyệt đã tạm dừng",
-    "description": "Tài khoản của bạn tạm thời bị hạn chế các tính năng Pro của trình duyệt, thường do đăng nhập trên nhiều thiết bị cùng lúc. Hãy đăng xuất khỏi các thiết bị khác rồi khởi chạy lại profile để khôi phục."
   },
   "camoufoxDeprecation": {
     "title": "Hỗ trợ Camoufox sắp kết thúc",

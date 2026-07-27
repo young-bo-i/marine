@@ -40,7 +40,6 @@ interface CamoufoxConfigDialogProps {
     config: CamoufoxConfig,
   ) => Promise<void>;
   isRunning?: boolean;
-  crossOsUnlocked?: boolean;
 }
 
 export function CamoufoxConfigDialog({
@@ -50,7 +49,6 @@ export function CamoufoxConfigDialog({
   onSave,
   onSaveWayfern,
   isRunning = false,
-  crossOsUnlocked = false,
 }: CamoufoxConfigDialogProps) {
   const { t } = useTranslation();
   // Use union type to support both Camoufox and Wayfern configs
@@ -172,8 +170,6 @@ export function CamoufoxConfigDialog({
                 onConfigChange={updateConfig}
                 forceAdvanced={true}
                 readOnly={isRunning}
-                crossOsUnlocked={crossOsUnlocked}
-                limitedMode={!crossOsUnlocked}
                 profileVersion={profile.version}
                 profileBrowser="wayfern"
               />
@@ -184,8 +180,6 @@ export function CamoufoxConfigDialog({
                 forceAdvanced={true}
                 readOnly={isRunning}
                 browserType="camoufox"
-                crossOsUnlocked={crossOsUnlocked}
-                limitedMode={!crossOsUnlocked}
                 profileVersion={profile.version}
                 profileBrowser="camoufox"
               />
