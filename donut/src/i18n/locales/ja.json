@@ -172,8 +172,7 @@
         "submit": "確認",
         "matchToast": "パスワードが一致しました",
         "mismatchToast": "パスワードが一致しません"
-      },
-      "requiresTeamOwner": "プロファイルの暗号化を変更できるのはチームのオーナーのみです。"
+      }
     },
     "advanced": {
       "title": "詳細設定",
@@ -237,7 +236,10 @@
       "cantModifyRunning": "実行中のプロファイルは変更できません",
       "cantModifyLaunching": "起動中はプロファイルを変更できません",
       "cantModifyStopping": "停止中はプロファイルを変更できません",
-      "cantModifyUpdating": "ブラウザの更新中はプロファイルを変更できません"
+      "cantModifyUpdating": "ブラウザの更新中はプロファイルを変更できません",
+      "marineLogin": "Marine ログイン",
+      "marineLoggedOut": "ログアウト済み — 再ログインが必要",
+      "marineLoginUnknown": "判定できません — 後で確認"
     },
     "actions": {
       "launch": "起動",
@@ -724,7 +726,6 @@
     "tokenCopied": "トークンをコピーしました",
     "mcpEnableLabel": "MCP サーバーを有効にする (Model Context Protocol)",
     "mcpEnableDescription": "Claude Desktop などの AI アシスタントがブラウザを制御できます。",
-    "mcpAcceptTermsFirst": "(設定で先に Wayfern の規約に同意してください)",
     "mcpStarted": "MCP サーバーをポート {{port}} で起動しました",
     "mcpStopped": "MCP サーバーを停止しました",
     "mcpToggleFailed": "MCP サーバーの切り替えに失敗しました",
@@ -1561,16 +1562,6 @@
     "creatingButton": "作成中...",
     "createButton": "作成"
   },
-  "wayfernTerms": {
-    "title": "Wayfern 利用規約",
-    "description": "Marine を使用する前に、Wayfern の利用規約を読み、同意する必要があります。",
-    "reviewLabel": "次の URL で利用規約をご確認ください:",
-    "agreeNotice": "「同意します」をクリックすると、これらの条項に拘束されることに同意します。",
-    "acceptButton": "同意します",
-    "acceptSuccess": "規約に同意しました",
-    "acceptFailed": "規約への同意に失敗しました",
-    "tryAgain": "もう一度お試しください"
-  },
   "permissionDialog": {
     "titleMicrophone": "マイクへのアクセスが必要です",
     "titleCamera": "カメラへのアクセスが必要です",
@@ -1830,11 +1821,9 @@
     "invalidLaunchHookUrl": "起動フックURLが無効です。完全な http:// または https:// URL を使用してください。",
     "cookieDbLocked": "Cookie を読み取れません — データベースがロックされています。ブラウザを閉じてから再試行してください。",
     "cookieDbUnavailable": "Cookie を読み取れません — Cookie ストアを利用できません。",
-    "selfHostedRequiresLogout": "セルフホストサーバーを設定する前に Marine アカウントからサインアウトしてください。",
     "proxyNotWorking": "選択したプロキシが機能していないため、プロファイルは作成されませんでした。",
     "proxyPaymentRequired": "選択したプロキシは支払いが必要です（402）。サブスクリプションが期限切れの可能性があります。そのため、プロファイルは作成されませんでした。",
     "vpnNotWorking": "選択したVPNが機能していないため、プロファイルは作成されませんでした。",
-    "camoufoxImportDeprecated": "Firefox ベース（Camoufox）のプロファイルのインポートはサポートされなくなりました。Camoufox は廃止予定です。代わりに Wayfern をご利用ください。",
     "marineProfileNotRunning": "選択したプロファイルは実行されていません。先に起動してください。",
     "marineNoCdp": "実行中のブラウザに接続できませんでした。プロファイルが起動していることを確認してください。",
     "marineGrabTimeout": "ページの取得がタイムアウトしました。",
@@ -1846,7 +1835,10 @@
     "marineGenerateTimeout": "生成がタイムアウトしました。",
     "marineFillFailed": "返信欄に入力できませんでした。{{detail}}",
     "marineMarkPostedFailed": "投稿済みにできませんでした。{{detail}}",
-    "teamOwnerOnly": "暗号化パスワードを変更できるのはチームのオーナーのみです。"
+    "marineDiscoveryAlreadyRunning": "すでに発見処理が実行中です。",
+    "marineDiscoveryEmptyPlan": "プロファイルとプラットフォームを 1 つ以上選んでください。",
+    "marineDiscoveryEmptyKeyword": "検索キーワードを入力してください。",
+    "marineDiscoveryProfileNotFound": "選択したプロファイルの 1 つが存在しません。"
   },
   "rail": {
     "profiles": "プロファイル",
@@ -1864,7 +1856,7 @@
     "network": "ネットワーク",
     "integrations": "連携",
     "account": "アカウント",
-    "marine": "コメント台帳"
+    "marine": "台帳"
   },
   "pageTitle": {
     "proxies": "ネットワーク",
@@ -1876,7 +1868,7 @@
     "account": "アカウント",
     "import": "プロファイルをインポート",
     "shortcuts": "キーボードショートカット",
-    "marine": "コメント台帳"
+    "marine": "台帳"
   },
   "encryption": {
     "required": {
@@ -2202,6 +2194,83 @@
       },
       "unknownPlatform": "不明なプラットフォーム",
       "profileId": "プロファイル ID: {{id}}"
+    },
+    "tabs": {
+      "prospects": "発見台帳",
+      "history": "コメント台帳"
+    },
+    "prospects": {
+      "title": "発見台帳",
+      "description": "検索で見つかった候補と、どのアカウントが触れたかの記録です。自分たちの 2 つのアカウントが同じコンテンツに重なるのを防ぐ唯一の保証で、検索フィルターは結果を散らすだけです。",
+      "loading": "発見台帳を読み込んでいます…",
+      "untitled": "無題",
+      "run": {
+        "label": "自動実行",
+        "title": "自動で 1 周まわす",
+        "description": "プロファイルを順番に開き、1 つのプラットフォームずつ処理し、閉じてから次に進みます。同時に 2 つは開きません。コメント欄に下書きを入力したところで停止し、送信はしません。",
+        "keyword": "キーワード",
+        "keywordPlaceholder": "例: 研究ツール",
+        "platforms": "プラットフォーム",
+        "profiles": "プロファイル",
+        "noProfiles": "Wayfern のプロファイルがありません。発見用の拡張機能は Wayfern にしか入らないため、実行には Wayfern が必要です。",
+        "start": "実行",
+        "stop": "停止",
+        "hint": "キーワードを入力し、プラットフォームとプロファイルを 1 つ以上選んでください。",
+        "progress": "{{done}}/{{total}} · {{phase}} · {{target}}",
+        "settledCount": "{{n}} 件を記録",
+        "startFailed": "実行を開始できませんでした",
+        "stopFailed": "実行を停止できませんでした",
+        "cycleGap": "巡回間隔（分）",
+        "cycleGapPlaceholder": "例: 30、空欄なら1回のみ"
+      },
+      "phase": {
+        "idle": "待機中",
+        "launching": "起動中",
+        "working": "実行中",
+        "closing": "終了処理中",
+        "pausing": "間隔待ち",
+        "done": "完了",
+        "cancelled": "キャンセル済み"
+      },
+      "outcome": {
+        "settled": "記録済み",
+        "timed_out": "記録なし",
+        "no_slot": "未対応のプラットフォーム",
+        "already_open": "すでに起動中のためスキップ",
+        "failed": "失敗",
+        "cancelled": "キャンセル済み"
+      },
+      "stats": {
+        "label": "台帳サマリー",
+        "posted": "投稿済み"
+      },
+      "filters": {
+        "label": "台帳フィルター",
+        "searchPlaceholder": "タイトル・ID・キーワードで検索",
+        "allPlatforms": "すべてのプラットフォーム"
+      },
+      "table": {
+        "platform": "プラットフォーム",
+        "title": "コンテンツ",
+        "keywords": "キーワード",
+        "accounts": "アカウント",
+        "open": "ブラウザーで開く",
+        "postedAt": "投稿日時"
+      },
+      "empty": {
+        "title": "台帳はまだ空です",
+        "description": "上で実行を開始するか、対応する検索ページでプロファイルを開いてください。拡張機能が見つけた内容を記録します。"
+      },
+      "error": {
+        "title": "発見台帳を読み込めませんでした",
+        "description": "台帳ファイルの読み取りに失敗しました。更新を試し、それでも失敗する場合はアプリのログを確認してください。"
+      },
+      "platform": {
+        "bilibili": "Bilibili",
+        "zhihu": "Zhihu",
+        "douyin": "Douyin",
+        "xiaohongshu": "Xiaohongshu"
+      }
     }
   }
 }

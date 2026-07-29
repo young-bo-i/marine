@@ -683,6 +683,11 @@
       sourceId: operation.sourceId,
       retainWhenUnfocused: operation.retainWhenUnfocused === true,
       leaseRenewal: operation.leaseRenewal === true,
+      // 这个函数是**逐字段重建**消息的，不是把 operation 整个发过去 —— 漏一个
+      // 字段就等于那个特性从未存在，而且没有任何报错。编排标记就在这里被丢过
+      // 一次：SW 侧的豁免代码是对的、content 侧也确实设了标记，可它到不了 SW，
+      // 表现为「鼠标一移开就 deferred」和之前一模一样，白查了很久。
+      orchestrated: operation.orchestrated === true,
     };
     let lastError = null;
     for (let attempt = 0; attempt < MARINE_RIME_SEND_ATTEMPTS; attempt++) {
@@ -696,7 +701,18 @@
         }
         if (response && response.ok === true) {
           if (!response.skipped) return { ok: true, applied: true, response };
-          if (!response.deferred) return { ok: true, applied: false, skipped: true, response };
+          if (!response.deferred) {
+            // 「SW 收下了但没写」以前在这里静默返回。编排跳过推迟闸之后连
+            // `deferred` 都没有，于是下面那条 warn 也不会打 —— 整条链路上一个字
+            // 都不出，12 秒后以「目标准备超时」收场，把矛头指向输入框和本地服务，
+            // 两个方向都是错的。记下原因，让超时文案能说出真话。
+            const why = String((response && response.reason) || 'unknown');
+            marineRimeTarget.lastSkipReason = why;
+            if (operation.orchestrated === true) {
+              marineLog('warn', 'rime-target', operation.op + ' 被 SW 跳过：' + why);
+            }
+            return { ok: true, applied: false, skipped: true, response };
+          }
           lastError = new Error('Marine Rime context deferred');
         } else {
           lastError = new Error(response && response.error || 'Marine Rime 未收到有效 ACK');
@@ -1914,8 +1930,10 @@
     const els = marineRimeGenEnsureUI();
     const active = marineRimeTarget.active;
 
+    // 编排期间不因目标切换中止在途生成 —— 上面已经冻结了人工事件，这里是双保险
+    // （比如适配器自己因为 DOM 重绘换了 contextId）。人工使用时行为不变。
     if (active && marineRimeGenBusy() && marineRimeGen.contextId &&
-        active.contextId !== marineRimeGen.contextId) {
+        active.contextId !== marineRimeGen.contextId && !marineProspectOrchestrating) {
       marineRimeGenAbort('target-switched');
     }
 
@@ -1964,6 +1982,12 @@
     marineRimeGenStopTyping();
     const typed = marineRimeGen.typed;
     marineRimeGen.state = 'idle';
+    // 把结束原因暴露出来：`done` 才是「整段敲完了」，其余（escape / 标签页隐藏
+    // 等中止）都会走到同一个函数、同样把 state 落回 idle。编排必须能分清这两者
+    // —— 分不清就会把中止当成完成，然后**发出半截评论**（实测在知乎发出过只有
+    // 两个字的评论）。序号用来区分「这一轮的结束」和「上一轮留下的结束」。
+    marineRimeGen.lastFinish = reason;
+    marineRimeGen.finishSeq = (marineRimeGen.finishSeq || 0) + 1;
     marineRimeGen.streamDone = false;
     marineRimeGen.raw = '';
     marineRimeGen.wanted = '';
@@ -1987,6 +2011,14 @@
     marineRimeGenStopTyping();
     marineRimeGen.state = 'idle';
     marineRimeGen.streamDone = false;
+    // 和 `marineRimeGenFinish` 一样要推进 finishSeq。
+    //
+    // 之前只有 finish 写它，于是所有走 fail 的失败（输入框失效、生成结果为空、
+    // 后端报错…）在编排看来既不是完成也不是中止 —— 只能干等到 120 秒超时，
+    // **所有失败都伪装成「生成超时」**，把排查往生成侧带偏。实测抖音那几轮
+    // 正是如此：`wanted` 已经是完整一整段，报的却是超时。
+    marineRimeGen.lastFinish = 'fail:' + String(label || '');
+    marineRimeGen.finishSeq = (marineRimeGen.finishSeq || 0) + 1;
     marineRimeGenShowError(label);
   }
 
@@ -2059,15 +2091,120 @@
     }
   }
 
+  /**
+   * 打字过程中重新解析编辑框。
+   *
+   * Draft.js（知乎）在接收输入时会**重建 DOM 节点**，我们打字开始时拿到的引用
+   * 当场失效 —— 实测：敲到第 3 个字 `editor.isConnected` 变 false，整轮生成以
+   * 「目标输入框已失效」告终。手动操作之所以不出问题，是因为人会先点一下输入
+   * 框、等它挂载稳定了再点生成；编排是点完立刻生成，抢在重建之前拿了引用。
+   *
+   * 引用会变，选择器不会。
+   *
+   * **不限编排**：节点重建是 Draft.js 自己的行为，跟谁触发生成无关 —— 手动点
+   * 「生成」一样会敲到一半就停（实测：只写进第一个输出块）。曾经把这层保护限
+   * 定在编排模式，等于只修了一半。
+   *
+   * 安全性来自两点，不是来自「谁触发的」：只在原节点**已经从文档上消失**时才
+   * 触发（还在就绝不换），且换回来的必须仍被 `marineRimeIsCommentEditor` 认成
+   * 评论输入框。两条都满足时换过去是唯一正确的动作 —— 原节点已经不存在，继续
+   * 往它上面敲字什么也不会发生。
+   */
+  function marineProspectRecoverEditor(stale) {
+    let fresh = marineProspectFindCommentEditor(marineCommentSearchRoot());
+    if (!fresh) {
+      // 输入框可能**整个消失了**，不只是换了节点。
+      //
+      // 知乎（Draft.js）是原地重建：旧节点失效、新节点立刻在同一位置出现，
+      // 重新查询就够。抖音同样是 Draft.js，但重建时会把整条输入条一起收起来 ——
+      // 实测那一刻页面上 `[contenteditable]` 的数量是 **0**，重新查询查无可查。
+      //
+      // 所以要允许再走一遍「打开评论区」。这一步是幂等的（已经开着就什么都不做），
+      // 反复调用安全。
+      // 重开是**两步**流程（图标 → 占位条），一次调用只推进一步，
+      // 靠打字泵的重试预算反复调用来走完。
+      try { marineProspectOpenCommentPanel(detectPlatform()); } catch (e) {}
+      fresh = marineProspectFindCommentEditor(marineCommentSearchRoot());
+    }
+    if (!fresh || !fresh.isConnected || fresh === stale) return null;
+    return fresh;
+  }
+
   function marineRimeGenPump() {
     const g = marineRimeGen;
     g.typeTimer = 0;
     if (g.state !== 'typing' && g.state !== 'streaming') return;
-    const editor = g.editor;
-    if (!editor || !editor.isConnected) { marineRimeGenFail('目标输入框已失效，请重新点选后再生成'); return; }
+
+    // 抖音：整段交给 Rust 侧用 CDP 真实键盘事件敲，不走页内写入。
+    //
+    // 它的编辑器对 `execCommand('insertText')` 有反制 —— 写一两个字就把整个评论
+    // 组件拆掉，而且点评论图标都恢复不了，手动点「生成」一样。CDP
+    // `Input.dispatchKeyEvent` 产生的是浏览器层面的可信事件，实测同一个编辑器
+    // 连打 8 个字毫发无损。
+    //
+    // 只对抖音这么做：另外三个平台的页内写入已经真实验证过，不该为它承担风险。
+    if (detectPlatform() === 'douyin' && !g.douyinDelegated) {
+      // 等整段产出完再委托：`wanted` 在流式过程中只是「目前收到的部分」，
+      // 提前交出去会只敲半截。CDP 是一次性把整段打完，没有续打的语义。
+      if (!g.streamDone) { g.typeTimer = setTimeout(marineRimeGenPump, 300); return; }
+      g.douyinDelegated = true;
+      void marineProspectTypeViaCdp(g.wanted).then(function (ok) {
+        // 无论成败都把 typed 推到终点：成了就是真敲完了，败了让上层的
+        // 「发送前核对输入框内容」那道闸去拦，不在这里静默继续敲。
+        g.typed = ok ? g.wanted : g.typed;
+        marineRimeGenFinish(ok ? 'done' : 'fail:CDP 打字失败');
+      });
+      return;
+    }
+
+
+    let editor = g.editor;
+    if (!editor || !editor.isConnected) {
+      // 节点被重建了就换成新的那个，而不是判死刑（见 marineProspectRecoverEditor）。
+      const fresh = marineProspectRecoverEditor(editor);
+      if (!fresh) {
+        // 抖音重建时输入条会整个消失一小会儿。立刻判死会把一次正常的重挂载
+        // 当成失败 —— 给它几轮时间，重挂上就继续敲。
+        // 预算要够走完「重开评论区」这条慢路。
+        //
+        // 抖音敲第一个字就会把**整个评论面板**收起来（不只是输入框重建）：实测
+        // 那一刻 `[data-e2e=comment-list]` 一起消失，只剩 `feed-comment-icon`。
+        // 恢复要重新走「点图标 → 等列表渲染 → 点占位条」两步，实测十几秒。
+        // 4.8 秒的预算刚好差一点，表现成「生成超时」，而 wanted 已经是完整
+        // 一整段（136 字）—— 症状会误导人去查生成侧。
+        g.recoverTries = (g.recoverTries || 0) + 1;
+        if (g.recoverTries <= 40) {
+          g.typeTimer = setTimeout(marineRimeGenPump, 600);
+          return;
+        }
+        marineRimeGenFail('目标输入框已失效，请重新点选后再生成');
+        return;
+      }
+      g.recoverTries = 0;
+      editor = fresh;
+      g.editor = fresh;
+      // 基线要跟着换：新节点里已有的文本就是新的起点，沿用旧基线会把已经敲进去
+      // 的内容再算一遍。
+      g.baseline = (marineTextOf(fresh) || '').slice(0, Math.max(0, (marineTextOf(fresh) || '').length - g.typed.length));
+      try { fresh.focus(); } catch (e) {}
+    }
     // contenteditable 的 insertText 落在「当前聚焦元素」上，焦点跑了就必须停手，
     // 否则会把话术写进别人的输入框。
-    if (!marineRimeGenEditorFocused(editor)) { marineRimeGenAbort('focus-lost'); return; }
+    //
+    // **先把焦点抢回来再停手**：知乎的评论弹层在敲字过程中会短暂夺走焦点，
+    // 一次都不容忍的话敲到第二个字就中止。抢回来是安全的 —— `editor` 就是当前
+    // 这一轮的目标，`focus()` 只会把焦点还给它自己，绝不会写到别人的输入框里
+    // （那条原始担忧针对的是「焦点在别处时继续 insertText」，这里恰恰相反）。
+    // 抢不回来（元素没了/被禁用）才真的停手。
+    //
+    // 同样不限编排：夺焦是 Draft.js 重绘的副作用，手动点生成一样会碰到。
+    if (!marineRimeGenEditorFocused(editor)) {
+      let recovered = false;
+      if (editor && editor.isConnected) {
+        try { editor.focus(); recovered = marineRimeGenEditorFocused(editor); } catch (e) {}
+      }
+      if (!recovered) { marineRimeGenAbort('focus-lost'); return; }
+    }
 
     if (g.wanted.indexOf(g.typed) !== 0) {
       // 流式抽取的前缀被最终结果修正了（少见）：一次性对齐到已知文本再继续逐字敲。
@@ -2093,8 +2230,13 @@
   function marineRimeGenBeginTyping() {
     const g = marineRimeGen;
     if (g.state === 'typing') return;
-    const editor = g.editor;
-    if (!editor || !editor.isConnected) { marineRimeGenFail('目标输入框已失效，请重新点选后再生成'); return; }
+    let editor = g.editor;
+    if (!editor || !editor.isConnected) {
+      const fresh = marineProspectRecoverEditor(editor);
+      if (!fresh) { marineRimeGenFail('目标输入框已失效，请重新点选后再生成'); return; }
+      editor = fresh;
+      g.editor = fresh;
+    }
     g.state = 'typing';
     g.typed = '';
     g.typingStartedAt = Date.now();
@@ -2167,7 +2309,13 @@
         return;
       }
       if (Date.now() - startedAt > 12000) {
-        marineRimeGenFail('目标准备超时，请重新点选输入框再试（若持续，请检查 Marine 本地服务连接）');
+        // 带上 SW 的拒写原因。原来这句只说「重新点选输入框 / 检查本地服务」，
+        // 而绝大多数情况下真实原因是 SW 的归属闸把 PUT 挡了（reason: authority /
+        // suspended-lease / …），照它指的两个方向查一定查不到。
+        const skip = marineRimeTarget.lastSkipReason;
+        marineRimeGenFail(skip
+          ? '目标准备超时（上下文未落地：' + String(skip) + '）'
+          : '目标准备超时，请重新点选输入框再试（若持续，请检查 Marine 本地服务连接）');
         return;
       }
       setTimeout(tick, 300);
@@ -2249,6 +2397,11 @@
       sourceId: marineRimeTarget.sourceId,
       retainWhenUnfocused: op === 'put' && !!active && active.contextId === contextId &&
         marineRimePersistentTargetIsOpen(active),
+      // 编排期间标签页多半不在前台（人在用别的程序），而 SW 默认只让活动标签页
+      // 占用那个全局上下文槽位。这个标记让 SW 知道「这是编排在驱动」，跳过焦点
+      // 闸。安全上没有放宽：消息只能来自本扩展的 content script（isolated
+      // world），页面 JS 发不出来。
+      orchestrated: marineProspectOrchestrating === true,
       leaseRenewal: op === 'put' && !!options && options.leaseRenewal === true,
     };
     const result = marineRimeSendQueue.catch(function () {}).then(function () {
@@ -2463,7 +2616,44 @@
     catch (e) { return false; }
   }
 
+  /**
+   * 编排模式。
+   *
+   * 存在的理由：整套目标追踪是给**人用侧边栏**设计的，隐含假设是「用户正看着
+   * 这个标签页」。两条行为直接建立在这个假设上：
+   *   1. 窗口失焦就清掉投放目标（`window-blur`）
+   *   2. SW 只让当前活动标签页占用那个全局 Rime 上下文槽位，后台 tab 的 PUT
+   *      被推迟并在 5 秒后丢弃
+   *
+   * 对编排来说这两条都是错的：调度器**独占**这个浏览器，就一个标签页在干活，
+   * 而运行期间人必须能用鼠标干别的（跑 5 个号 × 4 个平台要占用机器很久）。
+   * 实测形态：鼠标一移开，日志立刻出现 `已清理投放目标：window-blur` +
+   * `put 失败：Marine Rime context deferred`，然后生成超时、台账记 failed、
+   * 那条靶子按「失败不重试」永久作废。
+   *
+   * 刻意做成**有明确起止**的模式而不是全局常开：非编排时那两条保护仍然生效，
+   * 人手动用侧边栏的行为一点不变。
+   */
+  let marineProspectOrchestrating = false;
+
+  function marineProspectSetOrchestrating(on) {
+    marineProspectOrchestrating = !!on;
+  }
+
   function marineRimeRetainOrClear(reason) {
+    // 编排 + 正在生成时，任何失焦都不得清掉目标。
+    //
+    // 失焦有**三条**独立路径，之前只豁免了 `window-blur` 一条：
+    //   · `window-blur`  —— 人切到别的程序（编排期间是常态）
+    //   · `editor-blur`  —— 焦点离开输入框（小红书的评论条会自己夺焦，实测）
+    //   · 打字泵里的逐字焦点检查（已单独处理：先抢回来，抢不回才停手）
+    // 只堵一条的后果是换个平台就复发 —— 小红书正是走 `editor-blur` 断的。
+    //
+    // 限定在**生成进行中**：生成结束后保护立刻恢复，人工点走目标该清还是清。
+    if (marineProspectOrchestrating && marineRimeGenBusy()) {
+      marineRimeSchedulePosition();
+      return true;
+    }
     const active = marineRimeTarget.active;
     marineRimeClearPendingReply(reason);
     if (active && marineRimePersistentTargetIsOpen(active)) {
@@ -2516,6 +2706,15 @@
   }
 
   function marineRimeRefreshFromEvent(event) {
+    // 编排正在生成时，人工点击/聚焦不得改写投放目标。
+    //
+    // 编排独占这个标签页，而运行期间人要用鼠标干别的 —— 随手点一下页面别处就
+    // 会激活另一个编辑框、换掉 contextId，`marineRimeGenSync` 随即
+    // `abort('target-switched')`，一整轮生成白费。实测就是这么中断的。
+    //
+    // 只在**生成进行中**冻结，生成结束后立刻恢复：不是把目标追踪关掉，而是
+    // 不让它在最不能被打断的那段时间里插手。
+    if (marineProspectOrchestrating && marineRimeGenBusy()) return;
     if (marineRimeTarget.navigationRearmRequired) {
       const eventTime = Number(event && event.timeStamp) || 0;
       if (!event || event.isTrusted !== true || eventTime <= marineRimeTarget.navigationEventCutoff) return;
@@ -2701,11 +2900,23 @@
     window.addEventListener('focus', function () { setTimeout(function () { marineRimeRefreshFromEvent(null); }, 0); });
     document.addEventListener('visibilitychange', function () {
       if (document.hidden) {
-        // 必须显式中止打字：pump 靠自排 setTimeout 推进，标签页隐藏后会被浏览器
-        // clamp 到 1s（重度节流后 60s），而它的两个中止条件在这里都不成立——
-        // active 已被下面清成 null（所以 contextId 比较不触发），document.activeElement
-        // 在隐藏标签页里仍等于那个输入框（所以焦点校验也通过）。不管的话就变成
-        // 僵尸循环，用户切回来只看到半截草稿。已敲进去的字保留。
+        // 编排期间不中止。这是四条失焦路径里唯一没有编排豁免的一条（window-blur
+        // 和 editor-blur 都走 marineRimeRetainOrClear，那里已经豁免了），而它是
+        // 唯一「秒杀」级的——窗口被别的程序完全盖住或最小化就触发，一触发就
+        // 中止生成 → 台账记 failed → 靶子按「失败不重试」作废。编排本来就是要在
+        // 人用别的程序时跑完的，隐藏是常态不是异常。
+        //
+        // 这里刻意**不加** marineRimeGenBusy() 条件（和 marineRimeRetainOrClear
+        // 不同）：等输入框的那 40 秒里 GenBusy 为假，而那恰恰是人最可能切走的时段；
+        // 一旦清掉投放目标，等待方 40 秒后报「未能定位到直评输入框」，症状指向
+        // 输入框，真实原因是可见性——查错方向会被带偏。
+        if (marineProspectOrchestrating) { marineRimeSchedulePosition(); return; }
+        // 非编排（人在用侧边栏）时必须显式中止打字：pump 靠自排 setTimeout 推进，
+        // 标签页隐藏后会被浏览器 clamp 到 1s（重度节流后 60s），而它的两个中止
+        // 条件在这里都不成立——active 已被下面清成 null（所以 contextId 比较不
+        // 触发），document.activeElement 在隐藏标签页里仍等于那个输入框（所以焦点
+        // 校验也通过）。不管的话就变成僵尸循环，用户切回来只看到半截草稿。
+        // 已敲进去的字保留。
         marineRimeGenAbort('tab-hidden');
         marineRimeClearPendingReply('tab-hidden');
         marineRimeClear('tab-hidden');
@@ -2955,4 +3166,937 @@
     marineRimeStartTargetTracking();
   }
   marineLog('info', 'iso', '已加载 · 平台=' + PLATFORM_LABEL[detectPlatform()] + ' · ' + location.href);
+
+  // ---- 发现侧编排：落到搜索页就自动开工 ----------------------------------
+  //
+  // 触发方式刻意是「启动网址落地即跑」而不是按钮：Donut 启动 profile 时按该
+  // 账号的筛选位下发搜索 URL（marine/search_slot.rs），所以这里不需要拼 URL，
+  // 也不需要人点任何东西。非搜索页 shouldRun 直接返回 false。
+  //
+  // 编排只走到「打开靶子」为止 —— 话术生成与填入仍是页内「生成」按钮 + 人工
+  // 发送，见 prospect-run.js 顶部说明。
+  function marineProspectSend(message) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage(message, (reply) => {
+          void chrome.runtime.lastError;
+          resolve(reply || { ok: false });
+        });
+      } catch (e) { resolve({ ok: false }); }
+    });
+  }
+
+  /**
+   * 交接单存在 SW 侧（按 tab），不是 sessionStorage。
+   *
+   * sessionStorage 按 origin 分区，而搜索页和靶子页经常不同源 —— B 站永远是
+   * （search.bilibili.com -> www.bilibili.com），知乎专栏文章也是。用它的后果
+   * 是 Phase A 全绿、Phase B 静默不跑，台账里留下一条永远 claimed 的记录。
+   */
+  const marineProspectHandoffStore = {
+    read: async () => {
+      const r = await marineProspectSend({ __marineProspectHandoff: true, op: 'read' });
+      return r && r.ok ? r.data : null;
+    },
+    write: async (value) => {
+      const r = await marineProspectSend({ __marineProspectHandoff: true, op: 'write', value });
+      return !!(r && r.ok);
+    },
+    clear: async () => {
+      await marineProspectSend({ __marineProspectHandoff: true, op: 'clear' });
+    },
+  };
+
+  function marineStartProspectRun() {
+    if (typeof marineProspectRun === 'undefined') return;      // 未注入该站点
+    if (!marineProspectRun.shouldRun(location.href)) return;
+
+    // SW 代发：apiBase/token 只有 SW 读得到，且路由在 SW 侧有白名单。
+    const send = marineProspectSend;
+
+    // SPA 的结果卡片在 document_idle 时通常还没渲染（知乎/抖音/小红书都是），
+    // 这时解析条数不足、canary 判 unhealthy。所以非终局状态要退避重试，直到
+    // 渲染完成或放弃。B 站是 SSR，第一次就成，重试不产生额外开销。
+    const DELAYS_MS = [0, 1500, 3000, 5000, 8000, 12000];
+
+    const attempt = async (i) => {
+      const who = await send({ __marineProspectProfileId: true });
+      const result = await marineProspectRun.run({
+        profileId: who && who.profileId,
+        login: (platform) => marineLogin.status(platform),
+        // 掉登录才上报，走 SW 的写死路由（不进页面可控的白名单）。
+        // 不 await：编排不该为一次记账多等一个往返。
+        reportLogin: (result) => {
+          void marineProspectSend({ __marineLoginReport: true, result });
+        },
+        pageHtml: () => document.documentElement.outerHTML,
+        parse: (platform, raw) => marineDiscovery.parseFor(platform, raw),
+        canary: (platform, items) => marineDiscovery.canary.check(platform, items),
+        api: async (route, body) => {
+          const reply = await send({ __marineProspectApi: true, route, body });
+          if (!reply || !reply.ok) throw new Error((reply && reply.error) || '本地 API 调用失败');
+          return reply.data;
+        },
+        // location.assign 而不是 href=，语义一样但更明确是「导航」。
+        navigate: (url) => location.assign(url),
+        handoffStore: marineProspectHandoffStore,
+      }).catch((e) => ({ status: 'error', error: String(e && e.message || e) }));
+
+      // 终局才落幂等标记；unhealthy / login_unknown 这类「现在还不行」保持可重试。
+      const done = marineProspectRun.markDone(location.href, result.status);
+      marineLog('info', 'iso', '发现侧编排[' + (i + 1) + '/' + DELAYS_MS.length + ']：' + JSON.stringify(result));
+      if (done || i + 1 >= DELAYS_MS.length) return;
+      // 页面已经导航走了就别再重试（location 变了说明上一轮成功打开了靶子）。
+      if (!marineProspectRun.shouldRun(location.href)) return;
+      setTimeout(() => { void attempt(i + 1); }, DELAYS_MS[i + 1]);
+    };
+
+    void attempt(0);
+  }
+
+  // ---- Phase B：在靶子页自动生成并填入 ------------------------------------
+  //
+  // 驱动的是既有的页内生成链路（marineRimeGenStart：流式产出 + 拟人节奏敲进
+  // 输入框），不是另写一套。等待方式是轮询 marineRimeGen.state，因为那套是
+  // 状态机不是 Promise。
+  //
+  // 终止点由交接单里的 stopAfter 决定，当前 'fill' —— 敲完就停，不点发送。
+  // 评论区里「这是一条评论」的容器。用来把评论正文排除在关闭提示的扫描之外 ——
+  // 有人评论里写「为什么无法评论」就会把整条靶子误判成关闭，而 blocked 是**全局
+  // 永久**的，误判代价比漏判高得多。
+  const MARINE_COMMENT_ITEM_SELECTORS =
+    'bili-comment-thread-renderer, bili-comment-renderer, bili-comment-reply-renderer,' +
+    '.reply-item, .comment-item, .CommentItem, .comment-item-wrapper, .parent-comment';
+
+  function marineInsideCommentItem(el) {
+    for (let cur = el, depth = 0; cur && depth < 14; cur = marineComposedParent(cur), depth++) {
+      try {
+        if (cur.matches && cur.matches(MARINE_COMMENT_ITEM_SELECTORS)) return true;
+      } catch (e) {}
+    }
+    return false;
+  }
+
+  /**
+   * 评论区范围内的可见文本，供「评论区是不是关了」判据使用。
+   *
+   * 只取**叶子**节点：父节点的 textContent 会把整块内容重复一遍，扫一个评论区
+   * 能拼出好几 MB。穿 shadow DOM 是必须的 —— B 站的 <bili-comments> 把提示文案
+   * 整个藏在 shadow root 里，document.querySelector 看不见。
+   */
+  function marineProspectCommentAreaText() {
+    try {
+      const root = marineCommentSearchRoot();
+      if (!root) return '';
+      const parts = [];
+      const all = marineAllElements(root);
+      for (let i = 0; i < all.length && parts.length < 400; i++) {
+        const el = all[i];
+        if (el.childElementCount) continue;
+        const t = (el.textContent || '').trim();
+        if (!t || t.length > 200) continue;
+        if (marineInsideCommentItem(el)) continue;
+        parts.push(t);
+      }
+      return parts.join('\n');
+    } catch (e) { return ''; }
+  }
+
+  /**
+   * 自动打开评论区并选中直评输入框。
+   *
+   * 编排缺的正是这一步。整套目标追踪是**事件驱动**的（`click` / `focusin`），
+   * 为「人点一下评论框」设计；自动打开的页面没人滚也没人点，所以
+   * `marineRimeGen.editor` 永远是空的，Phase B 只能等到超时报「未能定位到直评
+   * 输入框」—— 实测就是卡在这里。
+   *
+   * 两件事：
+   *   1. **滚到评论区** —— B 站的 `<bili-comments>` 在首屏之下且懒渲染，不滚
+   *      过去 DOM 里根本没有输入框可选。
+   *   2. **聚焦它** —— 只有真的 focus 才会触发既有的 `focusin` 监听，由它把
+   *      目标登记进 `marineRimeGen`。这里刻意不自己给 `marineRimeGen.editor`
+   *      赋值：那样会绕过 classify（直评/回复的判定、directScope 快照），
+   *      等于把一套已经调好的逻辑复制一份出来。
+   *
+   * @returns {Promise<boolean>} 选中了没有
+   */
+  /**
+   * 有些平台的评论框**不在 DOM 里**，要先点一下入口才会出现。
+   *
+   * B 站的输入框一直在（只是懒渲染，滚过去就有）；知乎不是 —— 回答页默认没有
+   * 任何 contenteditable，必须先点「添加评论」把评论区展开。实测：不点的话页面
+   * 上 `[contenteditable=true]` 的数量是 0，怎么等都等不出来。
+   *
+   * 只写实测过的平台，其余返回 false（照 commentsClosed 那条纪律）。
+   */
+  function marineProspectOpenCommentPanel(platform) {
+    if (platform === 'douyin') return marineProspectOpenDouyinComments();
+    if (platform !== 'zhihu') return false;
+    // 知乎的入口是 BUTTON.ContentItem-action，文本「添加评论」。
+    // 文本前面带零宽字符（\u200b），所以用 indexOf 而不是相等匹配。
+    let all;
+    try { all = document.querySelectorAll('button'); } catch (e) { return false; }
+    for (let i = 0; i < all.length; i++) {
+      const el = all[i];
+      const text = String(el.textContent || '');
+      if (text.indexOf('添加评论') < 0 && text.indexOf('条评论') < 0) continue;
+      if (el.offsetParent === null) continue;
+      // 页面上有多个（问题头部一个、每条回答各一个）。只认回答自己那条操作栏里
+      // 的，否则会展开别人回答的评论区，直评就变成评到别处去了。
+      if (!el.closest || !el.closest('.ContentItem-actions')) continue;
+      try { el.scrollIntoView({ block: 'center' }); el.click(); } catch (e) { continue; }
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * 抖音：点开评论面板。
+   *
+   * 抖音用 `data-e2e` 标记关键节点，比猜类名可靠得多（类名是混淆过的，
+   * 实测形如 `XJJ1G7TE`，改版必变）。入口是 `feed-comment-icon`。
+   *
+   * 面板已经打开时（`comment-list` 在且输入框已出现）不要再点 —— 那会把它收回去。
+   */
+  // 评论图标每个文档只点一次。精选页点它只是开合抽屉，反复点会把刚开的关上。
+  let marineProspectDouyinIconClicked = false;
+
+  function marineProspectOpenDouyinComments() {
+    try {
+      // 输入框已经在了就什么都不做
+      if (document.querySelector('[contenteditable="true"], textarea')) return true;
+
+      // 第一步：把评论区调出来。
+      //
+      // 抖音有**两种页面形态**，入口完全不同：
+      //   · 视频页 `/video/…` —— 播放器右侧有评论图标 `feed-comment-icon`
+      //   · 图文笔记页 `/note/…` —— 右栏是「相关推荐 | 评论(N)」两个 tab，
+      //     默认停在「相关推荐」上，必须先点「评论」那个 tab 才切过去
+      // 只处理视频页的话，笔记页永远找不到输入框（实测：那条链路上
+      // `feed-comment-icon` 根本不存在）。
+      if (!document.querySelector('[data-e2e="comment-list"]')) {
+        // 图标只点一次。它在**三种**形态下都存在，但只有视频页点了会出评论区；
+        // 精选页点它只是开合右侧抽屉，反复点等于把刚开的又关上。
+        const icon = document.querySelector('[data-e2e="feed-comment-icon"]');
+        if (icon && !marineProspectDouyinIconClicked) {
+          marineProspectDouyinIconClicked = true;
+          icon.scrollIntoView({ block: 'center' });
+          icon.click();
+          return false;   // 面板要时间渲染，下一轮轮询再往下走
+        }
+        // 「评论」tab。两种形态都要走这一步，判据不能是「没有图标」：
+        //   · 图文笔记页 `/note/…`：右栏是「相关推荐 | 评论(N)」，没有图标
+        //   · **精选页 `/jingxuan?modal_id=…`**：右侧抽屉是
+        //     「详情 | TA的作品 | 评论 | AI抖音 | 相关推荐」，默认停在别的 tab 上，
+        //     而 `feed-comment-icon` **存在**——老代码因此永远走不到这里，
+        //     一轮轮点图标直到超时（实测卡满 240 秒）。
+        // 文本严格匹配，避免命中评论正文里出现的「评论」二字。
+        const tab = Array.prototype.slice
+          .call(document.querySelectorAll('*'))
+          .filter((el) => /^评论\s*\(?\d*\)?$/.test(String(el.textContent || '').trim()) &&
+            el.children.length <= 1 && marineVisible(el))
+          .pop();
+        if (!tab) return false;
+        tab.scrollIntoView({ block: 'center' });
+        tab.click();
+        return false;
+      }
+
+      // 第二步：点开输入条。
+      //
+      // 评论列表出来了不等于输入框出来了 —— 抖音先放一条占位条「留下你的精彩
+      // 评论吧」，点它才挂载真正的可编辑元素（挂出来的是 Draft.js，和知乎同一
+      // 套）。实测：只点评论图标的话，`comment-list` 有了、`[contenteditable]`
+      // 仍然是 0 个。
+      //
+      // 锚点用**语义结构**不用类名：抖音的类名是混淆的，而且**每个视频页都不
+      // 一样**（实测同一份代码在两个视频上分别是 `McY63d8B` 和 `Ii031XNo`）。
+      // 唯一稳定的是「输入条是 `[data-e2e=comment-list]` 的前一个兄弟」，
+      // 占位文案在它内部。
+      // 输入条的锚点有两种，因为**精选页根本没有 `comment-list`**（实测那一页
+      // 一个带 comment 的 data-e2e 都没有）。所以：有 `comment-list` 就用它的
+      // 前一个兄弟（视频页/笔记页最稳），没有就退回全文档按占位文案找。
+      const list = document.querySelector('[data-e2e="comment-list"]');
+      const head = (list && list.previousElementSibling) || document.body;
+      if (!head) return false;
+      const spots = Array.prototype.slice
+        .call(head.querySelectorAll('*'))
+        .filter((el) => String(el.textContent || '').trim().indexOf('留下你的精彩评论') === 0 &&
+          marineVisible(el));
+      // 取最内层：外层容器同样命中这段文本，点外层不一定触发挂载
+      // （B 站的发布按钮踩过同样的坑）。
+      const spot = spots[spots.length - 1];
+      if (!spot) return false;
+      spot.scrollIntoView({ block: 'center' });
+      spot.click();
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function marineProspectOpenCommentsAndFocus(deadlineMs) {
+    return new Promise(function (resolve) {
+      const deadline = Date.now() + (deadlineMs || 15000);
+      let scrolled = 0;
+      let opened = false;
+      (function attempt() {
+        // 先把评论区展开（对需要的平台）。只点一次 —— 反复点会把刚展开的收回去。
+        if (!opened) opened = marineProspectOpenCommentPanel(detectPlatform());
+        const root = marineCommentSearchRoot();
+        // 滚动要反复做：评论区是懒加载的，第一次滚过去时可能还没挂载，
+        // 而挂载后页面高度会变，之前的滚动位置就不再对准评论区了。
+        if (root && root !== document && typeof root.scrollIntoView === 'function' && scrolled < 6) {
+          try { root.scrollIntoView({ block: 'center' }); scrolled++; } catch (e) {}
+        }
+        const editor = marineProspectFindCommentEditor(root);
+        if (editor) {
+          try {
+            editor.scrollIntoView({ block: 'center' });
+            // click 在前、focus 在后：有些站点的输入框是点击后才真正挂上
+            // contenteditable 的壳子。
+            editor.click();
+            editor.focus();
+          } catch (e) {}
+          // 已经锁在这个输入框上就别再激活了。
+          //
+          // 激活会有三个来源同时触发：这里的显式调用、`click()` 和 `focus()`
+          // 各自引发的 focusin。每次激活都会换一个新的 contextId，而
+          // `marineRimeGenSync` 看到 contextId 变了就会
+          // `abort('target-switched')` —— 于是生成刚起步就被自己人打断。
+          // 实测：日志里连着三条「已锁定」，然后 `生成被中止：target-switched`。
+          const already = marineRimeTarget && marineRimeTarget.active;
+          if (already && already.editor === editor) {
+            setTimeout(function () { resolve(true); }, 200);
+            return;
+          }
+
+          // 再显式激活一次。
+          //
+          // 光靠合成事件是**不够的**，实测拿到过精确证据：`.click()` 派发的事件
+          // `isTrusted:false`，而 `.focus()` 在元素已聚焦时根本不产生事件 ——
+          // 于是 `marineRimeRefreshFromEvent` 里那道「导航后需要可信事件重新
+          // 武装」的闸永远不放行，`navigationRearmRequired` 一直是 true，目标
+          // 永远登记不上。
+          //
+          // 那道闸防的是「导航前的陈旧事件复活」，不是防我们自己的编排 ——
+          // 这里是本扩展在明确地驱动它。仍然走 `marineRimeActivate`（内部照常
+          // classify），所以直评/回复判定和 directScope 快照一个都不少，只是
+          // 不再要求一个人类的点击。
+          try { marineRimeActivate(editor); } catch (e) {}
+          // 事件是异步派发的，给追踪一点时间登记
+          setTimeout(function () {
+            resolve(!!(marineRimeGen && marineRimeGen.editor && marineRimeGen.editor.isConnected));
+          }, 400);
+          return;
+        }
+        if (Date.now() > deadline) return resolve(false);
+        setTimeout(attempt, 700);
+      })();
+    });
+  }
+
+  /**
+   * 评论区里第一个「既可编辑、又被判定为评论输入框」的元素（含 shadow DOM）。
+   *
+   * 从评论根开始找，**找不到就退回全文档**。不是保险，是必须：
+   * `marineCommentSearchRoot()` 的选择器是逗号列表，`querySelector` 按**文档
+   * 顺序**返回首个命中，B 站上先命中的可能是个普通 DIV，而输入框在
+   * `<bili-comments>` 的 shadow root 里 —— 只搜那个 DIV 永远空手（实测
+   * root=DIV、found=null）。退回全文档是安全的：判据本身就要求元素落在评论
+   * 容器内，扩大范围不会选中页面别处的输入框。
+   */
+  function marineProspectFindCommentEditor(root) {
+    const scoped = marineProspectScanForEditor(root);
+    if (scoped) return scoped;
+    return root && root !== document ? marineProspectScanForEditor(document) : null;
+  }
+
+  function marineProspectScanForEditor(root) {
+    const scope = root || document;
+    let all;
+    try { all = marineAllElements(scope); } catch (e) { return null; }
+    for (let i = 0; i < all.length; i++) {
+      const el = all[i];
+      const tag = (el.tagName || '').toLowerCase();
+      const editable = tag === 'textarea' || el.isContentEditable ||
+        (el.getAttribute && el.getAttribute('contenteditable') === 'true');
+      if (!editable) continue;
+      try { if (marineRimeIsCommentEditor(el)) return el; } catch (e) {}
+    }
+    return null;
+  }
+
+  function marineProspectGenerateAndFill() {
+    return new Promise(function (resolve) {
+      const g = marineRimeGen;
+      // 先把自己变成所在窗口内的活动标签页，再做别的。
+      //
+      // **不抢操作系统前台** —— 编排要在人用别的程序时跑完。这里只是让本标签页
+      // 在窗口内活动，从而不被判 `document.hidden`（隐藏标签页的打字泵会被浏览器
+      // clamp 到 1s 起）。上下文归属靠 `orchestrated` 标记放行，不靠焦点。
+      void marineProspectSend({ __marineProspectFocusTab: true }).then(function () {
+        // 目标追踪是事件驱动的，自动打开的页面不会有人去点评论框 —— 自己滚到
+        // 评论区并激活，再等目标登记好。
+        //
+        // 30s 而不是 15s：抖音的评论区要两步才打开（点图标 → 等列表渲染 →
+        // 点占位条），实测整条要十几秒；15s 的窗口经常在列表刚出来时就到期，
+        // 表现为「未能定位到直评输入框」，而手动同样的步骤是通的。
+        void marineProspectOpenCommentsAndFocus(30000);
+      });
+      // 等目标登记的窗口要比「打开评论区」的窗口更长，否则评论区刚打开就超时。
+      const deadline = Date.now() + 40000;
+      (function waitTarget() {
+        // 等的是**目标被激活**（marineRimeTarget.active），不是
+        // `marineRimeGen.editor`。
+        //
+        // 后者只在 `marineRimeGenStart()` 之后才被赋值 —— 等它再去调
+        // GenStart 是个死锁，而且症状具有误导性：日志报「未能定位到直评输入
+        // 框」，可实际上输入框早就选中了（同一轮日志里抓取链路跑完了整套：
+        // 字幕 186 条、评论、正文全拿到）。实测踩过。
+        const active = marineRimeTarget && marineRimeTarget.active;
+        if (active && active.editor && active.editor.isConnected) return waitPublished();
+        if (Date.now() > deadline) return giveUp();
+        setTimeout(waitTarget, 500);
+      })();
+
+      /**
+       * 输入框拿到了，但上下文槽位不一定拿得到 —— 分开等，因为这两件事的性质
+       * 完全不同：拿不到输入框是**这条靶子**的问题（该记 failed），拿不到槽位是
+       * **我们这边**的系统性故障（记 failed 会一条接一条地烧候选，因为 Failed 是
+       * 账号级终态、按「失败不重试」永久作废）。
+       *
+       * 不能直接进 begin()：那样只会在里面等满 12 秒再以「目标准备超时」收场，
+       * 外部看不出这是系统性问题还是这条靶子的问题。
+       */
+      function waitPublished() {
+        const until = Date.now() + 15000;
+        (function tick() {
+          const cur = marineRimeTarget && marineRimeTarget.active;
+          if (cur && cur.publishedContext) return begin();
+          if (Date.now() > until) {
+            return resolve({
+              ok: false,
+              reason: 'context_unavailable',
+              error: '上下文槽位未获得：' + String(marineRimeTarget.lastSkipReason || '无响应'),
+            });
+          }
+          setTimeout(tick, 300);
+        })();
+      }
+
+      // 等不到输入框时才去问「是不是根本不让评论」。
+      //
+      // 顺序是刻意的：输入框在 = 能评论，这时页面上出现「无法评论」字样只可能
+      // 是别处的噪声。先确认没有输入框，再看文案，等于两道独立的闸，比单靠文案
+      // 匹配稳得多。
+      function giveUp() {
+        let closed = null;
+        try {
+          closed = marineProspectRun.commentsClosed(detectPlatform(), marineProspectCommentAreaText());
+        } catch (e) {}
+        if (closed === true) {
+          return resolve({ ok: false, reason: 'comments_closed', error: '该内容已关闭评论' });
+        }
+        resolve({ ok: false, error: '未能定位到直评输入框' });
+      }
+
+      function begin() {
+        const before = g.typed || '';
+        try { marineRimeGenStart(); }
+        catch (e) { return resolve({ ok: false, error: '发起生成失败：' + String(e && e.message || e) }); }
+        // 生成是流式的，**只有 `lastFinish === 'done'` 才算敲完**。
+        //
+        // 曾经用「state 回落到 idle + 文本不再增长」推断，两次都错得很惨：
+        // 打字过程中 state 会短暂回落，而中止（Esc、标签页隐藏、目标被清）也会
+        // 把 state 落回 idle 并让文本停止增长 —— 于是半截草稿被判成完成，接上
+        // 发送之后就是往真实账号发出「这份」「"都」这样的两字评论（实测两次）。
+        //
+        // `marineRimeGenFinish(reason)` 是权威信号：走完整段才是 'done'。
+        // 用序号而不是值本身，避免把上一轮留下的 'done' 当成这一轮的。
+        const genDeadline = Date.now() + 120000;
+        const seqBefore = g.finishSeq || 0;
+        (function poll() {
+          if (g.state === 'error') return resolve({ ok: false, error: '生成失败' });
+          if (Date.now() > genDeadline) return resolve({ ok: false, error: '生成超时' });
+          if ((g.finishSeq || 0) > seqBefore) {
+            if (g.lastFinish !== 'done') {
+              return resolve({ ok: false, error: '生成被中止：' + String(g.lastFinish) });
+            }
+            const typed = g.typed || '';
+            if (typed === before || !typed.length) {
+              return resolve({ ok: false, error: '生成结束但没有写入内容' });
+            }
+            return resolve({ ok: true, text: typed });
+          }
+          setTimeout(poll, 500);
+        })();
+      }
+    });
+  }
+
+  /**
+   * 平台的发送控件。
+   *
+   * **只有 B 站有实测数据**，其余三个平台返回 null —— 和 `commentsClosed` 同一条
+   * 纪律：猜一个选择器进来，代价是往真实账号上发出去一条本不该发的评论，或者
+   * 点中别的按钮。没量过就不写。
+   *
+   * B 站实测（`bili-comments` 的 shadow root 内）：发布控件是 `textContent`
+   * 恰为「发布」的元素，**不是 `<button>`**（同层还有 168 个按钮类元素，多数是
+   * 表情/@ 之类的工具按钮，按 tagName 找必然选错）。
+   */
+  function marineProspectFindSendButton(platform) {
+    if (platform === 'zhihu') return marineProspectFindZhihuSendButton();
+    if (platform === 'xiaohongshu') return marineProspectFindXhsSendButton();
+    if (platform === 'douyin') return marineProspectFindDouyinSendButton();
+    if (platform !== 'bilibili') return null;
+    const host = document.querySelector('bili-comments');
+    if (!host) return null;
+    let all;
+    try { all = marineAllElements(host); } catch (e) { return null; }
+    const hits = [];
+    for (let i = 0; i < all.length; i++) {
+      const el = all[i];
+      // 严格相等而不是 includes：一条正文里出现「发布」两个字的评论会把
+      // 整个评论卡片匹配进来。
+      if (String(el.textContent || '').trim() !== '发布') continue;
+      if (el.offsetParent === null) continue;          // 不可见的不算
+      if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') continue;
+      if (el.disabled === true) continue;
+      hits.push(el);
+    }
+    if (!hits.length) return null;
+
+    // 命中的是**同一个按钮的多层包装**，不是多个按钮。实测这一组是：
+    //   DIV 898x120（整个评论框外壳）→ DIV 898x32（工具栏行）
+    //   → DIV 70x32（按钮外框）→ BUTTON（真正的控件）
+    // 取第一个（文档序最靠前）拿到的是最外层的外壳，点下去毫无反应 —— 踩过。
+    // 所以：优先 <button>，否则取面积最小的那个，即最内层。
+    const area = (el) => {
+      try { const r = el.getBoundingClientRect(); return r.width * r.height; }
+      catch (e) { return Number.MAX_SAFE_INTEGER; }
+    };
+    const buttons = hits.filter((el) => (el.tagName || '').toLowerCase() === 'button');
+    const pool = buttons.length ? buttons : hits;
+    const chosen = pool.reduce((best, el) => (area(el) < area(best) ? el : best), pool[0]);
+
+    // 尺寸兜底：最小的那个也可能大得离谱。
+    //
+    // 输入框一旦失去焦点，B站会把工具栏收起来 —— 内层 BUTTON 从 DOM 里消失，
+    // 只剩外层一个 771×78 的壳还带着「发布」两个字。「取最小」于是选中那个壳，
+    // 点下去毫无反应，而外部症状是「已点发送但未收到平台回执」——和真被风控拦
+    // 完全一样，无从区分（实测因此白跑两轮）。
+    //
+    // 宁可报「未找到发送按钮」：那是**响亮的**失败，一眼看得出是选择器的问题。
+    const MAX_SEND_BUTTON_AREA = 240 * 60;
+    if (area(chosen) > MAX_SEND_BUTTON_AREA) return null;
+    return chosen;
+  }
+
+  /**
+   * 知乎的发送控件。
+   *
+   * 比 B 站干净得多：草稿填好后，页面上恰好只有一个可见且未禁用的
+   * `<button>` 文本为「发布」（实测 `Button--primary Button--blue`，62×30）。
+   * 不在 shadow DOM 里，也没有多层同文本包装。
+   *
+   * 仍然要求 `!disabled`：输入框为空时知乎会把它置灰，点了没用还白跑一次。
+   */
+  function marineProspectFindZhihuSendButton() {
+    let all;
+    try { all = document.querySelectorAll('button'); } catch (e) { return null; }
+    for (let i = 0; i < all.length; i++) {
+      const el = all[i];
+      if (String(el.textContent || '').trim() !== '发布') continue;
+      if (el.offsetParent === null || el.disabled === true) continue;
+      if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') continue;
+      return el;
+    }
+    return null;
+  }
+
+  /**
+   * 当前直评输入框里的实际文本；读不到返回 null（和「空」严格区别对待 ——
+   * 读不到就拒发，空则是「没敲进去」，两者都不能当成「内容对」）。
+   *
+   * 三级兜底：跟踪到的目标 → 评论区里认出来的输入框 → 全文档唯一的可编辑元素。
+   * 知乎的评论框在弹层里，敲完字之后原来的引用可能已经不在文档上了（实测：
+   * 生成正常完成，发送前却报「读不到输入框」）。最后一级只在**恰好只有一个**
+   * 可编辑元素时才用 —— 有多个就说不清是哪个，宁可拒发。
+   */
+  function marineProspectReadEditorText(platform) {
+    void platform;
+    const readText = (el) => {
+      if (!el || !el.isConnected) return null;
+      try {
+        const tag = (el.tagName || '').toLowerCase();
+        return String(tag === 'textarea' ? el.value : el.textContent || '');
+      } catch (e) { return null; }
+    };
+
+    const active = marineRimeTarget && marineRimeTarget.active;
+    const tracked = readText(active && active.editor);
+    if (tracked !== null) return tracked;
+
+    const found = readText(marineProspectFindCommentEditor(marineCommentSearchRoot()));
+    if (found !== null) return found;
+
+    try {
+      const editable = Array.prototype.slice
+        .call(document.querySelectorAll('[contenteditable="true"], textarea'))
+        .filter((el) => el.isConnected && el.offsetParent !== null);
+      if (editable.length === 1) return readText(editable[0]);
+    } catch (e) {}
+    return null;
+  }
+
+  /**
+   * 小红书的发送控件。
+   *
+   * 输入框是 `#content-textarea`，发送按钮在同一个 `.engage-bar-container`
+   * 里（适配器已经用这个容器认输入框，复用同一个锚点，不另找一套）。
+   *
+   * 限定在容器内很重要：小红书页面上「发送」「发布」这类字样不止一处（右上角
+   * 还有发笔记的入口），全局找必然选错。
+   */
+  function marineProspectFindXhsSendButton() {
+    const editor = document.querySelector('#content-textarea');
+    const bar = editor && editor.closest && editor.closest('.engage-bar-container');
+    const scope = bar || document;
+    let all;
+    try { all = scope.querySelectorAll('button, [role="button"], .btn, [class*="submit" i], [class*="send" i]'); }
+    catch (e) { return null; }
+    for (let i = 0; i < all.length; i++) {
+      const el = all[i];
+      const text = String(el.textContent || '').trim();
+      if (text !== '发送' && text !== '发布') continue;
+      if (el.offsetParent === null || el.disabled === true) continue;
+      if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') continue;
+      return el;
+    }
+    return null;
+  }
+
+  /**
+   * 抖音的发送控件。
+   *
+   * 输入框那一行有三个 36×36 的图标控件（@ / 表情 / 发送），**都没有文字、类名
+   * 也是混淆的**（实测 `wchsYBpK jfGCpJo0`，改版必变）。唯一稳定的区分是
+   * **位置**：发送在最右边（实测 x=969 / 1005 / 1041，取最大那个）。
+   *
+   * 锚在输入框的祖先容器里找，不全局搜 —— 页面别处还有播放器的弹幕发送框。
+   */
+  function marineProspectFindDouyinSendButton() {
+    const editor = document.querySelector('[contenteditable="true"]');
+    if (!editor) return null;
+    let box = editor;
+    for (let i = 0; i < 6 && box.parentElement; i++) box = box.parentElement;
+    let all;
+    try { all = box.querySelectorAll('span'); } catch (e) { return null; }
+
+    let best = null;
+    let bestLeft = -Infinity;
+    for (let i = 0; i < all.length; i++) {
+      const el = all[i];
+      if (el.offsetParent === null) continue;
+      if (String(el.textContent || '').trim() !== '') continue;
+      let r;
+      try { r = el.getBoundingClientRect(); } catch (e) { continue; }
+      if (Math.abs(r.width - 36) > 6 || Math.abs(r.height - 36) > 6) continue;
+      if (r.left > bestLeft) { bestLeft = r.left; best = el; }
+    }
+    return best;
+  }
+
+  /**
+   * 点发送，并等平台确认。
+   *
+   * 两件事必须说清楚：
+   *
+   * 1. **必须点网站自己的按钮**，不能由扩展自己发请求。回执检测是在 MAIN world
+   *    里劫持页面的 `fetch`/`XMLHttpRequest`（content-main.js），扩展从 isolated
+   *    world 或 SW 发出的请求根本不经过那层劫持，**一条回执都不会产生** ——
+   *    也就等于永远无法确认评论真的上线了。
+   *
+   * 2. **成功的判据是回执，不是「点了按钮」**。B 站在风控拒绝时同样返回 HTTP
+   *    200，只有响应体 `code===0` 且带正数 `rpid` 才算数。这个判定已经由
+   *    publish-receipt.js 做好，这里只等它把结果挂到 isolated world 的全局上
+   *    （publish-bridge.js 的 `sendReceipt`）。
+   *
+   * 等不到回执就报失败 —— 宁可把一条其实发出去了的评论记成 `failed`，也不能把
+   * 没发出去的记成 `posted`：后者会让 per-item cap 和整个报表都失真。
+   */
+  /**
+   * 已经点过发送的交接单 key。
+   *
+   * 小红书暴露了一个危险形态：**评论已经发出去了，草稿却仍留在输入框里**
+   * （B 站/知乎发完会清空）。加上「没收到回执就记 failed」，任何重试路径都会
+   * 把同一条内容再发一遍 —— 而发送是整条链里唯一不可逆的动作。
+   *
+   * 所以按交接单 key 记一次性标记：**点过就不再点**，哪怕上一次被判成失败。
+   * 宁可漏发也不能重发。
+   */
+  const marineProspectSentKeys = Object.create(null);
+
+  /**
+   * 把整段文本交给 Rust 侧，用 CDP 真实键盘事件敲进当前焦点元素。
+   *
+   * 仅用于抖音，理由见调用点。Rust 侧会拒绝控制字符和超长文本，所以这里不需要
+   * 也不应该自己再造一套过滤 —— 校验只放一处。
+   */
+  /**
+   * 调试浏览器的 CDP 端口。
+   *
+   * 只有 `debug-browser.sh` 起的调试环境才有意义 —— 它用固定的 9333，而且
+   * app 认不出这个手动启动的浏览器。正式路径上返回 undefined，Rust 侧照常走
+   * `resolve_running_profile`。
+   *
+   * 判据必须是「这个扩展跑在调试 profile 里」而不是「端口通不通」：后者会让
+   * 任意页面通过占用 9333 来诱导代打。runtime-config 的 profileId 是 app 写
+   * 进去的，调试副本沿用真实 profileId，所以这里靠**扩展目录路径**区分。
+   */
+  function marineProspectDebugCdpPort() {
+    // 由 SW 从 runtime-config 里读出来（那个文件只有调试脚手架会写这个字段，
+    // app 打包的正式 profile 永远没有）。
+    //
+    // 不能靠扩展自己判断路径：`chrome.runtime.getURL()` 给的是
+    // `chrome-extension://<固定ID>/`，看不到磁盘位置；扩展名也是同一个。
+    return marineProspectDebugPortCache;
+  }
+  let marineProspectDebugPortCache;
+
+  function marineProspectTypeViaCdp(text) {
+    return marineProspectSend({ __marineProspectProfileId: true }).then(function (who) {
+      const profileId = who && who.profileId;
+      if (!profileId) {
+        marineLog('warn', 'iso', 'CDP 打字：拿不到 profileId');
+        return false;
+      }
+      return marineProspectSend({
+        __marineProspectApi: true,
+        route: 'type-text',
+        body: {
+          profile_id: profileId,
+          text: String(text || ''),
+          // 调试浏览器不是 app 启动的，app 认不出它 —— 带上端口让 debug 构建
+          // 能跑完整链路。release 构建会忽略这个字段（编译期就不存在）。
+          debug_cdp_port: marineProspectDebugCdpPort(),
+        },
+      }).then(function (reply) {
+        const ok = !!(reply && reply.ok);
+        // 失败原因必须留痕。这条链有三个可能的断点（拿不到 profileId、
+        // Rust 认不出 profile、CDP 本身失败），从外面看症状完全一样。
+        if (!ok) {
+          marineLog('warn', 'iso',
+            'CDP 打字失败：' + ((reply && reply.error) || '未知') +
+            '（' + String(text || '').length + ' 字）');
+        }
+        return ok;
+      });
+    }).catch(function (e) {
+      marineLog('warn', 'iso', 'CDP 打字异常：' + String((e && e.message) || e));
+      return false;
+    });
+  }
+
+  function marineProspectSendComment(platform, expectedText, handoffKey) {
+    return new Promise(function (resolve) {
+      const key = String(handoffKey || '');
+      if (key && marineProspectSentKeys[key]) {
+        return resolve({ ok: false, error: '这条已经点过发送，拒绝重复发送' });
+      }
+      // 发送前核对输入框里到底是什么。
+      //
+      // 这是最后一道、也是唯一一道能挡住「发出半截评论」的闸。生成判据再怎么
+      // 加固都是间接推断，而这里读的是**输入框的实际内容** —— 实测在知乎发出
+      // 过一条只有「这份」两个字的评论，就是因为没有这一步。
+      //
+      // 宁可不发也不发半截：没发出去还能再来一次，发出去的公开评论撤不回。
+      const expected = String(expectedText || '').trim();
+      if (expected) {
+        const actual = marineProspectReadEditorText(platform);
+        if (actual === null) {
+          return resolve({ ok: false, error: '发送前读不到输入框内容，拒绝发送' });
+        }
+        // 平台会规范化空白/换行，所以比长度而不是全等；短了就是没敲完。
+        if (actual.replace(/\s+/g, '').length < expected.replace(/\s+/g, '').length) {
+          return resolve({
+            ok: false,
+            error: '草稿只写了 ' + actual.length + '/' + expected.length + ' 字，拒绝发送',
+          });
+        }
+      }
+
+      const before = (typeof window !== 'undefined' && window.marineLastPublishedReceipt) || null;
+      const beforeId = before && before.eventId;
+
+      // 找按钮之前先把输入框重新聚上焦。
+      //
+      // B站（很可能不止它）在输入框失焦时会把工具栏收起来，内层的发送 BUTTON
+      // 直接从 DOM 里消失。编排打完字到点发送之间隔着一次读取核对，焦点很容易
+      // 已经不在输入框上 —— 于是要么找不到按钮，要么只找到外层的壳。
+      // 这里聚的是**输入框的 DOM 焦点**，和操作系统的窗口焦点无关，
+      // 不会把浏览器抢到前台。
+      let refocusDelay = 0;
+      try {
+        const activeTarget = marineRimeTarget && marineRimeTarget.active;
+        const editor = activeTarget && activeTarget.editor;
+        if (editor && editor.isConnected && marineDeepActiveElement(document) !== editor) {
+          editor.focus();
+          refocusDelay = 400;   // 给工具栏重新展开的时间
+        }
+      } catch (e) {}
+      setTimeout(afterRefocus, refocusDelay);
+
+      function afterRefocus() {
+      const btn = marineProspectFindSendButton(platform);
+      if (!btn) return resolve({ ok: false, error: '未找到发送按钮' });
+      // 记下点击那一刻**到底点了什么**。
+      //
+      // 「点了但没回执」和「点错了元素」的外部症状完全一样，都是一句
+      // 「已点发送但未收到平台回执」。上一次靠给回执桥加 `built` 字段才把
+      // 「没构造出来」和「构造了但被丢」分开，这里是同一类问题：没有这条，
+      // 只能对着一个静置的页面反推，而页面状态早就变了。
+      try {
+        const r = btn.getBoundingClientRect();
+        marineLog('info', 'send', platform + ' 点击发送：<' + String(btn.tagName || '?').toLowerCase()
+          + '> ' + Math.round(r.width) + '×' + Math.round(r.height)
+          + ' @' + Math.round(r.left) + ',' + Math.round(r.top)
+          + ' cls=' + String(btn.className || '').slice(0, 30)
+          + ' 窗口聚焦=' + (typeof document !== 'undefined' ? document.hasFocus() : '?'));
+      } catch (e) {}
+      // 标记要在**点击之前**落下：点完再标记的话，点击本身抛异常或页面立刻跳转
+      // 就会漏标，下一轮又点一次。宁可把一次没点成的也算成点过。
+      if (key) marineProspectSentKeys[key] = true;
+      try {
+        btn.scrollIntoView({ block: 'center' });
+        btn.click();
+      } catch (e) {
+        return resolve({ ok: false, error: '点击发送失败：' + String((e && e.message) || e) });
+      }
+
+      // 等回执。20s 够一次正常往返；超时按失败处理。
+      const deadline = Date.now() + 20000;
+      (function poll() {
+        const now = (typeof window !== 'undefined' && window.marineLastPublishedReceipt) || null;
+        if (now && now.eventId && now.eventId !== beforeId) {
+          return resolve({ ok: true, eventId: now.eventId, platformCommentId: now.platformCommentId });
+        }
+        if (Date.now() > deadline) {
+          return resolve({ ok: false, error: '已点发送但未收到平台回执（可能被风控拦截）' });
+        }
+        setTimeout(poll, 500);
+      })();
+      }
+    });
+  }
+
+  async function marineStartProspectTargetPhase() {
+    if (typeof marineProspectRun === 'undefined') return;
+    // 交接单在 SW 侧，读它是异步的。没有就说明这页不是编排打开的，完全不动。
+    if (!(await marineProspectRun.readHandoff({ handoffStore: marineProspectHandoffStore }))) return;
+    // 有交接单 = 这页是编排打开的。进入编排模式：豁免那两条「假设用户正看着
+    // 这个标签页」的行为（失焦清目标、后台 PUT 被推迟），否则人一动鼠标就会
+    // 烧掉一条靶子。跑完必须关掉 —— 非编排时那两条保护要照常生效。
+    marineProspectSetOrchestrating(true);
+    // 调试环境的 CDP 端口（正式 profile 拿不到，返回 undefined）。
+    try {
+      const cfg = await marineProspectSend({ __marineProspectProfileId: true });
+      marineProspectDebugPortCache = (cfg && cfg.debugCdpPort) || undefined;
+    } catch (e) {}
+    const send = marineProspectSend;
+    void marineProspectRun.runOnTarget({
+      handoffStore: marineProspectHandoffStore,
+      generateAndFill: () => marineProspectGenerateAndFill(),
+      // 只有交接单里 stopAfter==='send' 时才会被调用。哪些平台进入 send 模式
+      // 由 prospect-run 的 SEND_ENABLED_PLATFORMS 决定。
+      send: (platform, text, key) => marineProspectSendComment(platform, text, key),
+      api: async (route, body) => {
+        const reply = await send({ __marineProspectApi: true, route, body });
+        if (!reply || !reply.ok) throw new Error((reply && reply.error) || '本地 API 调用失败');
+        return reply.data;
+      },
+      // 只在「评论区对所有人关闭」时用得上：换一条靶子。跟 Phase A 用同一个
+      // 导航方式，落地后新页面的 Phase B 会靠新交接单接上。
+      navigate: (url) => { location.href = url; },
+    }).then((r) => {
+      marineLog('info', 'iso', '发现侧编排·靶子页：' + JSON.stringify(r));
+    }).finally(() => {
+      // 无论成败都要退出编排模式。留着的话这个标签页后续的人工操作会一直
+      // 绕过焦点保护。
+      marineProspectSetOrchestrating(false);
+    });
+  }
+
+  // 和上面适配器注册表同样的理由：discovery/login/prospect-run 与本文件分属
+  // 不同的 content_scripts 条目，跨条目注入顺序不在文档契约里，推迟一个宏任务
+  // 保证它们都已就位。
+  // 调试出口。
+  //
+  // content-iso 整个包在 IIFE 里，从外面（CDP 求值）一个内部状态都够不着 ——
+  // 排查目标追踪为什么没选中输入框时只能靠日志反推，代价极高。这里把只读的
+  // 状态挂出来。
+  //
+  // 安全上是干净的：content script 跑在 ISOLATED world，这个全局对页面 JS
+  // **不可见**（世界隔离，不是靠命名躲）。全部只读，没有能改状态的入口。
+  var marineInternals = {
+    gen: function () {
+      if (!marineRimeGen) return null;
+      const t = marineRimeTarget && marineRimeTarget.active;
+      return {
+        state: String(marineRimeGen.state),
+        // 按钮文案是这套状态机最可读的投影：生成 / 准备中… / 生成中… / 重新生成
+        btn: (marineRimeGen.els && marineRimeGen.els.lbl && marineRimeGen.els.lbl.textContent) || '',
+        typed: String(marineRimeGen.typed || '').length,
+        wanted: String(marineRimeGen.wanted || '').length,
+        streamDone: !!marineRimeGen.streamDone,
+        finishSeq: marineRimeGen.finishSeq || 0,
+        lastFinish: String(marineRimeGen.lastFinish || ''),
+        err: String(marineRimeGen.errorText || ''),
+        hasEditor: !!(marineRimeGen.editor && marineRimeGen.editor.isConnected),
+        editorTag: marineRimeGen.editor ? marineRimeGen.editor.tagName + '.' + String(marineRimeGen.editor.className || '').split(' ')[0] : null,
+        hasActive: !!t,
+        // 生成能不能启动全看它：没有就只能进「准备中」等上下文发布
+        pubCtx: !!(t && t.publishedContext),
+      };
+    },
+    target: function () {
+      return marineRimeTarget ? {
+        navigationRearmRequired: !!marineRimeTarget.navigationRearmRequired,
+        navigationEventCutoff: marineRimeTarget.navigationEventCutoff,
+        hasDirectScope: !!marineRimeTarget.directScope,
+        sourceId: String(marineRimeTarget.sourceId || ''),
+      } : null;
+    },
+    commentRoot: function () {
+      var r = marineCommentSearchRoot();
+      return r === document ? 'document' : (r ? r.tagName : null);
+    },
+    findEditor: function () {
+      var el = marineProspectFindCommentEditor(marineCommentSearchRoot());
+      return el ? el.tagName + '.' + String(el.className || '').split(' ')[0] : null;
+    },
+    isCommentEditor: function (sel) {
+      var el = document.querySelector(sel);
+      return el ? marineRimeIsCommentEditor(el) : 'no-such-element';
+    },
+    focusEditor: function () { return marineProspectOpenCommentsAndFocus(8000); },
+    // 调试用：按人工路径触发一次生成（点扩展自己的「生成」按钮），
+    // 用来和编排路径做 A/B —— 手动可用而编排不可用时，差别只可能在触发方式上。
+    clickGenButton: function () {
+      const b = marineRimeGen && marineRimeGen.els && marineRimeGen.els.genBtn;
+      if (!b) return 'no-button';
+      b.click();
+      return 'clicked';
+    },
+    // 打字期间编辑框还在不在文档上 —— 知乎实测敲到第 3 个字就 isConnected=false
+    editorAlive: function () {
+      const e = marineRimeGen && marineRimeGen.editor;
+      return { has: !!e, connected: !!(e && e.isConnected), inDoc: !!(e && document.contains(e)) };
+    },
+  };
+  if (typeof window !== 'undefined') window.marineInternals = marineInternals;
+
+  setTimeout(marineStartProspectRun, 0);
+  // 靶子页的第二阶段。给目标追踪一点时间先把直评框认出来。
+  setTimeout(marineStartProspectTargetPhase, 1500);
 })();

@@ -211,6 +211,9 @@ async function marineResolveConfig() {
     apiBase: pick('apiBase').replace(/\/+$/, ''),
     token: pick('token'),
     profileId: pick('profileId'),
+    // 只有调试脚手架会往 runtime-config 里写这个。app 打包的正式 profile 没有
+    // 它，所以正式路径上恒为 undefined —— Rust 侧照常走 resolve_running_profile。
+    debugCdpPort: Number(runtime.debugCdpPort) || undefined,
   };
   marineConfigCache = { at: Date.now(), value };
   return value;
@@ -300,17 +303,47 @@ async function marineContextFetch(method, contextId, context, shouldProceed) {
   } finally { clearTimeout(timeout); }
 }
 
+/**
+ * 平台评论 id。
+ *
+ * B 站/知乎是正整数（`rpid` / `id`），**小红书是 24 位十六进制字符串**
+ * （实测 `note_id: "6a5b0f18000000001c00fb2c"`）。只认正整数会把小红书的回执
+ * 一路判空 —— 而且是在最后一步静默丢掉，外部看到的仍是「没收到回执」。
+ *
+ * 两种都接受，但都要求**非空且形态确定**：id 是「这条评论真的上线了」的唯一
+ * 凭据，含糊的值不能放行。
+ */
 function marinePublishedPositiveId(value) {
   if (typeof value === 'number') {
     return Number.isSafeInteger(value) && value > 0 ? String(value) : '';
   }
   if (typeof value !== 'string') return '';
   const normalized = value.trim();
-  return /^[1-9]\d*$/.test(normalized) ? normalized : '';
+  if (/^[1-9]\d*$/.test(normalized)) return normalized;
+  if (/^[0-9a-f]{16,32}$/i.test(normalized)) return normalized;
+  return '';
 }
 
 function marinePublishedString(value, maxLength) {
   return typeof value === 'string' && value.length <= maxLength ? value : '';
+}
+
+/**
+ * 允许上报发布回执的站点。
+ *
+ * 从「只认 B 站」扩成一张表：每加一个平台，必须先有它的回执构造器
+ * （publish-receipt.js），否则收上来的东西没有「真的上线了」的凭据。
+ * 这里放宽 = 允许该站点的页面往发布历史里写记录，所以只列已实现的。
+ */
+function marineIsPublishCapableUrl(value) {
+  try {
+    const parsed = new URL(String(value || ''));
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+    return /(^|\.)bilibili\.com$/i.test(parsed.hostname) ||
+      /(^|\.)zhihu\.com$/i.test(parsed.hostname) ||
+      /(^|\.)xiaohongshu\.com$/i.test(parsed.hostname) ||
+      /(^|\.)douyin\.com$/i.test(parsed.hostname);
+  } catch (e) { return false; }
 }
 
 function marineIsBilibiliUrl(value) {
@@ -325,7 +358,7 @@ function marineIsBilibiliUrl(value) {
 function marineTrustedPublishedBridgeSender(sender) {
   return !!sender && !!sender.tab && Number.isInteger(sender.tab.id) &&
     (sender.frameId == null || Number.isInteger(sender.frameId)) &&
-    marineIsBilibiliUrl(sender.url || sender.tab.url);
+    marineIsPublishCapableUrl(sender.url || sender.tab.url);
 }
 
 function marinePublishedHandshakeNonce(value) {
@@ -426,14 +459,21 @@ async function marineEnsurePublishedCaptureForExistingTabs(reason) {
   let tabs;
   try {
     tabs = await chrome.tabs.query({
-      url: ['http://*.bilibili.com/*', 'https://*.bilibili.com/*'],
+      // 和 manifest 里回执桥的注入范围保持一致 —— 每加一个平台两处都要动，
+      // 只改一处的后果是「评论发出去了但回执永远收不到」（实测踩过）。
+      url: [
+        'http://*.bilibili.com/*', 'https://*.bilibili.com/*',
+        'http://*.zhihu.com/*', 'https://*.zhihu.com/*',
+        'http://*.xiaohongshu.com/*', 'https://*.xiaohongshu.com/*',
+        'http://*.douyin.com/*', 'https://*.douyin.com/*',
+      ],
     });
   } catch (e) {
     return { reason, scanned: 0, injected: 0 };
   }
   let injected = 0;
   for (const tab of tabs || []) {
-    if (!tab || !Number.isInteger(tab.id) || !marineIsBilibiliUrl(tab.url)) continue;
+    if (!tab || !Number.isInteger(tab.id) || !marineIsPublishCapableUrl(tab.url)) continue;
     if (await marineEnsurePublishedCapture(tab.id)) injected += 1;
   }
   return { reason, scanned: (tabs || []).length, injected };
@@ -472,8 +512,16 @@ function marineGenFillMatchesPost(tabId, postedText) {
   return short.length >= 8 && long.indexOf(short) !== -1;
 }
 
+/** 已实现回执构造器的平台。加平台时要和 publish-receipt.js / publish-bridge.js 一起改。 */
+const MARINE_RECEIPT_PLATFORMS = new Set(['bilibili', 'zhihu', 'xiaohongshu', 'douyin']);
+
 function marineSanitizePublishedReceipt(value) {
-  if (!value || value.schema_version !== 1 || value.platform !== 'bilibili') return null;
+  // 这个早退曾经写死 'bilibili'，和下面的 event_id 判据是**两处独立的闸**。
+  // 只改一处的后果极其隐蔽：回执在 bridge 侧已经构造成功、页内全局也挂上了、
+  // 台账都记了 posted，唯独发布历史里没有 —— 而外部完全看不出是哪一跳丢的。
+  if (!value || value.schema_version !== 1 || !MARINE_RECEIPT_PLATFORMS.has(value.platform)) {
+    return null;
+  }
   const platformCommentId = marinePublishedPositiveId(value.platform_comment_id);
   const rootId = marinePublishedPositiveId(value.root_id);
   const parentId = marinePublishedPositiveId(value.parent_id);
@@ -481,14 +529,20 @@ function marineSanitizePublishedReceipt(value) {
   const text = marinePublishedString(value.text_snapshot, 20_000);
   const targetUrl = marinePublishedString(value.target_url, 4096);
   const postedAt = Number(value.posted_at);
-  if (!platformCommentId || value.event_id !== 'bilibili:' + platformCommentId ||
-      !text.trim() || !targetUrl || !marineIsBilibiliUrl(targetUrl) ||
+  // event_id 必须是 `<platform>:<平台评论ID>`，且 platform 要和它自己声明的一致。
+  // 写死 'bilibili:' 会让知乎的回执在这里被静默丢掉 —— 表现是「评论确实发出去了、
+  // 台账却记 failed」，查起来很费劲（实测踩过）。
+  const platform = marinePublishedString(value.platform, 32);
+  if (!platformCommentId || !platform || value.event_id !== platform + ':' + platformCommentId ||
+      !text.trim() || !targetUrl || !marineIsPublishCapableUrl(targetUrl) ||
       !Number.isSafeInteger(postedAt) || postedAt <= 0) return null;
 
   return {
     schema_version: 1,
     event_id: value.event_id,
-    platform: 'bilibili',
+    // 按声明的平台原样带出去 —— 强行改回 bilibili 会让知乎的记录在 Rust 侧
+    // 被当成 B 站的，event_id 前缀和 platform 字段自相矛盾。
+    platform: platform,
     target_url: targetUrl,
     page_title: typeof value.page_title === 'string' ? value.page_title.slice(0, 512) : '',
     kind: targetCommentId ? 'reply' : 'direct',
@@ -508,7 +562,7 @@ function marineSanitizePublishedReceipt(value) {
 
 function marineTrustedPublishedSender(sender) {
   if (!sender || !sender.tab || sender.tab.id == null || (sender.frameId != null && sender.frameId !== 0)) return false;
-  return marineIsBilibiliUrl(sender.url || sender.tab.url);
+  return marineIsPublishCapableUrl(sender.url || sender.tab.url);
 }
 
 function marinePublishedOutboxKey(profileId, eventId) {
@@ -813,9 +867,9 @@ async function marineApplyContextMessage(msg, sender, expectedEpoch, expectedSou
 
   if (msg.op === 'put') {
     if (!msg.context || !msg.contextId || msg.context.contextId !== msg.contextId) throw new Error('无效的 Marine context');
-    if (revision && revision !== marineLatestRevisions.get(tabId)) return { ok: true, skipped: true };
-    if (expectedEpoch !== marineTabEpoch(tabId)) return { ok: true, skipped: true };
-    if (marineTabSources.get(tabId) !== expectedSource) return { ok: true, skipped: true };
+    if (revision && revision !== marineLatestRevisions.get(tabId)) return { ok: true, skipped: true, reason: 'revision' };
+    if (expectedEpoch !== marineTabEpoch(tabId)) return { ok: true, skipped: true, reason: 'epoch' };
+    if (marineTabSources.get(tabId) !== expectedSource) return { ok: true, skipped: true, reason: 'source' };
     let suspendedRenewalConfirmed = options.allowSuspendedRetainedRenewal === true &&
       marineExactSuspendedRetainedRenewal(msg, sender, expectedSource);
     let senderFocusConfirmed = true;
@@ -825,12 +879,37 @@ async function marineApplyContextMessage(msg, sender, expectedEpoch, expectedSou
     }
     suspendedRenewalConfirmed = options.allowSuspendedRetainedRenewal === true &&
       marineExactSuspendedRetainedRenewal(msg, sender, expectedSource);
-    if ((!senderFocusConfirmed || marineActiveTabId !== tabId) && !suspendedRenewalConfirmed) {
+    // 编排在驱动时跳过焦点闸。
+    //
+    // 焦点闸的存在理由是「全局只有一个 Rime 上下文槽位，只有用户正在看的那个
+    // tab 能占用」—— 那是给人用侧边栏定的规则。编排独占浏览器、只有一个标签页
+    // 在干活，而运行期间人必须能用鼠标干别的；照旧套用的话，鼠标一移开就
+    // `window-blur` + PUT 被推迟 → 生成超时 → 台账记 failed → 靶子按「失败不
+    // 重试」永久作废（实测）。
+    //
+    // 这个标记只能由本扩展的 content script 发出（isolated world），页面 JS
+    // 够不着；和交接单、聚焦入口同一条信任边界。
+    const orchestrated = msg && msg.orchestrated === true;
+    if (!orchestrated &&
+        (!senderFocusConfirmed || marineActiveTabId !== tabId) && !suspendedRenewalConfirmed) {
       const deferred = options.allowDefer !== false
         && marineDeferPut(msg, sender, expectedEpoch, expectedSource);
-      return { ok: true, skipped: true, deferred };
+      return { ok: true, skipped: true, deferred, reason: 'focus-gate' };
     }
+    // 编排同样要跳过**写闸**，不只是上面那道推迟闸。
+    //
+    // 这两道闸是分开的，只放行推迟闸等于没放行：人一切到别的程序，
+    // `onFocusChanged(WINDOW_ID_NONE)` 会把 `marineActiveTabId` 直接置成 null，
+    // 于是 `marineActiveTabId === tabId` 对**任何** tab 都不成立 →
+    // `marineContextFetch` 的 `shouldProceed()` 返回 false → 连 fetch 都不发 →
+    // 上面那句 `if (!wrote)` 回一个 `{ok:true, skipped:true}`。**报成功，实际没写**，
+    // 而且因为跳过了推迟闸，连 `deferred` 标志都没有，content 侧一条日志都不打。
+    // 12 秒后以「目标准备超时」收场，台账记 failed，靶子按「失败不重试」作废。
+    //
+    // 这个闭包同时被写前谓词和写后复核（那句 `!authorityIsCurrent()` 会补一个
+    // DELETE 把刚写的撤掉）用，所以放行放在这里，两处一起覆盖。
     const authorityIsCurrent = () => (
+      orchestrated ||
       marineActiveTabId === tabId ||
       (options.allowSuspendedRetainedRenewal === true &&
         marineExactSuspendedRetainedRenewal(msg, sender, expectedSource))
@@ -841,7 +920,7 @@ async function marineApplyContextMessage(msg, sender, expectedEpoch, expectedSou
         && authorityIsCurrent()
         && (!revision || revision === marineLatestRevisions.get(tabId))
     ));
-    if (!wrote) return { ok: true, skipped: true };
+    if (!wrote) return { ok: true, skipped: true, reason: 'authority' };
     // A tab switch/navigation/delete may happen while the localhost PUT is in
     // flight. Conditionally remove that just-written context instead of
     // letting an obsolete target come back after its clearing event.
@@ -850,13 +929,18 @@ async function marineApplyContextMessage(msg, sender, expectedEpoch, expectedSou
         || !authorityIsCurrent()
         || (revision && revision !== marineLatestRevisions.get(tabId))) {
       try { await marineContextFetch('DELETE', msg.contextId, null); } catch (e) {}
-      return { ok: true, skipped: true };
+      return { ok: true, skipped: true, reason: 'authority-recheck' };
     }
     marineTabContexts.set(tabId, {
       contextId: msg.contextId,
       revision,
       sourceId: expectedSource,
       retainWhenUnfocused: msg.retainWhenUnfocused === true,
+      // 记下这条上下文是编排建立的：失焦时 `marineSetActiveTab` 会清掉「上一个活动
+      // 标签页」的上下文，而清理会发 DELETE（见 marineClearTrackedTab）。对编排来说
+      // 那是致命的 —— 被 DELETE 的 contextId 会进后端的 revoked 名单，同一个 id
+      // 再也 PUT 不进去，生成阶段直接报「目标已失效」。
+      orchestrated,
     });
     marinePersistState();
     return { ok: true };
@@ -875,6 +959,18 @@ async function marineApplyContextMessage(msg, sender, expectedEpoch, expectedSou
     return { ok: true };
   }
   throw new Error('未知的 Marine context 操作');
+}
+
+/**
+ * 这个标签页的上下文是编排建立的吗？
+ *
+ * 用来把编排的上下文从「失焦即清理」里摘出来。清理不是标记一下而已 —— 它会对
+ * 那个 contextId 发 DELETE，后端会把它记进 revoked，之后同一个 id 永远 PUT 不进去。
+ * 不摘的话，人一切走浏览器，正在跑的那条腿就被判了死刑。
+ */
+function marineTabIsOrchestrated(tabId) {
+  const tracked = Number.isInteger(tabId) ? marineTabContexts.get(tabId) : null;
+  return !!tracked && tracked.orchestrated === true;
 }
 
 function marineClearTrackedTab(tabId, options = {}) {
@@ -1011,7 +1107,268 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 }
 
+
+// 发现侧编排（prospect-run.js）要访问本地 API 的 /prospects/* 与 profileId，
+// 但 content script 拿不到 runtime-config（apiBase/token 只有 SW 读得到），
+// 所以由 SW 代发。
+//
+// 路由白名单不是洁癖：编排跑在页面上下文里，页面是不可信环境。放开成任意
+// 路径就等于把整个本地 API 暴露给它，而本地 API 里有 /generate-stream 和
+// /history/published 这类会产生外部动作的端点。
+const MARINE_PROSPECT_ROUTES = new Set([
+  'prospects/ingest',
+  'prospects/claim',
+  'prospects/settle',
+  // 键盘代打。**这条比上面三条危险**：它让调用方能操作浏览器本身，而不只是
+  // 读写台账。放进来是因为抖音的编辑器对页内合成输入有反制（写一两个字就把整个
+  // 评论组件拆掉，手动也一样），只有 CDP 的可信键盘事件能过。
+  //
+  // 危险被三层约束兜住，缺一不可：
+  //   · Rust 侧只打字，不点击、不导航 —— 发送仍由扩展点站点自己的按钮
+  //   · Rust 侧拒绝控制字符（否则一个回车就能绕过发送闸）和超长文本
+  //   · 目标必须是**正在运行的** profile，由 resolve_running_profile 把关
+  'type-text',
+]);
+
+async function marineProspectApi(route, body) {
+  if (!MARINE_PROSPECT_ROUTES.has(route)) {
+    throw new Error('不允许的编排路由：' + route);
+  }
+  const config = await marineResolveConfig();
+  if (!config.apiBase || !config.token) throw new Error('未配置 Marine 本地 API');
+  const controller = new AbortController();
+  // 台账那几条是毫秒级的本地读写，15s 绰绰有余。但 `type-text` 是**同步等着
+  // Rust 逐字敲完**才返回 —— 拟人节奏下 180 字要一分多钟，15s 必然掐断。
+  // 实测症状是 `signal is aborted without reason`，而字其实正在被敲进去。
+  const timeoutMs = route === 'type-text' ? 180000 : 15000;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(config.apiBase + '/' + route, {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer ' + config.token,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body || {}),
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(route + ' 返回 ' + response.status);
+    const text = await response.text();
+    // claim 没得领时返回 null；空体也按 null 处理，调用方分支是一样的。
+    return text ? JSON.parse(text) : null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// 扩展自己的日志落盘。
+//
+// 侧边栏的「调试」tab 是**活的**消费者：只在面板打开时、只对当前活动标签页、
+// 只给人看。而发现调度器**每条腿结束都会关掉浏览器**——等去看的时候窗口连同
+// 里面每一行日志都没了，只剩台账里的结果，没有原因。这条通道就是补这个。
+//
+// 刻意**不走** MARINE_PROSPECT_ROUTES 白名单：那份白名单管的是「页面上下文能
+// 让 SW 代打哪些本地 API」，是安全边界。日志转发由 SW 自己发起，路径写死，
+// 不接受调用方指定，所以不能、也不需要进那份名单。
+/**
+ * 掉登录的上报路由。
+ *
+ * 和日志同一类：**写死在 SW 里**，不进 `MARINE_PROSPECT_ROUTES` 那份白名单 ——
+ * 那份名单是给不可信的页面上下文用的，页面能指定路由就等于能调任意本地 API。
+ *
+ * 只在**判定不是「已登录」**时才发。已登录不上报（没信息量），标记的清除由
+ * 调度器在「那条腿真发出去了」时做 —— 发成功比任何探测都更能证明登录有效。
+ */
+const MARINE_LOGIN_ROUTE = 'login-status';
+
+async function marineReportLogin(result) {
+  if (!result || !result.platform) return;
+  // 已登录不上报。三态里只有 false（确认登出）和 null（判断不了）值得记，
+  // 而这两者在存储和界面上必须继续分开：把「判断不了」当成登出，
+  // 运营会去重新登录一个其实健康的账号。
+  if (result.loggedIn === true) return;
+
+  let config;
+  try { config = await marineResolveConfig(); } catch (e) { return; }
+  if (!config.apiBase || !config.token || !config.profileId) return;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => { controller.abort(); }, 8000);
+  try {
+    await fetch(config.apiBase + '/' + MARINE_LOGIN_ROUTE, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + config.token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        profile_id: config.profileId,
+        platform: result.platform,
+        page_result: {
+          platform: result.platform,
+          logged_in: result.loggedIn,
+          evidence: result.evidence,
+          account_name: result.accountName || null,
+          account_id: result.accountId || null,
+          cookies_found: result.cookiesFound || [],
+        },
+      }),
+      signal: controller.signal,
+    });
+  } catch (e) {
+    // 上报失败不该影响编排：它的正事是决定要不要往下跑，不是记账。
+  } finally { clearTimeout(timer); }
+}
+
+const MARINE_LOG_ROUTE = 'debug/logs';
+const MARINE_LOG_MAX_BATCH = 200;
+
+async function marineForwardLogs(entries, sender) {
+  if (!Array.isArray(entries) || !entries.length) return;
+  let config;
+  try { config = await marineResolveConfig(); } catch (e) { return; }
+  if (!config.apiBase || !config.token) return;
+
+  // 日志是突发的（一次抓取几十条，每个 iframe 各一份）。截断而不是拒绝：
+  // 丢掉超出的部分好过让一次风暴打爆本地 API。
+  const batch = entries.slice(0, MARINE_LOG_MAX_BATCH).map((e) => Object.assign({}, e, {
+    profile_id: config.profileId || null,
+    url: (sender && sender.tab && sender.tab.url) || (sender && sender.url) || null,
+  }));
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    await fetch(config.apiBase + '/' + MARINE_LOG_ROUTE, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + config.token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entries: batch }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+  } catch (e) {
+    // 记日志失败绝不能影响被记录的那件事，静默吞掉。
+  }
+}
+
+// Phase A -> Phase B 的交接单，按 tab 存在 SW 侧。
+//
+// **不能用 sessionStorage**：它按 origin 分区，而搜索页和靶子页经常不同源 ——
+// B 站永远是（search.bilibili.com -> www.bilibili.com），知乎的专栏文章也是
+// （www.zhihu.com -> zhuanlan.zhihu.com）。用 sessionStorage 的后果是 Phase A
+// 一切正常（入账、claim、导航都成功），Phase B 在新源上读不到交接单直接静默
+// 退出，台账里留下一条永远停在 claimed、没有任何 touch 的记录 —— 实测就是这样。
+//
+// 按 tab 而不是全局：编排虽然是串行的，但一个被遗留的全局交接单会让下一个
+// 无关页面误以为自己是靶子。
+const MARINE_HANDOFF_PREFIX = 'marineProspectHandoff:';
+
+async function marineHandoff(op, tabId, value) {
+  if (tabId === undefined || tabId === null) throw new Error('交接单需要 tab 身份');
+  const key = MARINE_HANDOFF_PREFIX + tabId;
+  if (op === 'write') {
+    await chrome.storage.session.set({ [key]: value });
+    return true;
+  }
+  if (op === 'clear') {
+    await chrome.storage.session.remove(key);
+    return true;
+  }
+  if (op === 'read') {
+    const got = await chrome.storage.session.get(key);
+    return (got && got[key]) || null;
+  }
+  throw new Error('未知的交接单操作：' + op);
+}
+
+// 标签页关掉了就把它的交接单一起删掉，否则 chrome.storage.session 会慢慢攒下
+// 一堆永远不会被读到的条目（它只在浏览器重启时才整体清空）。
+// try/catch 不是洁癖：这一行在 `chrome.runtime.onMessage` 的注册**之前**。
+// 它一抛异常，消息监听器就永远挂不上，整个 SW 表现为「存在但不回消息」——
+// content script 侧看到的是 `Receiving end does not exist`，而 chrome://extensions
+// 里**一条错误都不显示**。实测踩过，查了很久：SW 脚本本身没崩，崩的是注册顺序。
+//
+// 一般规则：MV3 worker 顶层、在监听器注册完成之前的任何代码都必须防抛。
+try {
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    void chrome.storage.session.remove(MARINE_HANDOFF_PREFIX + tabId);
+  });
+} catch (e) {
+  // 清不掉遗留交接单只是慢慢攒一点 session 存储，比丢掉整个消息通道轻得多。
+}
+
+/**
+ * 让编排把自己的窗口/标签页拉到前台。
+ *
+ * **为什么还要抢焦点** —— 理由已经变了，别再按旧理由推断：
+ *
+ * 旧理由（已失效）：上下文的三道归属闸只认「当前活动标签页」。那个问题已经修好
+ * 了，`orchestrated` 的 PUT 现在在写闸、挂起租约闸、失焦清理三处都放行，
+ * **上下文本身不再需要任何焦点**。
+ *
+ * 真正的理由（实测）：**B 站的发布按钮只在窗口拿到操作系统焦点时才渲染**。
+ * 只改这一个变量，结果直接翻转：
+ *   窗口聚焦 → `<button> 70×32 cls=active` → posted
+ *   窗口失焦 → 只剩一个 768×50 的紧凑条外壳 → 找不到按钮
+ * 试过但**无效**的替代：合成 window focus 事件、在 MAIN world 覆盖
+ * `document.hasFocus()`、用 CDP 真实鼠标事件点那个紧凑条 —— 三种都没能让按钮
+ * 出现。所以这不是能绕过去的东西。
+ *
+ * 代价是自动化每跑一条腿会打断用户一次，这是知情的取舍，不是疏忽。
+ *
+ * tab 身份只认 `sender`，和交接单同一条规矩：让调用方自报 tabId 等于允许一个
+ * 页面把别的标签页抢到前台。
+ */
+async function marineFocusSenderTab(sender) {
+  const tab = sender && sender.tab;
+  const tabId = tab && tab.id;
+  if (!Number.isInteger(tabId)) throw new Error('聚焦需要 tab 身份');
+  if (Number.isInteger(tab.windowId)) {
+    try { await chrome.windows.update(tab.windowId, { focused: true }); } catch (e) {}
+  }
+  try { await chrome.tabs.update(tabId, { active: true }); } catch (e) {}
+  return { tabId };
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg && msg.__marineLoginReport) {
+    void marineReportLogin(msg.result);
+    return;   // 不回执：编排不等这个
+  }
+  if (msg && Array.isArray(msg.__marineLogBatch)) {
+    // 不 return true：侧边栏那条监听也要收到同一条消息，而且日志不需要回执。
+    void marineForwardLogs(msg.__marineLogBatch, sender);
+  }
+  if (msg && msg.__marineProspectFocusTab) {
+    void marineFocusSenderTab(sender)
+      .then((data) => sendResponse({ ok: true, data }))
+      .catch((error) => sendResponse({ ok: false, error: String((error && error.message) || error) }));
+    return true;
+  }
+  if (msg && msg.__marineProspectHandoff) {
+    // tab 身份只认 sender，不认消息内容 —— 让调用方自己声明 tabId 等于允许一个
+    // 页面去读写别的标签页的交接单。
+    void marineHandoff(msg.op, sender && sender.tab && sender.tab.id, msg.value)
+      .then(data => sendResponse({ ok: true, data }))
+      .catch(error => sendResponse({ ok: false, error: String(error && error.message || error) }));
+    return true;
+  }
+  if (msg && msg.__marineProspectApi) {
+    void marineProspectApi(msg.route, msg.body)
+      .then(data => sendResponse({ ok: true, data }))
+      .catch(error => sendResponse({ ok: false, error: String(error && error.message || error) }));
+    return true;
+  }
+  if (msg && msg.__marineProspectProfileId) {
+    void marineResolveConfig()
+      .then(config => sendResponse({
+        ok: true,
+        profileId: config.profileId || null,
+        // 调试脚手架会往 runtime-config 里写这个字段；app 打包的正式 profile
+        // 永远没有，所以正式路径上它是 undefined。
+        debugCdpPort: config.debugCdpPort || undefined,
+      }))
+      .catch(() => sendResponse({ ok: false, profileId: null }));
+    return true;
+  }
+
   if (msg && msg.__marineGenFill) {
     // content-iso 报告一次「页内生成并填入」的草稿文本，按 tab 记下供发帖回执来源判定。
     marineRecordGenFill(sender && sender.tab && sender.tab.id, msg.text);
@@ -1043,14 +1400,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const revision = Number(msg.revision) || 0;
       if (tabId == null) return { immediate: { ok: false, error: '缺少来源标签页' } };
       const sourceId = marineSourceId(msg, sender, tabId);
+      // 这道闸在 marineApplyContextMessage **之前**就返回，所以那里面的编排豁免
+      // 够不着它 —— 必须在这里单独放行一次。触发前提是存在挂起的保留租约，而
+      // 只有实现了 persistentTargetIsOpen 的平台（小红书 / 抖音）会走到，
+      // 所以 B 站、知乎跑通不代表这条不存在：换平台必复发。
+      const orchestrated = msg && msg.orchestrated === true;
       const hasSuspendedRetainedLease = marineFocusedWindowId === null &&
         marineActiveTabId === null && Number.isInteger(marineSuspendedRetainedTabId);
-      if (hasSuspendedRetainedLease && msg.op === 'put' &&
+      if (hasSuspendedRetainedLease && msg.op === 'put' && !orchestrated &&
           !marineExactSuspendedRetainedRenewal(msg, sender, sourceId)) {
         // While Chrome is explicitly unfocused, never let another tab, a
         // retired document, or a newer/older revision mutate worker ownership
         // before it has re-proved foreground authority.
-        return { immediate: { ok: true, skipped: true } };
+        return { immediate: { ok: true, skipped: true, reason: 'suspended-lease' } };
       }
       if (hasSuspendedRetainedLease && msg.op === 'delete' &&
           tabId === marineSuspendedRetainedTabId &&
@@ -1058,7 +1420,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return { immediate: { ok: true, skipped: true } };
       }
       const source = marinePrepareSource(tabId, sourceId);
-      if (!source.accepted) return { immediate: { ok: true, skipped: true } };
+      if (!source.accepted) return { immediate: { ok: true, skipped: true, reason: 'retired-source' } };
       const latest = marineLatestRevisions.get(tabId) || 0;
       if (revision && revision < latest) return { immediate: { ok: true, skipped: true } };
       if (revision && revision > latest) {
@@ -1120,14 +1482,21 @@ async function marineSetActiveTab(tabId, shouldApply = () => true, options = {})
   const suspended = marineSuspendedRetainedTabId;
   if (Number.isInteger(suspended) && tabId != null) {
     marineSuspendedRetainedTabId = null;
-    if (suspended !== tabId) marineClearTrackedTab(suspended);
+    if (suspended !== tabId && !marineTabIsOrchestrated(suspended)) marineClearTrackedTab(suspended);
   } else if (tabId == null && options.preserveRetained !== true) {
     marineSuspendedRetainedTabId = null;
-    if (Number.isInteger(suspended)) marineClearTrackedTab(suspended);
+    if (Number.isInteger(suspended) && !marineTabIsOrchestrated(suspended)) {
+      marineClearTrackedTab(suspended);
+    }
   }
   marineActiveTabId = tabId;
   marinePersistState();
-  if (previous != null && previous !== tabId) marineClearTrackedTab(previous);
+  // 编排的上下文不随焦点走。清理会 DELETE 掉 contextId（后端记进 revoked，同 id
+  // 再也写不进去），而编排期间人本来就在用别的程序 —— 那等于每切一次窗口就废掉
+  // 一条腿。真正该清的时机仍然照旧：导航（tabs.onUpdated）和关闭（tabs.onRemoved）。
+  if (previous != null && previous !== tabId && !marineTabIsOrchestrated(previous)) {
+    marineClearTrackedTab(previous);
+  }
   if (tabId != null) marineReplayDeferredPut(tabId);
   return true;
 }
@@ -1194,7 +1563,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     // pushState/replaceState keeps the same content-script document/source.
     void marineStateReady.then(() => marineClearTrackedTab(tabId));
   }
-  if (changeInfo.status === 'complete' && tab && marineIsBilibiliUrl(tab.url)) {
+  if (changeInfo.status === 'complete' && tab && marineIsPublishCapableUrl(tab.url)) {
     void marineEnsurePublishedCapture(tabId);
   }
 });

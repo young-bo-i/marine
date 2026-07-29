@@ -172,8 +172,7 @@
         "submit": "验证",
         "matchToast": "密码正确",
         "mismatchToast": "密码不匹配"
-      },
-      "requiresTeamOwner": "只有团队所有者才能更改配置文件加密。"
+      }
     },
     "advanced": {
       "title": "高级",
@@ -237,7 +236,10 @@
       "cantModifyRunning": "无法修改正在运行的配置文件",
       "cantModifyLaunching": "启动期间无法修改配置文件",
       "cantModifyStopping": "停止期间无法修改配置文件",
-      "cantModifyUpdating": "浏览器更新期间无法修改配置文件"
+      "cantModifyUpdating": "浏览器更新期间无法修改配置文件",
+      "marineLogin": "Marine 登录",
+      "marineLoggedOut": "已登出，需要重新登录",
+      "marineLoginUnknown": "判断不了，稍后再看"
     },
     "actions": {
       "launch": "启动",
@@ -724,7 +726,6 @@
     "tokenCopied": "令牌已复制",
     "mcpEnableLabel": "启用 MCP 服务器 (Model Context Protocol)",
     "mcpEnableDescription": "允许 Claude Desktop 等 AI 助手控制浏览器。",
-    "mcpAcceptTermsFirst": "(请先在设置中接受 Wayfern 条款)",
     "mcpStarted": "MCP 服务器已在端口 {{port}} 上启动",
     "mcpStopped": "MCP 服务器已停止",
     "mcpToggleFailed": "切换 MCP 服务器失败",
@@ -1561,16 +1562,6 @@
     "creatingButton": "正在创建...",
     "createButton": "创建"
   },
-  "wayfernTerms": {
-    "title": "Wayfern 条款和条件",
-    "description": "在使用 Marine 之前,你必须阅读并同意 Wayfern 的条款和条件。",
-    "reviewLabel": "请查看以下条款和条件:",
-    "agreeNotice": "点击「我接受」即表示你同意受这些条款约束。",
-    "acceptButton": "我接受",
-    "acceptSuccess": "已成功接受条款",
-    "acceptFailed": "接受条款失败",
-    "tryAgain": "请重试"
-  },
   "permissionDialog": {
     "titleMicrophone": "需要麦克风访问权限",
     "titleCamera": "需要摄像头访问权限",
@@ -1830,11 +1821,9 @@
     "invalidLaunchHookUrl": "启动钩子 URL 无效。请使用完整的 http:// 或 https:// URL。",
     "cookieDbLocked": "无法读取 Cookie — 数据库已锁定。请关闭浏览器后重试。",
     "cookieDbUnavailable": "无法读取 Cookie — Cookie 存储不可用。",
-    "selfHostedRequiresLogout": "在配置自托管服务器之前请先退出 Marine 账户。",
     "proxyNotWorking": "所选代理无法使用，因此未创建配置文件。",
     "proxyPaymentRequired": "所选代理需要付费（402），其订阅可能已过期，因此未创建配置文件。",
     "vpnNotWorking": "所选 VPN 无法使用，因此未创建配置文件。",
-    "camoufoxImportDeprecated": "不再支持导入基于 Firefox 的 (Camoufox) 配置文件。Camoufox 即将停用——请改用 Wayfern。",
     "marineProfileNotRunning": "所选配置文件未在运行，请先启动它。",
     "marineNoCdp": "无法连接到运行中的浏览器，请确认该配置文件已启动。",
     "marineGrabTimeout": "抓取页面超时。",
@@ -1846,7 +1835,10 @@
     "marineGenerateTimeout": "生成超时。",
     "marineFillFailed": "无法填入回复框。{{detail}}",
     "marineMarkPostedFailed": "无法标记为已发布。{{detail}}",
-    "teamOwnerOnly": "只有团队所有者才能更改加密密码。"
+    "marineDiscoveryAlreadyRunning": "已有一轮任务在进行中。",
+    "marineDiscoveryEmptyPlan": "请至少选择一个配置文件和一个平台。",
+    "marineDiscoveryEmptyKeyword": "请填写搜索关键词。",
+    "marineDiscoveryProfileNotFound": "所选配置文件中有一个已不存在。"
   },
   "rail": {
     "profiles": "配置文件",
@@ -1864,7 +1856,7 @@
     "network": "网络",
     "integrations": "集成",
     "account": "账号",
-    "marine": "评论账本"
+    "marine": "台账"
   },
   "pageTitle": {
     "proxies": "网络",
@@ -1876,7 +1868,7 @@
     "account": "账户",
     "import": "导入配置文件",
     "shortcuts": "键盘快捷键",
-    "marine": "评论账本"
+    "marine": "台账"
   },
   "encryption": {
     "required": {
@@ -2202,6 +2194,83 @@
       },
       "unknownPlatform": "未知平台",
       "profileId": "配置身份 ID：{{id}}"
+    },
+    "tabs": {
+      "prospects": "发现台账",
+      "history": "评论账本"
+    },
+    "prospects": {
+      "title": "发现台账",
+      "description": "每一条被搜索发现的候选内容，以及哪些账号碰过它。这是防止我们两个账号撞到同一条内容的唯一保证——搜索筛选只能分散结果，去重靠这份台账。",
+      "loading": "正在加载发现台账…",
+      "untitled": "无标题",
+      "run": {
+        "label": "自动化任务",
+        "title": "自动跑一轮",
+        "description": "依次打开每个配置文件，一次只做一个平台，做完关掉再进下一个，绝不同时开两个。当前只把话术填入评论框就停，不会点发送。",
+        "keyword": "关键词",
+        "keywordPlaceholder": "例如：科研工具",
+        "platforms": "平台",
+        "profiles": "配置文件",
+        "noProfiles": "没有 Wayfern 配置文件。发现用的扩展只会装进 Wayfern，所以跑一轮必须有一个。",
+        "start": "跑一轮",
+        "stop": "停止",
+        "hint": "请填写关键词，并至少选择一个平台和一个配置文件。",
+        "progress": "{{done}}/{{total}} · {{phase}} · {{target}}",
+        "settledCount": "落账 {{n}} 条",
+        "startFailed": "无法启动任务",
+        "stopFailed": "无法停止任务",
+        "cycleGap": "循环间隔（分钟）",
+        "cycleGapPlaceholder": "例如 30，留空只跑一轮"
+      },
+      "phase": {
+        "idle": "空闲",
+        "launching": "正在启动",
+        "working": "进行中",
+        "closing": "正在关闭",
+        "pausing": "间隔等待",
+        "done": "已完成",
+        "cancelled": "已取消"
+      },
+      "outcome": {
+        "settled": "已落账",
+        "timed_out": "未落账",
+        "no_slot": "平台不支持",
+        "already_open": "已在运行，已跳过",
+        "failed": "失败",
+        "cancelled": "已取消"
+      },
+      "stats": {
+        "label": "台账概览",
+        "posted": "已发布"
+      },
+      "filters": {
+        "label": "台账筛选",
+        "searchPlaceholder": "搜索标题、ID 或关键词",
+        "allPlatforms": "全部平台"
+      },
+      "table": {
+        "platform": "平台",
+        "title": "内容",
+        "keywords": "关键词",
+        "accounts": "涉及账号",
+        "open": "在浏览器中打开",
+        "postedAt": "发布时间"
+      },
+      "empty": {
+        "title": "台账还是空的",
+        "description": "在上方启动一轮任务，或手动把配置文件打开到支持的搜索页——扩展会自动记录发现的内容。"
+      },
+      "error": {
+        "title": "无法加载发现台账",
+        "description": "读取台账文件失败。请刷新重试；若持续失败，请查看应用日志。"
+      },
+      "platform": {
+        "bilibili": "哔哩哔哩",
+        "zhihu": "知乎",
+        "douyin": "抖音",
+        "xiaohongshu": "小红书"
+      }
     }
   }
 }

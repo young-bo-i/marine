@@ -134,6 +134,15 @@ pub fn history_dir() -> PathBuf {
   data_dir().join("history")
 }
 
+/// Marine: the prospect ledger — ONE file for ALL profiles.
+///
+/// Deliberately not per-profile like `history_dir`: its whole job is answering
+/// "has any of my accounts already touched this content", which a per-profile
+/// layout cannot do without reading every file on every claim.
+pub fn prospects_dir() -> PathBuf {
+  data_dir().join("prospects")
+}
+
 pub fn dns_blocklist_dir() -> PathBuf {
   cache_dir().join("dns_blocklists")
 }

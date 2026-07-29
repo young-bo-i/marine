@@ -719,15 +719,6 @@ impl CloudAuthManager {
     }
   }
 
-  /// Whether this session belongs to a team. Not a paywall — team lock APIs
-  /// operate on a server-side team that either exists for this account or not.
-  pub async fn is_on_team_plan(&self) -> bool {
-    if let Some(state) = self.get_user().await {
-      return state.user.team_id.is_some();
-    }
-    false
-  }
-
   pub async fn get_user(&self) -> Option<CloudAuthState> {
     let state = self.state.lock().await;
     state.clone()
@@ -1277,19 +1268,65 @@ pub async fn cloud_refresh_profile() -> Result<CloudUser, String> {
   Ok(user)
 }
 
+/// Host portion of a sync server URL, lowercased, with scheme, userinfo, port,
+/// path, query and fragment stripped. IPv6 literals keep their address.
+fn sync_url_host(url: &str) -> String {
+  let lowered = url.trim().to_ascii_lowercase();
+  let after_scheme = match lowered.find("://") {
+    Some(i) => &lowered[i + 3..],
+    None => lowered.as_str(),
+  };
+  let after_userinfo = match after_scheme.rfind('@') {
+    Some(i) => &after_scheme[i + 1..],
+    None => after_scheme,
+  };
+  let authority = after_userinfo
+    .split(['/', '?', '#'])
+    .next()
+    .unwrap_or_default();
+  let host = match authority.strip_prefix('[') {
+    // IPv6 literal: [::1]:8080 -> ::1
+    Some(rest) => rest.split(']').next().unwrap_or_default(),
+    None => authority.split(':').next().unwrap_or_default(),
+  };
+  host.trim_end_matches('.').to_string()
+}
+
+/// True when the URL points at Donut's hosted sync service, for ANY scheme,
+/// port, path or trailing-slash variant, and for any `*.donutbrowser.com`
+/// endpoint. Anything else — including an IP or a LAN hostname — is treated as
+/// a user-owned self-hosted server that must never be cleared automatically.
+pub fn is_cloud_sync_url(url: &str) -> bool {
+  let host = sync_url_host(url);
+  host == "donutbrowser.com" || host.ends_with(".donutbrowser.com")
+}
+
 #[tauri::command]
 pub async fn cloud_logout(app_handle: tauri::AppHandle) -> Result<(), String> {
   CLOUD_AUTH.logout().await?;
 
-  // Always clear the stored sync URL and token on cloud logout. While the
-  // user was signed in, the cloud auth flow populated these with the hosted
-  // sync server's URL + a server-issued token — leaving them in place would
-  // pre-fill the Self-Hosted tab with our production URL and a token the
-  // user never typed. The cloud-URL-only check we used to do here missed
-  // trailing-slash / scheme variants and any future cloud endpoint moves.
+  // Clear the stored sync URL + token ONLY when they point at Donut's hosted
+  // service (or there is no URL at all). A self-hosted server the user
+  // configured themselves has to survive a cloud logout — clearing it
+  // unconditionally destroyed the URL and token with no confirmation and no
+  // way to get them back.
+  //
+  // The earlier attempt at this compared the full URL string and so missed
+  // scheme / port / path / trailing-slash variants; `is_cloud_sync_url`
+  // compares the HOST instead, which is immune to all of those and also
+  // covers any future `*.donutbrowser.com` endpoint.
   let manager = crate::settings_manager::SettingsManager::instance();
-  let _ = manager.save_sync_server_url(None);
-  let _ = manager.remove_sync_token(&app_handle).await;
+  let stored_url = manager.load_settings().ok().and_then(|s| s.sync_server_url);
+  let clear_sync_config = match stored_url.as_deref() {
+    None => true,
+    Some(url) => is_cloud_sync_url(url),
+  };
+  if clear_sync_config {
+    let _ = manager.save_sync_server_url(None);
+    let _ = manager.remove_sync_token(&app_handle).await;
+  } else {
+    log::info!("Cloud logout: keeping self-hosted sync config");
+  }
 
   // Remove cloud-managed and cloud-derived proxies
   crate::proxy_manager::PROXY_MANAGER.remove_cloud_proxies();
@@ -1516,4 +1553,63 @@ pub async fn restart_sync_service(app_handle: tauri::AppHandle) -> Result<(), St
   });
 
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{is_cloud_sync_url, sync_url_host};
+
+  #[test]
+  fn cloud_sync_url_matches_every_variant_of_the_hosted_endpoint() {
+    // The previous full-string comparison missed all of these, which is why it
+    // was replaced by an unconditional wipe. Host matching must catch them.
+    for url in [
+      "https://sync.donutbrowser.com",
+      "https://sync.donutbrowser.com/",
+      "http://sync.donutbrowser.com",
+      "sync.donutbrowser.com",
+      "  https://SYNC.DonutBrowser.com/  ",
+      "https://sync.donutbrowser.com:443",
+      "https://sync.donutbrowser.com/v1/objects",
+      "https://sync.donutbrowser.com.",
+      "https://user:pass@sync.donutbrowser.com",
+      // any future cloud endpoint on the same domain
+      "https://sync2.donutbrowser.com",
+      "https://donutbrowser.com",
+    ] {
+      assert!(
+        is_cloud_sync_url(url),
+        "{url} should be recognised as cloud"
+      );
+    }
+  }
+
+  #[test]
+  fn self_hosted_urls_are_never_treated_as_cloud() {
+    for url in [
+      "http://211.101.236.27:12342",
+      "http://211.101.236.27:12342/",
+      "https://sync.example.com",
+      "http://localhost:3456",
+      "http://[::1]:3456",
+      "http://sync.donutbrowser.com.evil.test",
+      "https://notdonutbrowser.com",
+      "",
+    ] {
+      assert!(
+        !is_cloud_sync_url(url),
+        "{url} must be kept as a self-hosted config"
+      );
+    }
+  }
+
+  #[test]
+  fn sync_url_host_strips_scheme_userinfo_port_and_path() {
+    assert_eq!(
+      sync_url_host("https://a:b@Host.Example:8443/x?y#z"),
+      "host.example"
+    );
+    assert_eq!(sync_url_host("http://[::1]:3456/health"), "::1");
+    assert_eq!(sync_url_host("211.101.236.27:12342"), "211.101.236.27");
+  }
 }

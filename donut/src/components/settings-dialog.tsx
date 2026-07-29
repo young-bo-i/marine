@@ -44,7 +44,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { useCloudAuth } from "@/hooks/use-cloud-auth";
 import { useLanguage } from "@/hooks/use-language";
 import type { PermissionType } from "@/hooks/use-permissions";
 import { usePermissions } from "@/hooks/use-permissions";
@@ -152,12 +151,6 @@ export function SettingsDialog({
     isMicrophoneAccessGranted,
     isCameraAccessGranted,
   } = usePermissions();
-  const { user: cloudUser } = useCloudAuth();
-  // Encryption is available to everyone except team members who aren't owners
-  const canUseEncryption =
-    cloudUser == null ||
-    cloudUser.teamId == null ||
-    cloudUser.teamRole === "owner";
   const {
     currentLanguage,
     changeLanguage,
@@ -1001,11 +994,7 @@ export function SettingsDialog({
                 {t("settings.encryption.description")}
               </p>
 
-              {!canUseEncryption ? (
-                <p className="text-sm text-muted-foreground">
-                  {t("settings.encryption.requiresTeamOwner")}
-                </p>
-              ) : hasE2ePassword ? (
+              {hasE2ePassword ? (
                 <div className="space-y-3">
                   <div className="flex items-center gap-2">
                     <Badge variant="default">

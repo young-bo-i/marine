@@ -9,5 +9,8 @@ extend-exclude = [
 ]
 
 [default.extend-words]
+# B 站自家 markup 里就写作 vui_pagenation（他们的拼写错误）。
+# 发现侧解析器必须逐字匹配这个 class，改成正确拼写会让解析失效。
+pagenation = "pagenation"
 DBE = "DBE"
 nd = "nd"

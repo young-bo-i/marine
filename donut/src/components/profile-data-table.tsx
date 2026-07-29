@@ -129,6 +129,20 @@ declare module "@tanstack/react-table" {
 
 // Stable table meta type to pass volatile state/handlers into TanStack Table without
 // causing column definitions to be recreated on every render.
+/**
+ * 一个平台上的登录问题。
+ *
+ * `logged_in` 是三态里的两种「不好」：`false` = 确认登出（去补登录），
+ * `null` = 判断不了（接口超时/改版，稍后再看）。这两个**不能合并**：把
+ * 「判断不了」显示成「已登出」，运营会去重新登录一个其实健康的账号，
+ * 而真正的问题被藏起来了。
+ */
+interface MarineLoginIssue {
+  platform: string;
+  logged_in: boolean | null;
+  checked_at: number;
+}
+
 interface TableMeta {
   t: (key: string, options?: Record<string, unknown>) => string;
   selectedProfiles: string[];
@@ -140,6 +154,11 @@ interface TableMeta {
   stoppingProfiles: Set<string>;
   isUpdating: (browser: string) => boolean;
   browserState: ReturnType<typeof useBrowserState>;
+
+  /// 每个 profile 掉了登录的平台。**只有掉登录的才在里面** —— 自动化跑到某个
+  /// 平台时如果发现没登录/判断不了就上报，发成功了则由调度器把标记清掉。
+  /// 所以「没有条目」= 目前没发现问题，不是「已确认全部正常」。
+  loginIssues: Record<string, MarineLoginIssue[]>;
 
   // Tags editor state
   tagsOverrides: Record<string, string[]>;
@@ -405,104 +424,6 @@ function ExtCell({
                   {groupId === g.id && <LuCheck className="mr-2 size-3.5" />}
                   <span className={groupId === g.id ? "" : "ml-5"}>
                     {g.name}
-                  </span>
-                </CommandItem>
-              ))}
-            </CommandGroup>
-          </CommandList>
-        </Command>
-      </PopoverContent>
-    </Popover>
-  );
-}
-
-// Inline DNS blocklist dropdown — same Popover/Command pattern as Ext.
-function DnsCell({
-  profile,
-  meta,
-}: {
-  profile: BrowserProfile;
-  meta: TableMeta;
-}) {
-  const [open, setOpen] = React.useState(false);
-  const [isSaving, setIsSaving] = React.useState(false);
-  const level = profile.dns_blocklist ?? null;
-  // Backend levels are: light, normal, pro, pro_plus, ultimate (+ null).
-  // Keep the list ordered from least to most restrictive.
-  const LEVELS: { value: string; labelKey: string }[] = [
-    { value: "light", labelKey: "dnsBlocklist.light" },
-    { value: "normal", labelKey: "dnsBlocklist.normal" },
-    { value: "pro", labelKey: "dnsBlocklist.pro" },
-    { value: "pro_plus", labelKey: "dnsBlocklist.proPlus" },
-    { value: "ultimate", labelKey: "dnsBlocklist.ultimate" },
-  ];
-  const currentLabel =
-    level === null
-      ? null
-      : (LEVELS.find((l) => l.value === level)?.labelKey ?? null);
-
-  const onPick = async (nextLevel: string | null) => {
-    setIsSaving(true);
-    try {
-      await invoke("update_profile_dns_blocklist", {
-        profileId: profile.id,
-        dnsBlocklist: nextLevel,
-      });
-    } catch (err) {
-      console.error("Failed to update DNS blocklist:", err);
-    } finally {
-      setIsSaving(false);
-      setOpen(false);
-    }
-  };
-
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          data-onborda="dns-blocklist"
-          disabled={isSaving}
-          className="flex h-7 w-full items-center gap-1.5 rounded px-1.5 text-left text-xs text-muted-foreground transition-colors duration-100 hover:bg-accent/50 hover:text-foreground disabled:opacity-50"
-          title={
-            level
-              ? meta.t("profiles.table.dnsLevel", { level })
-              : meta.t("dnsBlocklist.none")
-          }
-        >
-          <FiWifi className="size-3 shrink-0" />
-          <span className="flex-1 truncate text-[11px] tracking-wide">
-            {currentLabel ? meta.t(currentLabel) : "—"}
-          </span>
-          <LuChevronDown className="size-3 shrink-0 text-muted-foreground" />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent className="w-48 p-0" align="start">
-        <Command>
-          <CommandList>
-            <CommandGroup>
-              <CommandItem
-                value="__none__"
-                onSelect={() => {
-                  void onPick(null);
-                }}
-              >
-                {level === null && <LuCheck className="mr-2 size-3.5" />}
-                <span className={level === null ? "" : "ml-5"}>
-                  {meta.t("dnsBlocklist.none")}
-                </span>
-              </CommandItem>
-              {LEVELS.map((l) => (
-                <CommandItem
-                  key={l.value}
-                  value={l.value}
-                  onSelect={() => {
-                    void onPick(l.value);
-                  }}
-                >
-                  {level === l.value && <LuCheck className="mr-2 size-3.5" />}
-                  <span className={level === l.value ? "" : "ml-5"}>
-                    {meta.t(l.labelKey)}
                   </span>
                 </CommandItem>
               ))}
@@ -1873,6 +1794,56 @@ export function ProfilesDataTable({
     stoppingProfiles,
   ]);
 
+  // 掉登录的平台，按 profile 分组。
+  //
+  // 只有**出问题的**才在里面：自动化跑到某个平台时发现没登录或判断不了才上报，
+  // 而那条腿真把评论发出去了则由调度器把标记清掉（发成功比任何探测都更能证明
+  // 登录有效）。所以「空」= 目前没发现问题，不是「已确认全部正常」。
+  const [loginIssues, setLoginIssues] = React.useState<
+    Record<string, MarineLoginIssue[]>
+  >({});
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const all = await invoke<
+          Record<
+            string,
+            Record<
+              string,
+              {
+                platform: string;
+                logged_in: boolean | null;
+                checked_at: number;
+              }
+            >
+          >
+        >("marine_login_status_all");
+        if (cancelled) return;
+        const next: Record<string, MarineLoginIssue[]> = {};
+        for (const [profileId, byPlatform] of Object.entries(all ?? {})) {
+          const issues = Object.values(byPlatform)
+            .filter((v) => v.logged_in !== true)
+            .sort((a, b) => a.platform.localeCompare(b.platform));
+          if (issues.length > 0) next[profileId] = issues;
+        }
+        setLoginIssues(next);
+      } catch {
+        // 观测数据读不到不该影响 profile 列表本身。
+      }
+    };
+    void load();
+    // 自动化在跑的时候标记会变，定时refresh 一下就够 —— 不值得为它加事件通道。
+    const timer = setInterval(() => {
+      void load();
+    }, 30_000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
+
   // Build table meta from volatile state so columns can stay stable
   const tableMeta = React.useMemo<TableMeta>(
     () => ({
@@ -1886,6 +1857,7 @@ export function ProfilesDataTable({
       stoppingProfiles,
       isUpdating,
       browserState,
+      loginIssues,
 
       // Tags editor state
       tagsOverrides,
@@ -1995,6 +1967,7 @@ export function ProfilesDataTable({
       stoppingProfiles,
       isUpdating,
       browserState,
+      loginIssues,
       tagsOverrides,
       allTags,
       openTagsEditorFor,
@@ -2618,33 +2591,43 @@ export function ProfilesDataTable({
         },
       },
       {
-        id: "note",
-        size: 80,
+        id: "marineLogin",
+        size: 130,
         header: ({ table }) => {
           const meta = table.options.meta as TableMeta;
-          return meta.t("profileTable.noteHeader");
+          return meta.t("profiles.table.marineLogin");
         },
         cell: ({ row, table }) => {
           const meta = table.options.meta as TableMeta;
-          const profile = row.original;
-          const isCrossOs = isCrossOsProfile(profile);
-          const isCrossOsBlocked = isCrossOs;
-          const isRunning =
-            meta.isClient && meta.runningProfiles.has(profile.id);
-          const isLaunching = meta.launchingProfiles.has(profile.id);
-          const isStopping = meta.stoppingProfiles.has(profile.id);
-          const isDisabled =
-            isRunning || isLaunching || isStopping || isCrossOsBlocked;
-
+          const issues = meta.loginIssues[row.original.id] ?? [];
+          if (issues.length === 0) {
+            // 「没发现问题」不是「已确认全部正常」—— 自动化没跑到的平台这里也是空的。
+            // 所以用一个中性的破折号，而不是绿色的对勾。
+            return <span className="text-xs text-muted-foreground">—</span>;
+          }
           return (
-            <NoteCell
-              profile={profile}
-              isDisabled={isDisabled}
-              noteOverrides={meta.noteOverrides ?? {}}
-              openNoteEditorFor={meta.openNoteEditorFor ?? null}
-              setOpenNoteEditorFor={meta.setOpenNoteEditorFor}
-              setNoteOverrides={meta.setNoteOverrides}
-            />
+            <div className="flex flex-wrap gap-1">
+              {issues.map((issue) => (
+                <span
+                  key={issue.platform}
+                  title={meta.t(
+                    issue.logged_in === false
+                      ? "profiles.table.marineLoggedOut"
+                      : "profiles.table.marineLoginUnknown",
+                  )}
+                  className={cn(
+                    "inline-flex items-center rounded-md border px-1.5 py-0.5 text-[10px] font-medium",
+                    // 确认登出 = 要动手（红）；判断不了 = 再看看（黄）。
+                    // 合成一种颜色会让人去重新登录一个其实健康的账号。
+                    issue.logged_in === false
+                      ? "border-destructive/40 bg-destructive/10 text-destructive"
+                      : "border-warning/40 bg-warning/10 text-warning",
+                  )}
+                >
+                  {meta.t(`marine.prospects.platform.${issue.platform}`)}
+                </span>
+              ))}
+            </div>
           );
         },
       },
@@ -2908,19 +2891,6 @@ export function ProfilesDataTable({
           const meta = table.options.meta as TableMeta;
           const profile = row.original;
           return <ExtCell profile={profile} meta={meta} />;
-        },
-      },
-      {
-        id: "dns",
-        size: 95,
-        header: ({ table }) => {
-          const meta = table.options.meta as TableMeta;
-          return meta.t("profiles.table.dns");
-        },
-        cell: ({ row, table }) => {
-          const meta = table.options.meta as TableMeta;
-          const profile = row.original;
-          return <DnsCell profile={profile} meta={meta} />;
         },
       },
       {

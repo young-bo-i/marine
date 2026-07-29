@@ -226,7 +226,7 @@ export function ExtensionManagementDialog({
       setExtensions(exts);
       setExtensionGroups(groups);
     } catch {
-      // User may not have pro subscription
+      // Managers not ready yet — render empty rather than erroring.
       setExtensions([]);
       setExtensionGroups([]);
     } finally {

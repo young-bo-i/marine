@@ -202,7 +202,7 @@ export function ImportProfileDialog({
         error instanceof Error ? error.message : String(error);
 
       if (parseBackendError(error)) {
-        // Structured backend error (e.g. CAMOUFOX_IMPORT_DEPRECATED) — localize.
+        // Structured backend error — localize.
         toast.error(translateBackendError(t, error));
       } else if (errorMessage.includes("No downloaded versions found")) {
         const browserDisplayName = getBrowserDisplayName(browserType);

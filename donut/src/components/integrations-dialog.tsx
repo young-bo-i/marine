@@ -29,7 +29,6 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { useWayfernTerms } from "@/hooks/use-wayfern-terms";
 import { translateBackendError } from "@/lib/backend-errors";
 import { showErrorToast, showSuccessToast } from "@/lib/toast-utils";
 import { cn } from "@/lib/utils";
@@ -122,8 +121,6 @@ export function IntegrationsDialog({
   const [agents, setAgents] = useState<McpAgentInfo[]>([]);
   const [busyAgentIds, setBusyAgentIds] = useState<Set<string>>(new Set());
   const [apiPortDraft, setApiPortDraft] = useState<string>("10108");
-
-  const { termsAccepted } = useWayfernTerms();
 
   const loadSettings = useCallback(async () => {
     try {
@@ -534,17 +531,12 @@ export function IntegrationsDialog({
                       </Label>
                       <p className="text-xs text-muted-foreground">
                         {t("integrations.mcpEnableDescription")}
-                        {!termsAccepted && (
-                          <span className="ml-1 text-warning">
-                            {t("integrations.mcpAcceptTermsFirst")}
-                          </span>
-                        )}
                       </p>
                     </div>
                   </div>
                   <AnimatedSwitch
                     checked={settings.mcp_enabled && mcpConfig !== null}
-                    disabled={!termsAccepted || isMcpStarting}
+                    disabled={isMcpStarting}
                     onCheckedChange={(checked) => void handleMcpToggle(checked)}
                   />
                 </div>

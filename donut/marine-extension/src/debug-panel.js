@@ -47,6 +47,18 @@ var marineDebug = (function () {
     buffer.push(e);
     if (buffer.length > MAX) buffer.shift();
     forward(e);
+    // 镜像到 console。
+    //
+    // 不是冗余：另外两条通路都会在最需要它们的时候失效 —— 侧边栏只在面板打开时
+    // 活着（而调度器每条腿结束都关浏览器），SW 转发依赖的正是「SW 消息通道 +
+    // 本地 API」这套本身就可能是故障点的机制。console 只依赖页面自己，而且
+    // CDP 的 Runtime.consoleAPICalled 是**事件订阅**，Wayfern 的付费闸门只封
+    // Runtime.evaluate 那类求值方法，不影响事件 —— 实测确认。
+    // 统一前缀是为了好过滤。
+    try {
+      console.log('[marine]', e.level, e.tag ? '[' + e.tag + ']' : '', e.msg,
+        e.data === undefined ? '' : e.data);
+    } catch (err) {}
     return e;
   }
   function safeJson(v) { try { return JSON.stringify(v); } catch (e) { return String(v); } }

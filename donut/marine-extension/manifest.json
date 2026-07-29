@@ -1,12 +1,21 @@
 {
   "manifest_version": 3,
   "name": "Marine 字幕 & 文本提取器",
-  "version": "0.1.5",
+  "version": "0.1.31",
   "description": "提取页面正文、字幕与评论，并为 Bilibili、知乎、小红书建立精确直评/回复目标。",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzPEPxV+qWzHG1AItK3YhlLmBUOQmq+LXVjhPI8x64h3v2+C8ONogkUaYKHlnDs7DvYF1CsStiE3Z7yuljh1mWxdL2/34clY5fZnBzTRhRnNgrnRIifEapsDp+8qSKCyJY+j7vrJhdyjjPvBSfaaQbUpjqqkgtxZoh91NU+OzdPkOcqiZ/wkNcyno34ZegKqc86pJtuKIXhcS3RMOxFLv3lJxywnsW5E/rDa9sk37JBABk3ECLMr28HG2f83uE4KpsKNyT//tjmXpDOMplIvUPR9LQyfpYn43pTJ7E3Tv+H7Zbl5KF3swZVsV4BhXEFTLn0yUohmj1XuUo1SwrwdzxwIDAQAB",
   "minimum_chrome_version": "114",
-  "permissions": ["storage", "downloads", "sidePanel", "scripting", "dom", "alarms"],
-  "host_permissions": ["<all_urls>"],
+  "permissions": [
+    "storage",
+    "downloads",
+    "sidePanel",
+    "scripting",
+    "dom",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "icons": {
     "16": "icons/icon-16.png",
     "32": "icons/icon-32.png",
@@ -26,27 +35,56 @@
     "default_path": "popup.html"
   },
   "background": {
-    "service_worker": "src/sw-entry-0.1.5.js"
+    "service_worker": "src/sw-entry-0.1.31.js"
   },
   "content_scripts": [
     {
-      "matches": ["*://*.bilibili.com/*"],
-      "js": ["src/publish-receipt.js", "src/publish-bridge.js"],
+      "matches": [
+        "*://*.bilibili.com/*"
+      ],
+      "js": [
+        "src/publish-receipt.js",
+        "src/publish-bridge.js"
+      ],
       "run_at": "document_start",
       "world": "ISOLATED",
       "all_frames": true
     },
     {
-      "matches": ["*://*.bilibili.com/*"],
-      "js": ["src/content-main.js"],
+      "js": [
+        "src/publish-receipt.js",
+        "src/publish-bridge.js"
+      ],
+      "matches": [
+        "*://*.zhihu.com/*",
+        "*://*.xiaohongshu.com/*",
+        "*://*.douyin.com/*"
+      ],
+      "run_at": "document_start",
+      "world": "ISOLATED",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "*://*.bilibili.com/*"
+      ],
+      "js": [
+        "src/content-main.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN",
       "all_frames": true
     },
     {
-      "matches": ["<all_urls>"],
-      "exclude_matches": ["*://*.bilibili.com/*"],
-      "js": ["src/content-main.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "exclude_matches": [
+        "*://*.bilibili.com/*"
+      ],
+      "js": [
+        "src/content-main.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN",
       "all_frames": false
@@ -64,13 +102,18 @@
       "js": [
         "src/platforms/youtube.js",
         "src/platforms/bilibili.js",
+        "src/platforms/discovery.js",
+        "src/platforms/login.js",
+        "src/platforms/prospect-run.js",
         "src/platforms/comment-targets.js"
       ],
       "run_at": "document_idle",
       "all_frames": false
     },
     {
-      "matches": ["<all_urls>"],
+      "matches": [
+        "<all_urls>"
+      ],
       "js": [
         "src/debug-panel.js",
         "src/format.js",

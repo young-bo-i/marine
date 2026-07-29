@@ -172,9 +172,8 @@ export function AccountPage({
       showSuccessToast(t("sync.config.settingsSaved"));
     } catch (error) {
       console.error("Failed to save sync settings:", error);
-      // Use the structured backend-error translator so the cloud-vs-self-
-      // hosted mutex (`SELF_HOSTED_REQUIRES_LOGOUT`) shows a clear message
-      // instead of the generic "save failed" toast.
+      // Use the structured backend-error translator so a coded failure shows
+      // a clear message instead of the generic "save failed" toast.
       showErrorToast(translateBackendError(t as never, error));
     } finally {
       setIsSavingSelfHosted(false);

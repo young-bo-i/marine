@@ -172,8 +172,7 @@
         "submit": "Validate",
         "matchToast": "Password is correct",
         "mismatchToast": "Password does not match"
-      },
-      "requiresTeamOwner": "Only the team owner can change profile encryption."
+      }
     },
     "advanced": {
       "title": "Advanced",
@@ -237,7 +236,10 @@
       "cantModifyRunning": "Can't modify running profile",
       "cantModifyLaunching": "Can't modify profile while launching",
       "cantModifyStopping": "Can't modify profile while stopping",
-      "cantModifyUpdating": "Can't modify profile while browser is updating"
+      "cantModifyUpdating": "Can't modify profile while browser is updating",
+      "marineLogin": "Marine login",
+      "marineLoggedOut": "Signed out — sign in again",
+      "marineLoginUnknown": "Could not tell — check later"
     },
     "actions": {
       "launch": "Launch",
@@ -724,7 +726,6 @@
     "tokenCopied": "Token copied",
     "mcpEnableLabel": "Enable MCP Server (Model Context Protocol)",
     "mcpEnableDescription": "Allow AI assistants like Claude Desktop to control browsers.",
-    "mcpAcceptTermsFirst": "(Accept Wayfern terms in Settings first)",
     "mcpStarted": "MCP server started on port {{port}}",
     "mcpStopped": "MCP server stopped",
     "mcpToggleFailed": "Failed to toggle MCP server",
@@ -1561,16 +1562,6 @@
     "creatingButton": "Creating...",
     "createButton": "Create"
   },
-  "wayfernTerms": {
-    "title": "Wayfern Terms and Conditions",
-    "description": "Before using Marine, you must read and agree to Wayfern's Terms and Conditions.",
-    "reviewLabel": "Please review the Terms and Conditions at:",
-    "agreeNotice": "By clicking \"I Accept\", you agree to be bound by these terms.",
-    "acceptButton": "I Accept",
-    "acceptSuccess": "Terms accepted successfully",
-    "acceptFailed": "Failed to accept terms",
-    "tryAgain": "Please try again"
-  },
   "permissionDialog": {
     "titleMicrophone": "Microphone Access Required",
     "titleCamera": "Camera Access Required",
@@ -1830,11 +1821,9 @@
     "invalidLaunchHookUrl": "Invalid launch hook URL. Use a full http:// or https:// URL.",
     "cookieDbLocked": "Could not read cookies — the database is locked. Close the browser and try again.",
     "cookieDbUnavailable": "Could not read cookies — the cookie store is unavailable.",
-    "selfHostedRequiresLogout": "Sign out of your Marine account before configuring a self-hosted server.",
     "proxyNotWorking": "The selected proxy isn't working, so the profile wasn't created.",
     "proxyPaymentRequired": "The selected proxy requires payment (402) — its subscription may have expired — so the profile wasn't created.",
     "vpnNotWorking": "The selected VPN isn't working, so the profile wasn't created.",
-    "camoufoxImportDeprecated": "Importing Firefox-based (Camoufox) profiles is no longer supported. Camoufox is being deprecated — please use Wayfern instead.",
     "marineProfileNotRunning": "The selected profile isn't running. Launch it first.",
     "marineNoCdp": "Couldn't connect to the running browser. Make sure the profile is running.",
     "marineGrabTimeout": "Grabbing the page timed out.",
@@ -1846,7 +1835,10 @@
     "marineGenerateTimeout": "Generation timed out.",
     "marineFillFailed": "Couldn't fill the reply box. {{detail}}",
     "marineMarkPostedFailed": "Couldn't mark as posted. {{detail}}",
-    "teamOwnerOnly": "Only the team owner can change the encryption password."
+    "marineDiscoveryAlreadyRunning": "A discovery run is already in progress.",
+    "marineDiscoveryEmptyPlan": "Pick at least one profile and one platform.",
+    "marineDiscoveryEmptyKeyword": "Enter a search keyword.",
+    "marineDiscoveryProfileNotFound": "One of the selected profiles no longer exists."
   },
   "rail": {
     "profiles": "Profiles",
@@ -1864,7 +1856,7 @@
     "network": "Network",
     "integrations": "Integrations",
     "account": "Account",
-    "marine": "Comment ledger"
+    "marine": "Ledgers"
   },
   "pageTitle": {
     "proxies": "Network",
@@ -1876,7 +1868,7 @@
     "account": "Account",
     "import": "Import profile",
     "shortcuts": "Keyboard shortcuts",
-    "marine": "Comment ledger"
+    "marine": "Ledgers"
   },
   "encryption": {
     "required": {
@@ -2202,6 +2194,83 @@
       },
       "unknownPlatform": "Unknown platform",
       "profileId": "Profile ID: {{id}}"
+    },
+    "tabs": {
+      "prospects": "Discovery ledger",
+      "history": "Comment ledger"
+    },
+    "prospects": {
+      "title": "Discovery ledger",
+      "description": "Every candidate a search turned up, and which accounts have touched it. This is what keeps two of our accounts off the same piece of content — search filters only spread results out, the ledger is the guarantee.",
+      "loading": "Loading discovery ledger…",
+      "untitled": "Untitled",
+      "run": {
+        "label": "Automation run",
+        "title": "Run discovery",
+        "description": "Opens each profile in turn, works one platform at a time, then closes it before moving on — never two at once. The run stops after writing the draft into the comment box; it does not send.",
+        "keyword": "Keyword",
+        "keywordPlaceholder": "e.g. research tools",
+        "platforms": "Platforms",
+        "profiles": "Profiles",
+        "noProfiles": "No Wayfern profile found. The discovery extension only loads in Wayfern, so a run needs one.",
+        "start": "Run",
+        "stop": "Stop",
+        "hint": "Pick a keyword, at least one platform and at least one profile.",
+        "progress": "{{done}}/{{total}} · {{phase}} · {{target}}",
+        "settledCount": "{{n}} settled",
+        "startFailed": "Could not start the run",
+        "stopFailed": "Could not stop the run",
+        "cycleGap": "Cycle gap (min)",
+        "cycleGapPlaceholder": "e.g. 30 — blank runs once"
+      },
+      "phase": {
+        "idle": "Idle",
+        "launching": "Launching",
+        "working": "Working",
+        "closing": "Closing",
+        "pausing": "Pausing",
+        "done": "Finished",
+        "cancelled": "Cancelled"
+      },
+      "outcome": {
+        "settled": "Settled",
+        "timed_out": "Nothing settled",
+        "no_slot": "Platform not supported",
+        "already_open": "Already open — skipped",
+        "failed": "Failed",
+        "cancelled": "Cancelled"
+      },
+      "stats": {
+        "label": "Ledger summary",
+        "posted": "Posted"
+      },
+      "filters": {
+        "label": "Ledger filters",
+        "searchPlaceholder": "Search title, id or keyword",
+        "allPlatforms": "All platforms"
+      },
+      "table": {
+        "platform": "Platform",
+        "title": "Content",
+        "keywords": "Keyword",
+        "accounts": "Accounts",
+        "open": "Open in browser",
+        "postedAt": "Posted at"
+      },
+      "empty": {
+        "title": "Nothing in the ledger yet",
+        "description": "Start a run above, or open a profile on a supported search page — the extension records what it finds."
+      },
+      "error": {
+        "title": "Could not load the discovery ledger",
+        "description": "Reading the ledger file failed. Try refreshing; if it keeps failing, check the app log."
+      },
+      "platform": {
+        "bilibili": "Bilibili",
+        "zhihu": "Zhihu",
+        "douyin": "Douyin",
+        "xiaohongshu": "Xiaohongshu"
+      }
     }
   }
 }

@@ -172,8 +172,7 @@
         "submit": "Validar",
         "matchToast": "A senha está correta",
         "mismatchToast": "A senha não corresponde"
-      },
-      "requiresTeamOwner": "Apenas o proprietário da equipe pode alterar a criptografia de perfis."
+      }
     },
     "advanced": {
       "title": "Avançado",
@@ -237,7 +236,10 @@
       "cantModifyRunning": "Não é possível modificar um perfil em execução",
       "cantModifyLaunching": "Não é possível modificar o perfil durante a inicialização",
       "cantModifyStopping": "Não é possível modificar o perfil durante a parada",
-      "cantModifyUpdating": "Não é possível modificar o perfil enquanto o navegador é atualizado"
+      "cantModifyUpdating": "Não é possível modificar o perfil enquanto o navegador é atualizado",
+      "marineLogin": "Login Marine",
+      "marineLoggedOut": "Desconectado — entre novamente",
+      "marineLoginUnknown": "Não foi possível determinar; verifique depois"
     },
     "actions": {
       "launch": "Iniciar",
@@ -724,7 +726,6 @@
     "tokenCopied": "Token copiado",
     "mcpEnableLabel": "Ativar servidor MCP (Model Context Protocol)",
     "mcpEnableDescription": "Permite que assistentes de IA como o Claude Desktop controlem navegadores.",
-    "mcpAcceptTermsFirst": "(Aceite primeiro os termos da Wayfern nas Configurações)",
     "mcpStarted": "Servidor MCP iniciado na porta {{port}}",
     "mcpStopped": "Servidor MCP parado",
     "mcpToggleFailed": "Falha ao alternar o servidor MCP",
@@ -1561,16 +1562,6 @@
     "creatingButton": "Criando...",
     "createButton": "Criar"
   },
-  "wayfernTerms": {
-    "title": "Termos e condições da Wayfern",
-    "description": "Antes de usar o Marine, você deve ler e concordar com os Termos e Condições da Wayfern.",
-    "reviewLabel": "Por favor, revise os Termos e Condições em:",
-    "agreeNotice": "Ao clicar em \"Aceito\", você concorda em ficar vinculado a esses termos.",
-    "acceptButton": "Aceito",
-    "acceptSuccess": "Termos aceitos com sucesso",
-    "acceptFailed": "Falha ao aceitar os termos",
-    "tryAgain": "Tente novamente"
-  },
   "permissionDialog": {
     "titleMicrophone": "Acesso ao microfone necessário",
     "titleCamera": "Acesso à câmera necessário",
@@ -1830,11 +1821,9 @@
     "invalidLaunchHookUrl": "URL do hook de inicialização inválida. Use uma URL completa http:// ou https://.",
     "cookieDbLocked": "Não foi possível ler os cookies — o banco de dados está bloqueado. Feche o navegador e tente novamente.",
     "cookieDbUnavailable": "Não foi possível ler os cookies — o repositório de cookies está indisponível.",
-    "selfHostedRequiresLogout": "Saia da sua conta Marine antes de configurar um servidor auto-hospedado.",
     "proxyNotWorking": "O proxy selecionado não está funcionando, então o perfil não foi criado.",
     "proxyPaymentRequired": "O proxy selecionado exige pagamento (402) — sua assinatura pode ter expirado — então o perfil não foi criado.",
     "vpnNotWorking": "A VPN selecionada não está funcionando, então o perfil não foi criado.",
-    "camoufoxImportDeprecated": "A importação de perfis baseados em Firefox (Camoufox) não é mais suportada. O Camoufox está sendo descontinuado — use o Wayfern.",
     "marineProfileNotRunning": "O perfil selecionado não está em execução. Inicie-o primeiro.",
     "marineNoCdp": "Não foi possível conectar ao navegador em execução. Verifique se o perfil está em execução.",
     "marineGrabTimeout": "A captura da página expirou.",
@@ -1846,7 +1835,10 @@
     "marineGenerateTimeout": "A geração expirou.",
     "marineFillFailed": "Não foi possível preencher a resposta. {{detail}}",
     "marineMarkPostedFailed": "Não foi possível marcar como publicado. {{detail}}",
-    "teamOwnerOnly": "Apenas o proprietário da equipe pode alterar a senha de criptografia."
+    "marineDiscoveryAlreadyRunning": "Já há uma execução de descoberta em andamento.",
+    "marineDiscoveryEmptyPlan": "Escolha ao menos um perfil e uma plataforma.",
+    "marineDiscoveryEmptyKeyword": "Digite uma palavra-chave de busca.",
+    "marineDiscoveryProfileNotFound": "Um dos perfis selecionados não existe mais."
   },
   "rail": {
     "profiles": "Perfis",
@@ -1864,7 +1856,7 @@
     "network": "Rede",
     "integrations": "Integrações",
     "account": "Conta",
-    "marine": "Registro de comentários"
+    "marine": "Registros"
   },
   "pageTitle": {
     "proxies": "Rede",
@@ -1876,7 +1868,7 @@
     "account": "Conta",
     "import": "Importar perfil",
     "shortcuts": "Atalhos de teclado",
-    "marine": "Registro de comentários"
+    "marine": "Registros"
   },
   "encryption": {
     "required": {
@@ -2202,6 +2194,83 @@
       },
       "unknownPlatform": "Plataforma desconhecida",
       "profileId": "ID do perfil: {{id}}"
+    },
+    "tabs": {
+      "prospects": "Registro de descoberta",
+      "history": "Registro de comentários"
+    },
+    "prospects": {
+      "title": "Registro de descoberta",
+      "description": "Cada candidato que uma busca trouxe e quais contas já o tocaram. É isto que impede duas das nossas contas de caírem no mesmo conteúdo: os filtros de busca apenas espalham os resultados, a garantia é o registro.",
+      "loading": "Carregando o registro de descoberta…",
+      "untitled": "Sem título",
+      "run": {
+        "label": "Execução automática",
+        "title": "Executar descoberta",
+        "description": "Abre cada perfil por vez, trabalha uma plataforma de cada vez e o fecha antes de seguir — nunca dois ao mesmo tempo. A execução para depois de escrever o rascunho na caixa de comentário: ela não envia.",
+        "keyword": "Palavra-chave",
+        "keywordPlaceholder": "ex.: ferramentas de pesquisa",
+        "platforms": "Plataformas",
+        "profiles": "Perfis",
+        "noProfiles": "Nenhum perfil Wayfern encontrado. A extensão de descoberta só carrega no Wayfern, então uma execução precisa de um.",
+        "start": "Executar",
+        "stop": "Parar",
+        "hint": "Escolha uma palavra-chave, ao menos uma plataforma e ao menos um perfil.",
+        "progress": "{{done}}/{{total}} · {{phase}} · {{target}}",
+        "settledCount": "{{n}} registrados",
+        "startFailed": "Não foi possível iniciar a execução",
+        "stopFailed": "Não foi possível parar a execução",
+        "cycleGap": "Intervalo (min)",
+        "cycleGapPlaceholder": "ex.: 30 — vazio executa uma vez"
+      },
+      "phase": {
+        "idle": "Ocioso",
+        "launching": "Iniciando",
+        "working": "Em andamento",
+        "closing": "Fechando",
+        "pausing": "Em pausa",
+        "done": "Concluído",
+        "cancelled": "Cancelado"
+      },
+      "outcome": {
+        "settled": "Registrado",
+        "timed_out": "Nada registrado",
+        "no_slot": "Plataforma sem suporte",
+        "already_open": "Já aberto — ignorado",
+        "failed": "Falhou",
+        "cancelled": "Cancelado"
+      },
+      "stats": {
+        "label": "Resumo do registro",
+        "posted": "Publicados"
+      },
+      "filters": {
+        "label": "Filtros do registro",
+        "searchPlaceholder": "Buscar título, id ou palavra-chave",
+        "allPlatforms": "Todas as plataformas"
+      },
+      "table": {
+        "platform": "Plataforma",
+        "title": "Conteúdo",
+        "keywords": "Palavra-chave",
+        "accounts": "Contas",
+        "open": "Abrir no navegador",
+        "postedAt": "Publicado em"
+      },
+      "empty": {
+        "title": "O registro ainda está vazio",
+        "description": "Inicie uma execução acima ou abra um perfil em uma página de busca compatível — a extensão registra o que encontrar."
+      },
+      "error": {
+        "title": "Não foi possível carregar o registro de descoberta",
+        "description": "A leitura do arquivo do registro falhou. Tente atualizar; se continuar falhando, verifique o log do aplicativo."
+      },
+      "platform": {
+        "bilibili": "Bilibili",
+        "zhihu": "Zhihu",
+        "douyin": "Douyin",
+        "xiaohongshu": "Xiaohongshu"
+      }
     }
   }
 }

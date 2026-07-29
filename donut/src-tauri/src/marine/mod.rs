@@ -13,11 +13,17 @@
 pub mod automation;
 pub mod bookmarks;
 pub mod cdp;
+pub mod debug_log;
 pub mod extension;
 pub mod generate;
 pub mod history;
+pub mod login;
+pub mod login_status;
+pub mod prospect;
 pub mod rime;
 pub mod rime_plugin;
+pub mod scheduler;
+pub mod search_slot;
 
 /// Capability token handed to the in-browser extension, derived one-way from the
 /// full API bearer.

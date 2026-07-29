@@ -483,11 +483,6 @@ impl SyncEngine {
     String::new()
   }
 
-  /// Check if this is a self-hosted sync (no cloud login).
-  async fn is_self_hosted_sync() -> bool {
-    !crate::cloud_auth::CLOUD_AUTH.is_logged_in().await
-  }
-
   /// Resolve a remote config object's user-edit timestamp (`updated_at`) for
   /// conflict resolution. Prefers the value from S3 object metadata returned by
   /// the HEAD (`stat`) — no body transfer. Falls back to downloading and
@@ -569,16 +564,6 @@ impl SyncEngine {
         profile.id
       );
       return self.sync_cross_os_metadata(app_handle, profile).await;
-    }
-
-    // Skip team profiles for self-hosted sync
-    if Self::is_self_hosted_sync().await && profile.created_by_id.is_some() {
-      log::info!(
-        "Skipping team profile for self-hosted sync: {} ({})",
-        profile.name,
-        profile.id
-      );
-      return Ok(());
     }
 
     // Skip if profile is currently running locally

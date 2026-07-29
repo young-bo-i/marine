@@ -81,12 +81,9 @@ export interface SyncSettings {
 }
 
 /**
- * Capability/limit set derived from the plan by the backend. Features are gated
- * on these flags instead of a single "is paid?" check, so a plan like the future
- * "starter" tier (cross-OS fingerprints + cloud backup, no automation) is just
- * data. Mirrors `apps/backend/src/plans/entitlements.ts`. Resolve via
- * `getEntitlements()` — the desktop populates it, but it stays optional for
- * safety on older state.
+ * Capability/limit set as reported by the backend. Nothing in this build gates
+ * on it — every feature is available unconditionally — but it stays part of the
+ * `CloudUser` payload the desktop hands over.
  */
 export interface Entitlements {
   active: boolean;

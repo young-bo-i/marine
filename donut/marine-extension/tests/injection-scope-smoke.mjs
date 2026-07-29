@@ -39,7 +39,18 @@ const adapterEntry = manifest.content_scripts.find((entry) =>
 assert.ok(adapterEntry, "platform scripts must live in their own content_scripts entry");
 assert.deepEqual(
   adapterEntry.js,
-  ["src/platforms/youtube.js", "src/platforms/bilibili.js", "src/platforms/comment-targets.js"],
+  [
+    "src/platforms/youtube.js",
+    "src/platforms/bilibili.js",
+    // 发现侧解析器（搜索结果 -> 候选）。放在 comment-targets 之前只是为了让
+    // 「发现 -> 投放」的阅读顺序和数据流一致，两者之间没有加载依赖。
+    "src/platforms/discovery.js",
+    // 登录态识别：权威接口必须在页内调用（签名由页面 JS 计算）。
+    "src/platforms/login.js",
+    // 发现侧编排：落到搜索页就自动跑（启动网址由 Donut 下发）。
+    "src/platforms/prospect-run.js",
+    "src/platforms/comment-targets.js",
+  ],
   "every src/platforms/* file must be in the host-scoped entry",
 );
 assert.equal(adapterEntry.all_frames, false);

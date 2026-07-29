@@ -172,8 +172,7 @@
         "submit": "확인",
         "matchToast": "비밀번호가 일치합니다",
         "mismatchToast": "비밀번호가 일치하지 않습니다"
-      },
-      "requiresTeamOwner": "프로필 암호화는 팀 소유자만 변경할 수 있습니다."
+      }
     },
     "advanced": {
       "title": "고급",
@@ -237,7 +236,10 @@
       "cantModifyRunning": "실행 중인 프로필은 수정할 수 없습니다",
       "cantModifyLaunching": "실행하는 동안 프로필을 수정할 수 없습니다",
       "cantModifyStopping": "중지하는 동안 프로필을 수정할 수 없습니다",
-      "cantModifyUpdating": "브라우저 업데이트 중에는 프로필을 수정할 수 없습니다"
+      "cantModifyUpdating": "브라우저 업데이트 중에는 프로필을 수정할 수 없습니다",
+      "marineLogin": "Marine 로그인",
+      "marineLoggedOut": "로그아웃됨 — 다시 로그인 필요",
+      "marineLoginUnknown": "판단 불가 — 나중에 확인"
     },
     "actions": {
       "launch": "실행",
@@ -724,7 +726,6 @@
     "tokenCopied": "토큰 복사됨",
     "mcpEnableLabel": "MCP 서버 활성화 (Model Context Protocol)",
     "mcpEnableDescription": "Claude Desktop과 같은 AI 어시스턴트가 브라우저를 제어할 수 있도록 허용합니다.",
-    "mcpAcceptTermsFirst": "(먼저 설정에서 Wayfern 약관에 동의하세요)",
     "mcpStarted": "MCP 서버가 포트 {{port}}에서 시작되었습니다",
     "mcpStopped": "MCP 서버가 중지되었습니다",
     "mcpToggleFailed": "MCP 서버 토글 실패",
@@ -1561,16 +1562,6 @@
     "creatingButton": "생성 중...",
     "createButton": "생성"
   },
-  "wayfernTerms": {
-    "title": "Wayfern 이용 약관",
-    "description": "Marine를 사용하기 전에 Wayfern의 이용 약관을 읽고 동의해야 합니다.",
-    "reviewLabel": "다음 위치에서 이용 약관을 검토하세요:",
-    "agreeNotice": "\"동의함\"을 클릭하면 이 약관에 동의하는 것입니다.",
-    "acceptButton": "동의함",
-    "acceptSuccess": "약관에 동의했습니다",
-    "acceptFailed": "약관 동의 실패",
-    "tryAgain": "다시 시도하세요"
-  },
   "permissionDialog": {
     "titleMicrophone": "마이크 액세스가 필요합니다",
     "titleCamera": "카메라 액세스가 필요합니다",
@@ -1830,11 +1821,9 @@
     "invalidLaunchHookUrl": "잘못된 실행 후크 URL입니다. 전체 http:// 또는 https:// URL을 사용하세요.",
     "cookieDbLocked": "쿠키를 읽을 수 없습니다 — 데이터베이스가 잠겨 있습니다. 브라우저를 닫고 다시 시도하세요.",
     "cookieDbUnavailable": "쿠키를 읽을 수 없습니다 — 쿠키 저장소를 사용할 수 없습니다.",
-    "selfHostedRequiresLogout": "자체 호스팅 서버를 구성하기 전에 Marine 계정에서 로그아웃하세요.",
     "proxyNotWorking": "선택한 프록시가 작동하지 않아 프로필이 생성되지 않았습니다.",
     "proxyPaymentRequired": "선택한 프록시는 결제가 필요합니다(402). 구독이 만료되었을 수 있어 프로필이 생성되지 않았습니다.",
     "vpnNotWorking": "선택한 VPN이 작동하지 않아 프로필이 생성되지 않았습니다.",
-    "camoufoxImportDeprecated": "Firefox 기반(Camoufox) 프로필 가져오기는 더 이상 지원되지 않습니다. Camoufox는 지원 종료 예정입니다. 대신 Wayfern을 사용하세요.",
     "marineProfileNotRunning": "선택한 프로필이 실행 중이 아닙니다. 먼저 실행하세요.",
     "marineNoCdp": "실행 중인 브라우저에 연결할 수 없습니다. 프로필이 실행 중인지 확인하세요.",
     "marineGrabTimeout": "페이지 가져오기 시간이 초과되었습니다.",
@@ -1846,7 +1835,10 @@
     "marineGenerateTimeout": "생성 시간이 초과되었습니다.",
     "marineFillFailed": "답글창에 입력할 수 없습니다. {{detail}}",
     "marineMarkPostedFailed": "게시됨으로 표시할 수 없습니다. {{detail}}",
-    "teamOwnerOnly": "암호화 비밀번호는 팀 소유자만 변경할 수 있습니다."
+    "marineDiscoveryAlreadyRunning": "이미 발견 작업이 진행 중입니다.",
+    "marineDiscoveryEmptyPlan": "프로필과 플랫폼을 각각 하나 이상 선택하세요.",
+    "marineDiscoveryEmptyKeyword": "검색 키워드를 입력하세요.",
+    "marineDiscoveryProfileNotFound": "선택한 프로필 중 하나가 더 이상 존재하지 않습니다."
   },
   "rail": {
     "profiles": "프로필",
@@ -1864,7 +1856,7 @@
     "network": "네트워크",
     "integrations": "통합",
     "account": "계정",
-    "marine": "댓글 기록장"
+    "marine": "대장"
   },
   "pageTitle": {
     "proxies": "네트워크",
@@ -1876,7 +1868,7 @@
     "account": "계정",
     "import": "프로필 가져오기",
     "shortcuts": "키보드 단축키",
-    "marine": "댓글 기록장"
+    "marine": "대장"
   },
   "encryption": {
     "required": {
@@ -2202,6 +2194,83 @@
       },
       "unknownPlatform": "알 수 없는 플랫폼",
       "profileId": "프로필 ID: {{id}}"
+    },
+    "tabs": {
+      "prospects": "발견 대장",
+      "history": "댓글 대장"
+    },
+    "prospects": {
+      "title": "발견 대장",
+      "description": "검색으로 찾아낸 모든 후보와 어떤 계정이 손댔는지에 대한 기록입니다. 우리 계정 둘이 같은 콘텐츠에 겹치는 것을 막는 유일한 보장이며, 검색 필터는 결과를 분산시킬 뿐입니다.",
+      "loading": "발견 대장을 불러오는 중…",
+      "untitled": "제목 없음",
+      "run": {
+        "label": "자동 실행",
+        "title": "자동으로 한 바퀴 돌리기",
+        "description": "프로필을 차례로 열어 한 번에 한 플랫폼씩 처리하고, 닫은 뒤 다음으로 넘어갑니다. 동시에 두 개를 열지 않습니다. 댓글 입력란에 초안을 채운 뒤 멈추며 전송하지 않습니다.",
+        "keyword": "키워드",
+        "keywordPlaceholder": "예: 연구 도구",
+        "platforms": "플랫폼",
+        "profiles": "프로필",
+        "noProfiles": "Wayfern 프로필이 없습니다. 발견용 확장 프로그램은 Wayfern에만 설치되므로 실행하려면 Wayfern이 필요합니다.",
+        "start": "실행",
+        "stop": "중지",
+        "hint": "키워드를 입력하고 플랫폼과 프로필을 각각 하나 이상 선택하세요.",
+        "progress": "{{done}}/{{total}} · {{phase}} · {{target}}",
+        "settledCount": "{{n}}건 기록",
+        "startFailed": "실행을 시작할 수 없습니다",
+        "stopFailed": "실행을 중지할 수 없습니다",
+        "cycleGap": "반복 간격(분)",
+        "cycleGapPlaceholder": "예: 30, 비우면 1회만"
+      },
+      "phase": {
+        "idle": "대기 중",
+        "launching": "시작 중",
+        "working": "진행 중",
+        "closing": "종료 중",
+        "pausing": "간격 대기",
+        "done": "완료됨",
+        "cancelled": "취소됨"
+      },
+      "outcome": {
+        "settled": "기록됨",
+        "timed_out": "기록 없음",
+        "no_slot": "지원하지 않는 플랫폼",
+        "already_open": "이미 실행 중이라 건너뜀",
+        "failed": "실패",
+        "cancelled": "취소됨"
+      },
+      "stats": {
+        "label": "대장 요약",
+        "posted": "게시됨"
+      },
+      "filters": {
+        "label": "대장 필터",
+        "searchPlaceholder": "제목, ID 또는 키워드 검색",
+        "allPlatforms": "모든 플랫폼"
+      },
+      "table": {
+        "platform": "플랫폼",
+        "title": "콘텐츠",
+        "keywords": "키워드",
+        "accounts": "계정",
+        "open": "브라우저에서 열기",
+        "postedAt": "게시 시각"
+      },
+      "empty": {
+        "title": "대장이 아직 비어 있습니다",
+        "description": "위에서 실행을 시작하거나 지원되는 검색 페이지에서 프로필을 여세요. 확장 프로그램이 찾은 내용을 기록합니다."
+      },
+      "error": {
+        "title": "발견 대장을 불러올 수 없습니다",
+        "description": "대장 파일을 읽지 못했습니다. 새로 고침해 보고 계속 실패하면 앱 로그를 확인하세요."
+      },
+      "platform": {
+        "bilibili": "Bilibili",
+        "zhihu": "Zhihu",
+        "douyin": "Douyin",
+        "xiaohongshu": "Xiaohongshu"
+      }
     }
   }
 }

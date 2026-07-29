@@ -262,10 +262,21 @@
   const COMMENT_RE = /\/x\/v2\/reply(?:\/wbi\/main|\/reply|\/add)?(\?|$)/i;
   const ZHIHU_RE = /\/api\/v4\/(comment_v5\/|questions\/\d+\/(feeds|answers)|answers\/\d+(\/|\?|$)|articles\/\d+(\/|\?|$)|[^?]*\/(root_comment|child_comment|comments))/i;
   // 小红书：评论 comment/page + comment/sub/page；笔记详情 feed。
-  const XHS_RE = /\/api\/sns\/web\/v\d+\/(comment\/(sub\/)?page|feed)/i;
+  // 覆盖整个 comment/ 家族，不只是读列表的 page/sub/page。
+  //
+  // 原来只匹配 `comment/page|feed`，于是**发布 POST 从来没被分类成 comment**，
+  // `postPublishedCandidate` 一次都不会被调用 —— 回执桥握手正常、forwards 也在
+  // 涨，唯独那次发布悄无声息。实测形态：评论确实上线了，`diag().lastPost` 却是
+  // null，台账记 failed 而草稿还留在输入框里（有重复发送的风险）。
+  //
+  // 捕获放宽是安全的：真正判定「这是不是一次成功发布」的是 publish-receipt.js
+  // 里的构造器，它要求路径是写操作且能取到正数评论 id。捕获窄了才会漏。
+  const XHS_RE = /\/api\/sns\/web\/v\d+\/(comment\/|feed)/i;
   // 抖音：评论列表 /aweme/v1/web/comment/list（一级）+ /comment/list/reply（子评论）。
   // 抖音公开 web API；若线上路径有出入，捕获数会为 0，需按实际抓包微调此正则。
-  const DOUYIN_RE = /\/aweme\/v1\/web\/comment\/list(\/reply)?\//i;
+  // 覆盖整个 comment/ 家族（读列表 + 写操作）。只匹配 list 的话，发布 POST
+  // 永远不会被分类成 comment，回执链路第一步就断 —— 小红书正是这么踩的。
+  const DOUYIN_RE = /\/aweme\/v1\/web\/comment\//i;
 
   function hostnameOf(value) {
     try {

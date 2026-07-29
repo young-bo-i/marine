@@ -11,15 +11,9 @@ use crate::profile::ProfileManager;
 const ACCEPT_TERMS_FLAG: &str = "--accept-terms-and-conditions";
 const MIN_VALID_TIMESTAMP: i64 = 1577836800; // 2020-01-01 00:00:00 UTC
 
-/// Latches the accepted verdict. `is_terms_accepted` runs on EVERY local API
-/// request (`terms_check_middleware`) and otherwise costs a `stat(2)` plus a
-/// full file read each time — the largest fixed per-request cost once the API
-/// token cache removed the Argon2 KDF.
-///
-/// Only `true` is cached, and accepting terms is a one-way transition, so this
-/// can never latch a stale answer that blocks the user: the "not accepted yet"
-/// state is re-read from disk every time, which is exactly the state where the
-/// middleware rejects the request anyway.
+/// Latches the accepted verdict so the common case avoids a `stat(2)` plus a
+/// full file read. Only `true` is cached and acceptance is a one-way
+/// transition, so this can never latch a stale answer.
 static TERMS_ACCEPTED: AtomicBool = AtomicBool::new(false);
 
 pub struct WayfernTermsManager {

@@ -114,6 +114,10 @@ const chrome = {
       async set(values) {
         Object.assign(sessionState, values);
       },
+      // 编排的交接单按 tab 存在这里，标签页关掉时会被删。
+      async remove(key) {
+        delete sessionState[key];
+      },
     },
     onChanged: storageChanged,
   },
@@ -641,5 +645,79 @@ assert.deepEqual(
 );
 await new Promise((resolve) => setTimeout(resolve, 30));
 assert.equal(sessionState.marineRimeLeaseStateV1.suspendedRetainedTabId, null);
+
+// ---------------------------------------------------------------------------
+// 编排必须能在浏览器完全失焦时写入上下文。
+//
+// 这是整套里最贵的一条教训：曾经只有「推迟闸」认 orchestrated，写闸和失焦清理
+// 都不认。三道闸只放行一道，外部症状和一道都不放行**完全相同** —— PUT 静默不
+// 落地、12 秒后报「目标准备超时」、台账记 failed、按「失败不重试」把候选永久
+// 作废。当时的测试只 grep 了 "msg.orchestrated === true" 这个字符串，半截接线
+// 照样通过，于是这个 bug 一直活着，靠「把浏览器窗口抢到前台」硬绕过去 ——
+// 代价是自动化一跑就抢走用户的鼠标。
+//
+// 所以这几条必须是**行为**断言：真的让窗口失焦，真的看 apiCalls。
+focusWindow(90);
+activeTabByWindow.set(90, 21);
+tabActivated.emit({ tabId: 21, windowId: 90 });
+await flushTasks();
+
+// 先建立一条编排的上下文，此时窗口还在前台。
+const orchestratedId = "orchestrated-while-unfocused";
+assert.equal(
+  (await sendContext(
+    21,
+    { ...putMessage(orchestratedId, 1, "document-orchestrated"), orchestrated: true },
+    { active: true, windowId: 90 },
+  )).ok,
+  true,
+);
+
+// 人切到别的程序 —— 浏览器整体失焦。
+focusWindow(chrome.windows.WINDOW_ID_NONE);
+await flushTasks();
+
+assert.equal(
+  apiCalls.some(
+    (call) => call.method === "DELETE" && call.contextId === orchestratedId,
+  ),
+  false,
+  "失焦不得撤销编排的上下文 —— DELETE 会让后端把这个 contextId 记进 revoked，" +
+    "同一个 id 再也 PUT 不进去，生成阶段直接报「目标已失效」",
+);
+
+// 失焦状态下继续 PUT（生成过程中上下文会随光标位置反复更新）。
+const callsBeforeUnfocusedOrchestratedPut = apiCalls.length;
+const unfocusedOrchestrated = await sendContext(
+  21,
+  { ...putMessage(orchestratedId, 2, "document-orchestrated"), orchestrated: true },
+  { active: true, windowId: 90 },
+);
+assert.equal(unfocusedOrchestrated.ok, true);
+assert.equal(
+  apiCalls.slice(callsBeforeUnfocusedOrchestratedPut).some(
+    (call) => call.method === "PUT" && call.contextId === orchestratedId,
+  ),
+  true,
+  "编排的 PUT 在浏览器失焦时必须真的发出去 —— 报 ok 但不写是这个 bug 的原始形态",
+);
+
+// 反面：人工路径（没有 orchestrated 标记）的保护一点都不能放宽。
+// 侧边栏那套规矩仍然是「只有你正在看的那个 tab 能占用全局槽位」。
+const manualId = "manual-while-unfocused";
+const callsBeforeManualUnfocusedPut = apiCalls.length;
+const manualUnfocused = await sendContext(
+  21,
+  putMessage(manualId, 3, "document-manual"),
+  { active: true, windowId: 90 },
+);
+assert.equal(manualUnfocused.ok, true);
+assert.equal(
+  apiCalls.slice(callsBeforeManualUnfocusedPut).some(
+    (call) => call.method === "PUT" && call.contextId === manualId,
+  ),
+  false,
+  "没有编排标记的 PUT 在失焦时仍然不准落地 —— 放宽的是编排，不是所有人",
+);
 
 console.log("Marine extension Rime service-worker smoke: OK");

@@ -172,8 +172,7 @@
         "submit": "Validar",
         "matchToast": "La contraseña es correcta",
         "mismatchToast": "La contraseña no coincide"
-      },
-      "requiresTeamOwner": "Solo el propietario del equipo puede cambiar el cifrado de perfiles."
+      }
     },
     "advanced": {
       "title": "Avanzado",
@@ -237,7 +236,10 @@
       "cantModifyRunning": "No se puede modificar un perfil en ejecución",
       "cantModifyLaunching": "No se puede modificar el perfil mientras se inicia",
       "cantModifyStopping": "No se puede modificar el perfil mientras se detiene",
-      "cantModifyUpdating": "No se puede modificar el perfil mientras se actualiza el navegador"
+      "cantModifyUpdating": "No se puede modificar el perfil mientras se actualiza el navegador",
+      "marineLogin": "Sesión Marine",
+      "marineLoggedOut": "Sesión cerrada: vuelve a iniciar",
+      "marineLoginUnknown": "No se pudo determinar; revisa luego"
     },
     "actions": {
       "launch": "Iniciar",
@@ -724,7 +726,6 @@
     "tokenCopied": "Token copiado",
     "mcpEnableLabel": "Activar servidor MCP (Model Context Protocol)",
     "mcpEnableDescription": "Permite que asistentes IA como Claude Desktop controlen los navegadores.",
-    "mcpAcceptTermsFirst": "(Acepta primero los términos de Wayfern en Configuración)",
     "mcpStarted": "Servidor MCP iniciado en puerto {{port}}",
     "mcpStopped": "Servidor MCP detenido",
     "mcpToggleFailed": "Error al alternar el servidor MCP",
@@ -1561,16 +1562,6 @@
     "creatingButton": "Creando...",
     "createButton": "Crear"
   },
-  "wayfernTerms": {
-    "title": "Términos y condiciones de Wayfern",
-    "description": "Antes de usar Marine, debes leer y aceptar los Términos y Condiciones de Wayfern.",
-    "reviewLabel": "Por favor, revisa los Términos y Condiciones en:",
-    "agreeNotice": "Al hacer clic en \"Acepto\", aceptas estos términos.",
-    "acceptButton": "Acepto",
-    "acceptSuccess": "Términos aceptados correctamente",
-    "acceptFailed": "Error al aceptar los términos",
-    "tryAgain": "Por favor, inténtalo de nuevo"
-  },
   "permissionDialog": {
     "titleMicrophone": "Se requiere acceso al micrófono",
     "titleCamera": "Se requiere acceso a la cámara",
@@ -1830,11 +1821,9 @@
     "invalidLaunchHookUrl": "URL del hook de inicio no válida. Usa una URL completa http:// o https://.",
     "cookieDbLocked": "No se pudieron leer las cookies — la base de datos está bloqueada. Cierra el navegador e inténtalo de nuevo.",
     "cookieDbUnavailable": "No se pudieron leer las cookies — el almacén de cookies no está disponible.",
-    "selfHostedRequiresLogout": "Cierra sesión en tu cuenta de Marine antes de configurar un servidor autoalojado.",
     "proxyNotWorking": "El proxy seleccionado no funciona, por lo que no se creó el perfil.",
     "proxyPaymentRequired": "El proxy seleccionado requiere pago (402) —su suscripción puede haber vencido— por lo que no se creó el perfil.",
     "vpnNotWorking": "La VPN seleccionada no funciona, por lo que no se creó el perfil.",
-    "camoufoxImportDeprecated": "La importación de perfiles basados en Firefox (Camoufox) ya no es compatible. Camoufox está en desuso; usa Wayfern en su lugar.",
     "marineProfileNotRunning": "El perfil seleccionado no está en ejecución. Inícialo primero.",
     "marineNoCdp": "No se pudo conectar con el navegador en ejecución. Asegúrate de que el perfil esté en ejecución.",
     "marineGrabTimeout": "Se agotó el tiempo al capturar la página.",
@@ -1846,7 +1835,10 @@
     "marineGenerateTimeout": "La generación agotó el tiempo.",
     "marineFillFailed": "No se pudo rellenar la respuesta. {{detail}}",
     "marineMarkPostedFailed": "No se pudo marcar como publicado. {{detail}}",
-    "teamOwnerOnly": "Solo el propietario del equipo puede cambiar la contraseña de cifrado."
+    "marineDiscoveryAlreadyRunning": "Ya hay una ejecución de descubrimiento en curso.",
+    "marineDiscoveryEmptyPlan": "Elige al menos un perfil y una plataforma.",
+    "marineDiscoveryEmptyKeyword": "Introduce una palabra clave de búsqueda.",
+    "marineDiscoveryProfileNotFound": "Uno de los perfiles seleccionados ya no existe."
   },
   "rail": {
     "profiles": "Perfiles",
@@ -1864,7 +1856,7 @@
     "network": "Red",
     "integrations": "Integraciones",
     "account": "Cuenta",
-    "marine": "Registro de comentarios"
+    "marine": "Registros"
   },
   "pageTitle": {
     "proxies": "Red",
@@ -1876,7 +1868,7 @@
     "account": "Cuenta",
     "import": "Importar perfil",
     "shortcuts": "Atajos de teclado",
-    "marine": "Registro de comentarios"
+    "marine": "Registros"
   },
   "encryption": {
     "required": {
@@ -2202,6 +2194,83 @@
       },
       "unknownPlatform": "Plataforma desconocida",
       "profileId": "ID del perfil: {{id}}"
+    },
+    "tabs": {
+      "prospects": "Registro de descubrimiento",
+      "history": "Registro de comentarios"
+    },
+    "prospects": {
+      "title": "Registro de descubrimiento",
+      "description": "Cada candidato que encontró una búsqueda y qué cuentas lo han tocado. Esto es lo que evita que dos de nuestras cuentas coincidan en el mismo contenido: los filtros de búsqueda solo dispersan los resultados, la garantía es el registro.",
+      "loading": "Cargando el registro de descubrimiento…",
+      "untitled": "Sin título",
+      "run": {
+        "label": "Ejecución automática",
+        "title": "Ejecutar descubrimiento",
+        "description": "Abre cada perfil por turno, trabaja una plataforma a la vez y lo cierra antes de continuar; nunca dos a la vez. La ejecución se detiene tras escribir el borrador en el cuadro de comentarios: no lo envía.",
+        "keyword": "Palabra clave",
+        "keywordPlaceholder": "p. ej. herramientas de investigación",
+        "platforms": "Plataformas",
+        "profiles": "Perfiles",
+        "noProfiles": "No se encontró ningún perfil de Wayfern. La extensión de descubrimiento solo se carga en Wayfern, así que una ejecución necesita uno.",
+        "start": "Ejecutar",
+        "stop": "Detener",
+        "hint": "Elige una palabra clave, al menos una plataforma y al menos un perfil.",
+        "progress": "{{done}}/{{total}} · {{phase}} · {{target}}",
+        "settledCount": "{{n}} registrados",
+        "startFailed": "No se pudo iniciar la ejecución",
+        "stopFailed": "No se pudo detener la ejecución",
+        "cycleGap": "Intervalo (min)",
+        "cycleGapPlaceholder": "p. ej. 30 — vacío ejecuta una vez"
+      },
+      "phase": {
+        "idle": "Inactivo",
+        "launching": "Iniciando",
+        "working": "En curso",
+        "closing": "Cerrando",
+        "pausing": "En pausa",
+        "done": "Finalizado",
+        "cancelled": "Cancelado"
+      },
+      "outcome": {
+        "settled": "Registrado",
+        "timed_out": "Nada registrado",
+        "no_slot": "Plataforma no admitida",
+        "already_open": "Ya abierto: omitido",
+        "failed": "Error",
+        "cancelled": "Cancelado"
+      },
+      "stats": {
+        "label": "Resumen del registro",
+        "posted": "Publicados"
+      },
+      "filters": {
+        "label": "Filtros del registro",
+        "searchPlaceholder": "Buscar título, id o palabra clave",
+        "allPlatforms": "Todas las plataformas"
+      },
+      "table": {
+        "platform": "Plataforma",
+        "title": "Contenido",
+        "keywords": "Palabra clave",
+        "accounts": "Cuentas",
+        "open": "Abrir en el navegador",
+        "postedAt": "Publicado"
+      },
+      "empty": {
+        "title": "El registro aún está vacío",
+        "description": "Inicia una ejecución arriba o abre un perfil en una página de búsqueda admitida: la extensión registra lo que encuentra."
+      },
+      "error": {
+        "title": "No se pudo cargar el registro de descubrimiento",
+        "description": "Falló la lectura del archivo del registro. Prueba a actualizar; si sigue fallando, revisa el registro de la aplicación."
+      },
+      "platform": {
+        "bilibili": "Bilibili",
+        "zhihu": "Zhihu",
+        "douyin": "Douyin",
+        "xiaohongshu": "Xiaohongshu"
+      }
     }
   }
 }

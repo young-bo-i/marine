@@ -172,8 +172,7 @@
         "submit": "Xác thực",
         "matchToast": "Mật khẩu chính xác",
         "mismatchToast": "Mật khẩu không khớp"
-      },
-      "requiresTeamOwner": "Chỉ chủ sở hữu nhóm mới có thể thay đổi mã hóa hồ sơ."
+      }
     },
     "advanced": {
       "title": "Nâng cao",
@@ -237,7 +236,10 @@
       "cantModifyRunning": "Không thể chỉnh sửa profile đang chạy",
       "cantModifyLaunching": "Không thể chỉnh sửa profile khi đang khởi chạy",
       "cantModifyStopping": "Không thể chỉnh sửa profile khi đang dừng",
-      "cantModifyUpdating": "Không thể chỉnh sửa profile khi trình duyệt đang cập nhật"
+      "cantModifyUpdating": "Không thể chỉnh sửa profile khi trình duyệt đang cập nhật",
+      "marineLogin": "Đăng nhập Marine",
+      "marineLoggedOut": "Đã đăng xuất — hãy đăng nhập lại",
+      "marineLoginUnknown": "Không xác định được — kiểm tra sau"
     },
     "actions": {
       "launch": "Khởi chạy",
@@ -724,7 +726,6 @@
     "tokenCopied": "Đã sao chép token",
     "mcpEnableLabel": "Bật máy chủ MCP (Model Context Protocol)",
     "mcpEnableDescription": "Cho phép trợ lý AI như Claude Desktop điều khiển trình duyệt.",
-    "mcpAcceptTermsFirst": "(Chấp nhận điều khoản Wayfern trong Cài đặt trước)",
     "mcpStarted": "Máy chủ MCP đã khởi động trên cổng {{port}}",
     "mcpStopped": "Máy chủ MCP đã dừng",
     "mcpToggleFailed": "Bật/tắt máy chủ MCP thất bại",
@@ -1561,16 +1562,6 @@
     "creatingButton": "Đang tạo...",
     "createButton": "Tạo"
   },
-  "wayfernTerms": {
-    "title": "Điều khoản và điều kiện Wayfern",
-    "description": "Trước khi sử dụng Marine, bạn phải đọc và đồng ý với Điều khoản và Điều kiện của Wayfern.",
-    "reviewLabel": "Vui lòng xem lại Điều khoản và Điều kiện tại:",
-    "agreeNotice": "Bằng cách nhấn \"Tôi chấp nhận\", bạn đồng ý bị ràng buộc bởi các điều khoản này.",
-    "acceptButton": "Tôi chấp nhận",
-    "acceptSuccess": "Chấp nhận điều khoản thành công",
-    "acceptFailed": "Chấp nhận điều khoản thất bại",
-    "tryAgain": "Vui lòng thử lại"
-  },
   "permissionDialog": {
     "titleMicrophone": "Yêu cầu quyền truy cập micro",
     "titleCamera": "Yêu cầu quyền truy cập camera",
@@ -1830,11 +1821,9 @@
     "invalidLaunchHookUrl": "URL hook khởi chạy không hợp lệ. Sử dụng URL http:// hoặc https:// đầy đủ.",
     "cookieDbLocked": "Không thể đọc cookie — cơ sở dữ liệu bị khóa. Đóng trình duyệt và thử lại.",
     "cookieDbUnavailable": "Không thể đọc cookie — kho cookie không khả dụng.",
-    "selfHostedRequiresLogout": "Đăng xuất khỏi tài khoản Marine trước khi cấu hình máy chủ tự lưu trữ.",
     "proxyNotWorking": "Proxy đã chọn không hoạt động, nên profile chưa được tạo.",
     "proxyPaymentRequired": "Proxy đã chọn yêu cầu thanh toán (402) — gói đăng ký của nó có thể đã hết hạn — nên profile chưa được tạo.",
     "vpnNotWorking": "VPN đã chọn không hoạt động, nên profile chưa được tạo.",
-    "camoufoxImportDeprecated": "Không còn hỗ trợ nhập profile dựa trên Firefox (Camoufox). Camoufox đang bị ngừng hỗ trợ — vui lòng dùng Wayfern.",
     "marineProfileNotRunning": "Profile đã chọn chưa chạy. Hãy khởi chạy trước.",
     "marineNoCdp": "Không thể kết nối với trình duyệt đang chạy. Hãy đảm bảo profile đang chạy.",
     "marineGrabTimeout": "Lấy trang đã hết thời gian chờ.",
@@ -1846,7 +1835,10 @@
     "marineGenerateTimeout": "Tạo đã hết thời gian chờ.",
     "marineFillFailed": "Không thể điền vào ô trả lời. {{detail}}",
     "marineMarkPostedFailed": "Không thể đánh dấu đã đăng. {{detail}}",
-    "teamOwnerOnly": "Chỉ chủ sở hữu nhóm mới có thể thay đổi mật khẩu mã hóa."
+    "marineDiscoveryAlreadyRunning": "Đã có một lượt phát hiện đang chạy.",
+    "marineDiscoveryEmptyPlan": "Hãy chọn ít nhất một hồ sơ và một nền tảng.",
+    "marineDiscoveryEmptyKeyword": "Hãy nhập từ khóa tìm kiếm.",
+    "marineDiscoveryProfileNotFound": "Một trong các hồ sơ đã chọn không còn tồn tại."
   },
   "rail": {
     "profiles": "Profile",
@@ -1864,7 +1856,7 @@
     "network": "Mạng",
     "integrations": "Tích hợp",
     "account": "Tài khoản",
-    "marine": "Nhật ký bình luận"
+    "marine": "Sổ sách"
   },
   "pageTitle": {
     "proxies": "Mạng",
@@ -1876,7 +1868,7 @@
     "account": "Tài khoản",
     "import": "Nhập profile",
     "shortcuts": "Phím tắt",
-    "marine": "Nhật ký bình luận"
+    "marine": "Sổ sách"
   },
   "encryption": {
     "required": {
@@ -2202,6 +2194,83 @@
       },
       "unknownPlatform": "Nền tảng không xác định",
       "profileId": "ID hồ sơ: {{id}}"
+    },
+    "tabs": {
+      "prospects": "Sổ phát hiện",
+      "history": "Sổ bình luận"
+    },
+    "prospects": {
+      "title": "Sổ phát hiện",
+      "description": "Mọi ứng viên mà tìm kiếm đưa về, kèm theo những tài khoản đã đụng đến nó. Đây là thứ duy nhất ngăn hai tài khoản của ta trùng vào cùng một nội dung; bộ lọc tìm kiếm chỉ giúp phân tán kết quả.",
+      "loading": "Đang tải sổ phát hiện…",
+      "untitled": "Không có tiêu đề",
+      "run": {
+        "label": "Chạy tự động",
+        "title": "Chạy phát hiện",
+        "description": "Mở lần lượt từng hồ sơ, xử lý mỗi lần một nền tảng rồi đóng lại trước khi sang cái tiếp theo — không bao giờ mở hai cái cùng lúc. Lượt chạy dừng sau khi điền bản nháp vào ô bình luận: nó không gửi.",
+        "keyword": "Từ khóa",
+        "keywordPlaceholder": "ví dụ: công cụ nghiên cứu",
+        "platforms": "Nền tảng",
+        "profiles": "Hồ sơ",
+        "noProfiles": "Không tìm thấy hồ sơ Wayfern. Tiện ích phát hiện chỉ nạp trong Wayfern, nên một lượt chạy cần có nó.",
+        "start": "Chạy",
+        "stop": "Dừng",
+        "hint": "Hãy nhập từ khóa và chọn ít nhất một nền tảng cùng một hồ sơ.",
+        "progress": "{{done}}/{{total}} · {{phase}} · {{target}}",
+        "settledCount": "đã ghi {{n}}",
+        "startFailed": "Không thể bắt đầu lượt chạy",
+        "stopFailed": "Không thể dừng lượt chạy",
+        "cycleGap": "Khoảng lặp (phút)",
+        "cycleGapPlaceholder": "vd. 30 — để trống chạy một lần"
+      },
+      "phase": {
+        "idle": "Rảnh",
+        "launching": "Đang khởi động",
+        "working": "Đang chạy",
+        "closing": "Đang đóng",
+        "pausing": "Đang tạm nghỉ",
+        "done": "Đã xong",
+        "cancelled": "Đã hủy"
+      },
+      "outcome": {
+        "settled": "Đã ghi",
+        "timed_out": "Không ghi được gì",
+        "no_slot": "Nền tảng không hỗ trợ",
+        "already_open": "Đang mở — đã bỏ qua",
+        "failed": "Thất bại",
+        "cancelled": "Đã hủy"
+      },
+      "stats": {
+        "label": "Tóm tắt sổ",
+        "posted": "Đã đăng"
+      },
+      "filters": {
+        "label": "Bộ lọc sổ",
+        "searchPlaceholder": "Tìm theo tiêu đề, ID hoặc từ khóa",
+        "allPlatforms": "Tất cả nền tảng"
+      },
+      "table": {
+        "platform": "Nền tảng",
+        "title": "Nội dung",
+        "keywords": "Từ khóa",
+        "accounts": "Tài khoản",
+        "open": "Mở trong trình duyệt",
+        "postedAt": "Đã đăng lúc"
+      },
+      "empty": {
+        "title": "Sổ vẫn còn trống",
+        "description": "Bắt đầu một lượt chạy ở trên, hoặc mở hồ sơ trên trang tìm kiếm được hỗ trợ — tiện ích sẽ ghi lại những gì nó tìm thấy."
+      },
+      "error": {
+        "title": "Không thể tải sổ phát hiện",
+        "description": "Đọc tệp sổ thất bại. Hãy thử làm mới; nếu vẫn lỗi, kiểm tra nhật ký ứng dụng."
+      },
+      "platform": {
+        "bilibili": "Bilibili",
+        "zhihu": "Zhihu",
+        "douyin": "Douyin",
+        "xiaohongshu": "Xiaohongshu"
+      }
     }
   }
 }

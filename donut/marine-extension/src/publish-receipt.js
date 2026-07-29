@@ -5,6 +5,20 @@
   const BILIBILI_HOST_RE = /(^|\.)bilibili\.com$/i;
   const PUBLISH_HOST = 'api.bilibili.com';
   const PUBLISH_PATH = '/x/v2/reply/add';
+  const ZHIHU_HOST_RE = /(^|\.)zhihu\.com$/i;
+  // 实测命中：/api/v4/comment_v5/articles/{id}/comment
+  // answers/questions 走同一族路径，一并认。
+  const ZHIHU_PUBLISH_PATH_RE = /^\/api\/v4\/comment_v5\/(articles|answers|questions|pins)\/\d+\/comment$/i;
+  const XHS_HOST_RE = /(^|\.)xiaohongshu\.com$/i;
+  // 实测：笔记页读列表走 GET /api/sns/web/v2/comment/page。写操作在同族
+  // `comment/` 下，首次真实发送后用 diag().lastPost 收紧成确切路径。
+  const XHS_PUBLISH_PATH_RE = /^\/api\/sns\/web\/v\d+\/comment\/(post|create|add)$/i;
+  // 已知的读接口，永远不能被当成发布。
+  const XHS_READ_PATH_RE = /\/comment\/(page|sub\/page|list)$/i;
+  const DOUYIN_HOST_RE = /(^|\.)douyin\.com$/i;
+  // 实测：视频页读评论走 GET /aweme/v1/web/comment/list/。写操作在同族。
+  const DOUYIN_PUBLISH_PATH_RE = /^\/aweme\/v\d+\/web\/comment\/(publish|create|post)\/?$/i;
+  const DOUYIN_READ_PATH_RE = /\/comment\/list(\/reply)?\/?$/i;
   const RECOVERY_PATHS = new Set([
     '/x/v2/reply',
     '/x/v2/reply/reply',
@@ -99,6 +113,225 @@
       parent_id: parentId || null,
       root_id: rootId || null,
     };
+  }
+
+  /**
+   * 知乎的发布回执。
+   *
+   * 判据全部来自实测（2026-07-28，专栏文章直评）：
+   *   POST https://www.zhihu.com/api/v4/comment_v5/articles/{id}/comment  → 200
+   *   {"id":"11541384708","type":"comment","resource_type":"article",
+   *    "member_id":824201953,"content":"<p>…</p>"}
+   *
+   * 和 B 站的对应关系：`id` ↔ `rpid`，`member_id` ↔ `member.mid`。
+   * 知乎这个接口没有 B 站那种 `code` 字段——HTTP 2xx + 一个正数 `id` 就是成功
+   * 的全部证据，所以 `id` 必须严格校验：没有它就没有「真的上线了」的凭据。
+   *
+   * `content` 是 HTML（`<p>…</p>`），落账前剥掉标签 —— 台账里存的是给人看的
+   * 文本快照，不是待渲染的富文本。
+   */
+  function marineBuildZhihuPublishedReceipt(input) {
+    input = input || {};
+    if (!ZHIHU_HOST_RE.test(String(input.pageHostname || ''))) return null;
+    if (String(input.method || '').toUpperCase() !== 'POST') return null;
+    const status = Number(input.status);
+    if (input.ok !== true || !Number.isInteger(status) || status < 200 || status >= 300) return null;
+
+    let endpoint;
+    try { endpoint = new URL(String(input.url || ''), 'https://www.zhihu.com/'); }
+    catch (e) { return null; }
+    if (!ZHIHU_HOST_RE.test(endpoint.hostname)) return null;
+    // 只认「新建评论」这一个动作。评论列表 / 子评论 / 点赞都在 comment_v5 下面，
+    // 放宽路径会把「读到了别人的评论」当成「我发出去了」。
+    if (!ZHIHU_PUBLISH_PATH_RE.test(endpoint.pathname)) return null;
+
+    let payload;
+    try { payload = typeof input.body === 'string' ? JSON.parse(input.body) : input.body; }
+    catch (e) { return null; }
+    if (!payload || typeof payload !== 'object') return null;
+    if (String(payload.type || '') !== 'comment') return null;
+
+    const commentId = positiveId(payload.id);
+    if (!commentId) return null;
+
+    const text = boundedString(zhihuPlainText(payload.content), 20_000);
+    if (!text.trim()) return null;
+
+    // 回复别人时才有 reply_comment_id / parent；直评两者都空。
+    const replyTo = positiveId(payload.reply_comment_id) ||
+      (payload.reply_to_comment && positiveId(payload.reply_to_comment.id)) || '';
+
+    return {
+      schema_version: 1,
+      event_id: 'zhihu:' + commentId,
+      platform: 'zhihu',
+      kind: replyTo ? 'reply' : 'direct',
+      text_snapshot: text,
+      posted_at: publishedAt(payload.created_time, input.observedAt),
+      site_account_id: positiveId(payload.member_id) || null,
+      site_account_name: (payload.author && boundedString(payload.author.name, 256).trim()) || null,
+      platform_comment_id: commentId,
+      target_comment_id: replyTo || null,
+      parent_id: replyTo || null,
+      root_id: null,
+    };
+  }
+
+  /**
+   * 小红书的发布回执。
+   *
+   * # 判据来自哪里
+   *
+   * 路径族是实测的：笔记页会发 `GET /api/sns/web/v2/comment/page` 读评论列表，
+   * 同族的写操作即 `comment/post`。但**发布响应的字段还没有实测样本** —— 首次
+   * 真实发送时用 `diag().lastPost` 记下确切路径和构造结果，再回来收紧这里。
+   *
+   * # 因此这里刻意保守
+   *
+   * 宁可漏判（记 `failed`，人工可查）也不能误判（记 `posted` 却其实没发出去，
+   * 那会消耗 per-item cap 并让报表虚高）。所以：
+   *   · 路径必须是 `comment/` 下的写操作，且不是已知的读接口（page/sub 等）
+   *   · 必须能取到一个正数评论 id —— 没有它就没有「真的上线了」的凭据
+   *
+   * 小红书的响应外层通常是 `{success, code, data:{...}}`，评论 id 在
+   * `data.comment.id`；也见过直接放在 `data.id`。两种都试，都取不到就返回 null。
+   */
+  /**
+   * 抖音的发布回执。
+   *
+   * 路径族实测：视频页读评论走 `GET /aweme/v1/web/comment/list/`，同族的写操作
+   * 即 `comment/publish/`。**响应字段还没有实测样本** —— 首次真实发送时用
+   * `diag().lastPost.body` 记下来再回来收紧。
+   *
+   * 抖音的响应惯例是 `{status_code:0, comment:{cid, text, user:{uid,nickname}}}`，
+   * `cid` 是 19 位十进制字符串，能被 `positiveId` 接住。
+   *
+   * 保守优先：拿不到评论 id 就返回 null（记 failed，人工可查），绝不虚报。
+   */
+  function marineBuildDouyinPublishedReceipt(input) {
+    input = input || {};
+    if (!DOUYIN_HOST_RE.test(String(input.pageHostname || ''))) return null;
+    if (String(input.method || '').toUpperCase() !== 'POST') return null;
+    const status = Number(input.status);
+    if (input.ok !== true || !Number.isInteger(status) || status < 200 || status >= 300) return null;
+
+    let endpoint;
+    try { endpoint = new URL(String(input.url || ''), 'https://www.douyin.com/'); }
+    catch (e) { return null; }
+    if (!DOUYIN_HOST_RE.test(endpoint.hostname)) return null;
+    if (!DOUYIN_PUBLISH_PATH_RE.test(endpoint.pathname)) return null;
+    if (DOUYIN_READ_PATH_RE.test(endpoint.pathname)) return null;
+
+    let payload;
+    try { payload = typeof input.body === 'string' ? JSON.parse(input.body) : input.body; }
+    catch (e) { return null; }
+    if (!payload || typeof payload !== 'object') return null;
+    // status_code 非 0 是业务失败（风控等），HTTP 仍然是 200。
+    if (payload.status_code !== undefined && payload.status_code !== 0) return null;
+
+    const comment = (payload.comment && typeof payload.comment === 'object') ? payload.comment : payload;
+    const commentId = positiveId(comment.cid) || positiveId(comment.comment_id) || positiveId(comment.id);
+    if (!commentId) return null;
+
+    const text = boundedString(String(comment.text || comment.content || ''), 20_000);
+    if (!text.trim()) return null;
+
+    const replyTo = positiveId(comment.reply_id) || positiveId(comment.reply_to_reply_id) || '';
+    const user = (comment.user && typeof comment.user === 'object') ? comment.user : {};
+
+    return {
+      schema_version: 1,
+      event_id: 'douyin:' + commentId,
+      platform: 'douyin',
+      kind: replyTo ? 'reply' : 'direct',
+      text_snapshot: text,
+      posted_at: publishedAt(comment.create_time, input.observedAt),
+      site_account_id: positiveId(user.uid) || null,
+      site_account_name: boundedString(user.nickname, 256).trim() || null,
+      platform_comment_id: commentId,
+      target_comment_id: replyTo || null,
+      parent_id: replyTo || null,
+      root_id: null,
+    };
+  }
+
+  /**
+   * 小红书的 id 是 **24 位十六进制字符串**，不是正整数。
+   *
+   * 实测响应：`user_id: "69c0fa620000000033037ae5"`、
+   * `note_id: "6a5b0f18000000001c00fb2c"`。评论 id 同族。
+   * 用通用的 `positiveId()`（只认正整数）会一律返回空 —— 表现是回执明明推到了
+   * 桥这边、路径和状态码都对，`built` 却始终是 `null`。
+   */
+  function xhsId(value) {
+    if (typeof value !== 'string') return '';
+    const v = value.trim();
+    return /^[0-9a-f]{16,32}$/i.test(v) ? v : '';
+  }
+
+  function marineBuildXiaohongshuPublishedReceipt(input) {
+    input = input || {};
+    if (!XHS_HOST_RE.test(String(input.pageHostname || ''))) return null;
+    if (String(input.method || '').toUpperCase() !== 'POST') return null;
+    const status = Number(input.status);
+    if (input.ok !== true || !Number.isInteger(status) || status < 200 || status >= 300) return null;
+
+    let endpoint;
+    try { endpoint = new URL(String(input.url || ''), 'https://www.xiaohongshu.com/'); }
+    catch (e) { return null; }
+    if (!XHS_HOST_RE.test(endpoint.hostname)) return null;
+    if (!XHS_PUBLISH_PATH_RE.test(endpoint.pathname)) return null;
+    // 读接口即使被误当成 POST 也不能进来 —— 「读到了别人的评论」变成
+    // 「我发出去了」是这条链上最坏的一种错。
+    if (XHS_READ_PATH_RE.test(endpoint.pathname)) return null;
+
+    let payload;
+    try { payload = typeof input.body === 'string' ? JSON.parse(input.body) : input.body; }
+    catch (e) { return null; }
+    if (!payload || typeof payload !== 'object') return null;
+    if (payload.success === false) return null;
+
+    const data = (payload.data && typeof payload.data === 'object') ? payload.data : payload;
+    const comment = (data.comment && typeof data.comment === 'object') ? data.comment : data;
+    const commentId = xhsId(comment.id) || xhsId(data.id);
+    if (!commentId) return null;
+
+    const text = boundedString(String(comment.content || data.content || ''), 20_000);
+    if (!text.trim()) return null;
+
+    const targetComment = xhsId(comment.target_comment_id) ||
+      (comment.target_comment && xhsId(comment.target_comment.id)) || '';
+    const user = (comment.user_info && typeof comment.user_info === 'object') ? comment.user_info : {};
+
+    return {
+      schema_version: 1,
+      event_id: 'xiaohongshu:' + commentId,
+      platform: 'xiaohongshu',
+      kind: targetComment ? 'reply' : 'direct',
+      text_snapshot: text,
+      posted_at: publishedAt(comment.create_time, input.observedAt),
+      site_account_id: xhsId(user.user_id) || null,
+      site_account_name: boundedString(user.nickname, 256).trim() || null,
+      platform_comment_id: commentId,
+      target_comment_id: targetComment || null,
+      parent_id: targetComment || null,
+      root_id: null,
+    };
+  }
+
+  /** 知乎的 content 是 HTML，落账前剥成纯文本。 */
+  function zhihuPlainText(value) {
+    if (typeof value !== 'string') return '';
+    return value
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/p>/gi, '\n')
+      .replace(/<[^>]*>/g, '')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .trim();
   }
 
   function exactId(value, name, allowZero) {
@@ -204,5 +437,8 @@
   }
 
   root.marineBuildBilibiliPublishedReceipt = marineBuildBilibiliPublishedReceipt;
+  root.marineBuildZhihuPublishedReceipt = marineBuildZhihuPublishedReceipt;
+  root.marineBuildXiaohongshuPublishedReceipt = marineBuildXiaohongshuPublishedReceipt;
+  root.marineBuildDouyinPublishedReceipt = marineBuildDouyinPublishedReceipt;
   root.marineBuildBilibiliRecoveredReceipts = marineBuildBilibiliRecoveredReceipts;
 })(globalThis);

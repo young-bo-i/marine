@@ -433,23 +433,6 @@ async fn export_profile_cookies(profile_id: String, format: String) -> Result<St
 }
 
 #[tauri::command]
-fn check_wayfern_terms_accepted() -> bool {
-  wayfern_terms::WayfernTermsManager::instance().is_terms_accepted()
-}
-
-#[tauri::command]
-fn check_wayfern_downloaded() -> bool {
-  wayfern_terms::WayfernTermsManager::instance().is_wayfern_downloaded()
-}
-
-#[tauri::command]
-async fn accept_wayfern_terms() -> Result<(), String> {
-  wayfern_terms::WayfernTermsManager::instance()
-    .accept_terms()
-    .await
-}
-
-#[tauri::command]
 async fn start_mcp_server(app_handle: tauri::AppHandle) -> Result<u16, String> {
   mcp_server::McpServer::instance().start(app_handle).await
 }
@@ -1330,6 +1313,81 @@ async fn marine_list_posting_history() -> Result<Vec<marine::history::PostingRec
     log::error!("Marine posting history task failed: {error}");
     marine::err("INTERNAL_ERROR")
   })?
+}
+
+/// The prospect ledger, whole. Same `spawn_blocking` reasoning as
+/// `marine_list_posting_history`: this reads and parses a file that grows with
+/// every search, and the ledger page re-invokes it on every progress event.
+#[tauri::command]
+async fn marine_login_status_all(
+) -> Result<std::collections::HashMap<String, marine::login_status::ProfileLogins>, String> {
+  tauri::async_runtime::spawn_blocking(|| {
+    marine::login_status::LOGIN_STATUS.all().map_err(|error| {
+      log::error!("Failed to read Marine login status: {error}");
+      marine::err("INTERNAL_ERROR")
+    })
+  })
+  .await
+  .map_err(|error| {
+    log::error!("Marine login status task failed: {error}");
+    marine::err("INTERNAL_ERROR")
+  })?
+}
+
+#[tauri::command]
+async fn marine_list_prospects() -> Result<Vec<marine::prospect::ProspectRecord>, String> {
+  tauri::async_runtime::spawn_blocking(|| {
+    marine::prospect::PROSPECTS.list().map_err(|error| {
+      log::error!("Failed to list Marine prospects: {error}");
+      marine::err("INTERNAL_ERROR")
+    })
+  })
+  .await
+  .map_err(|error| {
+    log::error!("Marine prospect list task failed: {error}");
+    marine::err("INTERNAL_ERROR")
+  })?
+}
+
+/// Start a serial discovery run. Returns as soon as the run is accepted; follow
+/// it through the `marine-discovery-progress` event or `marine_discovery_status`.
+#[tauri::command]
+async fn marine_start_discovery(
+  app_handle: tauri::AppHandle,
+  request: marine::scheduler::RunRequest,
+) -> Result<(), String> {
+  // Reject synchronously so a bad plan surfaces as a failed invoke rather than
+  // as a run that quietly ends one event later.
+  if request.profile_ids.is_empty() || request.platforms.is_empty() {
+    return Err(marine::err("MARINE_DISCOVERY_EMPTY_PLAN"));
+  }
+  if request.keyword.trim().is_empty() {
+    return Err(marine::err("MARINE_DISCOVERY_EMPTY_KEYWORD"));
+  }
+  if marine::scheduler::SCHEDULER.is_running() {
+    return Err(marine::err("MARINE_DISCOVERY_ALREADY_RUNNING"));
+  }
+
+  tauri::async_runtime::spawn(async move {
+    if let Err(e) = marine::scheduler::run(app_handle, request).await {
+      log::error!("Marine discovery run ended with an error: {e}");
+    }
+  });
+  Ok(())
+}
+
+/// Ask the in-flight run to stop after the current leg closes its browser.
+#[tauri::command]
+fn marine_stop_discovery() -> Result<(), String> {
+  marine::scheduler::SCHEDULER.request_cancel();
+  Ok(())
+}
+
+/// Current run progress. The page calls this once on mount; live updates arrive
+/// via the event.
+#[tauri::command]
+fn marine_discovery_status() -> Result<marine::scheduler::RunProgress, String> {
+  Ok(marine::scheduler::SCHEDULER.snapshot())
 }
 
 /// Update the tray menu labels with localized strings pushed from the frontend
@@ -2398,6 +2456,19 @@ pub fn run() {
         cloud_auth::CloudAuthManager::start_sync_token_refresh_loop(app_handle_cloud).await;
       });
 
+      // The Wayfern binary refuses to run until its own `license-accepted`
+      // file exists. Nothing in this build gates features on that file, so
+      // create it automatically instead of blocking the user behind a modal.
+      tauri::async_runtime::spawn(async {
+        let terms = wayfern_terms::WayfernTermsManager::instance();
+        if terms.is_wayfern_downloaded() && !terms.is_terms_accepted() {
+          match terms.accept_terms().await {
+            Ok(()) => log::info!("Wayfern terms accepted automatically"),
+            Err(e) => log::warn!("Automatic Wayfern terms acceptance failed: {e}"),
+          }
+        }
+      });
+
       Ok(())
     })
     .invoke_handler(tauri::generate_handler![
@@ -2500,6 +2571,11 @@ pub fn run() {
       stop_api_server,
       get_api_server_status,
       marine_list_posting_history,
+      marine_list_prospects,
+      marine_login_status_all,
+      marine_start_discovery,
+      marine_stop_discovery,
+      marine_discovery_status,
       get_all_traffic_snapshots,
       get_profile_traffic_snapshot,
       clear_all_traffic_stats,
@@ -2531,9 +2607,6 @@ pub fn run() {
       copy_profile_cookies,
       import_cookies_from_file,
       export_profile_cookies,
-      check_wayfern_terms_accepted,
-      check_wayfern_downloaded,
-      accept_wayfern_terms,
       start_mcp_server,
       stop_mcp_server,
       get_mcp_server_status,

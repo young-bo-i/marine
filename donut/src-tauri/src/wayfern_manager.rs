@@ -116,6 +116,21 @@ struct CdpTarget {
   target_type: String,
   #[serde(rename = "webSocketDebuggerUrl")]
   websocket_debugger_url: Option<String>,
+  // `/json` 一直带这两个键，但少一个字段整条反序列化就失败、页签列表直接变空 ——
+  // 而空列表在调用方那里等于「浏览器没窗口了」。给默认值，不赌。
+  #[serde(default)]
+  id: String,
+  #[serde(default)]
+  url: String,
+}
+
+/// 一个标签页的最小身份。给编排用：它需要知道「驱动的是哪个页签」才能在换平台时
+/// 导航同一个页签，而不是每换一次开一个新的。
+#[derive(Debug, Clone)]
+pub struct PageTarget {
+  pub id: String,
+  pub url: String,
+  pub websocket_debugger_url: Option<String>,
 }
 
 impl WayfernManager {
@@ -257,7 +272,32 @@ impl WayfernManager {
     Ok(targets)
   }
 
+  /// 单条 CDP 命令的上限。
+  ///
+  /// **没有它就是永久挂死**：这个函数在 WebSocket 上等应答，一直等。编排的换平台
+  /// 导航走的正是它，而 `Page.navigate` 实测会有不返回的时候（小红书那条腿）——
+  /// 一旦不返回，腿的超时**永远不会触发**，因为超时判断在轮询循环里、在导航之后。
+  /// 表现是整个调度器停在那里，日志一行都不再出，而浏览器停在 about:blank 转圈。
+  const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
   async fn send_cdp_command(
+    &self,
+    ws_url: &str,
+    method: &str,
+    params: serde_json::Value,
+  ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    match tokio::time::timeout(
+      Self::CDP_COMMAND_TIMEOUT,
+      self.send_cdp_command_inner(ws_url, method, params),
+    )
+    .await
+    {
+      Ok(r) => r,
+      Err(_) => Err(format!("CDP command {method} timed out").into()),
+    }
+  }
+
+  async fn send_cdp_command_inner(
     &self,
     ws_url: &str,
     method: &str,
@@ -747,7 +787,12 @@ impl WayfernManager {
       "--no-default-browser-check".to_string(),
       "--disable-background-mode".to_string(),
       "--disable-component-update".to_string(),
+      // 这三个一起，才让编排能在窗口不在前台时跑完。评论自动化整条链路（流式
+      // 生成、逐字打字、等待回执）都靠页内 setTimeout 推进，被节流就会撞上超时
+      // 预算 —— 而超时会让台账记 failed，那条候选按「失败不重试」永久作废。
       "--disable-background-timer-throttling".to_string(),
+      "--disable-backgrounding-occluded-windows".to_string(),
+      "--disable-renderer-backgrounding".to_string(),
       "--crash-server-url=".to_string(),
       "--disable-updater".to_string(),
       "--disable-session-crashed-bubble".to_string(),
@@ -856,6 +901,13 @@ impl WayfernManager {
       args.push("--dns-prefetch-disable".to_string());
     }
 
+    // 直接 spawn，拿得到 PID。
+    //
+    // 曾经改走 `open -g`（macOS 上唯一能起在后台、不抢前台的办法），但它立刻返回、
+    // 拿不到浏览器 PID，只能按 `--user-data-dir` 反查 —— 实测反查不上，于是按
+    // 「启动失败」把刚起来的浏览器清理掉，整条腿白跑。而不抢前台这个目标本身已经
+    // 放弃了：B 站的评论框在窗口没有系统焦点时根本不渲染输入框和发布按钮，编排
+    // 必须把窗口带到前台（见 `bring_to_front`）。既然要前台，`open -g` 就只剩风险。
     let mut command = TokioCommand::new(&executable_path);
     command
       .args(&args)
@@ -1244,6 +1296,170 @@ impl WayfernManager {
     let port = self.get_cdp_port(profile_path).await?;
     let targets = self.get_cdp_targets(port).await.ok()?;
     Some(targets.iter().filter(|t| t.target_type == "page").count())
+  }
+
+  /// 这个 profile 现在有哪些标签页。
+  ///
+  /// `None` 的含义是**判断不了**（端口没跟踪 / `/json` 请求失败），不是「没有页签」。
+  /// 调用方必须区分这两者：把「判断不了」当成「没窗口了」会误判会话失效。
+  ///
+  /// 纯只读。**不要**用 `BrowserRunner::check_browser_status` 代替它做会话探针 ——
+  /// 那个函数在页签数为零时会**杀掉浏览器**（零窗口收割），会话中途调用等于自己
+  /// 给自己埋雷。
+  pub async fn list_page_targets(&self, profile_path: &str) -> Option<Vec<PageTarget>> {
+    let port = self.get_cdp_port(profile_path).await?;
+    let targets = self.get_cdp_targets(port).await.ok()?;
+    Some(
+      targets
+        .into_iter()
+        .filter(|t| t.target_type == "page")
+        .map(|t| PageTarget {
+          id: t.id,
+          url: t.url,
+          websocket_debugger_url: t.websocket_debugger_url,
+        })
+        .collect(),
+    )
+  }
+
+  /// 把某个标签页导航到 `url`，返回实际驱动的 target id。
+  ///
+  /// `prefer` 是上一轮驱动的页签；它还在就继续用，不在了就退到第一个页签 ——
+  /// 用户手动关掉那个页签时靠这条自愈，不该因为 id 找不到就判整个会话失效。
+  ///
+  /// **和 `open_url_in_tab` 的区别**：那个是 UI 的「在已开浏览器里打开 URL」，
+  /// 语义就是要新开页签；这个是「原地换页」。编排换平台必须用这个 ——
+  /// 走 `launch_or_open_url` 那条路一旦失败会**回落去起第二个浏览器实例**
+  /// （见 browser_runner 的 fallback 分支），同一个 profile 目录两个浏览器
+  /// 是唯一能造成同账号并发发送的路径。
+  pub async fn navigate_in_tab(
+    &self,
+    profile_path: &str,
+    prefer: Option<&str>,
+    url: &str,
+  ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let targets = self
+      .list_page_targets(profile_path)
+      .await
+      .ok_or("CDP unreachable while navigating")?;
+    let target = prefer
+      .and_then(|id| targets.iter().find(|t| t.id == id))
+      .or_else(|| targets.first())
+      .ok_or("no page target to navigate")?;
+    let ws = target
+      .websocket_debugger_url
+      .as_deref()
+      .ok_or("page target has no debugger url")?;
+    self
+      .send_cdp_command(ws, "Page.navigate", json!({ "url": url }))
+      .await?;
+    Ok(target.id.clone())
+  }
+
+  /// 把标签页带到前台（操作系统层面）。
+  ///
+  /// **扩展自己做不到这件事**：`chrome.windows.update({focused:true})` 在 macOS 上
+  /// 抢不到系统焦点 —— 系统不允许后台应用自行抢占前台。实测证据：一条知乎评论
+  /// 在 `document.hasFocus() === false` 时发出成功，说明扩展那次聚焦调用没生效。
+  ///
+  /// 为什么非要前台：**B 站的评论框在窗口没有系统焦点时只渲染成一条紧凑条**，
+  /// 里面既没有真正的输入框也没有发布按钮，链路会以「未能定位到直评输入框」告终。
+  /// 知乎/小红书/抖音都不需要，只有 B 站。试过但无效的替代：合成 window focus
+  /// 事件、在 MAIN world 覆盖 `document.hasFocus()`、用 CDP 真实鼠标点那条紧凑条。
+  ///
+  /// 代价是每条腿会打断用户一次。这是知情的取舍。
+  pub async fn bring_to_front(&self, profile_path: &str, target_id: Option<&str>) -> bool {
+    let Some(targets) = self.list_page_targets(profile_path).await else {
+      return false;
+    };
+    let Some(target) = target_id
+      .and_then(|id| targets.iter().find(|t| t.id == id))
+      .or_else(|| targets.first())
+    else {
+      return false;
+    };
+    let Some(ws) = target.websocket_debugger_url.as_deref() else {
+      return false;
+    };
+    matches!(
+      tokio::time::timeout(
+        Duration::from_secs(8),
+        self.send_cdp_command(ws, "Page.bringToFront", json!({})),
+      )
+      .await,
+      Ok(Ok(_))
+    )
+  }
+
+  /// 渲染进程还应答吗（有界等待）。
+  ///
+  /// 为什么需要它：页面可以卡死到 `/json` 里 target 还在、`Page.navigate` 也照常
+  /// 返回（那是浏览器进程处理的），但渲染进程一动不动。实测小红书搜索页会稳定
+  /// 把渲染进程搞死。没有这个探针的话，一条腿要白等满 240 秒超时。
+  ///
+  /// 用 `DOM.getDocument` 而不是 `Runtime.evaluate`：后者被 Wayfern 二进制自带的
+  /// 付费闸门直接拒掉，拿它当探针会**把每一条腿都判成卡死**。`DOM.*` 实测放行。
+  ///
+  /// 必须包超时：`send_cdp_command` 自己会一直等下去，渲染进程卡死时它永不返回，
+  /// 整个调度器会跟着一起挂住。
+  pub async fn renderer_responds(&self, profile_path: &str, target_id: Option<&str>) -> bool {
+    let Some(targets) = self.list_page_targets(profile_path).await else {
+      return false;
+    };
+    let Some(target) = target_id
+      .and_then(|id| targets.iter().find(|t| t.id == id))
+      .or_else(|| targets.first())
+    else {
+      return false;
+    };
+    let Some(ws) = target.websocket_debugger_url.as_deref() else {
+      return false;
+    };
+    matches!(
+      tokio::time::timeout(
+        Duration::from_secs(8),
+        self.send_cdp_command(ws, "DOM.getDocument", json!({ "depth": 0 })),
+      )
+      .await,
+      Ok(Ok(_))
+    )
+  }
+
+  /// 把标签页收敛到只剩 `keep_id` 一个，返回关掉了几个。
+  ///
+  /// 两条硬约束写在实现里，不靠调用方自觉：
+  /// 1. **页签数 ≥ 2 才动手** —— Chromium 关掉最后一个标签页会退出整个浏览器，
+  ///    而浏览器一没，这个会话剩下的平台就全废了。
+  /// 2. **永不关 `keep_id`**。
+  ///
+  /// 失败是非致命的：主机制是「原地导航」，清页签只是收拾 `--restore-last-session`
+  /// 恢复出来的残留。清不掉就记 warn 继续跑。
+  pub async fn close_extra_page_targets(
+    &self,
+    profile_path: &str,
+    keep_id: &str,
+  ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let targets = self
+      .list_page_targets(profile_path)
+      .await
+      .ok_or("CDP unreachable while sweeping tabs")?;
+    if targets.len() < 2 {
+      return Ok(0);
+    }
+    let port = self
+      .get_cdp_port(profile_path)
+      .await
+      .ok_or("no CDP port while sweeping tabs")?;
+    let mut closed = 0usize;
+    for t in targets.iter().filter(|t| t.id != keep_id) {
+      let url = format!("http://127.0.0.1:{port}/json/close/{}", t.id);
+      match self.http_client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => closed += 1,
+        Ok(r) => log::warn!("Could not close tab {}: HTTP {}", t.id, r.status()),
+        Err(e) => log::warn!("Could not close tab {}: {e}", t.id),
+      }
+    }
+    Ok(closed)
   }
 
   /// Whether the tracked instance for this profile was launched windowed.

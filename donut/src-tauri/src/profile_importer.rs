@@ -21,9 +21,7 @@ pub struct DetectedProfile {
 }
 
 fn map_browser_type(browser: &str) -> &str {
-  // Firefox-based sources map to the now-deprecated Camoufox. They are no longer
-  // detected for import; the mapping is kept only so the import command can
-  // recognize and REJECT them. Everything else maps to Wayfern.
+  // Firefox-based sources map to Camoufox; everything else maps to Wayfern.
   match browser {
     "firefox" | "firefox-developer" | "zen" | "camoufox" => "camoufox",
     _ => "wayfern",
@@ -56,9 +54,8 @@ impl ProfileImporter {
   ) -> Result<Vec<DetectedProfile>, Box<dyn std::error::Error>> {
     let mut detected_profiles = Vec::new();
 
-    // Firefox-based browsers (Firefox, Firefox Developer, Zen) map to Camoufox,
-    // which is deprecated — they can no longer be imported. Only Chromium-based
-    // sources (mapping to Wayfern) are detected.
+    // Only Chromium-based sources are scanned — upstream removed the
+    // Firefox/Zen profile scanners, so there is nothing to enumerate for them.
     detected_profiles.extend(self.detect_chrome_profiles()?);
     detected_profiles.extend(self.detect_brave_profiles()?);
     detected_profiles.extend(self.detect_chromium_profiles()?);
@@ -470,12 +467,6 @@ pub async fn import_browser_profile(
   camoufox_config: Option<CamoufoxConfig>,
   wayfern_config: Option<WayfernConfig>,
 ) -> Result<(), String> {
-  // Camoufox is deprecated — Firefox-based profiles (which map to Camoufox) can
-  // no longer be imported. Reject them before doing any work.
-  if map_browser_type(&browser_type) == "camoufox" {
-    return Err(serde_json::json!({ "code": "CAMOUFOX_IMPORT_DEPRECATED" }).to_string());
-  }
-
   let importer = ProfileImporter::instance();
   importer
     .import_profile(

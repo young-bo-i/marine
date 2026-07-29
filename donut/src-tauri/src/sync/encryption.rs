@@ -337,7 +337,6 @@ pub async fn set_e2e_password(password: String) -> Result<(), String> {
   if password.len() < 8 {
     return Err("Password must be at least 8 characters".to_string());
   }
-  enforce_team_owner_for_encryption_change().await?;
   store_e2e_password(&password)
 }
 
@@ -356,21 +355,7 @@ pub fn verify_e2e_password(password: String) -> Result<bool, String> {
 
 #[tauri::command]
 pub async fn delete_e2e_password() -> Result<(), String> {
-  enforce_team_owner_for_encryption_change().await?;
   remove_e2e_password()
-}
-
-/// Inside a shared team, only the owner may flip the E2E password state —
-/// otherwise members could lock each other out by changing the key. This keys
-/// on actual team membership, not on a plan name.
-async fn enforce_team_owner_for_encryption_change() -> Result<(), String> {
-  use crate::cloud_auth::CLOUD_AUTH;
-  if let Some(state) = CLOUD_AUTH.get_user().await {
-    if state.user.team_id.is_some() && state.user.team_role.as_deref() != Some("owner") {
-      return Err(serde_json::json!({ "code": "TEAM_OWNER_ONLY" }).to_string());
-    }
-  }
-  Ok(())
 }
 
 #[cfg(test)]

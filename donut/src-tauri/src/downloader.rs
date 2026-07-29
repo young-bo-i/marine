@@ -568,12 +568,6 @@ impl Downloader {
     browser_str: String,
     version: String,
   ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    // Only check Wayfern terms if Wayfern is already downloaded
-    let terms_manager = crate::wayfern_terms::WayfernTermsManager::instance();
-    if terms_manager.is_wayfern_downloaded() && !terms_manager.is_terms_accepted() {
-      return Err("Please accept Wayfern Terms and Conditions before downloading browsers".into());
-    }
-
     // For Wayfern/Camoufox, resolve the actual available version from the API
     let version = if browser_str == "wayfern" {
       match self
@@ -923,6 +917,19 @@ impl Downloader {
       if archive_path.exists() {
         if let Err(e) = std::fs::remove_file(&archive_path) {
           log::warn!("Warning: Could not delete archive file after verification: {e}");
+        }
+      }
+    }
+
+    // Wayfern refuses to run until its own `license-accepted` file exists.
+    // Create it here so a fresh download is immediately usable — nothing in
+    // this build gates features on it, so there is nothing to prompt for.
+    if browser_str == "wayfern" {
+      let terms = crate::wayfern_terms::WayfernTermsManager::instance();
+      if !terms.is_terms_accepted() {
+        match terms.accept_terms().await {
+          Ok(()) => log::info!("Wayfern terms accepted automatically after download"),
+          Err(e) => log::warn!("Automatic Wayfern terms acceptance failed: {e}"),
         }
       }
     }

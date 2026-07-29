@@ -684,6 +684,12 @@ impl ProfileManager {
       });
     }
 
+    // Marine 的登录态观测数据跟着 profile 一起走，别留孤儿条目。
+    // 失败只记日志：删 profile 已经做完了，为一条观测记录回滚毫无意义。
+    if let Err(e) = crate::marine::login_status::LOGIN_STATUS.forget(profile_id) {
+      log::warn!("Warning: Failed to forget Marine login status: {e}");
+    }
+
     // Rebuild tag suggestions after deletion
     let _ = crate::tag_manager::TAG_MANAGER.lock().map(|tm| {
       let _ = tm.rebuild_from_profiles(&self.list_profiles().unwrap_or_default());

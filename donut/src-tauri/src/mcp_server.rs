@@ -18,12 +18,10 @@ use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use crate::browser::ProxySettings;
-use crate::cloud_auth::CLOUD_AUTH;
 use crate::group_manager::GROUP_MANAGER;
 use crate::profile::{BrowserProfile, ProfileManager};
 use crate::proxy_manager::PROXY_MANAGER;
 use crate::settings_manager::SettingsManager;
-use crate::wayfern_terms::WayfernTermsManager;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -162,12 +160,6 @@ impl McpServer {
   }
 
   pub async fn start(&self, app_handle: AppHandle) -> Result<u16, String> {
-    if !WayfernTermsManager::instance().is_terms_accepted() {
-      return Err(
-        "Wayfern Terms and Conditions must be accepted before starting MCP server".to_string(),
-      );
-    }
-
     if self.is_running() {
       return Err("MCP server is already running".to_string());
     }
@@ -1216,7 +1208,7 @@ impl McpServer {
       // Synchronizer tools
       McpTool {
         name: "start_sync_session".to_string(),
-        description: "Start a synchronizer session. Launches a leader profile and follower profiles, then mirrors all actions from the leader to the followers in real time. Only Wayfern profiles are supported. Requires paid subscription.".to_string(),
+        description: "Start a synchronizer session. Launches a leader profile and follower profiles, then mirrors all actions from the leader to the followers in real time. Only Wayfern profiles are supported.".to_string(),
         input_schema: serde_json::json!({
           "type": "object",
           "properties": {
@@ -3710,12 +3702,6 @@ impl McpServer {
   }
 
   async fn handle_get_team_locks(&self) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.is_on_team_plan().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Team features require an active team plan".to_string(),
-      });
-    }
     let locks = crate::team_lock::TEAM_LOCK.get_locks().await;
     Ok(serde_json::json!({
       "content": [{
@@ -3729,12 +3715,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.is_on_team_plan().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Team features require an active team plan".to_string(),
-      });
-    }
     let profile_id = arguments
       .get("profile_id")
       .and_then(|v| v.as_str())

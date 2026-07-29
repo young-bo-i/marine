@@ -1167,18 +1167,33 @@ const manifest = JSON.parse(fs.readFileSync(new URL("../manifest.json", import.m
 assert.ok(manifest.permissions.includes("alarms"));
 const BILIBILI_MATCHES = ["*://*.bilibili.com/*"];
 
-// The publish-receipt bridge only ever serves Bilibili — publish-bridge.js
-// returns immediately on any other frame URL. It used to be injected into every
-// frame of every site on the web, which was pure attack surface for a provable
-// no-op. Look entries up by their js files: they are no longer index-stable.
-const receiptEntry = manifest.content_scripts.find((entry) =>
+// 回执桥只注入**已经实现了回执构造器**的站点。publish-bridge.js 在其他站点会
+// 立刻返回，所以多注入一个站点是纯粹的攻击面换一个可证明的空操作 —— 它曾经被
+// 注入到全网每个 frame，那是白送的风险。
+//
+// 这张表的准入条件不是「这个平台我们想发评论」，而是「publish-receipt.js 里有
+// 它的构造器」：没有构造器就拿不到「真的上线了」的凭据，收上来的东西会以
+// `posted` 写进发布历史，比不记更糟。
+// 目前：B 站（/x/v2/reply/add 的 code===0 + 正数 rpid）、
+//       知乎（/api/v4/comment_v5/{res}/{id}/comment 的 2xx + 正数 id）。
+// 按 js 文件查条目：索引不稳定。
+const receiptEntries = manifest.content_scripts.filter((entry) =>
   entry.js.includes("src/publish-receipt.js"),
 );
-assert.deepEqual(receiptEntry.js, ["src/publish-receipt.js", "src/publish-bridge.js"]);
-assert.equal(receiptEntry.run_at, "document_start");
-assert.equal(receiptEntry.world, "ISOLATED");
-assert.equal(receiptEntry.all_frames, true);
-assert.deepEqual(receiptEntry.matches, BILIBILI_MATCHES);
+assert.equal(receiptEntries.length, 2, "回执桥按帧策略拆成两条");
+for (const entry of receiptEntries) {
+  assert.deepEqual(entry.js, ["src/publish-receipt.js", "src/publish-bridge.js"]);
+  assert.equal(entry.run_at, "document_start");
+  assert.equal(entry.world, "ISOLATED");
+}
+// 帧策略必须和 MAIN world 那两条一一对应：ISOLATED 桥只能落在**它的 MAIN 对端
+// 也加载了**的帧里，否则就是一个没有生产者的消费者 —— 白送的注入面。
+const receiptEntry = receiptEntries.find((e) => e.all_frames === true);
+const receiptTopOnly = receiptEntries.find((e) => e.all_frames === false);
+assert.deepEqual(receiptEntry.matches, ["*://*.bilibili.com/*"],
+  "只有 B 站需要 all_frames（播放器是真子帧）");
+assert.deepEqual(receiptTopOnly.matches, ["*://*.zhihu.com/*", "*://*.xiaohongshu.com/*", "*://*.douyin.com/*"],
+  "其余平台仅顶帧，和 MAIN world 的 <all_urls> 那条对齐");
 
 // The MAIN world splits in two: Bilibili keeps all_frames (its player is a real
 // sub-frame), everything else drops to the top frame only — content-iso.js
@@ -1246,5 +1261,146 @@ assert.doesNotMatch(contentIsoSource, /published-comment|__marinePublishedCommen
 assert.match(popupSource, /lastGrab\.platform === 'bilibili'/);
 assert.match(popupSource, /window\.prompt\('请确认实际发布的文字/);
 assert.doesNotMatch(popupSource, /post\.textContent = '标记已发'/);
+
+// ---------------------------------------------------------------- 知乎回执
+//
+// 用**实测抓到的真实响应体**（2026-07-28，专栏文章直评）钉住判据。手抄一个
+// 想当然的形状会让这组测试变成自证预言：真正的风险是线上响应和我以为的不一样。
+{
+  const ZHIHU_REAL_BODY = JSON.stringify({
+    id: "11541384708",
+    type: "comment",
+    resource_type: "article",
+    member_id: 824201953,
+    url: "https://www.zhihu.com/api/v4/comment_v5/comments/11541384708",
+    hot: false,
+    top: false,
+    content: "\u003cp\u003eAI 能不能用真不是重点，开题最怕的是拿一坨“看起来都对”的话去糊弄研究价值。\u003c/p\u003e",
+  });
+
+  const buildZhihu = helperSandbox.marineBuildZhihuPublishedReceipt;
+  assert.equal(typeof buildZhihu, "function", "publish-receipt.js 要导出知乎构造器");
+  const build = (over) => buildZhihu(Object.assign({
+    pageHostname: "zhuanlan.zhihu.com",
+    method: "POST",
+    status: 200,
+    ok: true,
+    url: "https://www.zhihu.com/api/v4/comment_v5/articles/1995521640679904623/comment",
+    body: ZHIHU_REAL_BODY,
+    observedAt: 1785000000000,
+  }, over || {}));
+
+  const receipt = build();
+  assert.ok(receipt, "实测响应体必须能构造出回执");
+  assert.equal(receipt.platform, "zhihu");
+  assert.equal(receipt.event_id, "zhihu:11541384708");
+  assert.equal(receipt.platform_comment_id, "11541384708");
+  assert.equal(receipt.kind, "direct", "没有 reply_comment_id 就是直评");
+  assert.equal(receipt.site_account_id, "824201953");
+  assert.ok(receipt.text_snapshot.startsWith("AI 能不能用"), "content 是 HTML，落账前要剥成纯文本");
+  assert.ok(!receipt.text_snapshot.includes("<p>"), "标签必须剥掉");
+
+  // 回答页走同一族路径 —— 实测捕获到 /api/v4/comment_v5/answers/{id}/root_comment，
+  // 所以发布必然是 /api/v4/comment_v5/answers/{id}/comment。
+  assert.ok(
+    build({
+      pageHostname: "www.zhihu.com",
+      url: "https://www.zhihu.com/api/v4/comment_v5/answers/2063274292930991054/comment",
+    }),
+    "回答页的发布路径必须被认",
+  );
+
+  // 每一道闸都要真的挡住
+  assert.equal(build({ method: "GET" }), null, "只认 POST");
+  assert.equal(build({ ok: false }), null, "非 2xx 不算成功");
+  assert.equal(build({ status: 403 }), null, "非 2xx 不算成功");
+  assert.equal(
+    build({ url: "https://www.zhihu.com/api/v4/comment_v5/answers/123/root_comment" }),
+    null,
+    "评论列表接口不能被当成发布 —— 否则「读到了别人的评论」会被记成「我发出去了」",
+  );
+  assert.equal(
+    build({ body: JSON.stringify({ id: "1", type: "vote" }) }),
+    null,
+    "type 必须是 comment",
+  );
+  assert.equal(
+    build({ body: JSON.stringify({ type: "comment", content: "\u003cp\u003ehi\u003c/p\u003e" }) }),
+    null,
+    "没有正数 id 就没有「真的上线了」的凭据",
+  );
+  assert.equal(
+    build({ body: JSON.stringify({ id: "9", type: "comment", content: "" }) }),
+    null,
+    "空正文不算",
+  );
+  assert.equal(build({ pageHostname: "www.bilibili.com" }), null, "站点要对得上");
+}
+
+// ---------------------------------------------------------------- 小红书回执
+//
+// 用**实测抓到的真实响应**（2026-07-28，POST /api/sns/web/v1/comment/post）钉住。
+{
+  const buildXhs = helperSandbox.marineBuildXiaohongshuPublishedReceipt;
+  assert.equal(typeof buildXhs, "function", "publish-receipt.js 要导出小红书构造器");
+
+  // 实测响应形态：外层 {success,msg,data:{comment:{...}}}，id 全是 24 位十六进制
+  const XHS_BODY = JSON.stringify({
+    success: true,
+    msg: "成功",
+    data: {
+      comment: {
+        id: "6a5b0f18000000001c00fb99",
+        note_id: "6a5b0f18000000001c00fb2c",
+        status: 2,
+        content: "两天跑完确实爽，但统计分析这块真不能只看图好看。",
+        create_time: 1_785_238_480,
+        at_users: [],
+        user_info: { user_id: "69c0fa620000000033037ae5", nickname: "这是我" },
+      },
+    },
+  });
+
+  const build = (over) => buildXhs(Object.assign({
+    pageHostname: "www.xiaohongshu.com",
+    method: "POST",
+    status: 200,
+    ok: true,
+    url: "https://edith.xiaohongshu.com/api/sns/web/v1/comment/post",
+    body: XHS_BODY,
+    observedAt: 1785238480000,
+  }, over || {}));
+
+  const r = build();
+  assert.ok(r, "实测响应体必须能构造出回执");
+  assert.equal(r.platform, "xiaohongshu");
+  assert.equal(r.event_id, "xiaohongshu:6a5b0f18000000001c00fb99");
+  assert.equal(r.platform_comment_id, "6a5b0f18000000001c00fb99");
+  assert.equal(r.kind, "direct");
+  assert.equal(r.site_account_id, "69c0fa620000000033037ae5",
+    "小红书的 user_id 是十六进制，用只认整数的校验会判空");
+  assert.equal(r.site_account_name, "这是我");
+  assert.ok(r.text_snapshot.startsWith("两天跑完"));
+
+  // 读接口绝不能被当成发布
+  assert.equal(
+    build({ url: "https://edith.xiaohongshu.com/api/sns/web/v2/comment/page" }),
+    null,
+    "读评论列表不能被认成「我发出去了」",
+  );
+  assert.equal(build({ method: "GET" }), null);
+  assert.equal(build({ ok: false }), null);
+  assert.equal(
+    build({ body: JSON.stringify({ success: false, msg: "风控" }) }),
+    null,
+    "success:false 不算成功",
+  );
+  assert.equal(
+    build({ body: JSON.stringify({ success: true, data: { comment: { content: "x" } } }) }),
+    null,
+    "没有评论 id 就没有「真的上线了」的凭据",
+  );
+  assert.equal(build({ pageHostname: "www.zhihu.com" }), null, "站点要对得上");
+}
 
 console.log("Marine extension published receipt smoke: OK");

@@ -12,7 +12,6 @@ import { CamoufoxDeprecationDialog } from "@/components/camoufox-deprecation-dia
 import { CloneProfileDialog } from "@/components/clone-profile-dialog";
 import { CloseConfirmDialog } from "@/components/close-confirm-dialog";
 import { CommandPalette } from "@/components/command-palette";
-import { CommentHistoryPage } from "@/components/comment-history-page";
 import { CookieCopyDialog } from "@/components/cookie-copy-dialog";
 import { CookieManagementDialog } from "@/components/cookie-management-dialog";
 import { CreateProfileDialog } from "@/components/create-profile-dialog";
@@ -25,6 +24,7 @@ import { GroupManagementDialog } from "@/components/group-management-dialog";
 import HomeHeader from "@/components/home-header";
 import { ImportProfileDialog } from "@/components/import-profile-dialog";
 import { IntegrationsDialog } from "@/components/integrations-dialog";
+import { MarinePage } from "@/components/marine-page";
 import { ONBOARDING_TOUR } from "@/components/onboarding-provider";
 import { PermissionDialog } from "@/components/permission-dialog";
 import { ProfilesDataTable } from "@/components/profile-data-table";
@@ -43,7 +43,6 @@ import { SyncAllDialog } from "@/components/sync-all-dialog";
 import { SyncConfigDialog } from "@/components/sync-config-dialog";
 import { SyncFollowerDialog } from "@/components/sync-follower-dialog";
 import { ThankYouDialog } from "@/components/thank-you-dialog";
-import { WayfernTermsDialog } from "@/components/wayfern-terms-dialog";
 import { WelcomeDialog } from "@/components/welcome-dialog";
 import { WindowResizeWarningDialog } from "@/components/window-resize-warning-dialog";
 import { useAppUpdateNotifications } from "@/hooks/use-app-update-notifications";
@@ -56,7 +55,6 @@ import { useSyncSessions } from "@/hooks/use-sync-session";
 import { useUpdateNotifications } from "@/hooks/use-update-notifications";
 import { useVersionUpdater } from "@/hooks/use-version-updater";
 import { useVpnEvents } from "@/hooks/use-vpn-events";
-import { useWayfernTerms } from "@/hooks/use-wayfern-terms";
 import { translateBackendError } from "@/lib/backend-errors";
 import {
   ONBOARDING_TOUR_FINISHED_EVENT,
@@ -204,13 +202,6 @@ export default function Home() {
   const { getProfileSyncInfo } = useSyncSessions();
   const [syncLeaderProfile, setSyncLeaderProfile] =
     useState<BrowserProfile | null>(null);
-
-  // Wayfern terms hook
-  const {
-    termsAccepted,
-    isLoading: termsLoading,
-    checkTerms,
-  } = useWayfernTerms();
 
   const [currentPage, setCurrentPage] = useState<AppPage>("profiles");
   const [accountDialogOpen, setAccountDialogOpen] = useState(false);
@@ -1613,25 +1604,6 @@ export default function Home() {
     });
   }, [unsupportedProfileNames, t]);
 
-  // Re-check Wayfern terms when a browser download completes
-  useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    const setup = async () => {
-      unlisten = await listen<{ stage: string }>(
-        "download-progress",
-        (event) => {
-          if (event.payload.stage === "completed") {
-            void checkTerms();
-          }
-        },
-      );
-    };
-    void setup();
-    return () => {
-      if (unlisten) unlisten();
-    };
-  }, [checkTerms]);
-
   // Check permissions when they are initialized. During first-run onboarding
   // the welcome flow requests permissions, so the standalone dialog is deferred
   // until we know this isn't a first-run onboarding.
@@ -1753,7 +1725,7 @@ export default function Home() {
             <ShortcutsPage groupTargets={orderedGroupTargets} />
           )}
 
-          {currentPage === "marine" && <CommentHistoryPage />}
+          {currentPage === "marine" && <MarinePage />}
 
           {settingsDialogOpen && (
             <SettingsDialog
@@ -2140,12 +2112,6 @@ export default function Home() {
         onSyncConfigOpen={() => {
           setSyncConfigDialogOpen(true);
         }}
-      />
-
-      {/* Wayfern Terms and Conditions Dialog - shown if terms not accepted */}
-      <WayfernTermsDialog
-        isOpen={!termsLoading && termsAccepted === false}
-        onAccepted={checkTerms}
       />
 
       <WindowResizeWarningDialog

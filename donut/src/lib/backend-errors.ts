@@ -20,7 +20,6 @@ export type BackendErrorCode =
   | "INVALID_LAUNCH_HOOK_URL"
   | "COOKIE_DB_LOCKED"
   | "COOKIE_DB_UNAVAILABLE"
-  | "SELF_HOSTED_REQUIRES_LOGOUT"
   | "PROXY_NOT_FOUND"
   | "GROUP_NOT_FOUND"
   | "GROUP_ALREADY_EXISTS"
@@ -28,13 +27,11 @@ export type BackendErrorCode =
   | "EXTENSION_NOT_FOUND"
   | "EXTENSION_GROUP_NOT_FOUND"
   | "CANNOT_MODIFY_CLOUD_MANAGED_PROXY"
-  | "TEAM_OWNER_ONLY"
   | "SYNC_LOCKED_BY_PROFILE"
   | "SYNC_NOT_CONFIGURED"
   | "PROXY_NOT_WORKING"
   | "PROXY_PAYMENT_REQUIRED"
   | "VPN_NOT_WORKING"
-  | "CAMOUFOX_IMPORT_DEPRECATED"
   | "MARINE_PROFILE_NOT_RUNNING"
   | "MARINE_NO_CDP"
   | "MARINE_GRAB_TIMEOUT"
@@ -46,6 +43,10 @@ export type BackendErrorCode =
   | "MARINE_GENERATE_TIMEOUT"
   | "MARINE_FILL_FAILED"
   | "MARINE_MARK_POSTED_FAILED"
+  | "MARINE_DISCOVERY_ALREADY_RUNNING"
+  | "MARINE_DISCOVERY_EMPTY_PLAN"
+  | "MARINE_DISCOVERY_EMPTY_KEYWORD"
+  | "MARINE_DISCOVERY_PROFILE_NOT_FOUND"
   | "INTERNAL_ERROR";
 
 export interface BackendError {
@@ -124,8 +125,6 @@ export function translateBackendError(t: TFunction, err: unknown): string {
       return t("backendErrors.cookieDbLocked");
     case "COOKIE_DB_UNAVAILABLE":
       return t("backendErrors.cookieDbUnavailable");
-    case "SELF_HOSTED_REQUIRES_LOGOUT":
-      return t("backendErrors.selfHostedRequiresLogout");
     case "PROXY_NOT_FOUND":
       return t("backendErrors.proxyNotFound");
     case "GROUP_NOT_FOUND":
@@ -140,8 +139,6 @@ export function translateBackendError(t: TFunction, err: unknown): string {
       return t("backendErrors.extensionGroupNotFound");
     case "CANNOT_MODIFY_CLOUD_MANAGED_PROXY":
       return t("backendErrors.cannotModifyCloudManagedProxy");
-    case "TEAM_OWNER_ONLY":
-      return t("backendErrors.teamOwnerOnly");
     case "SYNC_LOCKED_BY_PROFILE":
       return t("backendErrors.syncLockedByProfile");
     case "SYNC_NOT_CONFIGURED":
@@ -152,8 +149,6 @@ export function translateBackendError(t: TFunction, err: unknown): string {
       return t("backendErrors.proxyPaymentRequired");
     case "VPN_NOT_WORKING":
       return t("backendErrors.vpnNotWorking");
-    case "CAMOUFOX_IMPORT_DEPRECATED":
-      return t("backendErrors.camoufoxImportDeprecated");
     case "MARINE_PROFILE_NOT_RUNNING":
       return t("backendErrors.marineProfileNotRunning");
     case "MARINE_NO_CDP":
@@ -184,6 +179,14 @@ export function translateBackendError(t: TFunction, err: unknown): string {
       return t("backendErrors.marineMarkPostedFailed", {
         detail: parsed.params?.message ?? "",
       });
+    case "MARINE_DISCOVERY_ALREADY_RUNNING":
+      return t("backendErrors.marineDiscoveryAlreadyRunning");
+    case "MARINE_DISCOVERY_EMPTY_PLAN":
+      return t("backendErrors.marineDiscoveryEmptyPlan");
+    case "MARINE_DISCOVERY_EMPTY_KEYWORD":
+      return t("backendErrors.marineDiscoveryEmptyKeyword");
+    case "MARINE_DISCOVERY_PROFILE_NOT_FOUND":
+      return t("backendErrors.marineDiscoveryProfileNotFound");
     case "INTERNAL_ERROR":
       return t("backendErrors.internal", {
         detail: parsed.params?.detail ?? "",

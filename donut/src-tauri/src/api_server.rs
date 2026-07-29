@@ -351,6 +351,12 @@ struct BatchStopResponse {
     marine_get_identities,
     marine_get_history,
     marine_append_history,
+    marine_search_slot,
+    marine_login_status,
+    marine_ingest_prospects,
+    marine_claim_prospect,
+    marine_settle_prospect,
+    marine_list_prospects,
     marine_append_published_history,
     marine_get_agents,
     marine_get_rime_status,
@@ -607,7 +613,33 @@ fn bounded_optional(
   bounded_required(&value, field, max_chars).map(Some)
 }
 
-fn validated_http_url(value: &str, require_bilibili: bool) -> Result<String, String> {
+/// Platforms whose published receipts we can verify.
+///
+/// Gate, not a formality: a receipt only means "the comment is live" because a
+/// platform-specific builder checked that platform's success criteria
+/// (`publish-receipt.js`). Accepting a platform with no builder would let a
+/// "posted" row into the history with nothing behind it.
+const RECEIPT_PLATFORMS: [&str; 4] = ["bilibili", "zhihu", "xiaohongshu", "douyin"];
+
+fn receipt_platform_host_ok(host: &str, platform: &str) -> bool {
+  let host = host.to_ascii_lowercase();
+  let root = match platform {
+    "bilibili" => "bilibili.com",
+    "zhihu" => "zhihu.com",
+    "xiaohongshu" => "xiaohongshu.com",
+    "douyin" => "douyin.com",
+    _ => return false,
+  };
+  host == root || host.ends_with(&format!(".{root}"))
+}
+
+/// `platform` = `Some(p)` pins the URL to that platform's own domain; `None`
+/// only checks that it is a usable http(s) URL.
+///
+/// Pinning matters on the receipt path: the receipt asserts "this comment is
+/// live at this URL", so a receipt claiming `platform: zhihu` with a Bilibili
+/// URL is incoherent and must not become a history row.
+fn validated_http_url(value: &str, platform: Option<&str>) -> Result<String, String> {
   let value = bounded_required(value, "target_url", HISTORY_MAX_URL_CHARS)?;
   let parsed = url::Url::parse(&value).map_err(|_| "target_url is not a valid URL".to_string())?;
   if !matches!(parsed.scheme(), "http" | "https") {
@@ -616,26 +648,42 @@ fn validated_http_url(value: &str, require_bilibili: bool) -> Result<String, Str
   if parsed.host_str().is_none() {
     return Err("target_url must include a host".to_string());
   }
-  if require_bilibili {
-    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
-    if host != "bilibili.com" && !host.ends_with(".bilibili.com") {
-      return Err("target_url must be a Bilibili page".to_string());
+  if let Some(platform) = platform {
+    let host = parsed.host_str().unwrap_or_default();
+    if !receipt_platform_host_ok(host, platform) {
+      return Err(format!("target_url must be a {platform} page"));
     }
   }
   Ok(value)
 }
 
+/// A platform's own comment id.
+///
+/// Bilibili and Zhihu hand out positive integers (`rpid` / `id`); **Xiaohongshu
+/// hands out 24-char hex strings** (measured: `6a5b0f18000000001c00fb2c`).
+/// Parsing as `u64` therefore rejected every Xiaohongshu receipt — and did so at
+/// the very last hop, where the symptom is indistinguishable from "no receipt
+/// arrived at all".
+///
+/// Both shapes are accepted, neither loosely: this id is the only evidence that
+/// the comment actually went live, so anything ambiguous is refused.
 fn normalized_platform_id(value: Option<String>, field: &str) -> Result<Option<String>, String> {
   let Some(value) = bounded_optional(value, field, HISTORY_MAX_ID_CHARS)? else {
     return Ok(None);
   };
-  let number = value
-    .parse::<u64>()
-    .map_err(|_| format!("{field} must be a positive integer"))?;
-  if number == 0 {
-    return Ok(None);
+  if let Ok(number) = value.parse::<u64>() {
+    if number == 0 {
+      return Ok(None);
+    }
+    return Ok(Some(number.to_string()));
   }
-  Ok(Some(number.to_string()))
+  let hex = value.trim();
+  if hex.len() >= 16 && hex.len() <= 32 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+    return Ok(Some(hex.to_string()));
+  }
+  Err(format!(
+    "{field} must be a positive integer or a hex platform id"
+  ))
 }
 
 fn normalized_published_at(value: Option<u64>, observed_at: u64) -> Result<u64, String> {
@@ -689,7 +737,7 @@ fn manual_history_record(
     profile_id: identity.id.clone(),
     profile_name_snapshot: identity.name.clone(),
     brand_id: bounded_required(&request.brand_id, "brand_id", 64)?,
-    target_url: validated_http_url(&request.target_url, false)?,
+    target_url: validated_http_url(&request.target_url, None)?,
     page_title: bounded_optional(
       Some(request.page_title),
       "page_title",
@@ -740,13 +788,21 @@ fn published_history_record(
   if request.schema_version != 1 {
     return Err("schema_version must be 1".to_string());
   }
-  if !request.platform.trim().eq_ignore_ascii_case("bilibili") {
-    return Err("platform must be bilibili".to_string());
+  // Was hardcoded to bilibili. Every hop of this chain had the same hardcode and
+  // each one silently dropped Zhihu receipts — the comment was live, the ledger
+  // said `posted`, and only the history was missing, with nothing to say which
+  // hop ate it.
+  let platform = request.platform.trim().to_ascii_lowercase();
+  if !RECEIPT_PLATFORMS.contains(&platform.as_str()) {
+    return Err(format!(
+      "platform must be one of {}",
+      RECEIPT_PLATFORMS.join(", ")
+    ));
   }
   let platform_comment_id =
     normalized_platform_id(Some(request.platform_comment_id), "platform_comment_id")?
       .ok_or_else(|| "platform_comment_id must be a positive integer".to_string())?;
-  let canonical_event_id = format!("bilibili:{platform_comment_id}");
+  let canonical_event_id = format!("{platform}:{platform_comment_id}");
   if let Some(event_id) = request.event_id.as_deref() {
     if event_id != canonical_event_id {
       return Err("event_id does not match platform_comment_id".to_string());
@@ -773,14 +829,14 @@ fn published_history_record(
     profile_id: identity.id.clone(),
     profile_name_snapshot: identity.name.clone(),
     brand_id: bounded_required(&request.brand_id, "brand_id", 64)?,
-    target_url: validated_http_url(&request.target_url, true)?,
+    target_url: validated_http_url(&request.target_url, Some(platform.as_str()))?,
     page_title: bounded_optional(
       Some(request.page_title),
       "page_title",
       HISTORY_MAX_TITLE_CHARS,
     )?
     .unwrap_or_default(),
-    platform: "bilibili".into(),
+    platform: platform.clone(),
     kind: inferred_kind.into(),
     angle: String::new(),
     text_snapshot: bounded_required_preserved(
@@ -809,7 +865,9 @@ fn published_history_record(
     root_id,
     context_id: bounded_optional(request.context_id, "context_id", HISTORY_MAX_ID_CHARS)?,
     generation_source: normalized_generation_source(request.generation_source),
-    confirmation_source: "bilibili-api".into(),
+    // `<platform>-api` — the receipt came from that platform's own publish
+    // response, not from a human confirming in the UI.
+    confirmation_source: format!("{platform}-api"),
     status: "published".into(),
     posted_at: normalized_published_at(request.posted_at, observed_at)?,
   })
@@ -1141,6 +1199,416 @@ where
   }
 }
 
+// ---------------------------------------------------------------- prospects
+//
+// The prospect ledger is the ONLY thing that makes multi-account discovery
+// safe: search filters spread candidates out but never guarantee disjointness,
+// so dedup has to be authoritative and central. The extension runs per-profile
+// and therefore cannot own it — these endpoints are how it reaches the shared
+// ledger.
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct MarineSearchSlotRequest {
+  platform: String,
+  keyword: String,
+  /// This account's position among the accounts working this platform (0-based).
+  /// Wraps when there are more accounts than sorts. Omit to get every slot,
+  /// which is how the UI previews how N accounts would be spread out.
+  #[serde(default)]
+  account_index: Option<usize>,
+}
+
+#[utoipa::path(
+  post, path = "/v1/marine/search-slot", request_body = MarineSearchSlotRequest,
+  responses((status = 200, description = "Slot for this account, or every slot when account_index is omitted. Empty for an unsupported platform.",
+             body = Vec<crate::marine::search_slot::SearchSlot>)),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_search_slot(
+  State(_state): State<ApiServerState>,
+  Json(req): Json<MarineSearchSlotRequest>,
+) -> Json<Vec<crate::marine::search_slot::SearchSlot>> {
+  Json(match req.account_index {
+    Some(i) => crate::marine::search_slot::slot_for(&req.platform, &req.keyword, i)
+      .into_iter()
+      .collect(),
+    None => crate::marine::search_slot::all_slots(&req.platform, &req.keyword),
+  })
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct MarineLoginCheckRequest {
+  profile_id: String,
+  platform: String,
+  /// What the extension's in-page check concluded, if it has run. Optional so
+  /// the endpoint is still useful before the page has been probed — the reply
+  /// then carries `logged_in: null` with `awaiting_page_check`.
+  ///
+  /// This is not a convenience: the authoritative call CANNOT be made from
+  /// here. Xiaohongshu and Douyin sign their "who am I" requests in page JS, so
+  /// a Rust-side call is rejected in a way that looks exactly like a logout.
+  #[serde(default)]
+  page_result: Option<crate::marine::login::LoginStatus>,
+}
+
+#[utoipa::path(
+  post, path = "/v1/marine/login-status", request_body = MarineLoginCheckRequest,
+  responses((status = 200, description = "Login status", body = crate::marine::login::LoginStatus)),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_login_status(
+  State(_state): State<ApiServerState>,
+  Json(req): Json<MarineLoginCheckRequest>,
+) -> Result<Json<crate::marine::login::LoginStatus>, (StatusCode, String)> {
+  let profile = crate::marine::cdp::resolve_running_profile(&req.profile_id)
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+  let port = crate::marine::cdp::get_cdp_port_for_profile(&profile)
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+  let ws = crate::marine::cdp::get_cdp_ws_url(port)
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+  let cookie_stage = crate::marine::login::cookie_probe(&req.platform, &ws)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+  let merged = crate::marine::login::merge(cookie_stage, req.page_result);
+
+  // 顺手落盘，让「哪个账号在哪个平台掉登录了」能在 profile 列表上直接看到。
+  //
+  // 落盘失败只记日志：这是**观测数据**，为它让调用方失败会把编排的登录检查一起
+  // 拖垮 —— 那条链路的正事是决定要不要往下跑，不是记账。
+  if let Err(e) = crate::marine::login_status::LOGIN_STATUS.record(
+    &req.profile_id,
+    crate::marine::login_status::RecordedLogin {
+      status: merged.clone(),
+      checked_at: crate::proxy_manager::now_secs(),
+    },
+  ) {
+    log::warn!("Could not record Marine login status: {e}");
+  }
+
+  Ok(Json(merged))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct MarineProspectIngestRequest {
+  candidates: Vec<crate::marine::prospect::Candidate>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct MarineProspectClaimRequest {
+  profile_id: String,
+  platform: String,
+  /// How many distinct accounts may post under one item. Defaults to 1.
+  #[serde(default)]
+  per_item_account_cap: Option<usize>,
+  /// Max age of a stored session-scoped `open_url` (Xiaohongshu). Defaults to 30 min.
+  #[serde(default)]
+  session_url_max_age_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct MarineProspectSettleRequest {
+  key: String,
+  profile_id: String,
+  /// `posted` or `skipped`.
+  state: String,
+}
+
+fn prospect_error(e: crate::marine::prospect::ProspectError) -> (StatusCode, String) {
+  use crate::marine::prospect::ProspectError as E;
+  match e {
+    E::UnsupportedPlatform(_) | E::MissingItemId => (StatusCode::BAD_REQUEST, e.to_string()),
+    _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+  }
+}
+
+#[utoipa::path(
+  post, path = "/v1/marine/prospects/ingest", request_body = MarineProspectIngestRequest,
+  responses((status = 200, description = "Ingested", body = crate::marine::prospect::IngestReport)),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_ingest_prospects(
+  State(_state): State<ApiServerState>,
+  Json(req): Json<MarineProspectIngestRequest>,
+) -> Result<Json<crate::marine::prospect::IngestReport>, (StatusCode, String)> {
+  let report =
+    tokio::task::spawn_blocking(move || crate::marine::prospect::PROSPECTS.ingest(&req.candidates))
+      .await
+      .map_err(|e| {
+        (
+          StatusCode::INTERNAL_SERVER_ERROR,
+          format!("ingest task failed: {e}"),
+        )
+      })?
+      .map_err(prospect_error)?;
+  Ok(Json(report))
+}
+
+#[utoipa::path(
+  post, path = "/v1/marine/prospects/claim", request_body = MarineProspectClaimRequest,
+  responses((status = 200, description = "Claimed record, or null when nothing is eligible",
+             body = Option<crate::marine::prospect::ProspectRecord>)),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_claim_prospect(
+  State(_state): State<ApiServerState>,
+  Json(req): Json<MarineProspectClaimRequest>,
+) -> Result<Json<Option<crate::marine::prospect::ProspectRecord>>, (StatusCode, String)> {
+  use crate::marine::prospect::{ClaimOptions, PROSPECTS};
+  let mut opts = ClaimOptions::default();
+  if let Some(v) = req.per_item_account_cap {
+    opts.per_item_account_cap = v;
+  }
+  if let Some(v) = req.session_url_max_age_secs {
+    opts.session_url_max_age_secs = v;
+  }
+  let claimed = tokio::task::spawn_blocking(move || {
+    PROSPECTS.claim_next(&req.profile_id, &req.platform, &opts)
+  })
+  .await
+  .map_err(|e| {
+    (
+      StatusCode::INTERNAL_SERVER_ERROR,
+      format!("claim task failed: {e}"),
+    )
+  })?
+  .map_err(prospect_error)?;
+
+  // `null` rather than an error: "nothing left for you" is a normal outcome the
+  // caller branches on, not a failure. (A 204 would be tidier HTTP, but this
+  // module's `StatusCode` is reqwest's, so a JSON null keeps the handler honest
+  // without dragging axum's response types through the whole file.)
+  Ok(Json(claimed))
+}
+
+#[utoipa::path(
+  post, path = "/v1/marine/prospects/settle", request_body = MarineProspectSettleRequest,
+  responses((status = 200, description = "Settled")),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_settle_prospect(
+  State(_state): State<ApiServerState>,
+  Json(req): Json<MarineProspectSettleRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+  use crate::marine::prospect::{ProspectState, PROSPECTS};
+  let state = match req.state.as_str() {
+    "posted" => ProspectState::Posted,
+    "skipped" => ProspectState::Skipped,
+    // Terminal state of the current debug phase: draft written into the comment
+    // box, send deliberately not clicked.
+    "filled" => ProspectState::Filled,
+    // Recorded, never retried — a failed attempt is data.
+    "failed" => ProspectState::Failed,
+    // Commenting is off on this item. Unlike every other state this withholds
+    // it from ALL accounts, which is why it is a property of the content and
+    // not of the caller.
+    "blocked" => ProspectState::Blocked,
+    // `seen` / `claimed` are rejected: letting a caller push an item back to
+    // "not touched yet" would erase the dedup evidence the ledger exists for.
+    other => {
+      return Err((
+        StatusCode::BAD_REQUEST,
+        format!("state must be posted|skipped|filled|failed|blocked, got {other}"),
+      ))
+    }
+  };
+  tokio::task::spawn_blocking(move || PROSPECTS.settle(&req.key, &req.profile_id, state))
+    .await
+    .map_err(|e| {
+      (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("settle task failed: {e}"),
+      )
+    })?
+    .map_err(prospect_error)?;
+  Ok(StatusCode::OK)
+}
+
+#[utoipa::path(
+  get, path = "/v1/marine/prospects",
+  responses((status = 200, description = "All prospects", body = Vec<crate::marine::prospect::ProspectRecord>)),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_list_prospects(
+  State(_state): State<ApiServerState>,
+) -> Result<Json<Vec<crate::marine::prospect::ProspectRecord>>, (StatusCode, String)> {
+  let all = tokio::task::spawn_blocking(|| crate::marine::prospect::PROSPECTS.list())
+    .await
+    .map_err(|e| {
+      (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("list task failed: {e}"),
+      )
+    })?
+    .map_err(prospect_error)?;
+  Ok(Json(all))
+}
+
+// ---------------------------------------------------------------- 键盘代打
+//
+// 抖音的评论编辑器对页内合成输入有反制：`execCommand('insertText')` 写进去
+// 一两个字之后，它把整个评论组件拆掉（实测 `[data-e2e=comment-list]` 消失，
+// 而且点评论图标 6 次都恢复不了），手动点「生成」也一样。
+//
+// 而 CDP `Input.dispatchKeyEvent` 产生的是**浏览器层面的可信事件**，页面无法
+// 与真人区分 —— 实测同一个编辑器上连打 8 个字，组件毫发无损。所以抖音的写入
+// 必须从扩展移到这里。
+//
+// 这条路由比 `prospects/*` 危险得多（它能让调用方操作浏览器），所以约束要更紧：
+//   · 只打字，不点击、不导航 —— 发送仍由扩展点站点自己的按钮
+//   · 文本长度封顶，且不接受控制字符
+//   · 目标只能是**该 profile 自己正在运行的浏览器**，profile_id 由调用方给出
+//     但必须能解析成一个在跑的 profile（`resolve_running_profile` 把关）
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct MarineTypeTextRequest {
+  profile_id: String,
+  /// 要敲进当前焦点元素的文本。
+  text: String,
+  /// 每分钟字数，控制拟人节奏。省略用默认值。
+  #[serde(default)]
+  wpm: Option<f64>,
+  /// **只在 debug 构建里有效**的调试端口。
+  ///
+  /// 正式路径上 profile 由 app 启动，`resolve_running_profile` 能从
+  /// `process_id` 认出它并查到 CDP 端口。调试用的浏览器是手动起的，app 不知道
+  /// 它的存在 —— 那道闸挡的正是「页面指挥 app 去操作任意浏览器」，不能为调试
+  /// 放宽。
+  ///
+  /// 所以留一个**编译期就消失**的口子：release 构建里这个分支根本不编译，
+  /// 攻击面不变；debug 构建里调试环境能跑完整链路。
+  #[serde(default)]
+  debug_cdp_port: Option<u16>,
+}
+
+/// 单次代打的字数上限。一条评论远用不了这么多，超过说明调用方状态不对。
+const MARINE_TYPE_MAX_CHARS: usize = 2000;
+
+#[utoipa::path(
+  post, path = "/v1/marine/type-text", request_body = MarineTypeTextRequest,
+  responses((status = 200, description = "Typed")),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_type_text(
+  State(_state): State<ApiServerState>,
+  Json(req): Json<MarineTypeTextRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+  let text = req.text;
+  if text.trim().is_empty() {
+    return Err((StatusCode::BAD_REQUEST, "text must not be empty".into()));
+  }
+  if text.chars().count() > MARINE_TYPE_MAX_CHARS {
+    return Err((StatusCode::BAD_REQUEST, "text is too long".into()));
+  }
+  // 控制字符会被当成按键（Tab 切焦点、Enter 提交），一律拒绝 —— 发送必须由
+  // 扩展点站点自己的按钮，不能靠打一个回车绕过去。
+  if text.chars().any(|c| c.is_control() && c != '\n') {
+    return Err((
+      StatusCode::BAD_REQUEST,
+      "text must not contain control characters".into(),
+    ));
+  }
+
+  let debug_port = if cfg!(debug_assertions) {
+    req.debug_cdp_port
+  } else {
+    None
+  };
+  let port = match debug_port {
+    Some(p) => p,
+    None => {
+      let profile = crate::marine::cdp::resolve_running_profile(&req.profile_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+      crate::marine::cdp::get_cdp_port_for_profile(&profile)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?
+    }
+  };
+  let ws = crate::marine::cdp::get_cdp_ws_url(port)
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+  crate::marine::automation::send_human_keystrokes(&ws, &text, req.wpm)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+  Ok(StatusCode::OK)
+}
+
+// ---------------------------------------------------------------- debug log
+//
+// The extension's own log, made durable. Its live consumer (the side panel's
+// debug tab) disappears with the window, and the discovery scheduler closes the
+// window at the end of every leg — so without this, the only surviving evidence
+// of a run is the ledger, which records outcomes and not reasons.
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct MarineDebugLogRequest {
+  entries: Vec<crate::marine::debug_log::LogEntry>,
+}
+
+#[utoipa::path(
+  post, path = "/v1/marine/debug/logs", request_body = MarineDebugLogRequest,
+  responses((status = 200, description = "Appended")),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_append_debug_logs(
+  State(_state): State<ApiServerState>,
+  Json(req): Json<MarineDebugLogRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+  let now = crate::proxy_manager::now_secs();
+  let mut entries = req.entries;
+  for e in &mut entries {
+    // The extension's `t` carries no date, so a line from yesterday would be
+    // indistinguishable from one a minute ago. Stamp on arrival.
+    if e.at == 0 {
+      e.at = now;
+    }
+  }
+  tokio::task::spawn_blocking(move || crate::marine::debug_log::DEBUG_LOG.append(&entries))
+    .await
+    .map_err(|e| {
+      (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("debug log task failed: {e}"),
+      )
+    })?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+  Ok(StatusCode::OK)
+}
+
+#[derive(Debug, Deserialize, ToSchema, Default)]
+struct MarineDebugLogQuery {
+  /// Newest N entries. Defaults to 200.
+  #[serde(default)]
+  limit: Option<usize>,
+}
+
+#[utoipa::path(
+  get, path = "/v1/marine/debug/logs",
+  params(("limit" = Option<usize>, Query, description = "Newest N entries (default 200)")),
+  responses((status = 200, description = "Newest entries, oldest first",
+             body = Vec<crate::marine::debug_log::LogEntry>)),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_get_debug_logs(
+  State(_state): State<ApiServerState>,
+  axum::extract::Query(q): axum::extract::Query<MarineDebugLogQuery>,
+) -> Result<Json<Vec<crate::marine::debug_log::LogEntry>>, (StatusCode, String)> {
+  let limit = q.limit.unwrap_or(200).clamp(1, 5000);
+  let entries =
+    tokio::task::spawn_blocking(move || crate::marine::debug_log::DEBUG_LOG.tail(limit))
+      .await
+      .map_err(|e| {
+        (
+          StatusCode::INTERNAL_SERVER_ERROR,
+          format!("debug log task failed: {e}"),
+        )
+      })?
+      .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+  Ok(Json(entries))
+}
+
 #[utoipa::path(
   post, path = "/v1/marine/history", request_body = MarineHistoryAppendRequest,
   responses((status = 200, description = "Recorded")),
@@ -1456,6 +1924,14 @@ impl ApiServer {
       .routes(routes!(marine_get_identities))
       .routes(routes!(marine_get_history))
       .routes(routes!(marine_append_history))
+      .routes(routes!(marine_search_slot))
+      .routes(routes!(marine_login_status))
+      .routes(routes!(marine_ingest_prospects))
+      .routes(routes!(marine_claim_prospect))
+      .routes(routes!(marine_settle_prospect))
+      .routes(routes!(marine_list_prospects))
+      .routes(routes!(marine_append_debug_logs, marine_get_debug_logs))
+      .routes(routes!(marine_type_text))
       .routes(routes!(marine_append_published_history))
       .routes(routes!(marine_get_agents))
       .routes(routes!(marine_get_rime_status))
@@ -1473,8 +1949,7 @@ impl ApiServer {
       .layer(middleware::from_fn_with_state(
         state.clone(),
         auth_middleware,
-      ))
-      .layer(middleware::from_fn(terms_check_middleware));
+      ));
 
     let api_for_v1 = api.clone();
     let app = Router::new()
@@ -1544,29 +2019,6 @@ impl ApiServer {
     self.port = None;
     Ok(())
   }
-}
-
-// Terms and Conditions check middleware
-async fn terms_check_middleware(
-  request: axum::extract::Request,
-  next: Next,
-) -> Result<Response, StatusCode> {
-  let terms_accepted = crate::wayfern_terms::WayfernTermsManager::instance().is_terms_accepted();
-  terms_check_middleware_with_acceptance(request, next, terms_accepted).await
-}
-
-async fn terms_check_middleware_with_acceptance(
-  request: axum::extract::Request,
-  next: Next,
-  terms_accepted: bool,
-) -> Result<Response, StatusCode> {
-  // Rime's Chrome-first bridge does not launch or download Wayfern. Keep its
-  // local, authenticated endpoints independent from the browser license gate.
-  if !terms_accepted && !is_rime_api_path(request.uri().path()) {
-    return Err(StatusCode::FORBIDDEN);
-  }
-
-  Ok(next.run(request).await)
 }
 
 // Authentication middleware
@@ -1670,17 +2122,6 @@ fn is_rime_consumer_path(path: &str) -> bool {
   matches!(
     path,
     "/v1/marine/rime/status"
-      | "/v1/marine/rime/prepare"
-      | "/v1/marine/rime/invoke"
-      | "/v1/marine/rime/invoke-stream"
-  )
-}
-
-fn is_rime_api_path(path: &str) -> bool {
-  matches!(
-    path,
-    "/v1/marine/rime/status"
-      | "/v1/marine/rime/context"
       | "/v1/marine/rime/prepare"
       | "/v1/marine/rime/invoke"
       | "/v1/marine/rime/invoke-stream"
@@ -3477,6 +3918,137 @@ mod tests {
     }
   }
 
+  fn zhihu_published_request() -> MarinePublishedHistoryRequest {
+    MarinePublishedHistoryRequest {
+      event_id: Some("zhihu:11541356856".into()),
+      target_url: "https://www.zhihu.com/question/1/answer/2".into(),
+      platform: "zhihu".into(),
+      platform_comment_id: "11541356856".into(),
+      ..test_published_history_request()
+    }
+  }
+
+  /// 这条链上「哪些平台算数」在五个地方各写了一遍（bridge 的 signalReady 与
+  /// sanitize、SW 的 sanitize、这里的 platform 校验与 URL 校验）。只改其中几处
+  /// 的后果极其隐蔽：评论确实上线了、台账记了 posted、页内回执也有，唯独发布
+  /// 历史里没有，而且没有任何线索指向是哪一跳丢的。实测被这个形态坑了两轮。
+  /// 小红书的评论 id 是 24 位十六进制，不是正整数。只认整数会让它的回执在
+  /// **最后一跳**被拒 —— 症状和「压根没收到回执」完全一样，极难分辨。
+  #[test]
+  fn platform_ids_accept_both_integer_and_hex_shapes() {
+    let identity = test_marine_identity();
+    let xhs = MarinePublishedHistoryRequest {
+      event_id: Some("xiaohongshu:6a5b0f18000000001c00fb2c".into()),
+      target_url: "https://www.xiaohongshu.com/explore/6a5b0f18000000001c00fb2c".into(),
+      platform: "xiaohongshu".into(),
+      platform_comment_id: "6a5b0f18000000001c00fb2c".into(),
+      ..test_published_history_request()
+    };
+    let record =
+      published_history_record(xhs, &identity, 1_700_000_100).expect("十六进制 id 必须被接受");
+    assert_eq!(
+      record.platform_comment_id.as_deref(),
+      Some("6a5b0f18000000001c00fb2c")
+    );
+    assert_eq!(record.platform, "xiaohongshu");
+
+    // 整数形态照常
+    assert!(
+      published_history_record(test_published_history_request(), &identity, 1_700_000_100).is_ok()
+    );
+  }
+
+  #[test]
+  fn platform_ids_still_reject_garbage() {
+    // 放宽到十六进制不等于什么都收：id 是「真的上线了」的唯一凭据。
+    let identity = test_marine_identity();
+    for bad in [
+      "",
+      "not-an-id",
+      "zzzz",
+      "6a5b",
+      "6a5b0f18000000001c00fb2c00000000000",
+    ] {
+      let req = MarinePublishedHistoryRequest {
+        event_id: Some(format!("xiaohongshu:{bad}")),
+        target_url: "https://www.xiaohongshu.com/explore/abc".into(),
+        platform: "xiaohongshu".into(),
+        platform_comment_id: bad.into(),
+        ..test_published_history_request()
+      };
+      assert!(
+        published_history_record(req, &identity, 1_700_000_100).is_err(),
+        "{bad:?} 不该被当成合法的平台评论 id"
+      );
+    }
+  }
+
+  #[test]
+  fn published_receipts_accept_every_platform_that_has_a_builder() {
+    let identity = test_marine_identity();
+    for (platform, request) in [
+      ("bilibili", test_published_history_request()),
+      ("zhihu", zhihu_published_request()),
+    ] {
+      let record = published_history_record(request, &identity, 1_700_000_100)
+        .unwrap_or_else(|e| panic!("{platform} 的回执应当被接受，实际报错：{e}"));
+      assert_eq!(record.platform, platform, "platform 字段要按声明的原样带出");
+      assert!(
+        record.event_id.as_deref().unwrap().starts_with(platform),
+        "event_id 前缀要和 platform 一致，否则两个字段自相矛盾"
+      );
+      assert_eq!(record.confirmation_source, format!("{platform}-api"));
+      assert_eq!(record.status, "published");
+    }
+  }
+
+  #[test]
+  fn published_receipts_reject_platforms_without_a_builder() {
+    // 没有回执构造器就没有「真的上线了」的凭据 —— 放进来会让历史里出现
+    // 一条什么都没验证过的 published 记录。
+    let identity = test_marine_identity();
+    for platform in ["douyin", "xiaohongshu", "weibo"] {
+      let request = MarinePublishedHistoryRequest {
+        platform: platform.into(),
+        event_id: Some(format!("{platform}:9001")),
+        ..test_published_history_request()
+      };
+      assert!(
+        published_history_record(request, &identity, 1_700_000_100).is_err(),
+        "{platform} 还没有回执检测，不能接受它的 published 记录"
+      );
+    }
+  }
+
+  #[test]
+  fn a_receipt_url_must_belong_to_the_platform_it_claims() {
+    // 回执断言的是「这条评论上线在这个 URL」。platform=zhihu 配一个 B 站 URL
+    // 是自相矛盾的，不能落成记录。
+    let identity = test_marine_identity();
+    let mismatched = MarinePublishedHistoryRequest {
+      target_url: "https://www.bilibili.com/video/BV1test".into(),
+      ..zhihu_published_request()
+    };
+    assert!(published_history_record(mismatched, &identity, 1_700_000_100).is_err());
+
+    let swapped = MarinePublishedHistoryRequest {
+      target_url: "https://www.zhihu.com/question/1/answer/2".into(),
+      ..test_published_history_request()
+    };
+    assert!(published_history_record(swapped, &identity, 1_700_000_100).is_err());
+  }
+
+  #[test]
+  fn zhihu_subdomains_are_accepted() {
+    // 专栏文章在 zhuanlan.zhihu.com —— 实测的第一条知乎回执就来自那里。
+    let identity = test_marine_identity();
+    let article = MarinePublishedHistoryRequest {
+      target_url: "https://zhuanlan.zhihu.com/p/1995521640679904623".into(),
+      ..zhihu_published_request()
+    };
+    assert!(published_history_record(article, &identity, 1_700_000_100).is_ok());
+  }
+
   #[test]
   fn marine_identity_response_exposes_only_id_and_name() {
     let value = serde_json::to_value(test_marine_identity()).unwrap();
@@ -3599,13 +4171,6 @@ mod tests {
       )
       .route("/invoke", axum::routing::post(marine_invoke_rime_action))
       .layer(Extension(store))
-  }
-
-  async fn unaccepted_terms_test_middleware(
-    request: axum::extract::Request,
-    next: Next,
-  ) -> Result<Response, StatusCode> {
-    terms_check_middleware_with_acceptance(request, next, false).await
   }
 
   // Removing `browser` from UpdateProfileRequest, and rejecting invalid
@@ -3943,51 +4508,6 @@ mod tests {
       .context_for_invoke(&request, rime_now_secs())
       .expect("renewed lease should still resolve");
     assert!(rime_context_same_lease(&current, &captured));
-  }
-
-  #[tokio::test]
-  async fn rime_routes_bypass_only_the_wayfern_terms_gate() {
-    async fn ok() -> StatusCode {
-      StatusCode::OK
-    }
-
-    let app = Router::new()
-      .route("/v1/marine/rime/status", get(ok))
-      .route("/v1/marine/rime/context", axum::routing::put(ok).delete(ok))
-      .route("/v1/marine/rime/prepare", axum::routing::post(ok))
-      .route("/v1/marine/rime/invoke", axum::routing::post(ok))
-      .route("/v1/marine/rime/invoke-stream", axum::routing::post(ok))
-      .route("/v1/profiles", get(ok))
-      .layer(middleware::from_fn(unaccepted_terms_test_middleware));
-
-    for (method, path) in [
-      ("GET", "/v1/marine/rime/status"),
-      ("PUT", "/v1/marine/rime/context"),
-      ("DELETE", "/v1/marine/rime/context"),
-      ("POST", "/v1/marine/rime/prepare"),
-      ("POST", "/v1/marine/rime/invoke"),
-      ("POST", "/v1/marine/rime/invoke-stream"),
-    ] {
-      let request = Request::builder()
-        .method(method)
-        .uri(path)
-        .body(Body::empty())
-        .unwrap();
-      assert_eq!(
-        app.clone().oneshot(request).await.unwrap().status(),
-        StatusCode::OK,
-        "{method} {path} should not require Wayfern terms"
-      );
-    }
-
-    let protected = Request::builder()
-      .uri("/v1/profiles")
-      .body(Body::empty())
-      .unwrap();
-    assert_eq!(
-      app.oneshot(protected).await.unwrap().status(),
-      StatusCode::FORBIDDEN
-    );
   }
 
   #[tokio::test]
