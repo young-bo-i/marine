@@ -1118,6 +1118,7 @@ chrome.runtime.onConnect.addListener((port) => {
 const MARINE_PROSPECT_ROUTES = new Set([
   'prospects/ingest',
   'prospects/claim',
+  'prospects/prepare-send',
   'prospects/settle',
   // 键盘代打。**这条比上面三条危险**：它让调用方能操作浏览器本身，而不只是
   // 读写台账。放进来是因为抖音的编辑器对页内合成输入有反制（写一两个字就把整个
@@ -1129,6 +1130,35 @@ const MARINE_PROSPECT_ROUTES = new Set([
   //   · 目标必须是**正在运行的** profile，由 resolve_running_profile 把关
   'type-text',
 ]);
+
+const MARINE_PROSPECT_READY_ROUTE = 'prospects/ready';
+
+/**
+ * 只读认证握手。这条路由 SW 写死，不放进页面可指定的路由白名单；
+ * 成功同时证明 runtime config、Bearer token 和本地 API bridge 都可用。
+ */
+async function marineProspectReady() {
+  const config = await marineResolveConfig();
+  if (!config.profileId || !config.apiBase || !config.token) {
+    throw new Error('编排就绪探针缺少 profileId/apiBase/token');
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(config.apiBase + '/' + MARINE_PROSPECT_READY_ROUTE, {
+      method: 'GET',
+      headers: { Authorization: 'Bearer ' + config.token },
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    if (response.status !== 204) {
+      throw new Error(MARINE_PROSPECT_READY_ROUTE + ' 返回 ' + response.status);
+    }
+    return { profileId: config.profileId };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 async function marineProspectApi(route, body) {
   if (!MARINE_PROSPECT_ROUTES.has(route)) {
@@ -1259,27 +1289,229 @@ async function marineForwardLogs(entries, sender) {
 // 按 tab 而不是全局：编排虽然是串行的，但一个被遗留的全局交接单会让下一个
 // 无关页面误以为自己是靶子。
 const MARINE_HANDOFF_PREFIX = 'marineProspectHandoff:';
+// 普通 Phase A -> B 交接只需要活到当前 tab 的下一份 document，继续放 session。
+// 但 sendStarted / pendingSettlement 已跨过不可逆边界：若浏览器退出或调度器在
+// hard-timeout 后关 tab，session 会被清掉，6h claim TTL 后就可能再次发送。
+// 这两种状态额外镜像到 local outbox；实际 storage key 同时包含 profile +
+// prospect key，恢复不依赖已经消失的 tabId。
+const MARINE_HANDOFF_OUTBOX_PREFIX = 'marineProspectSettlementOutbox:v1:';
+// 明确 4xx 的 active outbox 不能永久锁住整个 profile，也不能直接删除后重新发送。
+// dead-letter 只拦同一 profile+key；若该 key 以后重新 claim，会先恢复成
+// settlement-only handoff，绝不再次点击。
+const MARINE_HANDOFF_DEAD_LETTER_PREFIX = 'marineProspectSettlementDeadLetter:v1:';
+let marineHandoffQueue = Promise.resolve();
 
-async function marineHandoff(op, tabId, value) {
+function marineHandoffNeedsOutbox(value) {
+  return !!(value && (value.sendStarted || value.pendingSettlement));
+}
+
+function marineHandoffOutboxKey(profileId, prospectKey) {
+  const profile = String(profileId || '').trim();
+  const key = String(prospectKey || '').trim();
+  if (!profile || !key) throw new Error('持久交接单缺少 profileId/key');
+  return MARINE_HANDOFF_OUTBOX_PREFIX + encodeURIComponent(profile) + ':' + encodeURIComponent(key);
+}
+
+function marineHandoffDeadLetterKey(profileId, prospectKey) {
+  const profile = String(profileId || '').trim();
+  const key = String(prospectKey || '').trim();
+  if (!profile || !key) throw new Error('dead-letter 交接单缺少 profileId/key');
+  return MARINE_HANDOFF_DEAD_LETTER_PREFIX +
+    encodeURIComponent(profile) + ':' + encodeURIComponent(key);
+}
+
+async function marineHandoffOutboxes(profileId) {
+  const profile = String(profileId || '').trim();
+  if (!profile) return [];
+  const got = await chrome.storage.local.get(null);
+  const entries = [];
+  for (const [storageKey, raw] of Object.entries(got || {})) {
+    if (!storageKey.startsWith(MARINE_HANDOFF_OUTBOX_PREFIX)) continue;
+    if (!marineHandoffNeedsOutbox(raw) || String(raw.profileId || '').trim() !== profile) continue;
+    let expected;
+    try { expected = marineHandoffOutboxKey(profile, raw.key); } catch (e) { continue; }
+    // storage key 和 payload 必须互相证明；忽略手工残留/旧格式，不能误删别的任务。
+    if (storageKey !== expected) continue;
+    entries.push({ storageKey, value: raw });
+  }
+  entries.sort((a, b) => {
+    const at = Number(a.value.outboxAt || a.value.pendingSettlementAt ||
+      a.value.sendStartedAt || a.value.at || 0);
+    const bt = Number(b.value.outboxAt || b.value.pendingSettlementAt ||
+      b.value.sendStartedAt || b.value.at || 0);
+    return at - bt || a.storageKey.localeCompare(b.storageKey);
+  });
+  return entries;
+}
+
+async function marineHandoffRuntimeProfileId() {
+  const config = await marineResolveConfig();
+  return String((config && config.profileId) || '').trim();
+}
+
+async function marineHandoffUnlocked(op, tabId, value, reason) {
   if (tabId === undefined || tabId === null) throw new Error('交接单需要 tab 身份');
   const key = MARINE_HANDOFF_PREFIX + tabId;
   if (op === 'write') {
-    await chrome.storage.session.set({ [key]: value });
+    const got = await chrome.storage.session.get(key);
+    const existing = (got && got[key]) || null;
+    const existingKey = String((existing && existing.key) || '');
+    const nextKey = String((value && value.key) || '');
+    const nextProfileId = String((value && value.profileId) || '').trim();
+    const runtimeProfileId = await marineHandoffRuntimeProfileId();
+    if (!nextProfileId || nextProfileId !== runtimeProfileId) {
+      throw new Error('交接单 profile 与当前 runtime profile 不一致');
+    }
+    if (!nextKey) throw new Error('交接单缺少 prospect key');
+    let nextValue = value;
+    let nextNeedsOutbox = marineHandoffNeedsOutbox(nextValue);
+    const outboxKey = nextKey ? marineHandoffOutboxKey(nextProfileId, nextKey) : '';
+    const outboxes = await marineHandoffOutboxes(nextProfileId);
+    const sameOutbox = outboxes.find(entry => entry.storageKey === outboxKey) || null;
+    const conflictingOutbox = outboxes.find(entry => entry.storageKey !== outboxKey) || null;
+    const deadLetterKey = marineHandoffDeadLetterKey(nextProfileId, nextKey);
+    const deadLetterGot = await chrome.storage.local.get(deadLetterKey);
+    const sameDeadLetter = (deadLetterGot && deadLetterGot[deadLetterKey]) || null;
+    if (conflictingOutbox) {
+      throw new Error('拒绝覆盖待 settle 的持久交接单：' + conflictingOutbox.value.key);
+    }
+    if (sameDeadLetter && !sameOutbox) {
+      if (nextNeedsOutbox) {
+        // dead-letter 之后晚到的旧 document write 不能把它重新变成 active outbox。
+        throw new Error('拒绝复活 dead-letter 的不可逆交接单：' + nextKey);
+      }
+      const claimAt = Number((nextValue && nextValue.at) || 0);
+      const deadAt = Number(sameDeadLetter.deadLetterAt || 0);
+      if (!claimAt || claimAt < deadAt) {
+        throw new Error('拒绝 dead-letter 之前的陈旧交接写入：' + nextKey);
+      }
+      // 同 key 确实被后端重新 claim：把 tombstone 恢复为 settlement-only，
+      // Phase B 会先走 pendingSettlement 分支，绝不会重新生成/点击。
+      nextValue = Object.assign({}, nextValue, {
+        sendStarted: sameDeadLetter.sendStarted === true,
+        sendStartedAt: sameDeadLetter.sendStartedAt || deadAt || claimAt,
+        pendingSettlement: sameDeadLetter.pendingSettlement || 'failed',
+        pendingSettlementAt: sameDeadLetter.pendingSettlementAt || deadAt || claimAt,
+        outboxAt: Date.now(),
+        recoveredFromDeadLetter: true,
+      });
+      nextNeedsOutbox = true;
+    }
+    if (existing && existingKey !== nextKey &&
+        (existing.sendStarted || existing.pendingSettlement)) {
+      throw new Error('拒绝覆盖已开始发送/待 settle 的交接单：' + existingKey);
+    }
+    if (existing && existingKey === nextKey && marineHandoffNeedsOutbox(existing) &&
+        !nextNeedsOutbox) {
+      throw new Error('拒绝把不可逆交接单降级为普通交接单：' + existingKey);
+    }
+    if (sameOutbox && !nextNeedsOutbox) {
+      throw new Error('拒绝覆盖待 settle 的持久交接单：' + sameOutbox.value.key);
+    }
+    if (sameOutbox && sameOutbox.value.pendingSettlement === 'posted' &&
+        nextValue.pendingSettlement !== 'posted') {
+      throw new Error('拒绝把 posted 持久交接单降级为 ' +
+        String(nextValue.pendingSettlement || 'empty') + '：' + sameOutbox.value.key);
+    }
+    if (sameOutbox && sameOutbox.value.pendingSettlement === 'unconfirmed' &&
+        nextValue.pendingSettlement !== 'unconfirmed' &&
+        nextValue.pendingSettlement !== 'posted') {
+      throw new Error('拒绝把 unconfirmed 持久交接单降级为 ' +
+        String(nextValue.pendingSettlement || 'empty') + '：' + sameOutbox.value.key);
+    }
+
+    let storedValue = nextValue;
+    if (nextNeedsOutbox) {
+      storedValue = Object.assign({}, nextValue, {
+        outboxAt: Number(nextValue.outboxAt ||
+          (sameOutbox && sameOutbox.value.outboxAt) || Date.now()),
+      });
+      // durable 成功后才能回写 session/允许页面点击。若 session 写失败，保守留下
+      // failed outbox，下一份 document 只 settle，宁可少发也绝不重复发。
+      await chrome.storage.local.set({ [outboxKey]: storedValue });
+      if (sameDeadLetter) await chrome.storage.local.remove(deadLetterKey);
+    }
+    await chrome.storage.session.set({ [key]: storedValue });
+    return true;
+  }
+  if (op === 'deadLetter') {
+    const got = await chrome.storage.session.get(key);
+    const existing = (got && got[key]) || value || null;
+    if (!marineHandoffNeedsOutbox(existing)) {
+      throw new Error('只有不可逆交接单可以进入 dead-letter');
+    }
+    const outboxKey = marineHandoffOutboxKey(existing.profileId, existing.key);
+    const deadLetterKey = marineHandoffDeadLetterKey(existing.profileId, existing.key);
+    const tombstone = Object.assign({}, existing, {
+      deadLetterAt: Date.now(),
+      deadLetterReason: String(reason || '').slice(0, 500),
+    });
+    // tombstone 必须先 durable，再移除 active。任一步失败都保留至少一份证据；
+    // 调用方会返回 recoverable，不能把 partial move 误报成已清。
+    await chrome.storage.local.set({ [deadLetterKey]: tombstone });
+    await chrome.storage.local.remove(outboxKey);
+    await chrome.storage.session.remove(key);
     return true;
   }
   if (op === 'clear') {
+    const got = await chrome.storage.session.get(key);
+    const existing = (got && got[key]) || value || null;
+    if (marineHandoffNeedsOutbox(existing)) {
+      // 先删 durable，再删 session。local 删除失败时保留 session，让调用方重试；
+      // 反过来会在一次瞬时 local 错误后失去唯一可定位的 outbox 凭据。
+      await chrome.storage.local.remove([
+        marineHandoffOutboxKey(existing.profileId, existing.key),
+        marineHandoffDeadLetterKey(existing.profileId, existing.key),
+      ]);
+    }
     await chrome.storage.session.remove(key);
     return true;
   }
   if (op === 'read') {
     const got = await chrome.storage.session.get(key);
-    return (got && got[key]) || null;
+    const current = (got && got[key]) || null;
+    if (current) {
+      // local 是不可逆状态的提交点，必须比 session 权威。典型 partial write：
+      // posted 已 local.set 成功，但 session.set/消息回执中断，session 仍是 failed。
+      // 若直接返回 failed，后续写会被 posted->failed 单调闸拒绝并看起来“卡住”。
+      if (marineHandoffNeedsOutbox(current) && current.profileId && current.key) {
+        const active = await marineHandoffOutboxes(current.profileId);
+        const expected = marineHandoffOutboxKey(current.profileId, current.key);
+        const durable = active.find(entry => entry.storageKey === expected) || null;
+        if (durable) {
+          await chrome.storage.session.set({ [key]: durable.value });
+          return durable.value;
+        }
+      }
+      return current;
+    }
+
+    // tab/session 已被 scheduler 或浏览器关闭时，按**当前 runtime profile**找
+    // 最旧的不可逆 outbox。先重新挂回本 tab 的 session，再交给 Phase A/B；
+    // 后续 clear 因此能精确删除同一条 local 记录。
+    const profileId = await marineHandoffRuntimeProfileId();
+    const oldest = (await marineHandoffOutboxes(profileId))[0] || null;
+    if (!oldest) return null;
+    await chrome.storage.session.set({ [key]: oldest.value });
+    return oldest.value;
   }
   throw new Error('未知的交接单操作：' + op);
 }
 
-// 标签页关掉了就把它的交接单一起删掉，否则 chrome.storage.session 会慢慢攒下
-// 一堆永远不会被读到的条目（它只在浏览器重启时才整体清空）。
+// chrome.storage 没有 compare-and-set。这里必须跨 tab 全局排队：local outbox 是按
+// profile 共享的，只做 per-tab 队列仍会让两个 tab 同时通过「没有旧 outbox」检查。
+function marineHandoff(op, tabId, value, reason) {
+  if (tabId === undefined || tabId === null) {
+    return Promise.reject(new Error('交接单需要 tab 身份'));
+  }
+  const operation = marineHandoffQueue.catch(() => {})
+    .then(() => marineHandoffUnlocked(op, tabId, value, reason));
+  marineHandoffQueue = operation.catch(() => {});
+  return operation;
+}
+
+// 标签页关掉只删普通 session 交接；sendStarted/pendingSettlement 的 local outbox
+// 必须留下，下一条腿才能 settlement-only 恢复。否则 hard timeout 关 tab 后仍会丢。
 // try/catch 不是洁癖：这一行在 `chrome.runtime.onMessage` 的注册**之前**。
 // 它一抛异常，消息监听器就永远挂不上，整个 SW 表现为「存在但不回消息」——
 // content script 侧看到的是 `Receiving end does not exist`，而 chrome://extensions
@@ -1345,8 +1577,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.__marineProspectHandoff) {
     // tab 身份只认 sender，不认消息内容 —— 让调用方自己声明 tabId 等于允许一个
     // 页面去读写别的标签页的交接单。
-    void marineHandoff(msg.op, sender && sender.tab && sender.tab.id, msg.value)
+    void marineHandoff(msg.op, sender && sender.tab && sender.tab.id, msg.value, msg.reason)
       .then(data => sendResponse({ ok: true, data }))
+      .catch(error => sendResponse({ ok: false, error: String(error && error.message || error) }));
+    return true;
+  }
+  if (msg && msg.__marineProspectReady) {
+    void marineProspectReady()
+      .then(data => sendResponse({ ok: true, profileId: data.profileId }))
       .catch(error => sendResponse({ ok: false, error: String(error && error.message || error) }));
     return true;
   }

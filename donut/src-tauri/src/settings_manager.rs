@@ -25,6 +25,15 @@ use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
 /// Outer `None` = not loaded yet; `Some(None)` = confirmed absent.
 static API_TOKEN_CACHE: RwLock<Option<Option<String>>> = RwLock::new(None);
 
+/// Serialize API-token mutations.
+///
+/// Marine starts the local API in a detached startup task while a profile can
+/// be launched immediately from the UI.  Without a lock both paths can observe
+/// an empty vault, generate different tokens, and race their writes.  The
+/// extension stamped by the loser then receives 401s for the whole browser
+/// session even though both individual writes succeeded.
+static API_TOKEN_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn cached_api_token() -> Option<Option<String>> {
   API_TOKEN_CACHE
     .read()
@@ -230,7 +239,23 @@ impl SettingsManager {
     env!("DONUT_BROWSER_VAULT_PASSWORD").to_string()
   }
 
-  pub async fn generate_api_token(
+  /// Return the existing bearer token or create exactly one.
+  ///
+  /// The read is deliberately repeated while holding the mutation lock.  A
+  /// check performed before acquiring it would recreate the startup race this
+  /// method exists to close.
+  pub async fn get_or_create_api_token(
+    &self,
+    app_handle: &tauri::AppHandle,
+  ) -> Result<String, Box<dyn std::error::Error>> {
+    let _guard = API_TOKEN_MUTATION_LOCK.lock().await;
+    if let Some(token) = self.get_api_token(app_handle).await? {
+      return Ok(token);
+    }
+    self.generate_api_token_unlocked(app_handle).await
+  }
+
+  async fn generate_api_token_unlocked(
     &self,
     app_handle: &tauri::AppHandle,
   ) -> Result<String, Box<dyn std::error::Error>> {
@@ -246,12 +271,21 @@ impl SettingsManager {
     let token = general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
 
     // Store token securely
-    self.store_api_token(app_handle, &token).await?;
+    self.store_api_token_unlocked(app_handle, &token).await?;
 
     Ok(token)
   }
 
   pub async fn store_api_token(
+    &self,
+    app_handle: &tauri::AppHandle,
+    token: &str,
+  ) -> Result<(), Box<dyn std::error::Error>> {
+    let _guard = API_TOKEN_MUTATION_LOCK.lock().await;
+    self.store_api_token_unlocked(app_handle, token).await
+  }
+
+  async fn store_api_token_unlocked(
     &self,
     _app_handle: &tauri::AppHandle,
     token: &str,
@@ -440,6 +474,7 @@ impl SettingsManager {
     &self,
     _app_handle: &tauri::AppHandle,
   ) -> Result<(), Box<dyn std::error::Error>> {
+    let _guard = API_TOKEN_MUTATION_LOCK.lock().await;
     let token_file = self.get_settings_dir().join("api_token.dat");
 
     if token_file.exists() {
@@ -813,17 +848,11 @@ pub async fn save_app_settings(
         .await
         .map_err(|e| format!("Failed to store API token: {e}"))?;
     } else {
-      // Check if a token already exists on disk before generating a new one
-      let existing = manager.get_api_token(&app_handle).await.ok().flatten();
-      if let Some(t) = existing {
-        settings.api_token = Some(t);
-      } else {
-        let token = manager
-          .generate_api_token(&app_handle)
-          .await
-          .map_err(|e| format!("Failed to generate API token: {e}"))?;
-        settings.api_token = Some(token);
-      }
+      let token = manager
+        .get_or_create_api_token(&app_handle)
+        .await
+        .map_err(|e| format!("Failed to obtain API token: {e}"))?;
+      settings.api_token = Some(token);
     }
   }
 

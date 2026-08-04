@@ -197,7 +197,15 @@ pub async fn start_proxy_process_with_profile(
 
   // Spawn proxy worker process in the background using std::process::Command
   // This ensures proper process detachment on Unix systems
-  let exe = find_sidecar_executable("donut-proxy")?;
+  let exe = match find_sidecar_executable("donut-proxy") {
+    Ok(exe) => exe,
+    Err(error) => {
+      delete_proxy_config(&id);
+      return Err(error);
+    }
+  };
+
+  let worker_pid: u32;
 
   #[cfg(unix)]
   {
@@ -239,19 +247,21 @@ pub async fn start_proxy_process_with_profile(
     }
 
     // Spawn detached process
-    let child = cmd.spawn()?;
+    let child = match cmd.spawn() {
+      Ok(child) => child,
+      Err(error) => {
+        delete_proxy_config(&id);
+        return Err(error.into());
+      }
+    };
     let pid = child.id();
+    worker_pid = pid;
 
     // Store PID
     {
       let mut processes = PROXY_PROCESSES.lock().unwrap();
       processes.insert(id.clone(), pid);
     }
-
-    // Update config with PID
-    let mut config_with_pid = config.clone();
-    config_with_pid.pid = Some(pid);
-    save_proxy_config(&config_with_pid)?;
 
     // Don't wait for the child - it's detached
     drop(child);
@@ -304,8 +314,15 @@ pub async fn start_proxy_process_with_profile(
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
     cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
 
-    let child = cmd.spawn()?;
+    let child = match cmd.spawn() {
+      Ok(child) => child,
+      Err(error) => {
+        delete_proxy_config(&id);
+        return Err(error.into());
+      }
+    };
     let pid = child.id();
+    worker_pid = pid;
 
     // Set high priority so the proxy is killed last under resource pressure
     unsafe {
@@ -320,11 +337,6 @@ pub async fn start_proxy_process_with_profile(
       let mut processes = PROXY_PROCESSES.lock().unwrap();
       processes.insert(id.clone(), pid);
     }
-
-    // Update config with PID
-    let mut config_with_pid = config.clone();
-    config_with_pid.pid = Some(pid);
-    save_proxy_config(&config_with_pid)?;
 
     drop(child);
   }
@@ -370,69 +382,171 @@ pub async fn start_proxy_process_with_profile(
     attempts += 1;
     if attempts >= max_attempts {
       // Try to get the config one more time for better error message
-      if let Some(config) = get_proxy_config(&id) {
+      let failure = if let Some(config) = get_proxy_config(&id) {
         // Check if process is still running
         let process_running = config.pid.map(is_process_running).unwrap_or(false);
-        return Err(
-          format!(
-            "Proxy worker failed to start in time. Config: id={}, local_url={:?}, local_port={:?}, pid={:?}, process_running={}",
-            config.id, config.local_url, config.local_port, config.pid, process_running
-          )
-          .into(),
-        );
-      }
-      return Err(
+        format!(
+          "Proxy worker failed to start in time. Config: id={}, local_url={:?}, local_port={:?}, pid={:?}, process_running={}",
+          config.id, config.local_url, config.local_port, config.pid, process_running
+        )
+      } else {
         format!(
           "Proxy worker failed to start in time. Config not found for id: {}",
           id
         )
-        .into(),
-      );
+      };
+      let cleanup = rollback_spawned_proxy(&id, worker_pid).await;
+      return Err(match cleanup {
+        Ok(()) => failure.into(),
+        Err(cleanup_error) => format!("{failure}; cleanup also failed: {cleanup_error}").into(),
+      });
     }
   }
 }
 
-pub async fn stop_proxy_process(id: &str) -> Result<bool, Box<dyn std::error::Error>> {
-  let config = get_proxy_config(id);
-
-  if let Some(config) = config {
-    if let Some(pid) = config.pid {
-      // Kill the process
-      #[cfg(unix)]
-      {
-        use std::process::Command;
-        let _ = Command::new("kill")
-          .arg("-TERM")
-          .arg(pid.to_string())
-          .output();
-      }
-      #[cfg(windows)]
-      {
-        use std::os::windows::process::CommandExt;
-        use std::process::Command;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let _ = Command::new("taskkill")
-          .args(["/F", "/PID", &pid.to_string()])
-          .creation_flags(CREATE_NO_WINDOW)
-          .output();
-      }
-
-      // Wait a bit for the process to exit
-      tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-      // Remove from tracking
-      {
-        let mut processes = PROXY_PROCESSES.lock().unwrap();
-        processes.remove(id);
-      }
-
-      // Delete the config file
-      delete_proxy_config(id);
-      return Ok(true);
+pub(crate) async fn wait_for_proxy_process_exit(pid: u32, timeout: tokio::time::Duration) -> bool {
+  let deadline = tokio::time::Instant::now() + timeout;
+  loop {
+    if !is_process_running(pid) {
+      return true;
     }
+    if tokio::time::Instant::now() >= deadline {
+      return false;
+    }
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+  }
+}
+
+/// Verify that a persisted worker PID still belongs to this exact proxy ID.
+///
+/// Proxy configs survive crashes, while operating systems reuse PIDs.  Sending
+/// TERM based only on `is_process_running(pid)` can therefore kill an unrelated
+/// process.  An empty/unreadable command line is treated conservatively as an
+/// error; a readable mismatch is a stale config and must never be signalled.
+pub(crate) fn proxy_process_matches_id(pid: u32, id: &str) -> Result<bool, String> {
+  use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+
+  let system = System::new_with_specifics(
+    RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
+  );
+  let Some(process) = system.process(sysinfo::Pid::from_u32(pid)) else {
+    return Ok(false);
+  };
+  let command: Vec<String> = process
+    .cmd()
+    .iter()
+    .map(|part| part.to_string_lossy().into_owned())
+    .collect();
+  if command.is_empty() {
+    return Err(format!(
+      "Could not verify command line for proxy {id} process {pid}"
+    ));
+  }
+  let executable = process
+    .exe()
+    .and_then(|path| path.file_name())
+    .map(|name| name.to_string_lossy().into_owned())
+    .or_else(|| {
+      std::path::Path::new(&command[0])
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+    });
+  Ok(proxy_command_matches_id(
+    executable.as_deref(),
+    &command,
+    id,
+  ))
+}
+
+fn proxy_command_matches_id(executable: Option<&str>, command: &[String], id: &str) -> bool {
+  let executable_matches = executable.is_some_and(|name| {
+    let stem = name.strip_suffix(".exe").unwrap_or(name);
+    stem == "donut-proxy" || stem.starts_with("donut-proxy-")
+  });
+  let arguments_match = command.windows(4).any(|parts| {
+    parts[0] == "proxy-worker" && parts[1] == "start" && parts[2] == "--id" && parts[3] == id
+  });
+  executable_matches && arguments_match
+}
+
+async fn terminate_proxy_pid(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
+  if !is_process_running(pid) {
+    return Ok(());
   }
 
-  Ok(false)
+  #[cfg(unix)]
+  let terminate = {
+    use std::process::Command;
+    Command::new("kill")
+      .arg("-TERM")
+      .arg(pid.to_string())
+      .output()
+  };
+  #[cfg(windows)]
+  let terminate = {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    Command::new("taskkill")
+      .args(["/F", "/PID", &pid.to_string()])
+      .creation_flags(CREATE_NO_WINDOW)
+      .output()
+  };
+
+  let output = terminate?;
+  if !output.status.success() && is_process_running(pid) {
+    return Err(
+      format!(
+        "Failed to signal proxy process {pid}: {}",
+        String::from_utf8_lossy(&output.stderr)
+      )
+      .into(),
+    );
+  }
+  if !wait_for_proxy_process_exit(pid, tokio::time::Duration::from_secs(2)).await {
+    return Err(format!("Proxy process {pid} is still running after termination request").into());
+  }
+  Ok(())
+}
+
+fn forget_stopped_proxy(id: &str) -> Result<(), Box<dyn std::error::Error>> {
+  if !delete_proxy_config(id) && get_proxy_config(id).is_some() {
+    return Err(format!("Proxy {id} stopped, but its recovery config could not be removed").into());
+  }
+  PROXY_PROCESSES.lock().unwrap().remove(id);
+  Ok(())
+}
+
+async fn rollback_spawned_proxy(id: &str, pid: u32) -> Result<(), Box<dyn std::error::Error>> {
+  if proxy_process_matches_id(pid, id)? {
+    terminate_proxy_pid(pid).await?;
+  }
+  forget_stopped_proxy(id)
+}
+
+pub async fn stop_proxy_process(id: &str) -> Result<bool, Box<dyn std::error::Error>> {
+  let Some(config) = get_proxy_config(id) else {
+    return Ok(false);
+  };
+  let Some(pid) = config.pid else {
+    return Ok(false);
+  };
+
+  if !proxy_process_matches_id(pid, id)? {
+    log::warn!(
+      "Proxy config {id} points at missing or unrelated PID {pid}; removing stale tracking without signalling it"
+    );
+    forget_stopped_proxy(id)?;
+    return Ok(true);
+  }
+
+  terminate_proxy_pid(pid).await?;
+
+  // Tracking and the recovery config are ownership evidence.  Remove them
+  // only after the exact worker PID is confirmed gone; otherwise a failed
+  // signal turns a live orphan into an untraceable one.
+  forget_stopped_proxy(id)?;
+  Ok(true)
 }
 
 pub async fn stop_all_proxy_processes() -> Result<(), Box<dyn std::error::Error>> {
@@ -441,4 +555,67 @@ pub async fn stop_all_proxy_processes() -> Result<(), Box<dyn std::error::Error>
     let _ = stop_proxy_process(&config.id).await;
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test(flavor = "current_thread")]
+  async fn stale_proxy_pid_never_signals_an_unrelated_process() {
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = crate::app_dirs::set_test_data_dir(temp.path().to_path_buf());
+    let id = "stale-proxy-identity-test";
+    let mut config = ProxyConfig::new(id.to_string(), "DIRECT".to_string(), Some(0));
+    config.pid = Some(std::process::id());
+    save_proxy_config(&config).unwrap();
+
+    assert!(!proxy_process_matches_id(std::process::id(), id).unwrap());
+    assert!(stop_proxy_process(id).await.unwrap());
+    assert!(is_process_running(std::process::id()));
+    assert!(get_proxy_config(id).is_none());
+  }
+
+  #[test]
+  fn proxy_worker_command_identity_accepts_packaged_binary_variants() {
+    for executable in [
+      "donut-proxy",
+      "donut-proxy-aarch64-apple-darwin",
+      "donut-proxy-x86_64-pc-windows-msvc.exe",
+    ] {
+      let command = vec![
+        executable.to_string(),
+        "proxy-worker".to_string(),
+        "start".to_string(),
+        "--id".to_string(),
+        "proxy-123".to_string(),
+      ];
+      assert!(proxy_command_matches_id(
+        Some(executable),
+        &command,
+        "proxy-123"
+      ));
+    }
+  }
+
+  #[test]
+  fn proxy_worker_command_identity_rejects_wrong_binary_or_id() {
+    let command = vec![
+      "donut-proxy".to_string(),
+      "proxy-worker".to_string(),
+      "start".to_string(),
+      "--id".to_string(),
+      "proxy-123".to_string(),
+    ];
+    assert!(!proxy_command_matches_id(
+      Some("donut-proxy"),
+      &command,
+      "proxy-456"
+    ));
+    assert!(!proxy_command_matches_id(
+      Some("unrelated-process"),
+      &command,
+      "proxy-123"
+    ));
+  }
 }

@@ -44,6 +44,7 @@ type ProspectState =
   | "seen"
   | "claimed"
   | "posted"
+  | "unconfirmed"
   | "skipped"
   | "filled"
   | "failed"
@@ -69,6 +70,7 @@ export interface ProspectRecord {
   state: ProspectState;
   claimed_by?: string;
   claimed_at?: number;
+  send_started_at?: number;
   touches: AccountTouch[];
 }
 
@@ -258,7 +260,8 @@ export function ProspectLedgerPage() {
     [i18n.language],
   );
 
-  // 统计只讲**发出去的评论**，按平台拆开。
+  // 确认发布与「已点击但回执未知」必须分开统计。后者会保守占用公开足迹额度，
+  // 但不能冒充发布成功；否则运营侧只看到候选莫名永久不再分配。
   //
   // 以前还并排显示候选总数 / 未处理 / 已填入。那三个都不是成绩：前两个是发现池
   // 的规模，跟投放成果无关；`filled` 更是历史遗留 —— 四个平台都放开发送之后，
@@ -268,8 +271,13 @@ export function ProspectLedgerPage() {
   const stats = useMemo(() => {
     const byPlatform = new Map<string, number>();
     let posted = 0;
+    let unconfirmed = 0;
     for (const record of records) {
       for (const touch of record.touches) {
+        if (touch.state === "unconfirmed") {
+          unconfirmed += 1;
+          continue;
+        }
         if (touch.state !== "posted") continue;
         posted += 1;
         byPlatform.set(
@@ -278,7 +286,7 @@ export function ProspectLedgerPage() {
         );
       }
     }
-    return { posted, byPlatform };
+    return { posted, unconfirmed, byPlatform };
   }, [records]);
 
   const platformsPresent = useMemo(() => {
@@ -286,7 +294,8 @@ export function ProspectLedgerPage() {
     return PLATFORMS.filter((p) => present.has(p));
   }, [records]);
 
-  // 表格只列**发布出去的**。
+  // 表格列出确认发布和回执待确认的公开动作；待确认项必须显式标注，不能混进
+  // 已发布成绩，也不能隐藏掉它为何仍占着 per-item cap。
   //
   // 台账文件里还有大量 `seen`（每轮从搜索页入账的候选池）—— 那是编排选靶的工作
   // 数据，不是成果：一轮就能入几十条，把整张表淹掉。它们也不携带去重信息，
@@ -298,13 +307,17 @@ export function ProspectLedgerPage() {
     const needle = query.trim().toLowerCase();
     return records
       .map((record) => {
-        const postedAt = record.touches
-          .filter((touch) => touch.state === "posted")
-          .reduce((newest, touch) => Math.max(newest, touch.at), 0);
-        return { record, postedAt };
+        const publicTouches = record.touches.filter(
+          (touch) => touch.state === "posted" || touch.state === "unconfirmed",
+        );
+        const recordedAt = publicTouches.reduce(
+          (newest, touch) => Math.max(newest, touch.at),
+          0,
+        );
+        return { record, publicTouches, recordedAt };
       })
-      .filter(({ record, postedAt }) => {
-        if (postedAt === 0) return false;
+      .filter(({ record, recordedAt }) => {
+        if (recordedAt === 0) return false;
         if (platformFilter !== ALL_FILTER && record.platform !== platformFilter)
           return false;
         if (!needle) return true;
@@ -314,7 +327,7 @@ export function ProspectLedgerPage() {
           record.keywords.some((k) => k.toLowerCase().includes(needle))
         );
       })
-      .sort((a, b) => b.postedAt - a.postedAt);
+      .sort((a, b) => b.recordedAt - a.recordedAt);
   }, [records, query, platformFilter]);
 
   const profileNameById = useMemo(() => {
@@ -601,7 +614,7 @@ export function ProspectLedgerPage() {
 
         <section
           aria-label={t("marine.prospects.stats.label")}
-          className="grid grid-cols-2 gap-2 sm:grid-cols-5"
+          className="grid grid-cols-2 gap-2 sm:grid-cols-6"
         >
           <div className="rounded-lg border border-border bg-card px-3 py-2.5">
             <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
@@ -609,6 +622,14 @@ export function ProspectLedgerPage() {
             </p>
             <p className="mt-1 text-xl font-semibold tabular-nums">
               {stats.posted}
+            </p>
+          </div>
+          <div className="rounded-lg border border-warning/40 bg-card px-3 py-2.5">
+            <p className="text-[10px] tracking-wide text-warning uppercase">
+              {t("marine.prospects.stats.unconfirmed")}
+            </p>
+            <p className="mt-1 text-xl font-semibold tabular-nums">
+              {stats.unconfirmed}
             </p>
           </div>
           {PLATFORMS.map((platform) => (
@@ -695,7 +716,7 @@ export function ProspectLedgerPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {visible.map(({ record, postedAt }) => (
+              {visible.map(({ record, publicTouches, recordedAt }) => (
                 <TableRow key={record.key}>
                   <TableCell className="text-xs whitespace-nowrap">
                     {t(`marine.prospects.platform.${record.platform}`)}
@@ -723,19 +744,21 @@ export function ProspectLedgerPage() {
                     {record.keywords.join(" / ") || "—"}
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
-                    {/* 只列发出去的那个账号。失败/填入过的账号在这张表上是噪音 ——
-                        它们没发出东西，却会让人以为这条被处理过好几遍。 */}
-                    {record.touches
-                      .filter((touch) => touch.state === "posted")
-                      .map(
-                        (touch) =>
+                    {/* 失败/填入过的账号没有公开足迹；回执待确认的账号则必须可见，
+                        并明确区别于已经确认发布。 */}
+                    {publicTouches
+                      .map((touch) => {
+                        const name =
                           profileNameById.get(touch.profile_id) ??
-                          touch.profile_id,
-                      )
+                          touch.profile_id;
+                        return touch.state === "unconfirmed"
+                          ? `${name} · ${t("marine.prospects.stats.unconfirmed")}`
+                          : name;
+                      })
                       .join(" / ") || "—"}
                   </TableCell>
                   <TableCell className="text-xs whitespace-nowrap text-muted-foreground">
-                    {dateFormatter.format(postedAt * 1000)}
+                    {dateFormatter.format(recordedAt * 1000)}
                   </TableCell>
                 </TableRow>
               ))}

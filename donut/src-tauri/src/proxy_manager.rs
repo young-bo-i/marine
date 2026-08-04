@@ -183,8 +183,28 @@ impl StoredProxy {
 }
 
 // Global proxy manager to track active proxies and stored proxy configurations
+/// Placeholder keys for `active_proxies` live at the top of the `u32` range,
+/// above anything an OS hands out as a PID (Linux tops out around 4 million,
+/// macOS below 100k, Windows well under that).
+///
+/// A worker is registered before its browser exists, so it needs *some* key in
+/// the meantime. That key used to be the literal `0` for every launch at once,
+/// and `synchronizer` launches followers in parallel `JoinSet` batches while
+/// `launch_guard` only serialises *per profile* — so two launches would collide
+/// on `0`, the second silently evicting the first. Whoever then re-keyed `0` to
+/// a real PID adopted the wrong worker, and closing that browser stopped a
+/// different, still-running profile's proxy.
+const PLACEHOLDER_PID_BASE: u32 = u32::MAX - 0xFFFF;
+
+fn is_placeholder_pid(pid: u32) -> bool {
+  pid == 0 || pid >= PLACEHOLDER_PID_BASE
+}
+
 pub struct ProxyManager {
   active_proxies: Mutex<HashMap<u32, ProxyInfo>>, // Maps browser process ID to proxy info
+  /// Hands out the next unique placeholder key. Wraps within the reserved
+  /// window; a wrap needs 65k concurrent in-flight launches to matter.
+  next_placeholder: std::sync::atomic::AtomicU32,
   // Store proxy info by profile name for persistence across browser restarts
   profile_proxies: Mutex<HashMap<String, ProxySettings>>, // Maps profile name to proxy settings
   // Track active proxy IDs by profile name for targeted cleanup
@@ -200,6 +220,7 @@ impl ProxyManager {
   pub fn new() -> Self {
     let manager = Self {
       active_proxies: Mutex::new(HashMap::new()),
+      next_placeholder: std::sync::atomic::AtomicU32::new(PLACEHOLDER_PID_BASE),
       profile_proxies: Mutex::new(HashMap::new()),
       profile_active_proxy_ids: Mutex::new(HashMap::new()),
       stored_proxies: Mutex::new(HashMap::new()),
@@ -1490,6 +1511,16 @@ impl ProxyManager {
     // so the caller formats the right local proxy URL scheme.
     local_protocol: &str,
   ) -> Result<ProxySettings, String> {
+    // Callers that do not have a PID yet pass 0. Give each of them their own
+    // key so concurrent launches cannot evict one another — see
+    // [`PLACEHOLDER_PID_BASE`]. `update_proxy_pid_for_profile` swaps it for the
+    // real PID once the browser is up.
+    let browser_pid = if browser_pid == 0 {
+      self.take_placeholder_pid()
+    } else {
+      browser_pid
+    };
+
     if let Some(name) = profile_id {
       // Check if we have an active proxy recorded for this profile
       let maybe_existing_id = {
@@ -1743,54 +1774,14 @@ impl ProxyManager {
     app_handle: tauri::AppHandle,
     browser_pid: u32,
   ) -> Result<(), String> {
-    let (proxy_id, profile_id): (String, Option<String>) = {
-      let mut proxies = self.active_proxies.lock().unwrap();
-      match proxies.remove(&browser_pid) {
-        Some(proxy) => (proxy.id, proxy.profile_id.clone()),
+    let proxy_id = {
+      let proxies = self.active_proxies.lock().unwrap();
+      match proxies.get(&browser_pid) {
+        Some(proxy) => proxy.id.clone(),
         None => return Ok(()), // No proxy to stop
       }
     };
-
-    // Stop the proxy using the donut-proxy binary
-    let proxy_cmd = app_handle
-      .shell()
-      .sidecar("donut-proxy")
-      .map_err(|e| format!("Failed to create sidecar: {e}"))?
-      .arg("proxy")
-      .arg("stop")
-      .arg("--id")
-      .arg(&proxy_id);
-
-    // A failed spawn (sidecar missing, permission denied, fd exhaustion) must
-    // not panic the cleanup task — the proxy is already removed from tracking,
-    // so degrade gracefully like the non-success branch below.
-    match proxy_cmd.output().await {
-      Ok(output) if !output.status.success() => {
-        log::warn!(
-          "Proxy stop error: {}",
-          String::from_utf8_lossy(&output.stderr)
-        );
-      }
-      Ok(_) => {}
-      Err(e) => log::warn!("Failed to run donut-proxy stop: {e}"),
-    }
-
-    // Clear profile-to-proxy mapping if it references this proxy
-    if let Some(id) = profile_id {
-      let mut map = self.profile_active_proxy_ids.lock().unwrap();
-      if let Some(current_id) = map.get(&id) {
-        if current_id == &proxy_id {
-          map.remove(&id);
-        }
-      }
-    }
-
-    // Emit event for reactive UI updates
-    if let Err(e) = events::emit_empty("proxies-changed") {
-      log::error!("Failed to emit proxies-changed event: {e}");
-    }
-
-    Ok(())
+    self.stop_proxy_by_id(app_handle, &proxy_id).await
   }
 
   // Stop the proxy associated with a profile ID
@@ -1806,59 +1797,87 @@ impl ProxyManager {
     };
 
     if let Some(proxy_id) = proxy_id {
-      // Find the PID for this proxy
-      let pid = {
-        let proxies = self.active_proxies.lock().unwrap();
-        proxies.iter().find_map(|(pid, proxy)| {
-          if proxy.id == proxy_id {
-            Some(*pid)
-          } else {
-            None
-          }
-        })
-      };
-
-      if let Some(pid) = pid {
-        // Use the existing stop_proxy method
-        self.stop_proxy(app_handle, pid).await
-      } else {
-        // Proxy not found in active_proxies, try to stop it directly by ID
-        let proxy_cmd = app_handle
-          .shell()
-          .sidecar("donut-proxy")
-          .map_err(|e| format!("Failed to create sidecar: {e}"))?
-          .arg("proxy")
-          .arg("stop")
-          .arg("--id")
-          .arg(&proxy_id);
-
-        // Don't panic if the sidecar can't be spawned — still clear the mapping.
-        match proxy_cmd.output().await {
-          Ok(output) if !output.status.success() => {
-            log::warn!(
-              "Proxy stop error: {}",
-              String::from_utf8_lossy(&output.stderr)
-            );
-          }
-          Ok(_) => {}
-          Err(e) => log::warn!("Failed to run donut-proxy stop: {e}"),
-        }
-
-        // Clear profile-to-proxy mapping
-        let mut map = self.profile_active_proxy_ids.lock().unwrap();
-        map.remove(profile_id);
-
-        // Emit event for reactive UI updates
-        if let Err(e) = events::emit_empty("proxies-changed") {
-          log::error!("Failed to emit proxies-changed event: {e}");
-        }
-
-        Ok(())
-      }
+      self.stop_proxy_by_id(app_handle, &proxy_id).await
     } else {
       // No proxy found for this profile
       Ok(())
     }
+  }
+
+  /// Stop exactly one proxy worker by its generated ID.
+  ///
+  /// Launch rollback must not use the broader profile mapping: a failed
+  /// attempt may never have installed its mapping, while an older live browser
+  /// still owns the profile's current proxy.  Stopping and then removing
+  /// tracking by the worker ID makes cleanup safe even if another launch has
+  /// since replaced the profile mapping or the temporary PID slot.
+  pub async fn stop_proxy_by_id(
+    &self,
+    _app_handle: tauri::AppHandle,
+    proxy_id: &str,
+  ) -> Result<(), String> {
+    let stopped = crate::proxy_runner::stop_proxy_process(proxy_id)
+      .await
+      .map_err(|e| format!("Failed to stop proxy {proxy_id}: {e}"))?;
+    if !stopped || crate::proxy_storage::get_proxy_config(proxy_id).is_some() {
+      return Err(format!(
+        "Proxy {proxy_id} could not be confirmed stopped; preserving its tracking"
+      ));
+    }
+    self.detach_proxy_tracking_by_id(proxy_id);
+
+    if let Err(e) = events::emit_empty("proxies-changed") {
+      log::error!("Failed to emit proxies-changed event: {e}");
+    }
+    Ok(())
+  }
+
+  pub(crate) fn active_proxy_id_for_profile(&self, profile_id: &str) -> Option<String> {
+    self
+      .profile_active_proxy_ids
+      .lock()
+      .unwrap()
+      .get(profile_id)
+      .cloned()
+  }
+
+  /// Restore the mapping that existed before a failed launch, but never
+  /// overwrite a mapping installed by a newer owner.
+  pub(crate) fn restore_profile_proxy_mapping_if_absent(
+    &self,
+    profile_id: &str,
+    proxy_id: &str,
+  ) -> bool {
+    let proxy_still_exists = self
+      .active_proxies
+      .lock()
+      .unwrap()
+      .values()
+      .any(|proxy| proxy.id == proxy_id)
+      || crate::proxy_storage::get_proxy_config(proxy_id).is_some();
+    if !proxy_still_exists {
+      return false;
+    }
+
+    let mut map = self.profile_active_proxy_ids.lock().unwrap();
+    if map.contains_key(profile_id) {
+      return false;
+    }
+    map.insert(profile_id.to_string(), proxy_id.to_string());
+    true
+  }
+
+  fn detach_proxy_tracking_by_id(&self, proxy_id: &str) {
+    self
+      .active_proxies
+      .lock()
+      .unwrap()
+      .retain(|_, proxy| proxy.id != proxy_id);
+    self
+      .profile_active_proxy_ids
+      .lock()
+      .unwrap()
+      .retain(|_, active_id| active_id != proxy_id);
   }
 
   // Update the PID mapping for an existing proxy
@@ -1872,6 +1891,53 @@ impl ProxyManager {
     }
   }
 
+  /// A key no other in-flight launch holds, for a worker whose browser PID is
+  /// not known yet. See [`PLACEHOLDER_PID_BASE`].
+  fn take_placeholder_pid(&self) -> u32 {
+    self
+      .next_placeholder
+      .fetch_update(
+        std::sync::atomic::Ordering::SeqCst,
+        std::sync::atomic::Ordering::SeqCst,
+        |n| {
+          Some(if n == u32::MAX {
+            PLACEHOLDER_PID_BASE
+          } else {
+            n + 1
+          })
+        },
+      )
+      .unwrap_or(PLACEHOLDER_PID_BASE)
+  }
+
+  /// Re-key this profile's freshly started worker onto the browser PID it turned
+  /// out to get.
+  ///
+  /// Keyed by profile rather than by the old key, because the old key is a
+  /// placeholder this profile does not know and must not guess: guessing was
+  /// exactly the `update_proxy_pid(0, …)` bug, where a launch could adopt
+  /// whichever concurrent launch happened to write `0` last.
+  pub fn update_proxy_pid_for_profile(&self, profile_id: &str, new_pid: u32) -> Result<(), String> {
+    if new_pid == 0 {
+      return Err("refusing to key a proxy on PID 0".to_string());
+    }
+    let mut proxies = self.active_proxies.lock().unwrap();
+    let Some(old_key) = proxies
+      .iter()
+      .find(|(_, info)| info.profile_id.as_deref() == Some(profile_id))
+      .map(|(key, _)| *key)
+    else {
+      return Err(format!("No proxy found for profile {profile_id}"));
+    };
+    if old_key == new_pid {
+      return Ok(());
+    }
+    if let Some(info) = proxies.remove(&old_key) {
+      proxies.insert(new_pid, info);
+    }
+    Ok(())
+  }
+
   /// Persist the real browser PID onto the worker's on-disk config so the
   /// detached worker can self-terminate when that browser dies, independent of
   /// the GUI being alive. Resolved via the profile→proxy_id map rather than the
@@ -1882,7 +1948,7 @@ impl ProxyManager {
   /// of 0 (launch failed to report a PID) is ignored so the worker never
   /// self-exits against a bogus PID.
   pub fn set_browser_pid_for_profile(&self, profile_id: &str, browser_pid: u32) {
-    if browser_pid == 0 {
+    if is_placeholder_pid(browser_pid) {
       return;
     }
     let proxy_id = {
@@ -2097,9 +2163,10 @@ impl ProxyManager {
         let mut snapshot_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for (browser_pid, proxy_id, profile_id) in snapshot {
           snapshot_pids.insert(browser_pid);
-          // The sentinel PID=0 is used as a placeholder during launch,
-          // before update_proxy_pid has recorded the real browser PID.
-          if browser_pid == 0 {
+          // Placeholder keys stand in during launch, before the real browser
+          // PID is known. They match no process, so the liveness check below
+          // would reap a worker whose browser is still starting.
+          if is_placeholder_pid(browser_pid) {
             continue;
           }
           if system
@@ -2757,6 +2824,54 @@ mod tests {
     assert_eq!(info.profile_id.as_deref(), Some("prof_a"));
   }
 
+  /// 两个 profile 并行启动时，各自的 worker 必须重绑到**自己**的浏览器 PID。
+  ///
+  /// 以前两边都用占位键 0：后启动的把先启动的挤掉，`update_proxy_pid(0, pid)`
+  /// 于是认领了别人的 worker —— 关掉一个 profile 会停掉另一个还开着的 profile
+  /// 的代理，那个浏览器当场断网。
+  #[test]
+  fn concurrent_launches_do_not_adopt_each_others_proxy_workers() {
+    let pm = ProxyManager::new();
+    let a = pm.take_placeholder_pid();
+    let b = pm.take_placeholder_pid();
+    assert_ne!(a, b, "并发启动不能共用同一个占位键");
+
+    pm.insert_active_proxy(a, make_proxy_info("px_a", 9101, Some("prof_a")));
+    pm.insert_active_proxy(b, make_proxy_info("px_b", 9102, Some("prof_b")));
+
+    pm.update_proxy_pid_for_profile("prof_a", 3001).unwrap();
+    pm.update_proxy_pid_for_profile("prof_b", 3002).unwrap();
+
+    assert_eq!(pm.get_active_proxy(3001).unwrap().id, "px_a");
+    assert_eq!(pm.get_active_proxy(3002).unwrap().id, "px_b");
+    assert!(pm.get_active_proxy(a).is_none());
+    assert!(pm.get_active_proxy(b).is_none());
+  }
+
+  #[test]
+  fn placeholder_keys_are_never_mistaken_for_real_pids() {
+    assert!(is_placeholder_pid(0));
+    assert!(is_placeholder_pid(PLACEHOLDER_PID_BASE));
+    assert!(is_placeholder_pid(u32::MAX));
+    // 真实 PID 的量级：Linux 上限约 4 百万，macOS/Windows 更小。
+    for pid in [1u32, 500, 99_999, 4_194_304, 10_000_000] {
+      assert!(!is_placeholder_pid(pid), "{pid} 不该被当成占位键");
+    }
+  }
+
+  #[test]
+  fn rebinding_an_unknown_profile_is_an_error_not_a_silent_adoption() {
+    let pm = ProxyManager::new();
+    pm.insert_active_proxy(
+      pm.take_placeholder_pid(),
+      make_proxy_info("px_a", 9103, Some("prof_a")),
+    );
+    let result = pm.update_proxy_pid_for_profile("prof_missing", 4001);
+    assert!(result.is_err());
+    // 没有这个 profile 的记录时，绝不能顺手把别人的 worker 重绑过来。
+    assert!(pm.get_active_proxy(4001).is_none());
+  }
+
   #[test]
   fn test_update_proxy_pid_error_for_unknown_pid() {
     let pm = ProxyManager::new();
@@ -2787,6 +2902,55 @@ mod tests {
     assert_eq!(pm.profile_proxy_mapping_count(), 0);
     // Active proxy itself should still be there
     assert_eq!(pm.active_proxy_count(), 1);
+  }
+
+  #[test]
+  fn detach_proxy_tracking_by_id_preserves_other_launches() {
+    let pm = ProxyManager::new();
+    pm.insert_active_proxy(
+      500,
+      make_proxy_info("failed-attempt", 9100, Some("profile_x")),
+    );
+    pm.insert_active_proxy(
+      501,
+      make_proxy_info("existing-browser", 9101, Some("profile_x")),
+    );
+    pm.insert_active_proxy(
+      600,
+      make_proxy_info("other-profile", 9200, Some("profile_y")),
+    );
+    pm.insert_profile_proxy_mapping("profile_x".to_string(), "failed-attempt".to_string());
+    pm.insert_profile_proxy_mapping("profile_y".to_string(), "other-profile".to_string());
+
+    pm.detach_proxy_tracking_by_id("failed-attempt");
+
+    assert!(pm.get_active_proxy(500).is_none());
+    assert_eq!(pm.get_active_proxy(501).unwrap().id, "existing-browser");
+    assert_eq!(pm.get_active_proxy(600).unwrap().id, "other-profile");
+    let map = pm.profile_active_proxy_ids.lock().unwrap();
+    assert!(!map.contains_key("profile_x"));
+    assert_eq!(
+      map.get("profile_y").map(String::as_str),
+      Some("other-profile")
+    );
+  }
+
+  #[test]
+  fn failed_launch_cleanup_can_restore_the_prior_profile_mapping() {
+    let pm = ProxyManager::new();
+    pm.insert_active_proxy(501, make_proxy_info("prior-proxy", 9101, Some("profile_x")));
+    pm.insert_active_proxy(
+      0,
+      make_proxy_info("failed-attempt", 9102, Some("profile_x")),
+    );
+    pm.insert_profile_proxy_mapping("profile_x".to_string(), "failed-attempt".to_string());
+
+    pm.detach_proxy_tracking_by_id("failed-attempt");
+    assert!(pm.restore_profile_proxy_mapping_if_absent("profile_x", "prior-proxy"));
+    assert_eq!(
+      pm.active_proxy_id_for_profile("profile_x").as_deref(),
+      Some("prior-proxy")
+    );
   }
 
   #[test]

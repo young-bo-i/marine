@@ -43,6 +43,12 @@ fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
   }
 }
 
+fn write_runtime_config(path: &Path, config: &serde_json::Value) -> std::io::Result<()> {
+  let contents =
+    serde_json::to_vec_pretty(config).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+  write_private_file(path, &contents)
+}
+
 /// Resolve the source of the bundled Marine extension.
 fn source_dir(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
   // 1) Explicit override (useful for dev / testing).
@@ -202,43 +208,39 @@ pub async fn ensure_for_profile(
   // Marine auto-start block in `lib.rs` setup — because this launch path is
   // reachable from the `run_profile` API handler, and referencing the server's
   // router-building `start()` from here would create a type cycle. Here we only
-  // read the live port (or fall back to the preferred one) and the token,
-  // generating a token if one somehow doesn't exist yet.
+  // wait for the live port and obtain the token atomically.  Startup and a
+  // first profile launch can overlap; neither a guessed port nor two racing
+  // token generations is a usable runtime configuration.
   let manager = crate::settings_manager::SettingsManager::instance();
-  let preferred_port = manager.load_settings().map(|s| s.api_port).unwrap_or(10108);
+  let token = match manager.get_or_create_api_token(app_handle).await {
+    Ok(token) => token,
+    Err(e) => {
+      log::warn!("Marine: failed to obtain API token: {e}");
+      return None;
+    }
+  };
 
-  let token = match manager.get_api_token(app_handle).await.ok().flatten() {
-    Some(t) => t,
-    None => match manager.generate_api_token(app_handle).await {
-      Ok(t) => t,
+  let port =
+    match crate::api_server::wait_for_api_server_ready(std::time::Duration::from_secs(10)).await {
+      Ok(port) => port,
       Err(e) => {
-        log::warn!("Marine: failed to generate API token: {e}");
-        String::new()
+        log::warn!("Marine: local API is not ready; refusing to stamp a stale runtime config: {e}");
+        return None;
       }
-    },
-  };
-
-  let port = match crate::api_server::get_api_server_status().await {
-    Ok(Some(p)) => p,
-    _ => preferred_port,
-  };
+    };
 
   // Stamp the derived capability, never the full bearer: this file lives inside
   // the browser profile, and the extension only needs `/v1/marine/*`.
-  let capability = if token.is_empty() {
-    String::new()
-  } else {
-    super::extension_capability_token(&token)
-  };
+  let capability = super::extension_capability_token(&token);
 
   let cfg = serde_json::json!({
     "apiBase": format!("http://127.0.0.1:{port}/v1/marine"),
     "token": capability,
     "profileId": profile_id,
   });
-  let config_json = serde_json::to_vec_pretty(&cfg).unwrap_or_default();
-  if let Err(e) = write_private_file(&dst.join("marine-runtime-config.json"), &config_json) {
+  if let Err(e) = write_runtime_config(&dst.join("marine-runtime-config.json"), &cfg) {
     log::warn!("Marine: failed to stamp runtime config: {e}");
+    return None;
   }
 
   Some(dst)
@@ -265,6 +267,20 @@ mod tests {
       0o600
     );
     assert_eq!(fs::read(&path).unwrap(), b"{\"token\":\"secret\"}");
+  }
+
+  #[test]
+  fn runtime_config_write_failure_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("marine-runtime-config.json");
+    fs::create_dir(&destination).unwrap();
+
+    assert!(write_runtime_config(
+      &destination,
+      &serde_json::json!({ "apiBase": "http://127.0.0.1:10108" }),
+    )
+    .is_err());
+    assert!(destination.is_dir());
   }
 
   #[test]
@@ -304,7 +320,7 @@ mod tests {
       serde_json::from_str(include_str!("../../../marine-extension/manifest.json")).unwrap();
     let version = manifest["version"].as_str().unwrap();
     let worker = manifest["background"]["service_worker"].as_str().unwrap();
-    assert_eq!(version, "0.1.31");
+    assert_eq!(version, "0.1.32");
     assert_eq!(worker, format!("src/sw-entry-{version}.js"));
     let entry = fs::read_to_string(
       Path::new(env!("CARGO_MANIFEST_DIR"))

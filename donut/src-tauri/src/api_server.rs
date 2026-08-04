@@ -353,8 +353,10 @@ struct BatchStopResponse {
     marine_append_history,
     marine_search_slot,
     marine_login_status,
+    marine_prospect_ready,
     marine_ingest_prospects,
     marine_claim_prospect,
+    marine_prepare_prospect_send,
     marine_settle_prospect,
     marine_list_prospects,
     marine_append_published_history,
@@ -914,7 +916,9 @@ fn marine_settings_error(error: impl std::fmt::Display) -> (StatusCode, String) 
 
 /// One-shot generation. Runs the user-selected local connector (Codex / Claude
 /// CLI, or OpenAI-compatible) on the pre-built skill + grab payload and returns a
-/// single `blocks-v1` block. A human still posts every comment.
+/// single `blocks-v1` block. This endpoint never posts by itself; submission
+/// policy belongs to its caller (the discovery extension may auto-submit only
+/// after its target, draft, idempotency, and receipt guards pass).
 #[utoipa::path(
   post, path = "/v1/marine/generate", request_body = MarineGenerateRequest,
   responses(
@@ -942,7 +946,7 @@ async fn marine_generate_api(
 ///   {"type":"delta","text": "<raw model chunk>"}   (incremental preview)
 ///   {"type":"done","blocks":[{ "text", "title" }]} (final, authoritative)
 ///   {"type":"error","code":"…"}                    (failure)
-/// The result is only ever a draft — nothing is auto-submitted to the website.
+/// The response is only draft text; this endpoint never submits to a website.
 #[utoipa::path(
   post, path = "/v1/marine/generate-stream", request_body = RimeInvokeRequest,
   responses(
@@ -1311,16 +1315,40 @@ struct MarineProspectClaimRequest {
 struct MarineProspectSettleRequest {
   key: String,
   profile_id: String,
-  /// `posted` or `skipped`.
+  /// `posted`, `unconfirmed`, `skipped`, `filled`, `failed`, or `blocked`.
   state: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct MarineProspectPrepareSendRequest {
+  key: String,
+  profile_id: String,
 }
 
 fn prospect_error(e: crate::marine::prospect::ProspectError) -> (StatusCode, String) {
   use crate::marine::prospect::ProspectError as E;
   match e {
     E::UnsupportedPlatform(_) | E::MissingItemId => (StatusCode::BAD_REQUEST, e.to_string()),
+    E::NotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
+    E::ClaimOwnerMismatch { .. } => (StatusCode::CONFLICT, e.to_string()),
     _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
   }
+}
+
+/// Authenticated, read-only readiness probe for the discovery extension.
+///
+/// A content script being injected does not prove that its MV3 service worker
+/// can read the stamped runtime config or reach the local API.  The extension
+/// calls this through a fixed service-worker message before advertising
+/// automation readiness to the scheduler.  Keeping the route body-free makes
+/// the probe incapable of claiming or mutating prospect records.
+#[utoipa::path(
+  get, path = "/v1/marine/prospects/ready",
+  responses((status = 204, description = "Discovery bridge is authenticated and ready")),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_prospect_ready(State(_state): State<ApiServerState>) -> StatusCode {
+  StatusCode::NO_CONTENT
 }
 
 #[utoipa::path(
@@ -1382,6 +1410,35 @@ async fn marine_claim_prospect(
   Ok(Json(claimed))
 }
 
+/// Persist the owner-checked, non-expiring send lease before any public click.
+///
+/// A browser may publish successfully and then lose its settlement response.
+/// Once this transition commits, claim TTL must not hand the same item to a
+/// second profile while the durable extension outbox is still reconciling it.
+#[utoipa::path(
+  post, path = "/v1/marine/prospects/prepare-send",
+  request_body = MarineProspectPrepareSendRequest,
+  responses((status = 204, description = "Irreversible send lease persisted")),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_prepare_prospect_send(
+  State(_state): State<ApiServerState>,
+  Json(req): Json<MarineProspectPrepareSendRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+  tokio::task::spawn_blocking(move || {
+    crate::marine::prospect::PROSPECTS.prepare_send(&req.key, &req.profile_id)
+  })
+  .await
+  .map_err(|e| {
+    (
+      StatusCode::INTERNAL_SERVER_ERROR,
+      format!("prepare-send task failed: {e}"),
+    )
+  })?
+  .map_err(prospect_error)?;
+  Ok(StatusCode::NO_CONTENT)
+}
+
 #[utoipa::path(
   post, path = "/v1/marine/prospects/settle", request_body = MarineProspectSettleRequest,
   responses((status = 200, description = "Settled")),
@@ -1394,6 +1451,10 @@ async fn marine_settle_prospect(
   use crate::marine::prospect::{ProspectState, PROSPECTS};
   let state = match req.state.as_str() {
     "posted" => ProspectState::Posted,
+    // The publish button was clicked but the platform never produced an
+    // authoritative receipt.  It consumes the public-footprint cap because a
+    // delayed/hidden success is safer than allowing a second account to post.
+    "unconfirmed" => ProspectState::Unconfirmed,
     "skipped" => ProspectState::Skipped,
     // Terminal state of the current debug phase: draft written into the comment
     // box, send deliberately not clicked.
@@ -1409,7 +1470,7 @@ async fn marine_settle_prospect(
     other => {
       return Err((
         StatusCode::BAD_REQUEST,
-        format!("state must be posted|skipped|filled|failed|blocked, got {other}"),
+        format!("state must be posted|unconfirmed|skipped|filled|failed|blocked, got {other}"),
       ))
     }
   };
@@ -1847,6 +1908,14 @@ impl ApiServer {
     self.port
   }
 
+  fn readiness_snapshot(&self) -> (Option<u16>, bool) {
+    let task_running = self
+      .task_handle
+      .as_ref()
+      .is_some_and(|task| !task.is_finished());
+    (self.port, task_running)
+  }
+
   async fn start(
     &mut self,
     app_handle: tauri::AppHandle,
@@ -1864,29 +1933,30 @@ impl ApiServer {
       rime_runtime_instance_id: Arc::from(rime_runtime_instance_id.clone()),
     };
 
-    // Try preferred port first, then random port
-    let listener = match TcpListener::bind(format!("127.0.0.1:{preferred_port}")).await {
-      Ok(listener) => listener,
-      Err(_) => {
-        // Port conflict, try random port
-        let random_port = rand::random::<u16>().saturating_add(10000);
-        match TcpListener::bind(format!("127.0.0.1:{random_port}")).await {
-          Ok(listener) => {
-            let _ = events::emit(
-              "api-port-conflict",
-              format!("API server using fallback port {random_port}"),
-            );
-            listener
-          }
-          Err(e) => return Err(format!("Failed to bind to any port: {e}")),
-        }
-      }
-    };
+    // Try the preferred port first, then let the OS choose a genuinely free
+    // one.  Picking a single pseudo-random u16 still races every other process
+    // between selection and bind, and could overflow into a privileged port.
+    let (listener, used_fallback) =
+      match TcpListener::bind(format!("127.0.0.1:{preferred_port}")).await {
+        Ok(listener) => (listener, false),
+        Err(_) => (
+          TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| format!("Failed to bind to any port: {e}"))?,
+          true,
+        ),
+      };
 
     let actual_port = listener
       .local_addr()
       .map_err(|e| format!("Failed to get local address: {e}"))?
       .port();
+    if used_fallback {
+      let _ = events::emit(
+        "api-port-conflict",
+        format!("API server using fallback port {actual_port}"),
+      );
+    }
 
     // Create router with OpenAPI documentation
     let (v1_routes, _) = OpenApiRouter::new()
@@ -1926,8 +1996,10 @@ impl ApiServer {
       .routes(routes!(marine_append_history))
       .routes(routes!(marine_search_slot))
       .routes(routes!(marine_login_status))
+      .routes(routes!(marine_prospect_ready))
       .routes(routes!(marine_ingest_prospects))
       .routes(routes!(marine_claim_prospect))
+      .routes(routes!(marine_prepare_prospect_send))
       .routes(routes!(marine_settle_prospect))
       .routes(routes!(marine_list_prospects))
       .routes(routes!(marine_append_debug_logs, marine_get_debug_logs))
@@ -2201,6 +2273,89 @@ pub async fn start_api_server(
 pub async fn get_api_server_status() -> Result<Option<u16>, String> {
   let server_guard = API_SERVER.lock().await;
   Ok(server_guard.get_port())
+}
+
+async fn loopback_port_accepts(port: u16, timeout: std::time::Duration) -> bool {
+  matches!(
+    tokio::time::timeout(
+      timeout,
+      tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)),
+    )
+    .await,
+    Ok(Ok(_))
+  )
+}
+
+/// Wait until the startup task has bound the local API and report its *actual*
+/// port.
+///
+/// Profile launch and API startup are intentionally independent async tasks.
+/// A one-shot status read can therefore observe `None` just before startup
+/// falls back from an occupied preferred port.  Stamping the preferred port in
+/// that window leaves the extension disconnected for the entire browser
+/// session.  This bounded wait closes the race without making a failed API
+/// startup capable of hanging browser launch forever.
+pub async fn wait_for_api_server_ready(timeout: std::time::Duration) -> Result<u16, String> {
+  let deadline = tokio::time::Instant::now() + timeout;
+  let mut last_observation = "startup has not published a port".to_string();
+  loop {
+    let now = tokio::time::Instant::now();
+    if now >= deadline {
+      return Err(format!(
+        "local API did not become ready within {}s ({last_observation})",
+        timeout.as_secs(),
+      ));
+    }
+    let remaining = deadline.saturating_duration_since(now);
+    let (port, task_running) = match tokio::time::timeout(remaining, API_SERVER.lock()).await {
+      Ok(server) => server.readiness_snapshot(),
+      Err(_) => {
+        return Err(format!(
+          "local API did not become ready within {}s (timed out reading server state)",
+          timeout.as_secs(),
+        ));
+      }
+    };
+
+    match (port, task_running) {
+      (Some(port), true) => {
+        let connect_budget = deadline
+          .saturating_duration_since(tokio::time::Instant::now())
+          .min(std::time::Duration::from_millis(250));
+        if !connect_budget.is_zero() && loopback_port_accepts(port, connect_budget).await {
+          // The task can exit or a concurrent restart can replace the port while
+          // connect is in flight. Re-check the bookkeeping after the socket is
+          // proven reachable. Neither lock acquisition spans network I/O.
+          let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+          if remaining.is_zero() {
+            last_observation = format!("loopback port {port} accepted too late");
+          } else {
+            let confirmed = match tokio::time::timeout(remaining, API_SERVER.lock()).await {
+              Ok(server) => server.readiness_snapshot() == (Some(port), true),
+              Err(_) => false,
+            };
+            if confirmed {
+              return Ok(port);
+            }
+            last_observation = format!("server state changed while verifying loopback port {port}");
+          }
+        } else {
+          last_observation = format!("loopback port {port} is not accepting connections");
+        }
+      }
+      (Some(port), false) => {
+        last_observation = format!("server task for port {port} has exited");
+      }
+      (None, _) => {
+        last_observation = "startup has not published a port".to_string();
+      }
+    }
+
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if !remaining.is_zero() {
+      tokio::time::sleep(remaining.min(std::time::Duration::from_millis(100))).await;
+    }
+  }
 }
 
 /// Serialize a browser config (camoufox/wayfern) to JSON for an API response.
@@ -3887,6 +4042,24 @@ mod tests {
   use http_body_util::BodyExt;
   use tower::ServiceExt;
 
+  #[tokio::test]
+  async fn readiness_requires_a_live_task_and_reachable_loopback_port() {
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+      .await
+      .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    assert!(loopback_port_accepts(port, std::time::Duration::from_secs(1)).await);
+
+    let mut server = ApiServer::new();
+    server.port = Some(port);
+    server.task_handle = Some(tokio::spawn(std::future::pending::<()>()));
+    assert_eq!(server.readiness_snapshot(), (Some(port), true));
+
+    server.task_handle.as_ref().unwrap().abort();
+    tokio::task::yield_now().await;
+    assert_eq!(server.readiness_snapshot(), (Some(port), false));
+  }
+
   fn test_marine_identity() -> MarineIdentity {
     MarineIdentity {
       id: uuid::Uuid::new_v4().to_string(),
@@ -4289,6 +4462,22 @@ mod tests {
       .unwrap()
       .schemas
       .contains_key("RimePrepareResponse"));
+  }
+
+  #[test]
+  fn prospect_readiness_probe_is_documented() {
+    let api = ApiDoc::openapi();
+    assert!(
+      api.paths.paths.contains_key("/v1/marine/prospects/ready"),
+      "the extension bridge probe must remain part of the authenticated API"
+    );
+    assert!(
+      api
+        .paths
+        .paths
+        .contains_key("/v1/marine/prospects/prepare-send"),
+      "the pre-click send lease must remain part of the authenticated API"
+    );
   }
 
   #[test]

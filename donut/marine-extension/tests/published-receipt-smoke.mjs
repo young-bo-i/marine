@@ -1225,18 +1225,25 @@ const isoEntry = manifest.content_scripts.find((entry) =>
 assert.equal(isoEntry.all_frames, false);
 assert.match(contentIsoSource, /e\.source !== window/);
 
-// Platform adapters are their own host-scoped entry now, and Chrome injects
-// entries in manifest order — content-iso.js reads the registry those files
-// publish, so it must come after them.
+// content-iso.js reads the registry published by the platform adapters. When
+// they share one host-scoped entry, array order is deterministic; keep support
+// for a split manifest too, where entry order must provide the same guarantee.
 const adapterEntry = manifest.content_scripts.find((entry) =>
   entry.js.includes("src/platforms/comment-targets.js"),
 );
-assert.ok(adapterEntry, "platform adapters must have their own content_scripts entry");
-assert.ok(
-  manifest.content_scripts.indexOf(adapterEntry) < manifest.content_scripts.indexOf(isoEntry),
-  "platform adapters must be injected before content-iso.js",
-);
-assert.equal(isoEntry.js.some((f) => f.startsWith("src/platforms/")), false);
+assert.ok(adapterEntry, "platform adapters must be injected on supported hosts");
+if (adapterEntry === isoEntry) {
+  assert.ok(
+    adapterEntry.js.indexOf("src/platforms/comment-targets.js") <
+      adapterEntry.js.indexOf("src/content-iso.js"),
+    "within one entry, platform adapters must precede content-iso.js",
+  );
+} else {
+  assert.ok(
+    manifest.content_scripts.indexOf(adapterEntry) < manifest.content_scripts.indexOf(isoEntry),
+    "across entries, platform adapters must be injected before content-iso.js",
+  );
+}
 
 // NOTHING is web-accessible any more. `popup.html` was exposed for exactly one
 // reason — the injected floating panel iframed it FROM the page — and that panel

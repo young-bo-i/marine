@@ -1575,9 +1575,17 @@ rm "{}"
 
         let (file, parameters) = match ext.as_str() {
           "exe" => {
-            // NSIS installer: /S for silent, /UPDATE tells it this is an update
+            // NSIS installer: `/S` silent, `/UPDATE` marks this an update, `/R`
+            // relaunches us afterwards.
+            //
+            // `/R` is not optional. Tauri's installer template kills the running
+            // app under `IfSilent` (`CheckIfAppIsRunning` →
+            // `KillProcessCurrentUser`) and only restarts it when `/R` was
+            // passed — `/UPDATE` alone just sets `$UpdateMode`. Without it the
+            // operator clicks "restart now", the app vanishes, the update lands,
+            // and nothing ever comes back up.
             let file = installer_path.as_os_str().to_os_string();
-            let params = std::ffi::OsString::from("/S /UPDATE");
+            let params = std::ffi::OsString::from("/S /R /UPDATE");
             (file, params)
           }
           "msi" => {

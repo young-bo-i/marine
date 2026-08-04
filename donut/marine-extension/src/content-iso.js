@@ -1995,7 +1995,7 @@
       // 上报本次「页内生成并写入」的文本：稍后若这条被发布，sw 会据此把账本的
       // generation_source 标注为 'extension'（页内生成），区别于输入法/手填。
       try { chrome.runtime.sendMessage({ __marineGenFill: true, text: typed }); } catch (e) {}
-      marineLog('ok', 'iso', '已写入生成草稿（请人工确认后手动发送）');
+      marineLog('ok', 'iso', '已写入并核对生成草稿，准备自动提交');
     }
     marineRimeGenRenderButton();
     marineRimeSchedulePosition();
@@ -2262,18 +2262,18 @@
   }
 
   function marineRimeGenStart() {
-    if (marineRimeGenBusy()) return;
+    if (marineRimeGenBusy()) return false;
     const active = marineRimeTarget.active;
     if (!active) {
       marineRimeGenEnsureUI();
       marineRimeGenShowError('请先点选一个评论/回复框');
-      return;
+      return false;
     }
     if (!active.publishedContext) {
       // 上下文 PUT 是异步的（往返可能 1~2s）。刚聚焦就点「生成」时不该报错——
       // 先进「准备中」，发布完成后自动继续。
       marineRimeGenWaitForPublish(active);
-      return;
+      return true;
     }
     marineRimeGenLaunch({
       contextId: active.contextId,
@@ -2281,6 +2281,7 @@
       editor: active.editor,
       target: active.target,
     });
+    return true;
   }
 
   function marineRimeGenWaitForPublish(active) {
@@ -2848,6 +2849,10 @@
   function marineRimeHandleNavigation(url) {
     if (url && url === marineRimeTarget.pageUrl) return;
     marineRimeTarget.pageUrl = url || location.href;
+    // 这里只由真实 URL/navigation 变更进入，不是评论组件的 DOM 重挂载。
+    // 编排期间可容忍同一内容的 editor/contextId 重建，但 SPA 换内容时
+    // 必须立即中止在途生成，避免把 A 的文案继续写进 B 的输入框。
+    marineRimeGenAbort('navigation');
     marineRimeTarget.navigationRearmRequired = true;
     marineRimeTarget.navigationEventCutoff = performance.now();
     marineRimeClearPendingReply('navigation');
@@ -3155,11 +3160,10 @@
 
   // 日志转发到侧边栏「调试」tab（GET_LOGS 取历史 + 实时 __marineLog 推送），无页面悬浮层
   //
-  // 平台适配器现在只注入到各自的站点，和本文件分属不同的 content_scripts 条目。
-  // Chrome 按 manifest 顺序注入，但跨条目顺序并不在文档契约里。本该有适配器的站点上
-  // 如果注册表还没落地，就推迟一个宏任务再启动（同批 document_idle 脚本此时必已执行
-  // 完），避免静默退回 marineRimeAdapterSupportsPage 里「只认 B 站 /video/」的兜底
-  // 分支——那会让知乎/小红书/抖音一个监听器都挂不上。其它站点保持同步启动，行为不变。
+  // 已支持站点上，平台适配器与本文件位于同一条 content_scripts 的 js 数组，
+  // 并且适配器排在 content-iso 之前。这里仍保留一个宏任务的容错：如果旧版注入、
+  // 测试沙箱或未来 manifest 拆分导致注册表还没落地，就等当前批次执行完再
+  // 启动，避免知乎/小红书/抖音的目标监听器静默缺席。其它站点保持同步启动。
   if (!globalThis.MarineCommentTargetAdapters && ADAPTER_PLATFORMS[detectPlatform()]) {
     setTimeout(marineRimeStartTargetTracking, 0);
   } else {
@@ -3173,16 +3177,230 @@
   // 账号的筛选位下发搜索 URL（marine/search_slot.rs），所以这里不需要拼 URL，
   // 也不需要人点任何东西。非搜索页 shouldRun 直接返回 false。
   //
-  // 编排只走到「打开靶子」为止 —— 话术生成与填入仍是页内「生成」按钮 + 人工
-  // 发送，见 prospect-run.js 顶部说明。
-  function marineProspectSend(message) {
+  // 搜索页领取后会继续驱动靶子页的既有生成/发送链路；是否自动提交由交接单里的
+  // stopAfter 与平台回执能力共同决定，见 prospect-run.js。
+  const MARINE_PROSPECT_BOOT_DELAYS_MS = [0, 50, 100, 250, 500, 1000, 2000];
+  // MV3 cold wake + runtime config + session/local durable CAS 偶尔会超过 1s。消息超时
+  // 不会取消 SW 已开始的写，过早判失败会造成“页面说没写成、后台其实稍后成功”的
+  // 分叉；read 有上层重试给 3s，涉及不可逆凭据的 mutation 给足 5s。
+  const MARINE_PROSPECT_HANDOFF_READ_TIMEOUT_MS = 3000;
+  const MARINE_PROSPECT_HANDOFF_MUTATION_TIMEOUT_MS = 5000;
+  const MARINE_PROSPECT_CONTROL_TIMEOUT_MS = 5000;
+  // SW 内部 ready GET 自身有 5s abort；content 必须稍长，避免边界上先把
+  // 一个 SW 正在返回的权威失败压成 message_timeout。
+  const MARINE_PROSPECT_READY_TIMEOUT_MS = 7000;
+  const MARINE_PROSPECT_API_TIMEOUT_MS = 20000;
+  const MARINE_PROSPECT_TYPE_TIMEOUT_MS = 185000;
+  // 与 Rust 等待 document commit 的窗口对齐。正常站点首字节 6–10s 并不少见；
+  // 5s 会在首导航仍进行时再次 assign，反而取消本可成功的请求。
+  const MARINE_PROSPECT_NAVIGATION_WATCHDOG_MS = 12000;
+  let marineProspectPhaseAStarted = false;
+  let marineProspectBridgeReadyPromise = null;
+  let marineProspectReadyProfileId = '';
+
+  function marineProspectAutomationHost() {
+    const host = String((typeof location !== 'undefined' && location.hostname) || '').toLowerCase();
+    return host === 'bilibili.com' || host.endsWith('.bilibili.com') ||
+      host === 'zhihu.com' || host.endsWith('.zhihu.com') ||
+      host === 'xiaohongshu.com' || host.endsWith('.xiaohongshu.com') ||
+      host === 'xhslink.com' || host.endsWith('.xhslink.com') ||
+      host === 'douyin.com' || host.endsWith('.douyin.com');
+  }
+
+  function marineProspectWarmupPage(href) {
+    try {
+      const url = new URL(String(href || ''));
+      const host = url.hostname.toLowerCase();
+      // scheduler 为避免 XHS 从 about:blank 冷跳搜索导致 renderer 卡死，会先提交
+      // 官网首页并停约 4s。它不是 Phase B 靶子；读取/消费旧 handoff 会与随后搜索
+      // 导航打架，甚至提前改变 scheduler baseline。
+      return (host === 'xiaohongshu.com' || host === 'www.xiaohongshu.com') &&
+        (url.pathname === '' || url.pathname === '/');
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function marineProspectMarkBootstrapFailed(phase, label) {
+    try {
+      document.documentElement.removeAttribute('data-marine-prospect-ready');
+      document.documentElement.setAttribute('data-marine-prospect-failed', phase);
+    } catch (e) {}
+    const status = phase === 'phase_b' ? 'target_bootstrap_failed' : 'prospect_bootstrap_failed';
+    marineLog('error', 'iso', JSON.stringify({ status, phase, label }));
+  }
+
+  function marineProspectScheduleBoot(start, attempt, label, phase) {
+    const next = (Number(attempt) || 0) + 1;
+    if (next >= MARINE_PROSPECT_BOOT_DELAYS_MS.length) {
+      marineProspectMarkBootstrapFailed(phase, label);
+      return;
+    }
+    setTimeout(() => start(next), MARINE_PROSPECT_BOOT_DELAYS_MS[next]);
+  }
+
+  function marineProspectPhaseAReady() {
+    return typeof marineProspectRun !== 'undefined' && marineProspectRun &&
+      typeof marineProspectRun.shouldRun === 'function' &&
+      typeof marineProspectRun.run === 'function' &&
+      typeof marineLogin !== 'undefined' && marineLogin && typeof marineLogin.status === 'function' &&
+      typeof marineDiscovery !== 'undefined' && marineDiscovery &&
+      typeof marineDiscovery.parseFor === 'function' &&
+      marineDiscovery.canary && typeof marineDiscovery.canary.check === 'function';
+  }
+
+  function marineProspectPhaseBReady() {
+    return typeof marineProspectRun !== 'undefined' && marineProspectRun &&
+      typeof marineProspectRun.platformOfSearchPage === 'function' &&
+      typeof marineProspectRun.runOnTargetSingleFlight === 'function';
+  }
+
+  function marineProspectSend(message, timeoutMs) {
     return new Promise((resolve) => {
+      let settled = false;
+      let timer = null;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        resolve(value);
+      };
+      if (Number(timeoutMs) > 0) {
+        timer = setTimeout(() => finish({ ok: false, error: 'message_timeout' }), Number(timeoutMs));
+      }
       try {
         chrome.runtime.sendMessage(message, (reply) => {
-          void chrome.runtime.lastError;
-          resolve(reply || { ok: false });
+          const lastError = chrome.runtime.lastError;
+          finish(reply || { ok: false, error: lastError && lastError.message });
         });
-      } catch (e) { resolve({ ok: false }); }
+      } catch (e) { finish({ ok: false, error: String((e && e.message) || e) }); }
+    });
+  }
+
+  async function marineProspectEnsureBridgeReady() {
+    try {
+      if (document.documentElement.getAttribute('data-marine-prospect-ready') === '1' &&
+          marineProspectReadyProfileId) return true;
+    } catch (e) {}
+    if (marineProspectBridgeReadyPromise) return await marineProspectBridgeReadyPromise;
+
+    const probe = marineProspectSend(
+      { __marineProspectReady: true },
+      MARINE_PROSPECT_READY_TIMEOUT_MS,
+    ).then((reply) => {
+      const profileId = String((reply && reply.profileId) || '').trim();
+      if (!reply || reply.ok !== true || !profileId) return false;
+      marineProspectReadyProfileId = profileId;
+      try {
+        document.documentElement.setAttribute('data-marine-prospect-ready', '1');
+        document.documentElement.removeAttribute('data-marine-prospect-failed');
+      } catch (e) {}
+      return true;
+    }).catch(() => false);
+    marineProspectBridgeReadyPromise = probe;
+    const ready = await probe;
+    if (!ready && marineProspectBridgeReadyPromise === probe) {
+      marineProspectBridgeReadyPromise = null;
+    }
+    return ready;
+  }
+
+  /**
+   * 提交精确导航，并确认旧 document 真的离开了。
+   *
+   * `location.href` 可能在旧 document 卸载前就变成目标 URL，因此不把字符串
+   * 相等当成成功。只有 pagehide/unload（或文档已不再存活）才取消
+   * watchdog。第一个窗口后旧文档仍活着就精确重提交一次；第二个
+   * 窗口仍存活就返回单个结构化终局，不再建新 timer。
+   *
+   * runtime 只用于无浏览器 smoke 注入可控时钟/生命周期；正式路径不传。
+   */
+  function marineProspectNavigateWithWatchdog(url, meta, runtime) {
+    runtime = runtime || {};
+    meta = meta || {};
+    const expected = String(url || '');
+    const host = runtime.window || (typeof window !== 'undefined' ? window : null);
+    const doc = runtime.document || (typeof document !== 'undefined' ? document : null);
+    const loc = runtime.location || (typeof location !== 'undefined' ? location : null);
+    const schedule = runtime.setTimeout || ((fn, ms) => setTimeout(fn, ms));
+    const cancel = runtime.clearTimeout || ((id) => clearTimeout(id));
+    const delay = Number.isFinite(runtime.delayMs) && runtime.delayMs >= 0
+      ? runtime.delayMs
+      : MARINE_PROSPECT_NAVIGATION_WATCHDOG_MS;
+
+    return new Promise((resolve) => {
+      let finished = false;
+      let timer = null;
+      let attempts = 0;
+      let lastError = '';
+
+      const got = () => {
+        try { return String((loc && loc.href) || ''); } catch (e) { return ''; }
+      };
+      const documentAlive = () => {
+        if (typeof runtime.documentAlive === 'function') {
+          try { return runtime.documentAlive() === true; } catch (e) { return false; }
+        }
+        try { return !!(doc && doc.documentElement && doc.defaultView !== null); }
+        catch (e) { return false; }
+      };
+      const cleanup = () => {
+        if (timer !== null) {
+          cancel(timer);
+          timer = null;
+        }
+        if (host && typeof host.removeEventListener === 'function') {
+          host.removeEventListener('pagehide', onDocumentGone);
+          host.removeEventListener('unload', onDocumentGone);
+        }
+      };
+      const finish = (status) => {
+        if (finished) return;
+        finished = true;
+        cleanup();
+        const result = {
+          status,
+          expected,
+          got: got(),
+          key: String(meta.key || ''),
+          attempts,
+        };
+        if (lastError) result.error = lastError;
+        resolve(result);
+      };
+      function onDocumentGone() {
+        finish('target_navigation_committed');
+      }
+      const submit = () => {
+        attempts += 1;
+        try {
+          if (!loc || typeof loc.assign !== 'function') throw new Error('location.assign unavailable');
+          loc.assign(expected);
+        } catch (e) {
+          lastError = String((e && e.message) || e);
+        }
+      };
+      const check = () => {
+        timer = null;
+        if (finished) return;
+        if (!documentAlive()) {
+          finish('target_navigation_committed');
+          return;
+        }
+        if (attempts < 2) {
+          submit();
+          if (!finished) timer = schedule(check, delay);
+          return;
+        }
+        finish('target_navigation_stalled');
+      };
+
+      if (host && typeof host.addEventListener === 'function') {
+        host.addEventListener('pagehide', onDocumentGone, { once: true });
+        host.addEventListener('unload', onDocumentGone, { once: true });
+      }
+      submit();
+      if (!finished) timer = schedule(check, delay);
     });
   }
 
@@ -3195,21 +3413,53 @@
    */
   const marineProspectHandoffStore = {
     read: async () => {
-      const r = await marineProspectSend({ __marineProspectHandoff: true, op: 'read' });
-      return r && r.ok ? r.data : null;
+      const r = await marineProspectSend(
+        { __marineProspectHandoff: true, op: 'read' },
+        MARINE_PROSPECT_HANDOFF_READ_TIMEOUT_MS,
+      );
+      if (!r || !r.ok) throw new Error((r && r.error) || 'handoff_read_failed');
+      return r.data || null;
     },
     write: async (value) => {
-      const r = await marineProspectSend({ __marineProspectHandoff: true, op: 'write', value });
+      const r = await marineProspectSend(
+        { __marineProspectHandoff: true, op: 'write', value },
+        MARINE_PROSPECT_HANDOFF_MUTATION_TIMEOUT_MS,
+      );
       return !!(r && r.ok);
     },
-    clear: async () => {
-      await marineProspectSend({ __marineProspectHandoff: true, op: 'clear' });
+    clear: async (value) => {
+      const r = await marineProspectSend(
+        { __marineProspectHandoff: true, op: 'clear', value },
+        MARINE_PROSPECT_HANDOFF_MUTATION_TIMEOUT_MS,
+      );
+      if (!r || !r.ok) throw new Error((r && r.error) || 'handoff_clear_failed');
+    },
+    deadLetter: async (value, reason) => {
+      const r = await marineProspectSend(
+        { __marineProspectHandoff: true, op: 'deadLetter', value, reason },
+        MARINE_PROSPECT_HANDOFF_MUTATION_TIMEOUT_MS,
+      );
+      if (!r || !r.ok) throw new Error((r && r.error) || 'handoff_dead_letter_failed');
     },
   };
 
-  function marineStartProspectRun() {
-    if (typeof marineProspectRun === 'undefined') return;      // 未注入该站点
-    if (!marineProspectRun.shouldRun(location.href)) return;
+  async function marineStartProspectRun(bootAttempt) {
+    if (!marineProspectAutomationHost()) return;
+    if (marineProspectPhaseAStarted) return;
+    if (!marineProspectPhaseAReady() || !marineProspectPhaseBReady()) {
+      marineProspectScheduleBoot(marineStartProspectRun, bootAttempt, '发现侧编排', 'phase_a');
+      return;
+    }
+    // 同一批脚本两个 Phase 都会启动，但每个 document 只让它所属的一侧
+    // 做握手/打 marker，避免 A/B 同时耗尽后互相覆盖 failed 原因。
+    if (!marineProspectRun.platformOfSearchPage(location.href)) return;
+    if (!(await marineProspectEnsureBridgeReady())) {
+      marineProspectScheduleBoot(marineStartProspectRun, bootAttempt, '发现侧编排·认证握手', 'phase_a');
+      return;
+    }
+    const searchHref = location.href;
+    if (!marineProspectRun.shouldRun(searchHref)) return;
+    marineProspectPhaseAStarted = true;
 
     // SW 代发：apiBase/token 只有 SW 读得到，且路由在 SW 侧有白名单。
     const send = marineProspectSend;
@@ -3220,9 +3470,8 @@
     const DELAYS_MS = [0, 1500, 3000, 5000, 8000, 12000];
 
     const attempt = async (i) => {
-      const who = await send({ __marineProspectProfileId: true });
       const result = await marineProspectRun.run({
-        profileId: who && who.profileId,
+        profileId: marineProspectReadyProfileId,
         login: (platform) => marineLogin.status(platform),
         // 掉登录才上报，走 SW 的写死路由（不进页面可控的白名单）。
         // 不 await：编排不该为一次记账多等一个往返。
@@ -3233,17 +3482,25 @@
         parse: (platform, raw) => marineDiscovery.parseFor(platform, raw),
         canary: (platform, items) => marineDiscovery.canary.check(platform, items),
         api: async (route, body) => {
-          const reply = await send({ __marineProspectApi: true, route, body });
+          const reply = await send(
+            { __marineProspectApi: true, route, body },
+            MARINE_PROSPECT_API_TIMEOUT_MS,
+          );
           if (!reply || !reply.ok) throw new Error((reply && reply.error) || '本地 API 调用失败');
           return reply.data;
         },
-        // location.assign 而不是 href=，语义一样但更明确是「导航」。
-        navigate: (url) => location.assign(url),
+        // location.assign 提交后必须等旧 document 真正 pagehide/unload。
+        // href 可能提前变成目标字符串，不能用它单独判定导航成功。
+        navigate: (url, meta) => marineProspectNavigateWithWatchdog(url, meta),
         handoffStore: marineProspectHandoffStore,
       }).catch((e) => ({ status: 'error', error: String(e && e.message || e) }));
 
+      // 正常导航已经进入 pagehide/unload，旧 document 不再落幂等成功日志。
+      if (result.status === 'target_navigation_committed') return;
       // 终局才落幂等标记；unhealthy / login_unknown 这类「现在还不行」保持可重试。
-      const done = marineProspectRun.markDone(location.href, result.status);
+      // assign 可能在旧 document 还存活时就提前改写 location.href。幂等标记
+      // 必须属于启动时的搜索页，不能误记到 expected target URL 上。
+      const done = marineProspectRun.markDone(searchHref, result.status);
       marineLog('info', 'iso', '发现侧编排[' + (i + 1) + '/' + DELAYS_MS.length + ']：' + JSON.stringify(result));
       if (done || i + 1 >= DELAYS_MS.length) return;
       // 页面已经导航走了就别再重试（location 变了说明上一轮成功打开了靶子）。
@@ -3260,7 +3517,7 @@
   // 输入框），不是另写一套。等待方式是轮询 marineRimeGen.state，因为那套是
   // 状态机不是 Promise。
   //
-  // 终止点由交接单里的 stopAfter 决定，当前 'fill' —— 敲完就停，不点发送。
+  // 终止点由交接单里的 stopAfter 决定：已具备回执的平台会继续到 send。
   // 评论区里「这是一条评论」的容器。用来把评论正文排除在关闭提示的扫描之外 ——
   // 有人评论里写「为什么无法评论」就会把整条靶子误判成关闭，而 blocked 是**全局
   // 永久**的，误判代价比漏判高得多。
@@ -3361,6 +3618,19 @@
   // 评论图标每个文档只点一次。精选页点它只是开合抽屉，反复点会把刚开的关上。
   let marineProspectDouyinIconClicked = false;
 
+  // 这个函数有五个「没成功」的出口，以前一个都不吭声，失败一律表现为 40 秒后
+  // 的「未能定位到直评输入框」—— 五种完全不同的原因长成同一个样子，只能靠猜。
+  // 每种原因只报一次（轮询会调用几十次，每次都报会把日志淹掉）。
+  let marineProspectDouyinSaid = Object.create(null);
+  function marineProspectDouyinWhy(reason, detail) {
+    if (marineProspectDouyinSaid[reason]) return false;
+    marineProspectDouyinSaid[reason] = true;
+    try {
+      marineLog('warn', 'iso', '抖音评论区未打开·' + reason + (detail ? ' · ' + detail : ''));
+    } catch (e) {}
+    return false;
+  }
+
   function marineProspectOpenDouyinComments() {
     try {
       // 输入框已经在了就什么都不做
@@ -3396,7 +3666,12 @@
           .filter((el) => /^评论\s*\(?\d*\)?$/.test(String(el.textContent || '').trim()) &&
             el.children.length <= 1 && marineVisible(el))
           .pop();
-        if (!tab) return false;
+        if (!tab) {
+          return marineProspectDouyinWhy(
+            '既没有评论图标也找不到「评论」tab',
+            'icon=' + (icon ? '有' : '无') + ' 已点过=' + marineProspectDouyinIconClicked,
+          );
+        }
         tab.scrollIntoView({ block: 'center' });
         tab.click();
         return false;
@@ -3418,7 +3693,7 @@
       // 前一个兄弟（视频页/笔记页最稳），没有就退回全文档按占位文案找。
       const list = document.querySelector('[data-e2e="comment-list"]');
       const head = (list && list.previousElementSibling) || document.body;
-      if (!head) return false;
+      if (!head) return marineProspectDouyinWhy('评论列表没有前一个兄弟节点');
       const spots = Array.prototype.slice
         .call(head.querySelectorAll('*'))
         .filter((el) => String(el.textContent || '').trim().indexOf('留下你的精彩评论') === 0 &&
@@ -3426,7 +3701,26 @@
       // 取最内层：外层容器同样命中这段文本，点外层不一定触发挂载
       // （B 站的发布按钮踩过同样的坑）。
       const spot = spots[spots.length - 1];
-      if (!spot) return false;
+      if (!spot) {
+        // 占位文案是这里唯一的锚点，抖音改一次文案就会整条链路失效，而外在表现
+        // 只是「定位不到输入框」。把**实际看到的**候选文案打出来，下次一跑就知道
+        // 该把哪个字符串加进来，不用靠猜。
+        let seen = '';
+        try {
+          seen = Array.prototype.slice
+            .call(head.querySelectorAll('*'))
+            .filter((el) => el.children.length === 0 && marineVisible(el))
+            .map((el) => String(el.textContent || '').trim())
+            .filter((t) => t && t.length <= 30)
+            .slice(0, 8)
+            .join(' | ');
+        } catch (e) {}
+        return marineProspectDouyinWhy(
+          '找不到「留下你的精彩评论」占位条',
+          'comment-list=' + (list ? '有' : '无') + ' 锚点=' + (list ? '兄弟节点' : 'body') +
+            ' 附近文案=[' + seen + ']',
+        );
+      }
       spot.scrollIntoView({ block: 'center' });
       spot.click();
       return true;
@@ -3533,7 +3827,10 @@
       // **不抢操作系统前台** —— 编排要在人用别的程序时跑完。这里只是让本标签页
       // 在窗口内活动，从而不被判 `document.hidden`（隐藏标签页的打字泵会被浏览器
       // clamp 到 1s 起）。上下文归属靠 `orchestrated` 标记放行，不靠焦点。
-      void marineProspectSend({ __marineProspectFocusTab: true }).then(function () {
+      void marineProspectSend(
+        { __marineProspectFocusTab: true },
+        MARINE_PROSPECT_CONTROL_TIMEOUT_MS,
+      ).then(function () {
         // 目标追踪是事件驱动的，自动打开的页面不会有人去点评论框 —— 自己滚到
         // 评论区并激活，再等目标登记好。
         //
@@ -3601,8 +3898,24 @@
 
       function begin() {
         const before = g.typed || '';
-        try { marineRimeGenStart(); }
+        // 已有人工/自动生成在跑时绝不能把它的 finishSeq 当成本任务；目标在
+        // waitPublished 与这里之间也可能被 SPA 重建。两种都立即失败，不进 120s poll。
+        if (marineRimeGenBusy()) {
+          return resolve({ ok: false, reason: 'generator_busy', error: '生成器正忙，拒绝串用其他任务' });
+        }
+        const active = marineRimeTarget && marineRimeTarget.active;
+        if (!active || !active.publishedContext || !active.editor || !active.editor.isConnected) {
+          return resolve({ ok: false, reason: 'target_lost', error: '生成前目标已失效' });
+        }
+        // 基线必须在 start 前取。connect/postMessage 可能同步失败并推进 finishSeq；
+        // 先 start 再取会把本轮失败当成旧状态，随后白等满 120 秒。
+        const seqBefore = g.finishSeq || 0;
+        let started;
+        try { started = marineRimeGenStart(); }
         catch (e) { return resolve({ ok: false, error: '发起生成失败：' + String(e && e.message || e) }); }
+        if (started === false) {
+          return resolve({ ok: false, reason: 'start_rejected', error: '生成入口拒绝启动' });
+        }
         // 生成是流式的，**只有 `lastFinish === 'done'` 才算敲完**。
         //
         // 曾经用「state 回落到 idle + 文本不再增长」推断，两次都错得很惨：
@@ -3613,7 +3926,6 @@
         // `marineRimeGenFinish(reason)` 是权威信号：走完整段才是 'done'。
         // 用序号而不是值本身，避免把上一轮留下的 'done' 当成这一轮的。
         const genDeadline = Date.now() + 120000;
-        const seqBefore = g.finishSeq || 0;
         (function poll() {
           if (g.state === 'error') return resolve({ ok: false, error: '生成失败' });
           if (Date.now() > genDeadline) return resolve({ ok: false, error: '生成超时' });
@@ -3636,9 +3948,9 @@
   /**
    * 平台的发送控件。
    *
-   * **只有 B 站有实测数据**，其余三个平台返回 null —— 和 `commentsClosed` 同一条
-   * 纪律：猜一个选择器进来，代价是往真实账号上发出去一条本不该发的评论，或者
-   * 点中别的按钮。没量过就不写。
+   * B 站、知乎、小红书和抖音都已接入各自实测过的发送控件定位；未知平台
+   * 仍返回 null。发送会在真实账号上留下公开痕迹，所以只允许已有回执链路和
+   * 定位回归覆盖的平台进入这里。
    *
    * B 站实测（`bili-comments` 的 shadow root 内）：发布控件是 `textContent`
    * 恰为「发布」的元素，**不是 `<button>`**（同层还有 168 个按钮类元素，多数是
@@ -3723,30 +4035,58 @@
    * 生成正常完成，发送前却报「读不到输入框」）。最后一级只在**恰好只有一个**
    * 可编辑元素时才用 —— 有多个就说不清是哪个，宁可拒发。
    */
-  function marineProspectReadEditorText(platform) {
-    void platform;
-    const readText = (el) => {
-      if (!el || !el.isConnected) return null;
-      try {
-        const tag = (el.tagName || '').toLowerCase();
-        return String(tag === 'textarea' ? el.value : el.textContent || '');
-      } catch (e) { return null; }
-    };
+  /**
+   * 同一个输入框的**两种**文本读法，都拿出来给调用方比。
+   *
+   * 为什么不能只挑一种：
+   *   · `textContent` 在 contenteditable 上**没有块级分隔符** ——「第一行\n第二行」
+   *     读回来是「第一行第二行」，多行草稿永远对不上（B站/知乎/抖音 全中）。
+   *   · `innerText` 有分隔符，但它按**渲染结果**取值：知乎的评论框在弹层里，
+   *     实测发送前那一刻它可能已经不可见了，此时 innerText 给不出内容 ——
+   *     换成它之后知乎从「能发」变成了「内容不一致，拒绝发送」。
+   *
+   * 两种都取，任一对得上就放行。这不会削弱这道闸：真的只填进去半截，两种读法
+   * 都对不上。
+   */
+  function marineProspectEditorTexts(el) {
+    if (!el || !el.isConnected) return null;
+    try {
+      const tag = (el.tagName || '').toLowerCase();
+      if (tag === 'textarea') return [String(el.value)];
+      const out = [];
+      const rendered = el.innerText;
+      if (rendered != null) out.push(String(rendered));
+      out.push(String(el.textContent || ''));
+      return out;
+    } catch (e) { return null; }
+  }
+
+  /**
+   * 当前直评输入框这个**元素**（不是它的文本）。三级兜底同上。
+   */
+  function marineProspectResolveEditor() {
+    const usable = (el) => (el && el.isConnected ? el : null);
 
     const active = marineRimeTarget && marineRimeTarget.active;
-    const tracked = readText(active && active.editor);
-    if (tracked !== null) return tracked;
+    const tracked = usable(active && active.editor);
+    if (tracked) return tracked;
 
-    const found = readText(marineProspectFindCommentEditor(marineCommentSearchRoot()));
-    if (found !== null) return found;
+    const found = usable(marineProspectFindCommentEditor(marineCommentSearchRoot()));
+    if (found) return found;
 
     try {
       const editable = Array.prototype.slice
         .call(document.querySelectorAll('[contenteditable="true"], textarea'))
         .filter((el) => el.isConnected && el.offsetParent !== null);
-      if (editable.length === 1) return readText(editable[0]);
+      if (editable.length === 1) return editable[0];
     } catch (e) {}
     return null;
+  }
+
+  function marineProspectReadEditorText(platform) {
+    void platform;
+    const texts = marineProspectEditorTexts(marineProspectResolveEditor());
+    return texts && texts.length ? texts[0] : null;
   }
 
   /**
@@ -3837,6 +4177,13 @@
    */
   const marineProspectSentKeys = Object.create(null);
 
+  function marineProspectNormalizeDraft(value) {
+    return String(value || '')
+      .replace(/[\u200B-\u200D\u2060\uFEFF]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
   /**
    * 把整段文本交给 Rust 侧，用 CDP 真实键盘事件敲进当前焦点元素。
    *
@@ -3865,23 +4212,29 @@
   let marineProspectDebugPortCache;
 
   function marineProspectTypeViaCdp(text) {
-    return marineProspectSend({ __marineProspectProfileId: true }).then(function (who) {
+    return marineProspectSend(
+      { __marineProspectProfileId: true },
+      MARINE_PROSPECT_CONTROL_TIMEOUT_MS,
+    ).then(function (who) {
       const profileId = who && who.profileId;
       if (!profileId) {
         marineLog('warn', 'iso', 'CDP 打字：拿不到 profileId');
         return false;
       }
-      return marineProspectSend({
-        __marineProspectApi: true,
-        route: 'type-text',
-        body: {
-          profile_id: profileId,
-          text: String(text || ''),
-          // 调试浏览器不是 app 启动的，app 认不出它 —— 带上端口让 debug 构建
-          // 能跑完整链路。release 构建会忽略这个字段（编译期就不存在）。
-          debug_cdp_port: marineProspectDebugCdpPort(),
+      return marineProspectSend(
+        {
+          __marineProspectApi: true,
+          route: 'type-text',
+          body: {
+            profile_id: profileId,
+            text: String(text || ''),
+            // 调试浏览器不是 app 启动的，app 认不出它 —— 带上端口让 debug 构建
+            // 能跑完整链路。release 构建会忽略这个字段（编译期就不存在）。
+            debug_cdp_port: marineProspectDebugCdpPort(),
+          },
         },
-      }).then(function (reply) {
+        MARINE_PROSPECT_TYPE_TIMEOUT_MS,
+      ).then(function (reply) {
         const ok = !!(reply && reply.ok);
         // 失败原因必须留痕。这条链有三个可能的断点（拿不到 profileId、
         // Rust 认不出 profile、CDP 本身失败），从外面看症状完全一样。
@@ -3898,11 +4251,21 @@
     });
   }
 
-  function marineProspectSendComment(platform, expectedText, handoffKey) {
+  function marineProspectSendComment(
+    platform,
+    expectedText,
+    handoffKey,
+    expectedTargetUrl,
+    markAttempted,
+  ) {
     return new Promise(function (resolve) {
       const key = String(handoffKey || '');
       if (key && marineProspectSentKeys[key]) {
-        return resolve({ ok: false, error: '这条已经点过发送，拒绝重复发送' });
+        return resolve({
+          ok: false,
+          attempted: true,
+          error: '这条已经点过发送，拒绝重复发送',
+        });
       }
       // 发送前核对输入框里到底是什么。
       //
@@ -3911,17 +4274,35 @@
       // 过一条只有「这份」两个字的评论，就是因为没有这一步。
       //
       // 宁可不发也不发半截：没发出去还能再来一次，发出去的公开评论撤不回。
-      const expected = String(expectedText || '').trim();
+      const expected = marineProspectNormalizeDraft(expectedText);
       if (expected) {
-        const actual = marineProspectReadEditorText(platform);
-        if (actual === null) {
+        const candidates = marineProspectEditorTexts(marineProspectResolveEditor());
+        if (candidates === null) {
           return resolve({ ok: false, error: '发送前读不到输入框内容，拒绝发送' });
         }
-        // 平台会规范化空白/换行，所以比长度而不是全等；短了就是没敲完。
-        if (actual.replace(/\s+/g, '').length < expected.replace(/\s+/g, '').length) {
+        const actual = candidates[0];
+        // 页面会插入零宽字符并规范化换行/空白；去掉这些表现差异后必须全文相等。
+        // 只比长度会让「同长度、内容已被站点改写」的错稿直接通过并公开发布。
+        //
+        // 两种读法任一对得上就算数，理由见 `marineProspectEditorTexts`。
+        if (!candidates.some((t) => marineProspectNormalizeDraft(t) === expected)) {
+          // 以前这里只说「不一致」，不说哪里不一致 —— 而这道闸一旦误判，整条腿
+          // 就白跑且候选被烧掉，光看日志根本无从下手。把两边都截一段打出来。
+          try {
+            const brief = (t) => {
+              const n = marineProspectNormalizeDraft(t);
+              return '(' + n.length + ')' + n.slice(0, 60);
+            };
+            marineLog(
+              'warn',
+              'iso',
+              '草稿核对不一致 · 期望=' + brief(expectedText) +
+                ' · 实读=' + candidates.map(brief).join(' 或 '),
+            );
+          } catch (e) {}
           return resolve({
             ok: false,
-            error: '草稿只写了 ' + actual.length + '/' + expected.length + ' 字，拒绝发送',
+            error: '输入框内容与生成结果不一致，拒绝发送',
           });
         }
       }
@@ -3947,7 +4328,7 @@
       } catch (e) {}
       setTimeout(afterRefocus, refocusDelay);
 
-      function afterRefocus() {
+      async function afterRefocus() {
       const btn = marineProspectFindSendButton(platform);
       if (!btn) return resolve({ ok: false, error: '未找到发送按钮' });
       // 记下点击那一刻**到底点了什么**。
@@ -3964,14 +4345,64 @@
           + ' cls=' + String(btn.className || '').slice(0, 30)
           + ' 窗口聚焦=' + (typeof document !== 'undefined' ? document.hasFocus() : '?'));
       } catch (e) {}
+      // 故意放在 btn.click() 紧前。上层在生成完成后已验过一次，但重聚焦/
+      // 找按钮这个窗口里 SPA 仍可能从 A 切到 B，所以点击当下必须再验。
+      try { btn.scrollIntoView({ block: 'center' }); } catch (e) {}
+      const gotTargetUrl = String((typeof location !== 'undefined' && location.href) || '');
+      if (expectedTargetUrl && (typeof marineProspectRun === 'undefined' || !marineProspectRun ||
+          typeof marineProspectRun.sameTarget !== 'function' ||
+          !marineProspectRun.sameTarget(expectedTargetUrl, gotTargetUrl))) {
+        return resolve({
+          ok: false,
+          reason: 'target_changed_before_send',
+          error: '发送前目标页已变更，拒绝点击',
+          expected: expectedTargetUrl,
+          got: gotTargetUrl,
+        });
+      }
+      // 所有可证明的 pre-click failure 已在上面正常 resolve attempted:false。现在
+      // 即将跨不可逆边界，必须先把 unconfirmed durable；否则 click 触发同步导航
+      // 时旧 document 消失，下一份文档只看得到预备态 failed，会错误放开重发。
+      if (typeof markAttempted === 'function') {
+        try {
+          if ((await markAttempted()) !== true) throw new Error('attempt guard rejected');
+        } catch (e) {
+          return resolve({
+            ok: false,
+            attempted: true,
+            error: '发送尝试凭据写入失败：' + String((e && e.message) || e),
+          });
+        }
+      }
+      // durable mutation 最慢可等 5s，期间 SPA 仍可能换页；所以 guard 返回后还要
+      // 再读一次 URL。此时 unconfirmed 已 durable，若目标变了就不 click，但也不
+      // 能回退 failed（旧 document 可能在 guard 回执边界消失），保守按 attempted。
+      const finalTargetUrl = String((typeof location !== 'undefined' && location.href) || '');
+      if (expectedTargetUrl && (typeof marineProspectRun === 'undefined' || !marineProspectRun ||
+          typeof marineProspectRun.sameTarget !== 'function' ||
+          !marineProspectRun.sameTarget(expectedTargetUrl, finalTargetUrl))) {
+        return resolve({
+          ok: false,
+          attempted: true,
+          reason: 'target_changed_before_send',
+          error: '发送尝试凭据落定后目标页已变更，拒绝点击',
+          expected: expectedTargetUrl,
+          got: finalTargetUrl,
+        });
+      }
       // 标记要在**点击之前**落下：点完再标记的话，点击本身抛异常或页面立刻跳转
       // 就会漏标，下一轮又点一次。宁可把一次没点成的也算成点过。
       if (key) marineProspectSentKeys[key] = true;
       try {
-        btn.scrollIntoView({ block: 'center' });
         btn.click();
       } catch (e) {
-        return resolve({ ok: false, error: '点击发送失败：' + String((e && e.message) || e) });
+        // click() 已进入不可逆边界；即使调用栈抛错，站点 listener 也可能已产生
+        // 部分外部副作用。保守记 unconfirmed，绝不能按 failed 放开重领/重发。
+        return resolve({
+          ok: false,
+          attempted: true,
+          error: '点击发送失败：' + String((e && e.message) || e),
+        });
       }
 
       // 等回执。20s 够一次正常往返；超时按失败处理。
@@ -3982,7 +4413,11 @@
           return resolve({ ok: true, eventId: now.eventId, platformCommentId: now.platformCommentId });
         }
         if (Date.now() > deadline) {
-          return resolve({ ok: false, error: '已点发送但未收到平台回执（可能被风控拦截）' });
+          return resolve({
+            ok: false,
+            attempted: true,
+            error: '已点发送但未收到平台回执（可能被风控拦截）',
+          });
         }
         setTimeout(poll, 500);
       })();
@@ -3990,46 +4425,75 @@
     });
   }
 
-  async function marineStartProspectTargetPhase() {
-    if (typeof marineProspectRun === 'undefined') return;
-    // 交接单在 SW 侧，读它是异步的。没有就说明这页不是编排打开的，完全不动。
-    if (!(await marineProspectRun.readHandoff({ handoffStore: marineProspectHandoffStore }))) return;
-    // 有交接单 = 这页是编排打开的。进入编排模式：豁免那两条「假设用户正看着
-    // 这个标签页」的行为（失焦清目标、后台 PUT 被推迟），否则人一动鼠标就会
-    // 烧掉一条靶子。跑完必须关掉 —— 非编排时那两条保护要照常生效。
-    marineProspectSetOrchestrating(true);
-    // 调试环境的 CDP 端口（正式 profile 拿不到，返回 undefined）。
-    try {
-      const cfg = await marineProspectSend({ __marineProspectProfileId: true });
-      marineProspectDebugPortCache = (cfg && cfg.debugCdpPort) || undefined;
-    } catch (e) {}
+  async function marineStartProspectTargetPhase(bootAttempt) {
+    if (!marineProspectAutomationHost()) return;
+    // 必须在依赖/ready 握手和 handoff read 之前排除；warmup 的职责只有让搜索
+    // 导航可提交，恢复工作留给紧随其后的 Phase A search document。
+    if (marineProspectWarmupPage(location.href)) return;
+    if (!marineProspectPhaseAReady() || !marineProspectPhaseBReady()) {
+      marineProspectScheduleBoot(marineStartProspectTargetPhase, bootAttempt, '发现侧编排·靶子页', 'phase_b');
+      return;
+    }
+    if (marineProspectRun.platformOfSearchPage(location.href)) return;
+    if (!(await marineProspectEnsureBridgeReady())) {
+      marineProspectScheduleBoot(
+        marineStartProspectTargetPhase,
+        bootAttempt,
+        '发现侧编排·靶子页·认证握手',
+        'phase_b',
+      );
+      return;
+    }
+    // Phase A 与 Phase B 都注入在搜索页；上面已在握手之前完成 URL 分流。
     const send = marineProspectSend;
-    void marineProspectRun.runOnTarget({
+    void marineProspectRun.runOnTargetSingleFlight({
       handoffStore: marineProspectHandoffStore,
+      // 确认有交接单以后才进入编排模式。普通人工详情页会做几次只读重试，不能
+      // 因此绕过失焦保护。
+      beginTarget: async () => {
+        marineProspectSetOrchestrating(true);
+        // 调试环境的 CDP 端口（正式 profile 拿不到，返回 undefined）。
+        try {
+          const cfg = await marineProspectSend(
+            { __marineProspectProfileId: true },
+            MARINE_PROSPECT_CONTROL_TIMEOUT_MS,
+          );
+          marineProspectDebugPortCache = (cfg && cfg.debugCdpPort) || undefined;
+        } catch (e) {}
+      },
+      endTarget: () => {
+        // 无论成败都要退出编排模式。留着的话这个标签页后续的人工操作会一直
+        // 绕过焦点保护。
+        marineProspectSetOrchestrating(false);
+      },
       generateAndFill: () => marineProspectGenerateAndFill(),
+      currentHref: () => location.href,
       // 只有交接单里 stopAfter==='send' 时才会被调用。哪些平台进入 send 模式
       // 由 prospect-run 的 SEND_ENABLED_PLATFORMS 决定。
-      send: (platform, text, key) => marineProspectSendComment(platform, text, key),
+      send: (platform, text, key, expectedTargetUrl, markAttempted) =>
+        marineProspectSendComment(platform, text, key, expectedTargetUrl, markAttempted),
       api: async (route, body) => {
-        const reply = await send({ __marineProspectApi: true, route, body });
+        const reply = await send(
+          { __marineProspectApi: true, route, body },
+          MARINE_PROSPECT_API_TIMEOUT_MS,
+        );
         if (!reply || !reply.ok) throw new Error((reply && reply.error) || '本地 API 调用失败');
         return reply.data;
       },
       // 只在「评论区对所有人关闭」时用得上：换一条靶子。跟 Phase A 用同一个
       // 导航方式，落地后新页面的 Phase B 会靠新交接单接上。
-      navigate: (url) => { location.href = url; },
+      navigate: (url, meta) => marineProspectNavigateWithWatchdog(url, meta),
     }).then((r) => {
-      marineLog('info', 'iso', '发现侧编排·靶子页：' + JSON.stringify(r));
-    }).finally(() => {
-      // 无论成败都要退出编排模式。留着的话这个标签页后续的人工操作会一直
-      // 绕过焦点保护。
-      marineProspectSetOrchestrating(false);
+      // 无交接单是普通人工页面的常态，不刷日志；传输失败和所有真实编排结果都留证。
+      if (r && r.status !== 'no_handoff' && r.status !== 'target_already_started' &&
+          r.status !== 'target_navigation_committed') {
+        marineLog('info', 'iso', '发现侧编排·靶子页：' + JSON.stringify(r));
+      }
+    }).catch((e) => {
+      marineLog('error', 'iso', '发现侧编排·靶子页异常：' + String((e && e.message) || e));
     });
   }
 
-  // 和上面适配器注册表同样的理由：discovery/login/prospect-run 与本文件分属
-  // 不同的 content_scripts 条目，跨条目注入顺序不在文档契约里，推迟一个宏任务
-  // 保证它们都已就位。
   // 调试出口。
   //
   // content-iso 整个包在 IIFE 里，从外面（CDP 求值）一个内部状态都够不着 ——
@@ -4096,6 +4560,9 @@
   };
   if (typeof window !== 'undefined') window.marineInternals = marineInternals;
 
+  // discovery/login/prospect-run 已在同一条 manifest js 数组中排在本文件
+  // 之前。仍从下一个宏任务启动，并由 Phase A/B 的有界依赖重试覆盖
+  // 旧版注入、测试沙箱或 MV3 worker 恢复较慢的情况。
   setTimeout(marineStartProspectRun, 0);
   // 靶子页的第二阶段。给目标追踪一点时间先把直评框认出来。
   setTimeout(marineStartProspectTargetPhase, 1500);

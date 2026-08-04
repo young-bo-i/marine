@@ -110,6 +110,13 @@ pub struct WayfernManager {
   http_client: Client,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarineAutomationReadiness {
+  Ready,
+  Pending,
+  Failed(String),
+}
+
 #[derive(Debug, Deserialize)]
 struct CdpTarget {
   #[serde(rename = "type")]
@@ -227,39 +234,61 @@ impl WayfernManager {
       .or_else(|| pair("screenWidth", "screenHeight"))
   }
 
+  fn parse_stored_fingerprint(fingerprint_json: &str) -> Result<serde_json::Value, String> {
+    serde_json::from_str(fingerprint_json)
+      .map_err(|e| format!("Failed to parse stored fingerprint JSON: {e}"))
+  }
+
   async fn wait_for_cdp_ready(
     &self,
     port: u16,
   ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("http://127.0.0.1:{port}/json/version");
     // On first launch, macOS Gatekeeper verifies the binary which can take 30+ seconds.
-    // Use a generous timeout (60s) to handle this.
-    let max_attempts = 120;
+    // Use a real wall-clock deadline: a retry count does not bound the wait
+    // when each HTTP attempt has its own timeout.
+    let timeout = Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + timeout;
     let delay = Duration::from_millis(500);
 
     let mut last_error: Option<String> = None;
-    for attempt in 0..max_attempts {
-      match self.http_client.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-          log::info!("CDP ready on port {port} after {attempt} attempts");
+    let mut attempts = 0usize;
+    loop {
+      let now = tokio::time::Instant::now();
+      if now >= deadline {
+        break;
+      }
+      attempts += 1;
+      let request_budget = deadline
+        .saturating_duration_since(now)
+        .min(Duration::from_secs(2));
+      match tokio::time::timeout(request_budget, self.http_client.get(&url).send()).await {
+        Ok(Ok(resp)) if resp.status().is_success() => {
+          log::info!("CDP ready on port {port} after {attempts} attempts");
           return Ok(());
         }
-        Ok(resp) => {
+        Ok(Ok(resp)) => {
           last_error = Some(format!("HTTP {} from {url}", resp.status()));
-          tokio::time::sleep(delay).await;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
           last_error = Some(format!("request failed: {e}"));
-          tokio::time::sleep(delay).await;
+        }
+        Err(_) => {
+          last_error = Some(format!("request exceeded {request_budget:?}"));
         }
       }
+      let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+      if remaining.is_zero() {
+        break;
+      }
+      tokio::time::sleep(delay.min(remaining)).await;
     }
 
     let detail = last_error.unwrap_or_else(|| "no attempts completed".to_string());
     // Log at error level so we can diagnose Windows/AV/firewall-induced CDP hangs
     // in customer reports without needing them to reproduce in the moment.
-    log::error!("CDP not ready after {max_attempts} attempts on port {port}: {detail}");
-    Err(format!("CDP not ready after {max_attempts} attempts on port {port}: {detail}").into())
+    log::error!("CDP not ready after {timeout:?} ({attempts} attempts) on port {port}: {detail}");
+    Err(format!("CDP not ready after {timeout:?} on port {port}: {detail}").into())
   }
 
   async fn get_cdp_targets(
@@ -652,15 +681,15 @@ impl WayfernManager {
         .map(|o| o.keys().collect::<Vec<_>>())
     );
 
-    // Log timezone/geolocation fields specifically for debugging
+    // Keep sensitive location values out of customer log bundles. Presence is
+    // enough to diagnose an incomplete fingerprint.
     if let Some(obj) = fingerprint.as_object() {
-      log::info!(
-        "Generated fingerprint - timezone: {:?}, timezoneOffset: {:?}, latitude: {:?}, longitude: {:?}, language: {:?}",
-        obj.get("timezone"),
-        obj.get("timezoneOffset"),
-        obj.get("latitude"),
-        obj.get("longitude"),
-        obj.get("language")
+      log::debug!(
+        "Generated fingerprint location metadata present: timezone={}, timezone_offset={}, coordinates={}, language={}",
+        obj.contains_key("timezone"),
+        obj.contains_key("timezoneOffset"),
+        obj.contains_key("latitude") && obj.contains_key("longitude"),
+        obj.contains_key("language"),
       );
     }
 
@@ -680,6 +709,7 @@ impl WayfernManager {
     extension_paths: &[String],
     remote_debugging_port: Option<u16>,
     headless: bool,
+    restore_last_session: bool,
   ) -> Result<WayfernLaunchResult, Box<dyn std::error::Error + Send + Sync>> {
     let executable_path = BrowserRunner::instance()
       .get_browser_executable_path(profile)
@@ -815,9 +845,18 @@ impl WayfernManager {
       // user's open tabs persist across restarts on THIS device. Cross-device
       // tab sync is intentionally deferred (Chromium's `Sessions/` dir is
       // excluded from the file manifest), so this only restores locally.
-      // Windowed only — headless/MCP automation launches must start clean and
-      // never restore tabs.
-      args.push("--restore-last-session".to_string());
+      // Manual windowed launches restore; headless/MCP and discovery-owned
+      // automation sessions start clean and never restore tabs.
+      if restore_last_session {
+        args.push("--restore-last-session".to_string());
+      } else {
+        // Supplying an explicit startup URL prevents a profile preference such
+        // as "continue where you left off" from undoing the scheduler's clean
+        // launch policy.  The real platform navigation happens over CDP only
+        // after the target id is known.
+        args.push("--new-window".to_string());
+        args.push("about:blank".to_string());
+      }
 
       if let Some((w, h)) = config
         .fingerprint
@@ -972,17 +1011,41 @@ impl WayfernManager {
 
     let page_targets: Vec<_> = targets.iter().filter(|t| t.target_type == "page").collect();
     log::info!("Found {} page targets", page_targets.len());
+    // A discovery-owned launch will immediately collapse the browser to one
+    // tab and navigate it itself.  Even if Chromium restores tabs because of a
+    // profile preference, do not let an unresponsive historical tab multiply
+    // launch-time CDP work before the scheduler gets a chance to sweep it.
+    let targets_to_prepare = if restore_last_session {
+      page_targets.as_slice()
+    } else {
+      &page_targets[..page_targets.len().min(1)]
+    };
+    if targets_to_prepare.len() < page_targets.len() {
+      log::info!(
+        "Automation launch is preparing 1 of {} page targets; the scheduler will sweep the rest",
+        page_targets.len()
+      );
+    }
 
     // Apply fingerprint if configured
     let mut used_fingerprint: Option<String> = None;
     if let Some(fingerprint_json) = &config.fingerprint {
+      if targets_to_prepare.is_empty() {
+        kill_orphan("configured fingerprint has no page target");
+        return Err("configured fingerprint could not be applied: no page target exists".into());
+      }
       log::info!(
         "Applying fingerprint to Wayfern browser, fingerprint length: {} chars",
         fingerprint_json.len()
       );
 
-      let stored_value: serde_json::Value = serde_json::from_str(fingerprint_json)
-        .map_err(|e| format!("Failed to parse stored fingerprint JSON: {e}"))?;
+      let stored_value = match Self::parse_stored_fingerprint(fingerprint_json) {
+        Ok(value) => value,
+        Err(e) => {
+          kill_orphan("stored fingerprint JSON is invalid");
+          return Err(e.into());
+        }
+      };
 
       // The stored fingerprint should be the fingerprint object directly (after our fix in generate_fingerprint_config)
       // But for backwards compatibility, also handle the wrapped format
@@ -1024,16 +1087,16 @@ impl WayfernManager {
           .map(|o| o.keys().collect::<Vec<_>>())
       );
 
-      // Log timezone and geolocation fields specifically for debugging
+      // Keep sensitive location values out of customer log bundles. Presence
+      // booleans still make malformed/partial profiles diagnosable.
       if let Some(obj) = fingerprint_for_cdp.as_object() {
-        log::info!(
-          "Timezone/Geolocation fields - timezone: {:?}, timezoneOffset: {:?}, latitude: {:?}, longitude: {:?}, language: {:?}, languages: {:?}",
-          obj.get("timezone"),
-          obj.get("timezoneOffset"),
-          obj.get("latitude"),
-          obj.get("longitude"),
-          obj.get("language"),
-          obj.get("languages")
+        log::debug!(
+          "Fingerprint CDP location metadata present: timezone={}, timezone_offset={}, coordinates={}, language={}, languages={}",
+          obj.contains_key("timezone"),
+          obj.contains_key("timezoneOffset"),
+          obj.contains_key("latitude") && obj.contains_key("longitude"),
+          obj.contains_key("language"),
+          obj.contains_key("languages"),
         );
       }
 
@@ -1046,39 +1109,69 @@ impl WayfernManager {
         }
       }
 
-      for target in &page_targets {
-        if let Some(ws_url) = &target.websocket_debugger_url {
-          log::info!("Applying fingerprint to target via WebSocket: {}", ws_url);
-          match self
-            .send_cdp_command(ws_url, "Wayfern.setFingerprint", fingerprint_params.clone())
-            .await
-          {
-            Ok(result) => {
-              log::info!(
-                "Successfully applied fingerprint to page target: {:?}",
-                result
-              );
-              // Wayfern.setFingerprint echoes back the fingerprint it actually
-              // used, which may be UPGRADED from what we sent (e.g. when the
-              // stored fingerprint targets an older browser version). Capture
-              // it once, from the first target that succeeds, so the caller can
-              // persist the upgraded value to the profile.
-              if used_fingerprint.is_none() {
-                // getFingerprint/setFingerprint wrap the object as
-                // { fingerprint: {...} }; tolerate a bare object too.
-                let fp = result.get("fingerprint").cloned().unwrap_or(result);
-                if fp.is_object() {
-                  match serde_json::to_string(&Self::normalize_fingerprint(fp)) {
-                    Ok(s) => used_fingerprint = Some(s),
-                    Err(e) => {
-                      log::warn!("Failed to serialize used fingerprint: {e}")
-                    }
+      for (index, target) in targets_to_prepare.iter().enumerate() {
+        let Some(ws_url) = &target.websocket_debugger_url else {
+          if index == 0 {
+            kill_orphan("primary page target has no debugger URL for fingerprinting");
+            return Err(
+              "configured fingerprint could not be applied: primary page target has no debugger URL"
+                .into(),
+            );
+          }
+          log::error!(
+            "Could not apply fingerprint to secondary page target {}: debugger URL missing",
+            target.id
+          );
+          continue;
+        };
+        log::info!("Applying fingerprint to page target {}", target.id);
+        match self
+          .send_cdp_command(ws_url, "Wayfern.setFingerprint", fingerprint_params.clone())
+          .await
+        {
+          Ok(result) => {
+            let returned_fields = result
+              .get("fingerprint")
+              .unwrap_or(&result)
+              .as_object()
+              .map(|fields| fields.len())
+              .unwrap_or(0);
+            // Never dump the full result: it is tens of KB and contains the
+            // profile's device/geolocation fingerprint.  A count is enough
+            // to distinguish a real echo from an empty response.
+            log::info!(
+              "Applied fingerprint to page target {} ({returned_fields} returned fields)",
+              target.id
+            );
+            // Wayfern.setFingerprint echoes back the fingerprint it actually
+            // used, which may be UPGRADED from what we sent (e.g. when the
+            // stored fingerprint targets an older browser version). Capture
+            // it once, from the first target that succeeds, so the caller can
+            // persist the upgraded value to the profile.
+            if used_fingerprint.is_none() {
+              // getFingerprint/setFingerprint wrap the object as
+              // { fingerprint: {...} }; tolerate a bare object too.
+              let fp = result.get("fingerprint").cloned().unwrap_or(result);
+              if fp.is_object() {
+                match serde_json::to_string(&Self::normalize_fingerprint(fp)) {
+                  Ok(s) => used_fingerprint = Some(s),
+                  Err(e) => {
+                    log::warn!("Failed to serialize used fingerprint: {e}")
                   }
                 }
               }
             }
-            Err(e) => log::error!("Failed to apply fingerprint to target: {e}"),
           }
+          Err(e) if index == 0 => {
+            kill_orphan("could not apply fingerprint to primary page target");
+            return Err(
+              format!("Failed to apply configured fingerprint to primary page target: {e}").into(),
+            );
+          }
+          Err(e) => log::error!(
+            "Failed to apply fingerprint to secondary target {}: {e}",
+            target.id
+          ),
         }
       }
     } else {
@@ -1089,37 +1182,52 @@ impl WayfernManager {
 
     if let Some(url) = url {
       log::info!("Navigating to URL via CDP: {}", url);
-      if let Some(target) = page_targets.first() {
-        if let Some(ws_url) = &target.websocket_debugger_url {
-          if let Err(e) = self
-            .send_cdp_command(ws_url, "Page.navigate", json!({ "url": url }))
-            .await
-          {
-            log::error!("Failed to navigate to URL: {e}");
-          }
-        }
+      let Some(target) = page_targets.first() else {
+        kill_orphan("initial URL requested but no page target exists");
+        return Err("initial URL requested but no page target exists".into());
+      };
+      let Some(ws_url) = &target.websocket_debugger_url else {
+        kill_orphan("initial page target has no debugger URL");
+        return Err("initial page target has no debugger URL".into());
+      };
+      if let Err(e) = self
+        .send_cdp_command(ws_url, "Page.navigate", json!({ "url": url }))
+        .await
+      {
+        kill_orphan("initial Page.navigate failed");
+        return Err(format!("Failed to navigate to initial URL: {e}").into());
       }
     }
 
-    for target in &page_targets {
+    for target in targets_to_prepare {
       if let Some(ws_url) = &target.websocket_debugger_url {
-        let _ = self
-          .send_cdp_command(ws_url, "Emulation.clearDeviceMetricsOverride", json!({}))
-          .await;
-        let _ = self
-          .send_cdp_command(
-            ws_url,
-            "Emulation.setFocusEmulationEnabled",
-            json!({ "enabled": false }),
+        // These are cleanup hints, not launch prerequisites.  Run them in
+        // parallel under one short budget so a stale renderer cannot add three
+        // full CDP timeouts to the visible "browser is open" stage.
+        let cleanup = async {
+          tokio::join!(
+            self.send_cdp_command(ws_url, "Emulation.clearDeviceMetricsOverride", json!({})),
+            self.send_cdp_command(
+              ws_url,
+              "Emulation.setFocusEmulationEnabled",
+              json!({ "enabled": false }),
+            ),
+            self.send_cdp_command(
+              ws_url,
+              "Emulation.setEmulatedMedia",
+              json!({ "media": "", "features": [] }),
+            ),
           )
-          .await;
-        let _ = self
-          .send_cdp_command(
-            ws_url,
-            "Emulation.setEmulatedMedia",
-            json!({ "media": "", "features": [] }),
-          )
-          .await;
+        };
+        if tokio::time::timeout(Duration::from_secs(8), cleanup)
+          .await
+          .is_err()
+        {
+          log::warn!(
+            "Timed out applying best-effort emulation cleanup to target {}",
+            target.id
+          );
+        }
       }
     }
 
@@ -1190,27 +1298,101 @@ impl WayfernManager {
 
     if let Some(instance) = inner.instances.remove(id) {
       log::info!("Cleaning up Wayfern instance {}", instance.id);
+      // 别在关浏览器这段时间里占着锁 —— 优雅关闭要等上几秒。
+      drop(inner);
+
+      // 先请 Chromium 自己退。它在正常关闭时会把 cookie SQLite 和 Preferences
+      // flush 掉；被强杀则不会，未落盘的那个提交周期（约 30 秒）就没了。
+      //
+      // 在 macOS 上 SIGTERM 已经能触发这套收尾，Windows 却没有信号可发，原来
+      // 直接 `taskkill /F` = TerminateProcess，**零 shutdown 回调**：每关一次
+      // 浏览器就丢一批登录态，而这套编排每条腿都要关一次。
+      let closed_itself = match instance.cdp_port {
+        Some(port) => self.close_browser_via_cdp(port, instance.process_id).await,
+        None => false,
+      };
+
       if let Some(pid) = instance.process_id {
-        #[cfg(unix)]
-        {
-          use nix::sys::signal::{kill, Signal};
-          use nix::unistd::Pid;
-          let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+        if closed_itself {
+          log::info!("Wayfern instance {id} (PID: {pid}) shut itself down cleanly");
+        } else {
+          log::warn!("Wayfern instance {id} (PID: {pid}) did not exit on request; forcing");
+          #[cfg(unix)]
+          {
+            use nix::sys::signal::{kill, Signal};
+            use nix::unistd::Pid;
+            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+          }
+          #[cfg(windows)]
+          {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            // `/T` is not optional here. Windows never re-parents, and killing
+            // only the browser process leaves its renderers, GPU process and
+            // crashpad_handler alive — the last of which keeps a handle on the
+            // profile directory and makes the later cleanup fail.
+            let _ = std::process::Command::new("taskkill")
+              .args(["/PID", &pid.to_string(), "/T", "/F"])
+              .creation_flags(CREATE_NO_WINDOW)
+              .output();
+          }
+          log::info!("Stopped Wayfern instance {id} (PID: {pid})");
         }
-        #[cfg(windows)]
-        {
-          use std::os::windows::process::CommandExt;
-          const CREATE_NO_WINDOW: u32 = 0x08000000;
-          let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-        }
-        log::info!("Stopped Wayfern instance {id} (PID: {pid})");
       }
     }
 
     Ok(())
+  }
+
+  /// Ask the browser to close itself, and wait for the process to actually go.
+  ///
+  /// Returns whether it exited on its own. `Browser.close` is sent on the
+  /// browser-level WebSocket from `/json/version` — the per-page endpoints only
+  /// close tabs.
+  async fn close_browser_via_cdp(&self, port: u16, pid: Option<u32>) -> bool {
+    /// Long enough for Chromium to flush its profile, short enough that the
+    /// between-leg pause absorbs it. Measured shutdowns land near 2 s.
+    const GRACEFUL_SHUTDOWN_WAIT: Duration = Duration::from_secs(8);
+    /// 每次判活都是一次**全量进程表刷新**（Windows 上尤其贵），所以间隔要递增：
+    /// 常见的 2 秒左右退出用不了几次扫描，慢的情况也不会扫上几十次。
+    const FIRST_POLL: Duration = Duration::from_millis(100);
+    const MAX_POLL: Duration = Duration::from_secs(1);
+
+    let version_url = format!("http://127.0.0.1:{port}/json/version");
+    let Ok(Ok(resp)) = tokio::time::timeout(
+      Duration::from_secs(2),
+      self.http_client.get(&version_url).send(),
+    )
+    .await
+    else {
+      return false;
+    };
+    let Ok(body) = resp.json::<serde_json::Value>().await else {
+      return false;
+    };
+    let Some(ws) = body.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) else {
+      return false;
+    };
+
+    // The socket dies with the browser, so an error here is as likely to mean
+    // "it worked" as "it failed" — the process check below is what decides.
+    let _ = self.send_cdp_command(ws, "Browser.close", json!({})).await;
+
+    let Some(pid) = pid else {
+      // 没有 PID 就无从确认，只能按「没关成」处理，让调用方去强杀。
+      return false;
+    };
+    let deadline = tokio::time::Instant::now() + GRACEFUL_SHUTDOWN_WAIT;
+    let mut poll = FIRST_POLL;
+    while tokio::time::Instant::now() < deadline {
+      if !crate::proxy_storage::is_process_running(pid) {
+        return true;
+      }
+      tokio::time::sleep(poll).await;
+      poll = (poll * 2).min(MAX_POLL);
+    }
+    // 最后再看一眼：上面那次 sleep 可能刚好跨过了退出的瞬间。
+    !crate::proxy_storage::is_process_running(pid)
   }
 
   /// Opens a URL in a new tab for an existing Wayfern instance.
@@ -1423,6 +1605,95 @@ impl WayfernManager {
       .await,
       Ok(Ok(_))
     )
+  }
+
+  /// Whether Marine's discovery bridge has completed its bootstrap in the
+  /// selected tab.
+  ///
+  /// A responsive renderer is not enough: real runs have sat on a healthy old
+  /// page for minutes after a lost navigation/content-script injection.  The
+  /// Injection alone is insufficient: the MV3 worker may fail to wake or may
+  /// be unable to authenticate to the local API while the isolated script is
+  /// otherwise healthy.  Discovery therefore stamps
+  /// `data-marine-prospect-ready=1` only after its worker/API handshake, or a
+  /// `data-marine-prospect-failed` reason after bootstrap retries are spent.
+  /// We read those markers through `DOM.getDocument` because
+  /// `Runtime.evaluate` is blocked by Wayfern's capability gate.
+  pub async fn marine_automation_readiness(
+    &self,
+    profile_path: &str,
+    target_id: Option<&str>,
+  ) -> MarineAutomationReadiness {
+    let Some(targets) = self.list_page_targets(profile_path).await else {
+      return MarineAutomationReadiness::Pending;
+    };
+    let Some(target) = target_id
+      .and_then(|id| targets.iter().find(|t| t.id == id))
+      .or_else(|| targets.first())
+    else {
+      return MarineAutomationReadiness::Pending;
+    };
+    let Some(ws) = target.websocket_debugger_url.as_deref() else {
+      return MarineAutomationReadiness::Pending;
+    };
+    let result = match tokio::time::timeout(
+      Duration::from_secs(5),
+      self.send_cdp_command(
+        ws,
+        "DOM.getDocument",
+        json!({ "depth": 1, "pierce": false }),
+      ),
+    )
+    .await
+    {
+      Ok(Ok(value)) => value,
+      _ => return MarineAutomationReadiness::Pending,
+    };
+    if Self::cdp_tree_has_attribute(&result, "data-marine-prospect-ready", "1") {
+      return MarineAutomationReadiness::Ready;
+    }
+    if let Some(reason) = Self::cdp_tree_attribute_value(&result, "data-marine-prospect-failed") {
+      return MarineAutomationReadiness::Failed(reason);
+    }
+    MarineAutomationReadiness::Pending
+  }
+
+  fn cdp_tree_attribute_value(value: &serde_json::Value, name: &str) -> Option<String> {
+    if let Some(attributes) = value.get("attributes").and_then(|v| v.as_array()) {
+      for pair in attributes.chunks_exact(2) {
+        if pair[0].as_str() == Some(name) {
+          return pair[1].as_str().map(str::to_string);
+        }
+      }
+    }
+    match value {
+      serde_json::Value::Array(values) => values
+        .iter()
+        .find_map(|v| Self::cdp_tree_attribute_value(v, name)),
+      serde_json::Value::Object(values) => values
+        .values()
+        .find_map(|v| Self::cdp_tree_attribute_value(v, name)),
+      _ => None,
+    }
+  }
+
+  fn cdp_tree_has_attribute(value: &serde_json::Value, name: &str, expected: &str) -> bool {
+    if let Some(attributes) = value.get("attributes").and_then(|v| v.as_array()) {
+      for pair in attributes.chunks_exact(2) {
+        if pair[0].as_str() == Some(name) && pair[1].as_str() == Some(expected) {
+          return true;
+        }
+      }
+    }
+    match value {
+      serde_json::Value::Array(values) => values
+        .iter()
+        .any(|v| Self::cdp_tree_has_attribute(v, name, expected)),
+      serde_json::Value::Object(values) => values
+        .values()
+        .any(|v| Self::cdp_tree_has_attribute(v, name, expected)),
+      _ => false,
+    }
   }
 
   /// 把标签页收敛到只剩 `keep_id` 一个，返回关掉了几个。
@@ -1699,6 +1970,7 @@ impl WayfernManager {
         &[],
         None,
         false,
+        true,
       )
       .await
   }
@@ -1799,6 +2071,51 @@ mod tests {
     assert_eq!(
       WayfernManager::window_size_from_fingerprint("not json"),
       None
+    );
+  }
+
+  #[test]
+  fn stored_fingerprint_parse_reports_invalid_json() {
+    assert!(WayfernManager::parse_stored_fingerprint("not json").is_err());
+    assert_eq!(
+      WayfernManager::parse_stored_fingerprint(r#"{"fingerprint":{"timezone":"UTC"}}"#).unwrap()
+        ["fingerprint"]["timezone"],
+      "UTC"
+    );
+  }
+
+  #[test]
+  fn marine_readiness_markers_are_found_in_cdp_document_tree() {
+    let ready = serde_json::json!({
+      "root": {
+        "nodeName": "#document",
+        "children": [{
+          "nodeName": "HTML",
+          "attributes": ["lang", "zh-CN", "data-marine-prospect-ready", "1"]
+        }]
+      }
+    });
+    assert!(WayfernManager::cdp_tree_has_attribute(
+      &ready,
+      "data-marine-prospect-ready",
+      "1"
+    ));
+    assert!(!WayfernManager::cdp_tree_has_attribute(
+      &ready,
+      "data-marine-prospect-ready",
+      "0"
+    ));
+
+    let failed = serde_json::json!({
+      "root": {
+        "children": [{
+          "attributes": ["data-marine-prospect-failed", "phase_a"]
+        }]
+      }
+    });
+    assert_eq!(
+      WayfernManager::cdp_tree_attribute_value(&failed, "data-marine-prospect-failed").as_deref(),
+      Some("phase_a")
     );
   }
 }

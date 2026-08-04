@@ -1838,7 +1838,8 @@
     "marineDiscoveryAlreadyRunning": "Ya hay una ejecución de descubrimiento en curso.",
     "marineDiscoveryEmptyPlan": "Elige al menos un perfil y una plataforma.",
     "marineDiscoveryEmptyKeyword": "Introduce una palabra clave de búsqueda.",
-    "marineDiscoveryProfileNotFound": "Uno de los perfiles seleccionados ya no existe."
+    "marineDiscoveryProfileNotFound": "Uno de los perfiles seleccionados ya no existe.",
+    "marineDiscoveryProfileCrossOs": "El perfil «{{name}}» se creó en otro sistema operativo y no puede ejecutarse aquí. Crea un perfil nuevo en este equipo y vuelve a iniciar sesión."
   },
   "rail": {
     "profiles": "Perfiles",
@@ -2207,7 +2208,7 @@
       "run": {
         "label": "Ejecución automática",
         "title": "Ejecutar descubrimiento",
-        "description": "Abre cada perfil por turno, trabaja una plataforma a la vez y lo cierra antes de continuar; nunca dos a la vez. La ejecución se detiene tras escribir el borrador en el cuadro de comentarios: no lo envía.",
+        "description": "Abre cada perfil por turno y trabaja una plataforma a la vez; nunca dos a la vez. Tras verificar el borrador completo, envía el comentario y espera la confirmación de la plataforma.",
         "keyword": "Palabra clave",
         "keywordPlaceholder": "p. ej. herramientas de investigación",
         "platforms": "Plataformas",
@@ -2242,7 +2243,8 @@
       },
       "stats": {
         "label": "Resumen del registro",
-        "posted": "Publicados"
+        "posted": "Publicados",
+        "unconfirmed": "Pendientes de confirmar"
       },
       "filters": {
         "label": "Filtros del registro",
@@ -2255,7 +2257,7 @@
         "keywords": "Palabra clave",
         "accounts": "Cuentas",
         "open": "Abrir en el navegador",
-        "postedAt": "Publicado"
+        "postedAt": "Registrado"
       },
       "empty": {
         "title": "El registro aún está vacío",

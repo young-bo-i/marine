@@ -1838,7 +1838,8 @@
     "marineDiscoveryAlreadyRunning": "すでに発見処理が実行中です。",
     "marineDiscoveryEmptyPlan": "プロファイルとプラットフォームを 1 つ以上選んでください。",
     "marineDiscoveryEmptyKeyword": "検索キーワードを入力してください。",
-    "marineDiscoveryProfileNotFound": "選択したプロファイルの 1 つが存在しません。"
+    "marineDiscoveryProfileNotFound": "選択したプロファイルの 1 つが存在しません。",
+    "marineDiscoveryProfileCrossOs": "プロファイル「{{name}}」は別のオペレーティングシステムで作成されたため、ここでは実行できません。このマシンで新しいプロファイルを作成し、再度サインインしてください。"
   },
   "rail": {
     "profiles": "プロファイル",
@@ -2207,7 +2208,7 @@
       "run": {
         "label": "自動実行",
         "title": "自動で 1 周まわす",
-        "description": "プロファイルを順番に開き、1 つのプラットフォームずつ処理し、閉じてから次に進みます。同時に 2 つは開きません。コメント欄に下書きを入力したところで停止し、送信はしません。",
+        "description": "プロファイルを順番に開き、1 つのプラットフォームずつ処理します。同時に 2 つは開きません。完成した下書きを照合した後、コメントを送信し、プラットフォームの受領確認を待ちます。",
         "keyword": "キーワード",
         "keywordPlaceholder": "例: 研究ツール",
         "platforms": "プラットフォーム",
@@ -2242,7 +2243,8 @@
       },
       "stats": {
         "label": "台帳サマリー",
-        "posted": "投稿済み"
+        "posted": "投稿済み",
+        "unconfirmed": "確認待ち"
       },
       "filters": {
         "label": "台帳フィルター",
@@ -2255,7 +2257,7 @@
         "keywords": "キーワード",
         "accounts": "アカウント",
         "open": "ブラウザーで開く",
-        "postedAt": "投稿日時"
+        "postedAt": "記録日時"
       },
       "empty": {
         "title": "台帳はまだ空です",

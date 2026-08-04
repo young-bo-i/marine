@@ -36,6 +36,12 @@ pub struct BrowserRunner {
   /// awaiting the inner mutex.
   teardown_locks:
     std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+  /// Serialize launch entry points for the same profile.  In particular, the
+  /// discovery scheduler must be able to re-check that a profile is still
+  /// cold and, on failure, clean up only the resources it created without a
+  /// manual/API launch racing into that ownership window.
+  launch_locks:
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
   /// Profile ids whose launch has spawned a browser but not yet registered it.
   /// The launch path spawns the process long before it inserts the instance
   /// (a CDP-ready wait of up to 60s sits in between). No teardown may run in
@@ -65,6 +71,13 @@ pub struct LaunchInFlight {
   profile_id: String,
 }
 
+#[derive(Clone, Copy)]
+struct BrowserLaunchOptions {
+  remote_debugging_port: Option<u16>,
+  headless: bool,
+  restore_last_session: bool,
+}
+
 impl Drop for LaunchInFlight {
   fn drop(&mut self) {
     if let Ok(mut set) = BrowserRunner::instance().launching.lock() {
@@ -83,6 +96,7 @@ impl BrowserRunner {
       wayfern_manager: WayfernManager::instance(),
       zero_window_ticks: std::sync::Mutex::new(std::collections::HashMap::new()),
       teardown_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+      launch_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
       launching: std::sync::Mutex::new(std::collections::HashSet::new()),
     }
   }
@@ -92,6 +106,17 @@ impl BrowserRunner {
   async fn teardown_guard(&self, profile_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
     let lock = {
       let mut map = self.teardown_locks.lock().unwrap();
+      map
+        .entry(profile_id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+    };
+    lock.lock_owned().await
+  }
+
+  async fn launch_guard(&self, profile_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = {
+      let mut map = self.launch_locks.lock().unwrap();
       map
         .entry(profile_id.to_string())
         .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
@@ -236,9 +261,48 @@ impl BrowserRunner {
   ) -> Result<Option<ProxySettings>, String> {
     Self::fire_launch_hook(profile);
 
-    self
+    let resolved = self
       .resolve_proxy_with_refresh(profile.proxy_id.as_ref(), Some(&profile.id.to_string()))
-      .await
+      .await?;
+
+    // 「配了代理但解析不到」绝不能和「没配代理」走同一条路。两者都返回 None，
+    // 而 None 在下游只有一个意思：DIRECT。浏览器照常起来，指纹仍按代理的地理
+    // 位置伪造，流量却带着操作员的真实 IP 发出去 —— 对做账号运营的人来说这是
+    // 最贵的一种失败，而且不报错。云代理在启动前会刷新一次凭据，那一次网络抖动
+    // 就足以让 stored_proxies 里的记录被移除，所以这条路径是常态而非边角。
+    if profile.proxy_id.is_some() && resolved.is_none() {
+      log::error!(
+        "Refusing to launch profile {} (ID: {}): proxy {} could not be resolved; launching would connect directly",
+        profile.name,
+        profile.id,
+        profile.proxy_id.as_deref().unwrap_or("<unknown>")
+      );
+      return Err(serde_json::json!({ "code": "PROXY_NOT_FOUND" }).to_string());
+    }
+
+    Ok(resolved)
+  }
+
+  /// 同一条铁律的 VPN 版本，见 [`Self::resolve_launch_proxy`]。
+  fn vpn_upstream_required(
+    profile: &BrowserProfile,
+    port: Option<u16>,
+  ) -> Result<ProxySettings, String> {
+    let Some(port) = port else {
+      log::error!(
+        "Refusing to launch profile {} (ID: {}): VPN worker reported no local port; launching would connect directly",
+        profile.name,
+        profile.id
+      );
+      return Err(serde_json::json!({ "code": "VPN_NOT_WORKING" }).to_string());
+    };
+    Ok(ProxySettings {
+      proxy_type: "socks5".to_string(),
+      host: "127.0.0.1".to_string(),
+      port,
+      username: None,
+      password: None,
+    })
   }
 
   /// Get the executable path for a browser profile
@@ -271,7 +335,17 @@ impl BrowserRunner {
     local_proxy_settings: Option<&ProxySettings>,
   ) -> Result<BrowserProfile, Box<dyn std::error::Error + Send + Sync>> {
     self
-      .launch_browser_internal(app_handle, profile, url, local_proxy_settings, None, false)
+      .launch_browser_internal(
+        app_handle,
+        profile,
+        url,
+        local_proxy_settings,
+        BrowserLaunchOptions {
+          remote_debugging_port: None,
+          headless: false,
+          restore_last_session: true,
+        },
+      )
       .await
   }
 
@@ -281,9 +355,13 @@ impl BrowserRunner {
     profile: &BrowserProfile,
     url: Option<String>,
     _local_proxy_settings: Option<&ProxySettings>,
-    remote_debugging_port: Option<u16>,
-    headless: bool,
+    options: BrowserLaunchOptions,
   ) -> Result<BrowserProfile, Box<dyn std::error::Error + Send + Sync>> {
+    let BrowserLaunchOptions {
+      remote_debugging_port,
+      headless,
+      restore_last_session,
+    } = options;
     // Handle Camoufox profiles using CamoufoxManager
     if profile.browser == "camoufox" {
       // Get or create camoufox config
@@ -306,16 +384,12 @@ impl BrowserRunner {
         if let Some(ref vpn_id) = profile.vpn_id {
           match crate::vpn_worker_runner::start_vpn_worker(vpn_id).await {
             Ok(vpn_worker) => {
-              if let Some(port) = vpn_worker.local_port {
-                upstream_proxy = Some(ProxySettings {
-                  proxy_type: "socks5".to_string(),
-                  host: "127.0.0.1".to_string(),
-                  port,
-                  username: None,
-                  password: None,
-                });
-                log::info!("VPN worker started for Camoufox profile on port {}", port);
-              }
+              let settings = Self::vpn_upstream_required(profile, vpn_worker.local_port)?;
+              log::info!(
+                "VPN worker started for Camoufox profile on port {}",
+                settings.port
+              );
+              upstream_proxy = Some(settings);
             }
             Err(e) => {
               return Err(format!("Failed to start VPN worker: {e}").into());
@@ -486,11 +560,15 @@ impl BrowserRunner {
       updated_profile.process_id = Some(process_id);
       updated_profile.last_launch = Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
 
-      // Update the proxy manager with the correct PID
-      if let Err(e) = PROXY_MANAGER.update_proxy_pid(0, process_id) {
+      // Re-key the worker from its launch placeholder onto the real PID. Keyed
+      // by profile, never by the placeholder value: concurrent launches each
+      // hold a different one.
+      if let Err(e) =
+        PROXY_MANAGER.update_proxy_pid_for_profile(&profile.id.to_string(), process_id)
+      {
         log::warn!("Warning: Failed to update proxy PID mapping: {e}");
       } else {
-        log::info!("Updated proxy PID mapping from temp (0) to actual PID: {process_id}");
+        log::info!("Updated proxy PID mapping to actual PID: {process_id}");
       }
 
       // Persist the real browser PID so the detached proxy worker self-reaps
@@ -579,16 +657,12 @@ impl BrowserRunner {
         if let Some(ref vpn_id) = profile.vpn_id {
           match crate::vpn_worker_runner::start_vpn_worker(vpn_id).await {
             Ok(vpn_worker) => {
-              if let Some(port) = vpn_worker.local_port {
-                upstream_proxy = Some(ProxySettings {
-                  proxy_type: "socks5".to_string(),
-                  host: "127.0.0.1".to_string(),
-                  port,
-                  username: None,
-                  password: None,
-                });
-                log::info!("VPN worker started for Wayfern profile on port {}", port);
-              }
+              let settings = Self::vpn_upstream_required(profile, vpn_worker.local_port)?;
+              log::info!(
+                "VPN worker started for Wayfern profile on port {}",
+                settings.port
+              );
+              upstream_proxy = Some(settings);
             }
             Err(e) => {
               return Err(format!("Failed to start VPN worker: {e}").into());
@@ -835,6 +909,11 @@ impl BrowserRunner {
           "Marine: loaded 截流 extension for profile {}",
           updated_profile.name
         );
+      } else if !restore_last_session {
+        // A discovery launch without the bundled extension can only sit on the
+        // search page until the leg timeout.  Manual launches remain usable in
+        // degraded mode; automation must fail before spawning Chromium.
+        return Err("Marine extension/runtime API is not ready for automation".into());
       }
 
       // Drop-guard covering the whole spawn -> register -> persist window that
@@ -860,6 +939,7 @@ impl BrowserRunner {
           &extension_paths,
           remote_debugging_port,
           headless,
+          restore_last_session,
         )
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -892,11 +972,15 @@ impl BrowserRunner {
       updated_profile.process_id = Some(process_id);
       updated_profile.last_launch = Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
 
-      // Update the proxy manager with the correct PID
-      if let Err(e) = PROXY_MANAGER.update_proxy_pid(0, process_id) {
+      // Re-key the worker from its launch placeholder onto the real PID. Keyed
+      // by profile, never by the placeholder value: concurrent launches each
+      // hold a different one.
+      if let Err(e) =
+        PROXY_MANAGER.update_proxy_pid_for_profile(&profile.id.to_string(), process_id)
+      {
         log::warn!("Warning: Failed to update proxy PID mapping: {e}");
       } else {
-        log::info!("Updated proxy PID mapping from temp (0) to actual PID: {process_id}");
+        log::info!("Updated proxy PID mapping to actual PID: {process_id}");
       }
 
       // Persist the real browser PID so the detached proxy worker self-reaps
@@ -914,7 +998,16 @@ impl BrowserRunner {
           .map(|f| f.len())
           .unwrap_or(0)
       );
-      self.save_process_info(&updated_profile)?;
+      if let Err(e) = self.save_process_info(&updated_profile) {
+        // The process is already registered by this point.  Returning through
+        // `?` would report launch failure while leaving a fully usable browser
+        // detached from profile state; the next launch may then adopt it and
+        // create two automation sessions for one account.
+        if let Err(stop_err) = self.wayfern_manager.stop_wayfern(&wayfern_result.id).await {
+          log::warn!("Failed to stop Wayfern after process-info persistence failed: {stop_err}");
+        }
+        return Err(format!("Failed to save Wayfern process info: {e}").into());
+      }
       // No tag rebuild here — see the matching note on the Camoufox launch path.
       log::info!(
         "Successfully saved profile with process info: {}",
@@ -1070,6 +1163,7 @@ impl BrowserRunner {
     url: Option<String>,
     remote_debugging_port: Option<u16>,
     headless: bool,
+    restore_last_session: bool,
   ) -> Result<BrowserProfile, Box<dyn std::error::Error + Send + Sync>> {
     // Camoufox and Wayfern start (and PID-reconcile) their own local proxy
     // inside `launch_browser_internal`, so we hand it None here rather than
@@ -1080,8 +1174,11 @@ impl BrowserRunner {
         profile,
         url,
         None,
-        remote_debugging_port,
-        headless,
+        BrowserLaunchOptions {
+          remote_debugging_port,
+          headless,
+          restore_last_session,
+        },
       )
       .await
   }
@@ -1092,6 +1189,19 @@ impl BrowserRunner {
     profile: &BrowserProfile,
     url: Option<String>,
     internal_proxy_settings: Option<&ProxySettings>,
+  ) -> Result<BrowserProfile, Box<dyn std::error::Error + Send + Sync>> {
+    self
+      .launch_or_open_url_with_restore(app_handle, profile, url, internal_proxy_settings, true)
+      .await
+  }
+
+  async fn launch_or_open_url_with_restore(
+    &self,
+    app_handle: tauri::AppHandle,
+    profile: &BrowserProfile,
+    url: Option<String>,
+    internal_proxy_settings: Option<&ProxySettings>,
+    restore_last_session: bool,
   ) -> Result<BrowserProfile, Box<dyn std::error::Error + Send + Sync>> {
     log::info!(
       "launch_or_open_url called for profile: {} (ID: {})",
@@ -1173,8 +1283,11 @@ impl BrowserRunner {
                 &final_profile,
                 url,
                 internal_proxy_settings,
-                None,
-                false,
+                BrowserLaunchOptions {
+                  remote_debugging_port: None,
+                  headless: false,
+                  restore_last_session,
+                },
               )
               .await
           }
@@ -1182,14 +1295,30 @@ impl BrowserRunner {
       } else {
         // This case shouldn't happen since we checked is_some() above, but handle it gracefully
         log::info!("URL was unexpectedly None, launching new browser instance");
-        self
-          .launch_browser(
-            app_handle.clone(),
-            &final_profile,
-            url,
-            internal_proxy_settings,
-          )
-          .await
+        if restore_last_session {
+          self
+            .launch_browser(
+              app_handle.clone(),
+              &final_profile,
+              url,
+              internal_proxy_settings,
+            )
+            .await
+        } else {
+          self
+            .launch_browser_internal(
+              app_handle.clone(),
+              &final_profile,
+              url,
+              internal_proxy_settings,
+              BrowserLaunchOptions {
+                remote_debugging_port: None,
+                headless: false,
+                restore_last_session: false,
+              },
+            )
+            .await
+        }
       }
     } else {
       // Browser is not running or no URL provided, launch new instance
@@ -1204,8 +1333,11 @@ impl BrowserRunner {
           &final_profile,
           url,
           internal_proxy_settings,
-          None,
-          false,
+          BrowserLaunchOptions {
+            remote_debugging_port: None,
+            headless: false,
+            restore_last_session,
+          },
         )
         .await
     }
@@ -2733,6 +2865,206 @@ pub async fn launch_browser_profile(
   launch_browser_profile_impl(app_handle, profile, url, None, false, false).await
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LaunchFailureCleanup {
+  PreserveExisting,
+  RollbackOwnedAutomation,
+}
+
+struct ProfileLaunchOptions {
+  url: Option<String>,
+  remote_debugging_port: Option<u16>,
+  headless: bool,
+  force_new: bool,
+  restore_last_session: bool,
+  failure_cleanup: LaunchFailureCleanup,
+}
+
+#[derive(Default)]
+struct LaunchResourceSnapshot {
+  process_ids: std::collections::HashSet<u32>,
+  proxy_ids: std::collections::HashSet<String>,
+  active_proxy_id: Option<String>,
+}
+
+impl LaunchResourceSnapshot {
+  fn capture(profile: &BrowserProfile) -> Self {
+    Self {
+      process_ids: profile_process_ids(profile),
+      proxy_ids: profile_proxy_ids(&profile.id.to_string()),
+      active_proxy_id: PROXY_MANAGER.active_proxy_id_for_profile(&profile.id.to_string()),
+    }
+  }
+}
+
+fn normalized_path(path: &std::path::Path) -> PathBuf {
+  path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn profile_launch_paths(profile: &BrowserProfile) -> Vec<PathBuf> {
+  let profiles_dir = BrowserRunner::instance().profile_manager.get_profiles_dir();
+  let mut paths = vec![normalized_path(
+    &profile.get_profile_data_path(&profiles_dir),
+  )];
+  let effective = normalized_path(&crate::ephemeral_dirs::get_effective_profile_path(
+    profile,
+    &profiles_dir,
+  ));
+  if !paths.contains(&effective) {
+    paths.push(effective);
+  }
+  paths
+}
+
+fn command_line_uses_profile(cmd: &[std::ffi::OsString], paths: &[PathBuf]) -> bool {
+  for (index, arg) in cmd.iter().enumerate() {
+    let Some(arg) = arg.to_str() else { continue };
+    let candidate = if let Some(path) = arg.strip_prefix("--user-data-dir=") {
+      Some(path)
+    } else if arg == "-profile" {
+      cmd.get(index + 1).and_then(|next| next.to_str())
+    } else {
+      None
+    };
+    if candidate.is_some_and(|candidate| {
+      let candidate = normalized_path(std::path::Path::new(candidate));
+      paths.contains(&candidate)
+    }) {
+      return true;
+    }
+  }
+  false
+}
+
+fn profile_process_ids(profile: &BrowserProfile) -> std::collections::HashSet<u32> {
+  let paths = profile_launch_paths(profile);
+  let system = System::new_all();
+  system
+    .processes()
+    .iter()
+    .filter_map(|(pid, process)| {
+      command_line_uses_profile(process.cmd(), &paths).then_some(pid.as_u32())
+    })
+    .collect()
+}
+
+/// Live PIDs that are provably a browser we launched for one of `profiles`,
+/// paired with when each started.
+///
+/// Identity comes from the profile directory on the process's own command line,
+/// never from a PID remembered in `metadata.json`. A remembered PID is a claim
+/// about the past: the browser may have crashed, and on Windows — where the PID
+/// pool is small and recycled fast — that number is quite likely to belong to
+/// something else by now. Killing on that basis takes an unrelated process down.
+///
+/// One process-table scan for all profiles; the caller is running inside
+/// `RunEvent::Exit` and does not get to spend a scan per profile.
+pub(crate) fn launched_browser_roots(profiles: &[BrowserProfile]) -> Vec<(u32, u64)> {
+  let paths: Vec<PathBuf> = profiles.iter().flat_map(profile_launch_paths).collect();
+  if paths.is_empty() {
+    return Vec::new();
+  }
+  let system = System::new_all();
+  system
+    .processes()
+    .iter()
+    .filter(|&(_pid, process)| command_line_uses_profile(process.cmd(), &paths))
+    .map(|(pid, process)| (pid.as_u32(), process.start_time()))
+    .collect()
+}
+
+fn profile_proxy_ids(profile_id: &str) -> std::collections::HashSet<String> {
+  crate::proxy_storage::list_proxy_configs()
+    .into_iter()
+    .filter(|config| config.profile_id.as_deref() == Some(profile_id))
+    .map(|config| config.id)
+    .collect()
+}
+
+async fn stop_owned_process(pid: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+  #[cfg(target_os = "macos")]
+  return platform_browser::macos::kill_browser_process_impl(pid, None).await;
+
+  #[cfg(target_os = "windows")]
+  return platform_browser::windows::kill_browser_process_impl(pid).await;
+
+  #[cfg(target_os = "linux")]
+  return platform_browser::linux::kill_browser_process_impl(pid, None).await;
+
+  #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+  Err("Unsupported platform".into())
+}
+
+async fn rollback_owned_automation_launch(
+  app_handle: &tauri::AppHandle,
+  profile: &BrowserProfile,
+  before: LaunchResourceSnapshot,
+  sync_marked_running: bool,
+) {
+  // The shared per-profile launch guard is still held here, and automation
+  // performed a second occupancy check inside that guard before `before` was
+  // captured.  Consequently every process in this set difference belongs to
+  // this cold-start attempt; a live manual/API browser can never be selected.
+  let profile_id = profile.id.to_string();
+  let prior_active_proxy_id = before.active_proxy_id.clone();
+
+  let after_processes = profile_process_ids(profile);
+  for pid in after_processes.difference(&before.process_ids).copied() {
+    if let Err(e) = stop_owned_process(pid).await {
+      log::warn!("Failed to stop automation-owned browser PID {pid}: {e}");
+    }
+  }
+
+  let after_proxies = profile_proxy_ids(&profile_id);
+  for proxy_id in after_proxies.difference(&before.proxy_ids) {
+    if let Err(e) = PROXY_MANAGER
+      .stop_proxy_by_id(app_handle.clone(), proxy_id)
+      .await
+    {
+      log::warn!("Failed to stop automation-owned proxy {proxy_id} for {profile_id}: {e}");
+    }
+  }
+  if let Some(proxy_id) = prior_active_proxy_id {
+    if PROXY_MANAGER.restore_profile_proxy_mapping_if_absent(&profile_id, &proxy_id) {
+      log::info!(
+        "Restored prior proxy mapping {proxy_id} after failed automation launch for {profile_id}"
+      );
+    }
+  }
+
+  crate::team_lock::release_team_lock_if_needed(profile).await;
+  if sync_marked_running {
+    if let Some(scheduler) = crate::sync::get_global_scheduler() {
+      scheduler.mark_profile_stopped(&profile_id).await;
+    }
+  }
+}
+
+/// Launch a browser session owned by the discovery scheduler.
+///
+/// Automation starts clean instead of restoring every historical tab.  Apart
+/// from avoiding unrelated content scripts claiming work, this keeps launch
+/// time bounded: generic Wayfern startup applies several CDP commands to every
+/// restored page before returning.
+pub async fn launch_browser_profile_for_automation(
+  app_handle: tauri::AppHandle,
+  profile: BrowserProfile,
+) -> Result<BrowserProfile, String> {
+  launch_browser_profile_impl_with_restore(
+    app_handle,
+    profile,
+    ProfileLaunchOptions {
+      url: None,
+      remote_debugging_port: None,
+      headless: false,
+      force_new: false,
+      restore_last_session: false,
+      failure_cleanup: LaunchFailureCleanup::RollbackOwnedAutomation,
+    },
+  )
+  .await
+}
+
 pub async fn launch_browser_profile_impl(
   app_handle: tauri::AppHandle,
   profile: BrowserProfile,
@@ -2741,6 +3073,34 @@ pub async fn launch_browser_profile_impl(
   headless: bool,
   force_new: bool,
 ) -> Result<BrowserProfile, String> {
+  launch_browser_profile_impl_with_restore(
+    app_handle,
+    profile,
+    ProfileLaunchOptions {
+      url,
+      remote_debugging_port,
+      headless,
+      force_new,
+      restore_last_session: true,
+      failure_cleanup: LaunchFailureCleanup::PreserveExisting,
+    },
+  )
+  .await
+}
+
+async fn launch_browser_profile_impl_with_restore(
+  app_handle: tauri::AppHandle,
+  profile: BrowserProfile,
+  options: ProfileLaunchOptions,
+) -> Result<BrowserProfile, String> {
+  let ProfileLaunchOptions {
+    url,
+    remote_debugging_port,
+    headless,
+    force_new,
+    restore_last_session,
+    failure_cleanup,
+  } = options;
   log::info!(
     "Launch request received for profile: {} (ID: {})",
     profile.name,
@@ -2755,19 +3115,57 @@ pub async fn launch_browser_profile_impl(
     ));
   }
 
+  let browser_runner = BrowserRunner::instance();
+  // Both manual/API and automation launches take this same guard.  The
+  // automation occupancy check and its failure cleanup therefore describe one
+  // uninterrupted ownership window, without taking the teardown mutex (which
+  // the status check may itself need).
+  let _launch_guard = browser_runner.launch_guard(&profile.id.to_string()).await;
+
+  let owned_snapshot = if failure_cleanup == LaunchFailureCleanup::RollbackOwnedAutomation {
+    match browser_runner
+      .check_browser_status(app_handle.clone(), &profile)
+      .await
+    {
+      Ok(false) => {}
+      Ok(true) => {
+        return Err(format!(
+          "Automation launch aborted because profile '{}' became occupied",
+          profile.name
+        ));
+      }
+      Err(e) => {
+        return Err(format!(
+          "Automation launch aborted because profile '{}' status could not be verified: {e}",
+          profile.name
+        ));
+      }
+    }
+    let snapshot = LaunchResourceSnapshot::capture(&profile);
+    if !snapshot.process_ids.is_empty() {
+      return Err(format!(
+        "Automation launch aborted because profile '{}' became occupied",
+        profile.name
+      ));
+    }
+    Some(snapshot)
+  } else {
+    None
+  };
+
   // Team lock check: if profile is sync-enabled and user is on a team, acquire lock
   crate::team_lock::acquire_team_lock_if_needed(&profile).await?;
 
   // Notify sync scheduler that profile is now running and queue sync for when it stops
+  let mut sync_marked_running = false;
   if let Some(scheduler) = crate::sync::get_global_scheduler() {
     let pid = profile.id.to_string();
     scheduler.mark_profile_running(&pid).await;
+    sync_marked_running = true;
     if profile.is_sync_enabled() {
       scheduler.queue_profile_sync(pid).await;
     }
   }
-
-  let browser_runner = BrowserRunner::instance();
 
   // Resolve the most up-to-date profile from disk by ID to avoid using stale proxy_id/browser state
   let profile_for_launch = match browser_runner
@@ -2780,6 +3178,10 @@ pub async fn launch_browser_profile_impl(
       .find(|p| p.id == profile.id)
       .unwrap_or_else(|| profile.clone()),
     Err(e) => {
+      if let Some(snapshot) = owned_snapshot {
+        rollback_owned_automation_launch(&app_handle, &profile, snapshot, sync_marked_running)
+          .await;
+      }
       return Err(e);
     }
   };
@@ -2812,39 +3214,76 @@ pub async fn launch_browser_profile_impl(
         url,
         remote_debugging_port,
         headless,
+        restore_last_session,
       )
       .await
   } else {
     browser_runner
-      .launch_or_open_url(app_handle.clone(), &profile_for_launch, url, None)
+      .launch_or_open_url_with_restore(
+        app_handle.clone(),
+        &profile_for_launch,
+        url,
+        None,
+        restore_last_session,
+      )
       .await
   };
-  let updated_profile = launch_result.map_err(|e| {
-    log::info!("Browser launch failed for profile: {}, error: {}", profile_for_launch.name, e);
+  let updated_profile = match launch_result {
+    Ok(profile) => profile,
+    Err(e) => {
+      log::info!(
+        "Browser launch failed for profile: {}, error: {}",
+        profile_for_launch.name,
+        e
+      );
 
-    // Emit a failure event to clear loading states in the frontend
-    #[derive(serde::Serialize)]
-    struct RunningChangedPayload {
-      id: String,
-      is_running: bool,
-    }
-    let payload = RunningChangedPayload {
-      id: profile_for_launch.id.to_string(),
-      is_running: false,
-    };
+      // Compute the user-facing error before the async rollback consumes this
+      // branch.  All launch-side state is released before returning so a
+      // transient failure cannot leave the next run locked or "already
+      // running" with only a detached proxy behind it.
+      let message = if let Some(io_error) = e.downcast_ref::<std::io::Error>() {
+        if io_error.kind() == std::io::ErrorKind::Other
+          && io_error.to_string().contains("Exec format error")
+        {
+          format!(
+            "Failed to launch browser: Executable format error. This browser version is not compatible with your system architecture ({}). Please try a different browser or version that supports your platform.",
+            std::env::consts::ARCH
+          )
+        } else {
+          format!("Failed to launch browser or open URL: {e}")
+        }
+      } else {
+        format!("Failed to launch browser or open URL: {e}")
+      };
 
-    if let Err(e) = events::emit("profile-running-changed", &payload) {
-      log::warn!("Warning: Failed to emit profile running changed event: {e}");
-    }
-
-    // Check if this is an architecture compatibility issue
-    if let Some(io_error) = e.downcast_ref::<std::io::Error>() {
-      if io_error.kind() == std::io::ErrorKind::Other && io_error.to_string().contains("Exec format error") {
-        return format!("Failed to launch browser: Executable format error. This browser version is not compatible with your system architecture ({}). Please try a different browser or version that supports your platform.", std::env::consts::ARCH);
+      if let Some(snapshot) = owned_snapshot {
+        rollback_owned_automation_launch(
+          &app_handle,
+          &profile_for_launch,
+          snapshot,
+          sync_marked_running,
+        )
+        .await;
       }
+
+      // Emit a failure event to clear loading states in the frontend
+      #[derive(serde::Serialize)]
+      struct RunningChangedPayload {
+        id: String,
+        is_running: bool,
+      }
+      let payload = RunningChangedPayload {
+        id: profile_for_launch.id.to_string(),
+        is_running: !profile_process_ids(&profile_for_launch).is_empty(),
+      };
+
+      if let Err(e) = events::emit("profile-running-changed", &payload) {
+        log::warn!("Warning: Failed to emit profile running changed event: {e}");
+      }
+
+      return Err(message);
     }
-    format!("Failed to launch browser or open URL: {e}")
-  })?;
+  };
 
   log::info!(
     "Browser launch completed for profile: {} (ID: {})",
@@ -3052,6 +3491,62 @@ mod concurrency_guard_tests {
     .await
     .expect("a second profile must not be blocked by the first");
     drop((a, b));
+  }
+
+  #[tokio::test]
+  async fn launch_guard_serializes_manual_and_automation_entry_points() {
+    let first = BrowserRunner::instance()
+      .launch_guard("guard-test-launch-owner")
+      .await;
+    let waiter = tokio::spawn(async {
+      BrowserRunner::instance()
+        .launch_guard("guard-test-launch-owner")
+        .await
+    });
+
+    assert!(
+      tokio::time::timeout(std::time::Duration::from_millis(25), waiter)
+        .await
+        .is_err(),
+      "a second launch for the same profile entered the ownership window"
+    );
+    drop(first);
+
+    tokio::time::timeout(
+      std::time::Duration::from_secs(1),
+      BrowserRunner::instance().launch_guard("guard-test-launch-owner"),
+    )
+    .await
+    .expect("the launch guard must be released after the first launch completes");
+  }
+
+  #[test]
+  fn process_ownership_requires_an_exact_profile_argument() {
+    use std::ffi::OsString;
+
+    let paths = vec![PathBuf::from("/tmp/marine-profile-owned")];
+    assert!(command_line_uses_profile(
+      &[
+        OsString::from("wayfern"),
+        OsString::from("--user-data-dir=/tmp/marine-profile-owned"),
+      ],
+      &paths,
+    ));
+    assert!(command_line_uses_profile(
+      &[
+        OsString::from("camoufox"),
+        OsString::from("-profile"),
+        OsString::from("/tmp/marine-profile-owned"),
+      ],
+      &paths,
+    ));
+    assert!(!command_line_uses_profile(
+      &[
+        OsString::from("wayfern"),
+        OsString::from("--user-data-dir=/tmp/marine-profile-owned-by-someone-else"),
+      ],
+      &paths,
+    ));
   }
 
   /// The launch window between spawning the process and registering the

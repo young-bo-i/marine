@@ -15,7 +15,7 @@
 //
 // **终止点是显式配置的**（`stopAfter`），不是硬编码：
 //   'open' —— 打开靶子就停（最早的形态）
-//   'fill' —— 生成话术并填进输入框，**停在点发送的前一步**（当前调试阶段）
+//   'fill' —— 生成话术并填进输入框，**停在点发送的前一步**（fill-only 工作流）
 //   'send' —— 一路发出去
 // 之所以做成配置而不是删掉判断：发送是整条链里唯一不可逆的动作，把它变成一个
 // 一眼可见、可测试的开关，比散落在各处的 if 更难被误改。
@@ -106,6 +106,27 @@ var marineProspectRun = marineProspectRun || {};
     const profileId = deps.profileId;
     if (!profileId) return { status: 'no_profile_id' };
 
+    // 搜索页可能是旧 document/session 恢复出来的，SW 里仍保留着上一条的
+    // pending settlement。必须在当前平台的登录检查之前补记：上一条的
+    // settle 不应被下一平台掉登录阻断。失败时本轮零写入、零 claim。
+    const prior = await recoverSettlementBeforeClaim(deps, platform);
+    if (!prior.ok) {
+      return Object.assign({ platform }, prior.result || { status: 'handoff_read_failed' });
+    }
+    // 同一 scheduler leg 的旧 terminal touch 会让 Rust 下一次 poll 立刻结束并
+    // park about:blank。此时继续 claim/导航新 key，刚写下的新 handoff 会被截断。
+    // blocked 不计该 leg 的完成 touch；跨平台 touch 也不结束当前平台，所以这两类
+    // 仍可继续。其余同平台恢复必须直接终局，等下一轮再 claim。
+    if (prior.recovered && prior.platform === platform &&
+        ['posted', 'unconfirmed', 'skipped', 'filled', 'failed'].indexOf(prior.state) >= 0) {
+      return {
+        status: 'settled_before_claim',
+        platform,
+        key: prior.key,
+        state: prior.state,
+      };
+    }
+
     // ---- 1. 登录 ----------------------------------------------------------
     const login = await deps.login(platform);
     // 只在**不是「已登录」**时上报，让 profile 列表能标出哪个账号在哪个平台掉了。
@@ -164,7 +185,24 @@ var marineProspectRun = marineProspectRun || {};
       // 卡在 claimed 上直到 TTL 过期。
       return { status: 'handoff_write_failed', platform, key: claimed.key };
     }
-    deps.navigate(claimed.open_url);
+    const navigation = await deps.navigate(claimed.open_url, {
+      key: claimed.key,
+      platform,
+      reason: 'claim',
+    });
+    // 真实导航适配层会等 pagehide/unload，而不是看 location.href
+    // 是否提前变了。旧 document 若两个窗口后仍活着，要把它的结构化
+    // 终局传回去，不能误报 claimed 并落幂等标记。
+    if (navigation && (navigation.status === 'target_navigation_stalled' ||
+        navigation.status === 'target_navigation_committed')) {
+      return Object.assign({
+        platform,
+        ingested,
+        count: items.length,
+        title: claimed.title,
+        open_url: claimed.open_url,
+      }, navigation, { key: navigation.key || claimed.key });
+    }
     return {
       status: 'claimed',
       platform,
@@ -183,7 +221,19 @@ var marineProspectRun = marineProspectRun || {};
   // 到的条数不够，canary 就会判 unhealthy —— 这时候把页面标记成跑过，等渲染
   // 完了也永远不会再跑。（实测：知乎自动跑零 API 调用，手动清掉标记重跑一次
   // 立刻 claimed 15 条。B 站是 SSR 所以没暴露这个问题。）
-  const TERMINAL = ['claimed', 'nothing_to_claim', 'not_logged_in'];
+  const TERMINAL = [
+    'claimed',
+    'nothing_to_claim',
+    'not_logged_in',
+    'target_navigation_stalled',
+    // claim 已经发生；重跑整轮只会再 claim 一条，不会修好这一条。
+    'handoff_write_failed',
+    // 已有交接单时必须先消费/恢复它，Phase A 不能用新 claim 覆盖。
+    'handoff_in_progress',
+    'send_already_started',
+    // 同平台旧 pending 已补记；必须等 scheduler 收到这次 touch 后再开下一条。
+    'settled_before_claim',
+  ];
 
   function isTerminal(status) {
     return TERMINAL.indexOf(status) >= 0;
@@ -216,7 +266,7 @@ var marineProspectRun = marineProspectRun || {};
   // 所以第二阶段是独立入口：靠 Phase A 留下的交接单认领自己，再驱动既有的
   // 页内生成链路（marineRimeGenStart 那套：流式产出 + 拟人节奏敲进输入框）。
   //
-  // 终止点由交接单里的 stopAfter 决定，当前是 'fill' —— 敲完就停，不点发送。
+  // 终止点由交接单里的 stopAfter 决定；具备平台回执的站点会继续到 send。
 
   /**
    * 一条腿里最多换几次靶子。
@@ -287,7 +337,7 @@ var marineProspectRun = marineProspectRun || {};
    * 做成一个列表而不是一个全局开关：发送是整条链里唯一不可逆、且会在真实账号
    * 上留下公开痕迹的动作，逐平台放开才能保证每个平台都是「验证过才开」。
    *
-   * 三个平台都实现了回执检测（劫持页面 fetch，判据各不相同）：
+   * 四个平台都实现了回执检测（劫持页面 fetch，判据各不相同）：
    *   B 站：  /x/v2/reply/add 的 `code===0` + 正数 `rpid`
    *   知乎：  /api/v4/comment_v5/{res}/{id}/comment 的 2xx + 正数 `id`
    *   小红书：/api/sns/web/v{n}/comment/{post|create|add} 的 2xx + 正数评论 id
@@ -300,6 +350,23 @@ var marineProspectRun = marineProspectRun || {};
    */
   const SEND_ENABLED_PLATFORMS = ['bilibili', 'zhihu', 'xiaohongshu', 'douyin'];
 
+  // Phase A 写入后正常只需几秒就会被 Phase B 消费。超过这个窗口仍未开始
+  // 发送的交接单大概率是 tab/导航遗留，继续执行反而可能评论到过期页面。
+  // 发送已开始或存在待补 settle 时不适用 TTL：这两种状态是 at-most-once 的
+  // 持久化凭据，清掉它们会导致重复发送或台账永久卡在 claimed。
+  const HANDOFF_TTL_MS = 10 * 60 * 1000;
+  const PENDING_SETTLEMENT_STATES = {
+    posted: 1,
+    unconfirmed: 1,
+    failed: 1,
+    blocked: 1,
+    skipped: 1,
+    filled: 1,
+  };
+  // 最多三次。每次 API 前都会先确认 pendingSettlement 已持久化，
+  // 因此页面在任意退避窗口卸载，新 document 也只会补 settle。
+  const SETTLEMENT_RETRY_DELAYS_MS = [0, 500, 1500, 4000, 8000];
+
   function stopAfterFor(platform) {
     return SEND_ENABLED_PLATFORMS.indexOf(platform) >= 0 ? 'send' : 'fill';
   }
@@ -308,9 +375,11 @@ var marineProspectRun = marineProspectRun || {};
   async function writeHandoff(deps, claim, profileId, stopAfter, hops) {
     const store = storeOf(deps);
     if (!store) return false;
-    // 必须把 write 的结果传回去。忽略它等于「SW 没存下也照样导航」，那正是
-    // 这次要修的失败形态：页面过去了，却没人接手。
+    // 先读后写是最后一道防覆盖闸。Phase A 在 claim 之前会主动恢复
+    // pending settlement，但从预检到这里仍可能有异步状态变化。存在
+    // 任何旧 handoff 时都宁可拒绝，绝不覆盖 sendStarted/pendingSettlement。
     try {
+      if (await store.read()) return false;
       return !!(await store.write({
         key: claim.key, platform: claim.platform, open_url: claim.open_url,
         profileId, stopAfter: stopAfter || stopAfterFor(claim.platform), at: Date.now(),
@@ -327,33 +396,311 @@ var marineProspectRun = marineProspectRun || {};
     try { return (await store.read()) || null; } catch (e) { return null; }
   }
 
-  async function clearHandoff(deps) {
+  // 新文档起来时，MV3 worker 可能还在恢复，chrome.storage.session 也可能正好
+  // 返回一次瞬时错误。一次 read 就把它压成「没有交接单」会让 Phase B 永久消失。
+  // 退避本身不到 1 秒；消息侧另有 1 秒上限，整轮不会因 SW 不回包而无限挂住。
+  const HANDOFF_READ_DELAYS_MS = [0, 100, 250, 500];
+
+  async function readHandoffWithRetry(deps) {
+    deps = deps || {};
     const store = storeOf(deps);
-    if (!store) return;
-    try { await store.clear(); } catch (e) { /* 清不掉不改变本轮结论 */ }
+    if (!store) {
+      return { status: 'handoff_read_failed', handoff: null, attempts: 0, error: 'handoff store unavailable' };
+    }
+    const delays = Array.isArray(deps.handoffReadDelays) && deps.handoffReadDelays.length
+      ? deps.handoffReadDelays
+      : HANDOFF_READ_DELAYS_MS;
+    const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    let lastError = null;
+    let hadSuccessfulRead = false;
+
+    for (let i = 0; i < delays.length; i += 1) {
+      if (i > 0 && Number(delays[i]) > 0) await sleep(Number(delays[i]));
+      try {
+        const handoff = await store.read();
+        hadSuccessfulRead = true;
+        lastError = null;
+        if (handoff) return { status: 'handoff_ready', handoff, attempts: i + 1 };
+      } catch (e) {
+        lastError = String((e && e.message) || e);
+      }
+    }
+
+    return {
+      status: hadSuccessfulRead ? 'no_handoff' : 'handoff_read_failed',
+      handoff: null,
+      attempts: delays.length,
+      error: hadSuccessfulRead ? null : lastError,
+    };
+  }
+
+  async function clearHandoff(deps, handoff) {
+    const store = storeOf(deps);
+    if (!store) return false;
+    try { await store.clear(handoff); return true; } catch (e) { return false; }
+  }
+
+  async function deadLetterHandoff(deps, handoff, reason) {
+    const store = storeOf(deps);
+    if (!store) return false;
+    try {
+      // 浏览器真实 store 会把证据移入按 profile+key 隔离的 local tombstone；
+      // 简单注入 store 没实现 deadLetter 时退回 clear，保持 API 可测试/兼容。
+      if (typeof store.deadLetter === 'function') {
+        await store.deadLetter(handoff, reason);
+      } else {
+        await store.clear(handoff);
+      }
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  async function persistHandoff(deps, handoff) {
+    const store = storeOf(deps);
+    if (!store) return false;
+    try { return !!(await store.write(handoff)); } catch (e) { return false; }
+  }
+
+  function isPendingSettlement(value) {
+    return !!PENDING_SETTLEMENT_STATES[String(value || '')];
+  }
+
+  /**
+   * Phase A 的新 claim 闸：恢复旧 pending settlement，或拒绝覆盖仍在执行的
+   * handoff。恢复复用同一套有界 settle 退避；全部失败也会在
+   * ingest/claim 之前返回，不会领第二条。
+   */
+  async function recoverSettlementBeforeClaim(deps, currentPlatform) {
+    const store = storeOf(deps);
+    if (!store || typeof store.read !== 'function') {
+      return {
+        ok: false,
+        result: { status: 'handoff_read_failed', error: 'handoff store unavailable' },
+      };
+    }
+
+    const read = await readHandoffWithRetry(deps);
+    if (!read.handoff && read.status !== 'no_handoff') {
+      return {
+        ok: false,
+        result: {
+          status: 'handoff_read_failed',
+          attempts: read.attempts,
+          error: read.error,
+        },
+      };
+    }
+    const existing = read.handoff;
+    if (!existing) return { ok: true, recovered: false };
+
+    if (isPendingSettlement(existing.pendingSettlement)) {
+      const state = existing.pendingSettlement;
+      const recovered = await settleAndClear(
+        deps,
+        existing,
+        state,
+        { status: 'settled_before_claim', key: existing.key, state },
+      );
+      if (recovered.status === 'settle_failed') return { ok: false, result: recovered };
+      return {
+        ok: true,
+        recovered: true,
+        state,
+        key: existing.key,
+        platform: existing.platform,
+      };
+    }
+
+    // sendStarted 没有 pending state 是一张不完整但仍然不可覆盖的防重凭据。
+    // 没有权威结果时不猜 posted/failed。
+    if (existing.sendStarted) {
+      return {
+        ok: false,
+        result: { status: 'send_already_started', key: existing.key },
+      };
+    }
+
+    // 跨平台搜索说明 scheduler 已经 park about:blank 并完成了当前 search commit，
+    // 上一平台的旧导航不可能再“晚到”。此时若仍跳回旧平台，scheduler 只等当前
+    // 平台 touch，会白等整腿。安全地把旧 claim 记 failed/clear，再继续当前平台。
+    if (existing.platform && currentPlatform && existing.platform !== currentPlatform) {
+      const abandoned = await settleAndClear(
+        deps,
+        existing,
+        'failed',
+        {
+          status: 'cross_platform_handoff_settled',
+          key: existing.key,
+          platform: existing.platform,
+        },
+      );
+      if (abandoned.status === 'settle_failed') return { ok: false, result: abandoned };
+      return {
+        ok: true,
+        recovered: true,
+        state: 'failed',
+        key: existing.key,
+        platform: existing.platform,
+      };
+    }
+
+    // 同平台普通 pre-send handoff 说明上一条已 claim、但目标 document 没接上。不能 clear：
+    // 第一次导航可能只是晚到，清掉后它一旦 commit 就失去归属；也不能只报
+    // handoff_in_progress 后让后续平台逐条短路。安全恢复方式是保留同一交接单，
+    // 精确重导航到它的 open_url，让 Phase B 在新 document 继续消费。
+    if (existing.open_url && typeof deps.navigate === 'function') {
+      try {
+        const navigation = await deps.navigate(existing.open_url, {
+          key: existing.key,
+          platform: existing.platform,
+          reason: 'handoff_resume',
+        });
+        if (navigation && (navigation.status === 'target_navigation_stalled' ||
+            navigation.status === 'target_navigation_committed')) {
+          return {
+            ok: false,
+            result: Object.assign({
+              key: existing.key,
+              open_url: existing.open_url,
+              resumed: true,
+            }, navigation, { key: navigation.key || existing.key }),
+          };
+        }
+        return {
+          ok: false,
+          result: {
+            status: 'handoff_in_progress',
+            key: existing.key,
+            open_url: existing.open_url,
+            resumeSubmitted: true,
+          },
+        };
+      } catch (e) {
+        return {
+          ok: false,
+          result: {
+            status: 'handoff_in_progress',
+            key: existing.key,
+            open_url: existing.open_url,
+            error: String((e && e.message) || e),
+          },
+        };
+      }
+    }
+
+    return {
+      ok: false,
+      result: { status: 'handoff_in_progress', key: existing.key, open_url: existing.open_url },
+    };
   }
 
   /**
    * 在靶子页跑第二阶段。
    *
-   * 无论成功失败都会 settle 并清掉交接单 —— 失败按运营决定只记录不重试，
-   * 留着交接单只会让下次进这个页面又试一遍。
+   * settle 成功后才清交接单；发送已经开始但落账失败时保留 pendingSettlement，
+   * 让新 document 只补记台账、绝不再次点击。
    */
   async function runOnTarget(deps) {
     deps = deps || {};
     const handoff = deps.handoff !== undefined ? deps.handoff : await readHandoff(deps);
     if (!handoff) return { status: 'no_handoff' };
 
+    // 发送已经发生（或至少已经开始）后，跨 document 只允许补记台账，绝不能再
+    // 生成/点击一次。pendingSettlement 在点击前先保守写成 failed，确认回执后改成
+    // posted；页面中途卸载也始终有一个可恢复且 at-most-once 的状态。
+    if (isPendingSettlement(handoff.pendingSettlement)) {
+      const state = handoff.pendingSettlement;
+      return await settleAndClear(
+        deps,
+        handoff,
+        state,
+        { status: 'settled_after_retry', key: handoff.key, state },
+      );
+    }
+    if (handoff.sendStarted) {
+      return { status: 'send_already_started', key: handoff.key };
+    }
+
+    // 只淘汰尚未进入不可逆阶段的交接单。`at` 是 Phase A 写下的 epoch
+    // milliseconds；缺失、非数值或非正数都不能证明它仍然属于本轮。
+    // 未来时间不主动判死，给系统时钟回拨/修正留余地。
+    if (!handoff.pendingSettlement) {
+      const now = typeof deps.now === 'function' ? deps.now() : Date.now();
+      const at = handoff.at;
+      const expired = typeof at !== 'number' || !Number.isFinite(at) || at <= 0 ||
+        typeof now !== 'number' || !Number.isFinite(now) || now - at > HANDOFF_TTL_MS;
+      if (expired) {
+        await clearHandoff(deps, handoff);
+        return { status: 'handoff_expired', key: handoff.key, at: handoff.at };
+      }
+    }
+
     // 交接单是给某一个 URL 的。SPA 里用户/脚本可能已经点去别处了。
     const href = deps.href || (typeof location !== 'undefined' ? location.href : '');
     if (handoff.open_url && href && !sameTarget(handoff.open_url, href)) {
-      return { status: 'handoff_url_mismatch', expected: handoff.open_url, got: href };
+      const redirects = Number(handoff.mismatchRedirects) || 0;
+      // 平台会自动跳到推荐内容，尤其抖音精选页和 B 站连播。第一次认错页时精确
+      // 拉回 claim 给出的 URL；次数必须先写回 SW，否则新文档又从 0 开始会死循环。
+      if (redirects < 1 && deps.navigate) {
+        const repaired = Object.assign({}, handoff, { mismatchRedirects: redirects + 1 });
+        if (!(await persistHandoff(deps, repaired))) {
+          return {
+            status: 'handoff_redirect_persist_failed',
+            expected: handoff.open_url,
+            got: href,
+          };
+        }
+        try {
+          const navigation = await deps.navigate(handoff.open_url, {
+            key: handoff.key,
+            platform: handoff.platform,
+            reason: 'mismatch_repair',
+          });
+          if (navigation && (navigation.status === 'target_navigation_stalled' ||
+              navigation.status === 'target_navigation_committed')) {
+            return Object.assign({
+              expected: handoff.open_url,
+              got: href,
+              redirects: redirects + 1,
+            }, navigation, { key: navigation.key || handoff.key });
+          }
+          return {
+            status: 'handoff_redirected',
+            expected: handoff.open_url,
+            got: href,
+            redirects: redirects + 1,
+          };
+        } catch (e) {
+          await clearHandoff(deps, handoff);
+          return {
+            status: 'handoff_url_mismatch',
+            expected: handoff.open_url,
+            got: href,
+            redirects: redirects + 1,
+            error: String((e && e.message) || e),
+          };
+        }
+      }
+      // 一次精确纠正仍不匹配就是终局。清掉交接单，避免它跨 document 留在 tab
+      // 上，之后把用户打开的每一个普通详情页都再次当成自动任务。
+      await clearHandoff(deps, handoff);
+      return {
+        status: 'handoff_url_mismatch',
+        expected: handoff.open_url,
+        got: href,
+        redirects,
+      };
     }
 
     if (handoff.stopAfter === 'open') {
-      await clearHandoff(deps);
-      await settle(deps, handoff, 'skipped');
-      return { status: 'stopped_at_open', key: handoff.key };
+      return await settleAndClear(
+        deps,
+        handoff,
+        'skipped',
+        { status: 'stopped_at_open', key: handoff.key },
+      );
     }
 
     let outcome;
@@ -379,8 +726,13 @@ var marineProspectRun = marineProspectRun || {};
     if (outcome && outcome.reason === 'comments_closed') {
       // 记 blocked 而不是 failed：blocked 会把这条从**所有**账号的候选池里摘掉，
       // 否则另外 4 个号还会各花一条腿来重新发现同一件事。
-      await settle(deps, handoff, 'blocked');
-      await clearHandoff(deps);
+      const blocked = await settleAndClear(
+        deps,
+        handoff,
+        'blocked',
+        { status: 'blocked_settled', key: handoff.key },
+      );
+      if (blocked.status === 'settle_failed') return blocked;
       return await hopToNextTarget(deps, handoff);
     }
 
@@ -394,38 +746,143 @@ var marineProspectRun = marineProspectRun || {};
     // 代价说清楚：不落账 = 台账里这条停在 claimed，要等 claim TTL 过期才重新可领。
     // 用「一条 key 锁一段时间」换「不永久烧掉一整条腿」，这个交易是划算的。
     if (outcome && outcome.reason === 'context_unavailable') {
-      await clearHandoff(deps);
+      await clearHandoff(deps, handoff);
       return { status: 'aborted_no_context', key: handoff.key, error: outcome.error };
     }
 
     if (!outcome || !outcome.ok) {
-      await settle(deps, handoff, 'failed');
-      await clearHandoff(deps);
-      return { status: 'fill_failed', key: handoff.key, error: outcome && outcome.error };
+      return await settleAndClear(
+        deps,
+        handoff,
+        'failed',
+        { status: 'fill_failed', key: handoff.key, error: outcome && outcome.error },
+      );
     }
 
-    // stopAfter === 'send' 时才会走到发送；当前配置是 'fill'，到此为止。
+    // 只有 stopAfter === 'send' 才会走到发送。
     if (handoff.stopAfter === 'send') {
+      // 生成最长约 120s，这期间 SPA 可能已从靶子 A 切到 B。初始的 URL
+      // 校验早已过期；必须在任何发送 guard/点击之前重新读当前 URL。
+      const latestHref = typeof deps.currentHref === 'function'
+        ? deps.currentHref()
+        : (typeof location !== 'undefined' ? location.href : deps.href || '');
+      if (handoff.open_url && latestHref && !sameTarget(handoff.open_url, latestHref)) {
+        return await settleAndClear(
+          deps,
+          handoff,
+          'failed',
+          {
+            status: 'target_changed_before_send',
+            key: handoff.key,
+            expected: handoff.open_url,
+            got: latestHref,
+          },
+        );
+      }
+
+      // 跨 document 的不可逆动作闸。必须先持久化再调用 send；初始 pending state
+      // 保守记 failed，若点击过程中页面消失，新文档只补记失败、绝不会再点一次。
+      let guarded = Object.assign({}, handoff, {
+        sendStarted: true,
+        sendStartedAt: Date.now(),
+        pendingSettlement: 'failed',
+      });
+      if (!(await persistHandoff(deps, guarded))) {
+        return { status: 'send_guard_persist_failed', key: handoff.key };
+      }
+
+      // durable guard 落定后、真实点击前，再让后端把本次 claim 标成 send-started。
+      // 这样即使生成/网络抖动超过普通 claim TTL，也不会被另一 profile 重领并让
+      // 旧发送者 settle 409。prepare 的响应丢失也绝不能猜成功后继续点击；保守
+      // settle failed，整个恢复路径仍只处理台账、不产生第二次外部动作。
+      try {
+        await deps.api('prospects/prepare-send', {
+          key: handoff.key,
+          profile_id: handoff.profileId,
+        });
+      } catch (e) {
+        return await settleAndClear(
+          deps,
+          guarded,
+          'failed',
+          {
+            status: 'prepare_send_failed',
+            key: handoff.key,
+            error: String((e && e.message) || e),
+          },
+        );
+      }
+
       let sent;
+      let attemptGuarded = false;
+      const markAttempted = async () => {
+        if (attemptGuarded) return true;
+        const attemptedGuard = Object.assign({}, guarded, {
+          pendingSettlement: 'unconfirmed',
+          sendAttemptedAt: Date.now(),
+        });
+        if (!(await persistHandoff(deps, attemptedGuard))) {
+          throw new Error('send attempt guard persist failed');
+        }
+        guarded = attemptedGuard;
+        attemptGuarded = true;
+        return true;
+      };
       // 把生成出来的文本一并传下去：发送实现要拿它跟输入框里的实际内容核对，
       // 挡住「只敲了一半就点发布」（实测在知乎发出过一条两个字的评论）。
       // 把 key 一并传下去：发送实现据此保证「同一条只点一次」——
       // 小红书发完不清空草稿，重试会把同一条再发一遍。
-      try { sent = await deps.send(handoff.platform, outcome.text, handoff.key); }
-      catch (e) { sent = { ok: false, error: String((e && e.message) || e) }; }
-      if (!sent || !sent.ok) {
-        await settle(deps, handoff, 'failed');
-        await clearHandoff(deps);
-        return { status: 'send_failed', key: handoff.key, error: sent && sent.error };
+      // 第五个回调由真实 send 在所有 draft/button/target 前置检查通过后、btn.click
+      // 紧前 await。这样 click 导致同步导航/崩溃时，local 已是 unconfirmed；而按钮
+      // 缺失/错页仍不会调用回调，最终可以准确 settle failed。
+      try {
+        sent = await deps.send(
+          handoff.platform,
+          outcome.text,
+          handoff.key,
+          handoff.open_url,
+          markAttempted,
+        );
       }
-      await settle(deps, handoff, 'posted');
-      await clearHandoff(deps);
-      return { status: 'posted', key: handoff.key, text: outcome.text };
+      catch (e) {
+        // send adapter reject 无法证明异常发生在 click 前还是 click 后；所有明确的
+        // draft/button/target 前置拒绝都应正常 resolve attempted:false。这里保守按
+        // 已跨不可逆边界处理，避免未知异常把 public footprint 释放后再次发送。
+        sent = { ok: false, attempted: true, error: String((e && e.message) || e) };
+      }
+      const state = sent && sent.ok ? 'posted' : sent && sent.attempted ? 'unconfirmed' : 'failed';
+      if (state === 'posted' || state === 'unconfirmed') {
+        guarded = Object.assign({}, guarded, { pendingSettlement: state });
+        // 即使这次写失败也继续尝试 settle；sendStarted 仍在。unconfirmed 表示点击
+        // 已返回但回执未知，必须计作外部动作，绝不能降成 failed 后被别号重领。
+        await persistHandoff(deps, guarded);
+      }
+
+      return await settleAndClear(
+        deps,
+        guarded,
+        state,
+        sent && sent.reason === 'target_changed_before_send'
+          ? {
+              status: 'target_changed_before_send',
+              key: handoff.key,
+              expected: handoff.open_url,
+              got: sent.got,
+            }
+          : state === 'posted'
+          ? { status: 'posted', key: handoff.key, text: outcome.text }
+          : state === 'unconfirmed'
+          ? { status: 'send_unconfirmed', key: handoff.key, error: sent && sent.error }
+          : { status: 'send_failed', key: handoff.key, error: sent && sent.error },
+      );
     }
 
-    await settle(deps, handoff, 'filled');
-    await clearHandoff(deps);
-    return { status: 'filled', key: handoff.key, text: outcome.text };
+    return await settleAndClear(
+      deps,
+      handoff,
+      'filled',
+      { status: 'filled', key: handoff.key, text: outcome.text },
+    );
   }
 
   /**
@@ -461,7 +918,20 @@ var marineProspectRun = marineProspectRun || {};
 
     const handed = await writeHandoff(deps, claimed, handoff.profileId, handoff.stopAfter, hops);
     if (!handed) return { status: 'blocked_no_hop', key: handoff.key };
-    deps.navigate(claimed.open_url);
+    const navigation = await deps.navigate(claimed.open_url, {
+      key: claimed.key,
+      platform: handoff.platform,
+      reason: 'blocked_hop',
+    });
+    if (navigation && (navigation.status === 'target_navigation_stalled' ||
+        navigation.status === 'target_navigation_committed')) {
+      return Object.assign({
+        from: handoff.key,
+        title: claimed.title,
+        open_url: claimed.open_url,
+        hops,
+      }, navigation, { key: navigation.key || claimed.key });
+    }
     return {
       status: 'blocked_hopped',
       from: handoff.key,
@@ -472,22 +942,227 @@ var marineProspectRun = marineProspectRun || {};
     };
   }
 
-  /** 记录结果。settle 本身失败不改变结论 —— 已经填进去的事实不会因此撤销。 */
+  function settleFailed(handoff, state, error, recoverable, details) {
+    return {
+      status: 'settle_failed',
+      key: handoff.key,
+      state,
+      recoverable: recoverable === true,
+      error,
+      attempts: (details && details.attempts) || 0,
+      persistAttempts: (details && details.persistAttempts) || 0,
+      deadLetterAttempts: (details && details.deadLetterAttempts) || 0,
+      stage: (details && details.stage) || 'api',
+    };
+  }
+
+  /**
+   * 终局落账的唯一入口。
+   *
+   * 顺序不能换：先把 pendingSettlement 写到 tab 级 store，再调 settle API，
+   * API 成功后才清 handoff。退避期间如果 document 卸载，新 document 一眼就
+   * 能看出只许补 settle，不会重新生成/点击。
+   *
+   * Phase B 前 5 次退避为 0/0.5/1.5/4/8s；仍失败后以 8s 为上限继续
+   * settlement-only 唤起，直到成功或 document 卸载。这个循环绝不重进
+   * runOnTarget 的生成/发送分支。因此 content 只会看到最终成功；不会把
+   * 中间传输抖动日志化后让 scheduler 提前停车。
+   */
+  async function settleAndClear(deps, handoff, state, result, options) {
+    options = options || {};
+    const configured = Array.isArray(options.delays) && options.delays.length
+      ? options.delays
+      : (Array.isArray(deps.settlementRetryDelays) && deps.settlementRetryDelays.length
+          ? deps.settlementRetryDelays
+          : SETTLEMENT_RETRY_DELAYS_MS);
+    const delays = configured.slice(0, SETTLEMENT_RETRY_DELAYS_MS.length);
+    const sleep = deps.settlementSleep || deps.sleep ||
+      ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    const maxCycles = Number.isInteger(deps.settlementMaxAttempts) && deps.settlementMaxAttempts > 0
+      ? deps.settlementMaxAttempts
+      : Number.POSITIVE_INFINITY;
+    const pending = Object.assign({}, handoff, {
+      pendingSettlement: state,
+      pendingSettlementAt: handoff.pendingSettlementAt || Date.now(),
+    });
+    let lastError = 'settlement retry exhausted';
+    let lastStage = 'persist';
+    let attempts = 0;
+    let persistAttempts = 0;
+    let deadLetterAttempts = 0;
+    let deadLetterReason = null;
+
+    let cycle = 0;
+    while (cycle < maxCycles) {
+      const delayIndex = Math.min(cycle, delays.length - 1);
+      if (cycle > 0 && Number(delays[delayIndex]) > 0) {
+        await sleep(Number(delays[delayIndex]));
+      }
+      if (typeof deps.settlementIsActive === 'function' && deps.settlementIsActive() !== true) {
+        return settleFailed(handoff, state, lastError, true, {
+          attempts,
+          persistAttempts,
+          deadLetterAttempts,
+          stage: lastStage,
+        });
+      }
+      cycle += 1;
+
+      // API 已给出明确 nonrecoverable 4xx 后，后续循环只做 durable tombstone move。
+      // 不能再次 persist active/API settle：dead-letter 可能已部分成功，重新写 active
+      // 会与 tombstone 单调闸互锁。正式 document 按同一退避持续重试到成功/卸载。
+      if (deadLetterReason) {
+        deadLetterAttempts += 1;
+        if (await deadLetterHandoff(deps, pending, deadLetterReason)) {
+          return settleFailed(handoff, state, deadLetterReason, false, {
+            attempts,
+            persistAttempts,
+            deadLetterAttempts,
+            stage: 'dead_letter',
+          });
+        }
+        lastError = deadLetterReason + '; nonrecoverable outbox dead-letter failed';
+        lastStage = 'dead_letter';
+        continue;
+      }
+
+      persistAttempts += 1;
+      if (!(await persistHandoff(deps, pending))) {
+        lastError = 'pending settlement persist failed';
+        lastStage = 'persist';
+        continue;
+      }
+
+      attempts += 1;
+      const recorded = await settle(deps, pending, state);
+      if (recorded.ok) {
+        if (await clearHandoff(deps, pending)) return result;
+        lastError = 'settlement recorded but handoff clear failed';
+        lastStage = 'clear';
+        continue;
+      }
+      lastError = recorded.error;
+      lastStage = 'api';
+      // 明确的客户端/状态错误不会因为等待而恢复。继续 8s 循环只会
+      // 让 scheduler 白等整条腿。它也不能永久留在 active outbox：否则这个
+      // profile 之后所有不同 key 都会被 CAS 拒绝，形成毒 outbox。也不能直接丢掉
+      // “已经发送”的证据，否则 claim TTL 后同 key 可能二次公开发送。浏览器 store
+      // 会把它移到只阻挡同 key 的 dead-letter；同 key 再被 claim 时自动恢复为
+      // settlement-only。移动失败仍算 recoverable，绝不虚报已清理。
+      if (/(?:返回|status)\s*(?:400|404|409)\b/i.test(String(recorded.error || ''))) {
+        deadLetterReason = recorded.error;
+        deadLetterAttempts += 1;
+        if (!(await deadLetterHandoff(deps, pending, deadLetterReason))) {
+          lastError = deadLetterReason + '; nonrecoverable outbox dead-letter failed';
+          lastStage = 'dead_letter';
+          continue;
+        }
+        return settleFailed(handoff, state, deadLetterReason, false, {
+          attempts,
+          persistAttempts,
+          deadLetterAttempts,
+          stage: 'dead_letter',
+        });
+      }
+    }
+
+    // 只有测试/显式调用方设了 maxAttempts 才会到这里；正式 document
+    // 会持续 settlement-only 恢复。pending 仍保留，所以返回也必须是 recoverable。
+    return settleFailed(handoff, state, lastError, true, {
+      attempts,
+      persistAttempts,
+      deadLetterAttempts,
+      stage: lastStage,
+    });
+  }
+
+  /** 记录结果；失败必须显式返回，调用方不能清掉唯一的恢复凭据。 */
   async function settle(deps, handoff, state) {
     try {
       await deps.api('prospects/settle', {
         key: handoff.key, profile_id: handoff.profileId, state,
       });
-    } catch (e) { /* 记录失败只影响台账，不影响本轮判定 */ }
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: String((e && e.message) || e) };
+    }
+  }
+
+  // 同一个抖音内容会在详情页与精选抽屉之间改写 URL：
+  //   /video/<id> 或 /note/<id>  <->  /jingxuan?modal_id=<id>
+  // 路径不同但 id 相同，不能触发错页重定向。
+  function douyinTargetIdentity(value) {
+    try {
+      const url = new URL(value);
+      if (url.hostname !== 'douyin.com' && !url.hostname.endsWith('.douyin.com')) return null;
+      const direct = /^\/(?:video|note)\/(\d+)(?:\/|$)/.exec(url.pathname);
+      if (direct) return { id: direct[1] };
+      if (/^\/(?:video|note)(?:\/|$)/.test(url.pathname)) return { id: null };
+      if (/^\/jingxuan\/?$/.test(url.pathname)) {
+        const modal = url.searchParams.get('modal_id');
+        return { id: /^\d+$/.test(modal || '') ? modal : null };
+      }
+    } catch (e) {}
+    return null;
   }
 
   /** 忽略 query/hash 比较是不是同一个目标 —— 平台会往 URL 上追加追踪参数。 */
   function sameTarget(a, b) {
+    const douyinA = douyinTargetIdentity(a);
+    const douyinB = douyinTargetIdentity(b);
+    // 只要任一边是抖音详情壳，就必须两边都有明确且相同的内容 id。不能让
+    // `/jingxuan?modal_id=123` 与裸 `/jingxuan` 回退到「忽略 query」后误判相同。
+    if (douyinA || douyinB) {
+      return !!(douyinA && douyinB && douyinA.id && douyinA.id === douyinB.id);
+    }
     const strip = (u) => {
       try { const x = new URL(u); return x.origin + x.pathname.replace(/\/+$/, ''); }
       catch (e) { return String(u); }
     };
     return strip(a) === strip(b);
+  }
+
+  // Phase B 的交接读取与执行必须是一个 single-flight。旧接线会先 read 一次确认，
+  // runOnTarget 再 read 一次；第二次瞬时失败就把一张真实交接单变成 no_handoff。
+  // started key 在本 document 内保留，防止重复 bootstrap 触发第二次真实发送。
+  let targetPhaseFlight = null;
+  const targetPhaseStartedKeys = Object.create(null);
+
+  function runOnTargetSingleFlight(deps) {
+    deps = deps || {};
+    if (targetPhaseFlight) return targetPhaseFlight;
+
+    const flight = (async () => {
+      const read = deps.handoff !== undefined
+        ? { status: 'handoff_ready', handoff: deps.handoff, attempts: 0 }
+        : await readHandoffWithRetry(deps);
+      if (!read.handoff) return read;
+
+      const handoff = read.handoff;
+      const key = String(handoff.key || handoff.open_url || '');
+      if (key && targetPhaseStartedKeys[key]) {
+        return { status: 'target_already_started', key };
+      }
+      if (key) targetPhaseStartedKeys[key] = true;
+
+      let began = false;
+      try {
+        if (deps.beginTarget) {
+          began = true;
+          await deps.beginTarget(handoff);
+        }
+        return await runOnTarget(Object.assign({}, deps, { handoff }));
+      } finally {
+        if (began && deps.endTarget) await deps.endTarget(handoff);
+      }
+    })();
+
+    targetPhaseFlight = flight;
+    const clearFlight = () => {
+      if (targetPhaseFlight === flight) targetPhaseFlight = null;
+    };
+    void flight.then(clearFlight, clearFlight);
+    return flight;
   }
 
   marineProspectRun.run = run;
@@ -499,10 +1174,13 @@ var marineProspectRun = marineProspectRun || {};
   marineProspectRun.runOnTarget = runOnTarget;
   marineProspectRun.writeHandoff = writeHandoff;
   marineProspectRun.readHandoff = readHandoff;
+  marineProspectRun.readHandoffWithRetry = readHandoffWithRetry;
   marineProspectRun.clearHandoff = clearHandoff;
   marineProspectRun.sameTarget = sameTarget;
+  marineProspectRun.runOnTargetSingleFlight = runOnTargetSingleFlight;
   marineProspectRun.commentsClosed = commentsClosed;
   marineProspectRun.stopAfterFor = stopAfterFor;
   marineProspectRun.RUN_FLAG = RUN_FLAG;
   marineProspectRun.MAX_TARGET_HOPS = MAX_TARGET_HOPS;
+  marineProspectRun.HANDOFF_TTL_MS = HANDOFF_TTL_MS;
 })();

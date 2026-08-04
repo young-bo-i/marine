@@ -1217,38 +1217,54 @@ fn reap_all_browsers_sync() {
       return;
     }
   };
-  let targets: Vec<u32> = profiles
-    .iter()
-    .filter_map(|p| p.process_id)
-    .filter(|&pid| pid != 0)
-    .collect();
-  if targets.is_empty() {
+  // Roots come from the profile directory on each process's command line, not
+  // from the `process_id` remembered in metadata.json. A remembered PID is a
+  // claim about the past — the browser may have crashed, and on Windows the PID
+  // pool is small and recycled quickly, so that number is quite likely to name
+  // an unrelated live process by now. Killing on that basis, then walking its
+  // children, takes a whole innocent process tree down with it.
+  let roots = crate::browser_runner::launched_browser_roots(&profiles);
+  if roots.is_empty() {
     return;
   }
 
   use sysinfo::{Pid, System};
   let sys = System::new_all();
 
-  // Expand the launched PIDs to include every descendant, then SIGKILL the set.
-  let mut kill: std::collections::HashSet<u32> = targets.iter().copied().collect();
+  // Expand the verified roots to their descendants: Chromium's renderers, GPU
+  // process and crashpad_handler do not carry `--user-data-dir`, so identity
+  // alone would only ever find the top process — and on Windows nothing
+  // re-parents, so the rest would simply be left running.
+  let mut kill: std::collections::HashMap<u32, u64> = roots.iter().copied().collect();
   loop {
     let mut added = false;
     for (pid, proc_) in sys.processes() {
       let id = pid.as_u32();
-      if kill.contains(&id) {
+      if kill.contains_key(&id) {
         continue;
       }
-      if let Some(parent) = proc_.parent() {
-        if kill.contains(&parent.as_u32()) {
-          kill.insert(id);
-          added = true;
-        }
+      let Some(parent) = proc_.parent() else {
+        continue;
+      };
+      let Some(&parent_started) = kill.get(&parent.as_u32()) else {
+        continue;
+      };
+      // A process that started before its claimed parent cannot be its child —
+      // it inherited the number from a dead one. Windows never clears a
+      // recorded parent PID, so without this the recycled-PID case walks
+      // straight back in through the descendant expansion.
+      if proc_.start_time() < parent_started {
+        continue;
       }
+      kill.insert(id, proc_.start_time());
+      added = true;
     }
     if !added {
       break;
     }
   }
+  let kill: Vec<u32> = kill.into_keys().collect();
+  let targets = roots;
 
   log::info!(
     "Quit cleanup: killing {} browser process(es) (from {} launched) before exit",
@@ -1357,13 +1373,10 @@ async fn marine_start_discovery(
   request: marine::scheduler::RunRequest,
 ) -> Result<(), String> {
   // Reject synchronously so a bad plan surfaces as a failed invoke rather than
-  // as a run that quietly ends one event later.
-  if request.profile_ids.is_empty() || request.platforms.is_empty() {
-    return Err(marine::err("MARINE_DISCOVERY_EMPTY_PLAN"));
-  }
-  if request.keyword.trim().is_empty() {
-    return Err(marine::err("MARINE_DISCOVERY_EMPTY_KEYWORD"));
-  }
+  // as a run that quietly ends one event later. This includes resolving the
+  // profiles: a selection that went stale (deleted elsewhere, or pulled away by
+  // sync) is the one bad plan the operator cannot see coming.
+  marine::scheduler::validate_plan(&request)?;
   if marine::scheduler::SCHEDULER.is_running() {
     return Err(marine::err("MARINE_DISCOVERY_ALREADY_RUNNING"));
   }
@@ -1616,8 +1629,22 @@ pub fn run() {
       #[cfg(target_os = "windows")]
       let win_builder = win_builder.decorations(false);
 
+      // A panic here is the worst way to fail: the process dies before any log
+      // sink is useful and the user sees an app that simply does not open. The
+      // realistic cause on Windows is a missing WebView2 Runtime — bundling the
+      // bootstrapper (`webviewInstallMode` in tauri.conf.json) should prevent
+      // it, but an offline first run can still get there. Say so, then stop.
       #[allow(unused_variables)]
-      let window = win_builder.build().unwrap();
+      let window = match win_builder.build() {
+        Ok(window) => window,
+        Err(e) => {
+          log::error!(
+            "Failed to create the main window: {e}. On Windows this usually means the WebView2 \
+             Runtime is missing or damaged; installing Microsoft Edge WebView2 Runtime fixes it."
+          );
+          return Err(Box::new(e));
+        }
+      };
 
       // System tray so the user can keep the app running after the close
       // dialog's "Minimize" action hides the window. Best-effort: a tray
@@ -2290,18 +2317,13 @@ pub fn run() {
         let manager = crate::settings_manager::SettingsManager::instance();
 
         // 1) Ensure a token exists (the extension authenticates with it).
-        let mut have_token = manager
-          .get_api_token(&app_handle_api)
-          .await
-          .ok()
-          .flatten()
-          .is_some();
-        if !have_token {
-          match manager.generate_api_token(&app_handle_api).await {
-            Ok(_) => have_token = true,
-            Err(e) => log::error!("Marine: failed to generate API token at startup: {e}"),
+        let have_token = match manager.get_or_create_api_token(&app_handle_api).await {
+          Ok(_) => true,
+          Err(e) => {
+            log::error!("Marine: failed to obtain API token at startup: {e}");
+            false
           }
-        }
+        };
 
         // 2) Persist api_enabled = true — but only once a token is actually
         //    present, so a token-generation failure doesn't leave a sticky

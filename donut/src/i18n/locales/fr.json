@@ -1838,7 +1838,8 @@
     "marineDiscoveryAlreadyRunning": "Une exécution de découverte est déjà en cours.",
     "marineDiscoveryEmptyPlan": "Choisissez au moins un profil et une plateforme.",
     "marineDiscoveryEmptyKeyword": "Saisissez un mot-clé de recherche.",
-    "marineDiscoveryProfileNotFound": "L'un des profils sélectionnés n'existe plus."
+    "marineDiscoveryProfileNotFound": "L'un des profils sélectionnés n'existe plus.",
+    "marineDiscoveryProfileCrossOs": "Le profil « {{name}} » a été créé sur un autre système d'exploitation et ne peut pas s'exécuter ici. Créez un nouveau profil sur cette machine et reconnectez-vous."
   },
   "rail": {
     "profiles": "Profils",
@@ -2207,7 +2208,7 @@
       "run": {
         "label": "Exécution automatique",
         "title": "Lancer la découverte",
-        "description": "Ouvre chaque profil à tour de rôle, traite une plateforme à la fois, puis le ferme avant de passer au suivant — jamais deux en même temps. L'exécution s'arrête après avoir écrit le brouillon dans le champ de commentaire : elle ne l'envoie pas.",
+        "description": "Ouvre chaque profil à tour de rôle et traite une plateforme à la fois — jamais deux en même temps. Après vérification du brouillon complet, le commentaire est envoyé puis la confirmation de la plateforme est attendue.",
         "keyword": "Mot-clé",
         "keywordPlaceholder": "ex. outils de recherche",
         "platforms": "Plateformes",
@@ -2242,7 +2243,8 @@
       },
       "stats": {
         "label": "Résumé du registre",
-        "posted": "Publiés"
+        "posted": "Publiés",
+        "unconfirmed": "À confirmer"
       },
       "filters": {
         "label": "Filtres du registre",
@@ -2255,7 +2257,7 @@
         "keywords": "Mot-clé",
         "accounts": "Comptes",
         "open": "Ouvrir dans le navigateur",
-        "postedAt": "Publié le"
+        "postedAt": "Enregistré le"
       },
       "empty": {
         "title": "Le registre est encore vide",

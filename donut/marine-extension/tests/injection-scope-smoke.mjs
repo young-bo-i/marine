@@ -36,21 +36,22 @@ const PLATFORMS_WITH_FILES = new Set([
 const adapterEntry = manifest.content_scripts.find((entry) =>
   entry.js.some((file) => file.startsWith("src/platforms/")),
 );
-assert.ok(adapterEntry, "platform scripts must live in their own content_scripts entry");
+assert.ok(adapterEntry, "platform scripts must live in a host-scoped content_scripts entry");
+const expectedPlatformFiles = [
+  "src/platforms/youtube.js",
+  "src/platforms/bilibili.js",
+  // 发现侧解析器（搜索结果 -> 候选）。放在 comment-targets 之前只是为了让
+  // 「发现 -> 投放」的阅读顺序和数据流一致，两者之间没有加载依赖。
+  "src/platforms/discovery.js",
+  // 登录态识别：权威接口必须在页内调用（签名由页面 JS 计算）。
+  "src/platforms/login.js",
+  // 发现侧编排：落到搜索页就自动跑（启动网址由 Donut 下发）。
+  "src/platforms/prospect-run.js",
+  "src/platforms/comment-targets.js",
+];
 assert.deepEqual(
-  adapterEntry.js,
-  [
-    "src/platforms/youtube.js",
-    "src/platforms/bilibili.js",
-    // 发现侧解析器（搜索结果 -> 候选）。放在 comment-targets 之前只是为了让
-    // 「发现 -> 投放」的阅读顺序和数据流一致，两者之间没有加载依赖。
-    "src/platforms/discovery.js",
-    // 登录态识别：权威接口必须在页内调用（签名由页面 JS 计算）。
-    "src/platforms/login.js",
-    // 发现侧编排：落到搜索页就自动跑（启动网址由 Donut 下发）。
-    "src/platforms/prospect-run.js",
-    "src/platforms/comment-targets.js",
-  ],
+  adapterEntry.js.filter((file) => file.startsWith("src/platforms/")),
+  expectedPlatformFiles,
   "every src/platforms/* file must be in the host-scoped entry",
 );
 assert.equal(adapterEntry.all_frames, false);
@@ -63,7 +64,7 @@ const platformFiles = fs
   .map((f) => `src/platforms/${f}`)
   .sort();
 assert.deepEqual(
-  [...adapterEntry.js].sort(),
+  adapterEntry.js.filter((file) => file.startsWith("src/platforms/")).sort(),
   platformFiles,
   "a new src/platforms/ file must be added to the host-scoped manifest entry",
 );
@@ -138,10 +139,21 @@ const isoIndex = manifest.content_scripts.findIndex((e) =>
   e.js.includes("src/content-iso.js"),
 );
 const adapterIndex = manifest.content_scripts.indexOf(adapterEntry);
-assert.ok(adapterIndex < isoIndex, "platform adapters must be injected before content-iso.js");
+const isoEntry = manifest.content_scripts[isoIndex];
+if (adapterEntry === isoEntry) {
+  const consumerIndex = adapterEntry.js.indexOf("src/content-iso.js");
+  for (const file of expectedPlatformFiles) {
+    assert.ok(
+      adapterEntry.js.indexOf(file) < consumerIndex,
+      `${file} must be injected before content-iso.js`,
+    );
+  }
+} else {
+  assert.ok(adapterIndex < isoIndex, "platform adapters must be injected before content-iso.js");
+}
 
-// 顺序只是「预期」，不是契约：content-iso.js 还必须有那个延迟兜底，否则跨条目顺序
-// 一旦变化，评论目标会在 4 个平台上静默失效。
+// 同一 entry 的数组顺序是主契约；content-iso.js 仍保留有界 readiness 兜底，
+// 兼容未来再次拆 entry，也防御依赖脚本自身在启动时异常晚到。
 assert.match(contentIsoSource, /ADAPTER_PLATFORMS/);
 assert.match(
   contentIsoSource,

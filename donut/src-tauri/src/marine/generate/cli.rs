@@ -77,19 +77,111 @@ const CODEX_ISOLATION_CONFIG: &[&str] = &[
 // tool surface is disabled below, and unexpected JSON-RPC requests fail the
 // generation instead of being answered.
 
+/// The suffixes a bare command name may carry, most-preferred first.
+///
+/// On Unix this is just `[""]` — `PATHEXT` does not exist there, so the
+/// behaviour is byte-for-byte what it always was. On Windows it decides whether
+/// we find anything runnable at all: `npm i -g @anthropic-ai/claude-code`
+/// installs `claude.cmd`, `claude.ps1`, **and** a bare extensionless `claude`
+/// that is a `#!/bin/sh` script for Git-Bash. Matching the bare name first hands
+/// `CreateProcessW` a non-PE file, which fails with os error 193 — a
+/// launch-time failure the ledger then records as a permanently burnt candidate.
+///
+/// The empty suffix stays last so an extensionless match is a fallback, never a
+/// preference.
+/// The pure half of [`executable_suffixes`]. Takes `PATHEXT` rather than reading
+/// it, so Windows behaviour is testable anywhere — and so no test has to mutate
+/// a process-global that its neighbours are concurrently reading.
+fn suffixes_from(pathext: Option<&str>) -> Vec<String> {
+  let Some(pathext) = pathext else {
+    return vec![String::new()];
+  };
+  let mut out: Vec<String> = pathext
+    .split(';')
+    .map(|e| e.trim().to_string())
+    .filter(|e| e.starts_with('.') && e.len() > 1)
+    .collect();
+  out.push(String::new());
+  out
+}
+
+/// Whether `path`'s extension marks it executable on this platform.
+///
+/// Unix has no such notion (the `x` bit decides), so everything passes and the
+/// permission check in [`is_executable_file`] remains the only gate.
+fn has_executable_extension(path: &Path) -> bool {
+  extension_allowed(
+    path,
+    std::env::var_os("PATHEXT")
+      .as_deref()
+      .map(|v| v.to_string_lossy().into_owned())
+      .as_deref(),
+  )
+}
+
+/// The pure half of [`has_executable_extension`].
+fn extension_allowed(path: &Path, pathext: Option<&str>) -> bool {
+  let Some(pathext) = pathext else {
+    return true;
+  };
+  let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+    return false;
+  };
+  pathext.split(';').any(|allowed| {
+    allowed
+      .trim()
+      .trim_start_matches('.')
+      .eq_ignore_ascii_case(ext)
+  })
+}
+
 /// Resolve a binary: first any candidate path that is a real file, else look it
 /// up by `name` on `$PATH`. `None` if not found anywhere.
+///
+/// Both halves try [`executable_suffixes`], so a candidate written as
+/// `…\.local\bin\claude` still matches the `claude.exe` actually on disk.
 fn resolve_binary(cands: &[String], name: &str) -> Option<String> {
+  resolve_binary_with(
+    cands,
+    name,
+    std::env::var_os("PATHEXT")
+      .as_deref()
+      .map(|v| v.to_string_lossy().into_owned())
+      .as_deref(),
+  )
+}
+
+/// The pure half of [`resolve_binary`].
+fn resolve_binary_with(cands: &[String], name: &str, pathext: Option<&str>) -> Option<String> {
+  let suffixes = suffixes_from(pathext);
+  let pick = |base: PathBuf| -> Option<String> {
+    for suffix in &suffixes {
+      let candidate = if suffix.is_empty() {
+        base.clone()
+      } else {
+        let mut with_ext = base.clone().into_os_string();
+        with_ext.push(suffix);
+        PathBuf::from(with_ext)
+      };
+      if candidate.is_file() && extension_allowed(&candidate, pathext) {
+        return Some(candidate.to_string_lossy().to_string());
+      }
+    }
+    None
+  };
+
   for c in cands {
-    if !c.is_empty() && PathBuf::from(c).is_file() {
-      return Some(c.clone());
+    if c.is_empty() {
+      continue;
+    }
+    if let Some(found) = pick(PathBuf::from(c)) {
+      return Some(found);
     }
   }
   if let Some(paths) = std::env::var_os("PATH") {
     for dir in std::env::split_paths(&paths) {
-      let p = dir.join(name);
-      if p.is_file() {
-        return Some(p.to_string_lossy().to_string());
+      if let Some(found) = pick(dir.join(name)) {
+        return Some(found);
       }
     }
   }
@@ -113,6 +205,15 @@ fn is_executable_file(path: &Path) -> bool {
     return false;
   };
   if !metadata.is_file() {
+    return false;
+  }
+  // Deliberately outside the `cfg` below so it is compiled and tested on every
+  // platform. Windows has no execute bit — the extension is what makes a file
+  // runnable there, and treating everything as executable is what let an
+  // extensionless npm sh-shim through to fail at `CreateProcessW`. On Unix
+  // there is no `PATHEXT`, so this is unconditionally true and the permission
+  // check below remains the only gate.
+  if !has_executable_extension(path) {
     return false;
   }
   #[cfg(unix)]
@@ -292,19 +393,39 @@ fn resolve_codex_launch(codex: &Path) -> Result<CodexLaunch, String> {
   resolve_codex_launch_with_nodes(codex, &node_candidates(codex))
 }
 
+/// Where a global npm install puts its shims. Empty off Windows.
+///
+/// The extensionless paths below already resolve to `name.exe` via
+/// [`executable_suffixes`], which covers the native installers; this adds the
+/// npm layout, whose shim lives in `%APPDATA%\npm` rather than anywhere the
+/// POSIX candidates would look.
+fn windows_npm_candidate(name: &str) -> Vec<String> {
+  std::env::var_os("APPDATA")
+    .map(|appdata| {
+      vec![PathBuf::from(&appdata)
+        .join("npm")
+        .join(name)
+        .to_string_lossy()
+        .to_string()]
+    })
+    .unwrap_or_default()
+}
+
 fn codex_candidates() -> Vec<String> {
   let home = dirs::home_dir().unwrap_or_default();
-  vec![
+  let mut out = vec![
     "/Applications/Codex.app/Contents/Resources/codex".to_string(),
     home.join(".local/bin/codex").to_string_lossy().to_string(),
     "/opt/homebrew/bin/codex".to_string(),
     "/usr/local/bin/codex".to_string(),
-  ]
+  ];
+  out.extend(windows_npm_candidate("codex"));
+  out
 }
 
 fn claude_candidates() -> Vec<String> {
   let home = dirs::home_dir().unwrap_or_default();
-  vec![
+  let mut out = vec![
     home.join(".local/bin/claude").to_string_lossy().to_string(),
     home
       .join(".claude/local/claude")
@@ -312,7 +433,9 @@ fn claude_candidates() -> Vec<String> {
       .to_string(),
     "/opt/homebrew/bin/claude".to_string(),
     "/usr/local/bin/claude".to_string(),
-  ]
+  ];
+  out.extend(windows_npm_candidate("claude"));
+  out
 }
 
 fn find_codex() -> String {
@@ -1744,6 +1867,126 @@ mod stream_tests {
       "web_search=\"disabled\"",
     ] {
       assert!(CODEX_ISOLATION_CONFIG.contains(&config));
+    }
+  }
+
+  /// Windows 上「找得到」不等于「跑得起来」。
+  ///
+  /// npm 全局安装会同时放下 `claude`（`#!/bin/sh` 的 shim）、`claude.cmd`、
+  /// `claude.ps1`，没有 `.exe`。旧实现用裸名 `is_file()` 命中的正是那个 sh
+  /// 脚本，交给 CreateProcessW 就是 os error 193 —— 而这个失败会被台账记成
+  /// 不可逆的 failed，把候选永久烧掉。
+  ///
+  /// 这些用例靠 `PATHEXT` 驱动，所以在 macOS 上也能钉住 Windows 的语义。
+  mod executable_resolution {
+    use super::super::{extension_allowed, is_executable_file, resolve_binary_with, suffixes_from};
+    use std::path::{Path, PathBuf};
+
+    /// Windows 的 PATHEXT 缺省值。测试把它**当参数传**，不写进进程环境 ——
+    /// 改 env 会泄漏到并发跑的邻居测试里（实测弄挂过 native_codex_does_not_require_node）。
+    const WINDOWS: Option<&str> = Some(".COM;.EXE;.BAT;.CMD");
+    const UNIX: Option<&str> = None;
+
+    fn touch(dir: &Path, name: &str) -> PathBuf {
+      let p = dir.join(name);
+      std::fs::write(&p, b"#!/bin/sh\n").unwrap();
+      #[cfg(unix)]
+      {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+      }
+      p
+    }
+
+    fn lower(v: Option<String>) -> Option<String> {
+      v.map(|s| s.to_ascii_lowercase())
+    }
+
+    fn as_lower(p: &Path) -> Option<String> {
+      Some(p.to_string_lossy().to_ascii_lowercase())
+    }
+
+    /// npm 全局安装会同时放下 `claude`（`#!/bin/sh` 的 shim）、`claude.cmd`、
+    /// `claude.ps1`，没有 `.exe`。旧实现用裸名 `is_file()` 命中的正是那个 sh
+    /// 脚本，交给 CreateProcessW 就是 os error 193 —— 而这个失败会被台账记成
+    /// 不可逆的 failed，把候选永久烧掉。
+    #[test]
+    fn a_bare_name_never_wins_over_a_real_windows_executable() {
+      let dir = tempfile::tempdir().unwrap();
+      touch(dir.path(), "claude");
+      let cmd = touch(dir.path(), "claude.cmd");
+
+      let candidate = dir.path().join("claude").to_string_lossy().to_string();
+      // 大小写按 PATHEXT 的写法来（`.CMD`）；两边文件系统都大小写不敏感，
+      // 构造出的路径照样打得开，所以比较时忽略大小写。
+      assert_eq!(
+        lower(resolve_binary_with(
+          std::slice::from_ref(&candidate),
+          "claude",
+          WINDOWS
+        )),
+        as_lower(&cmd),
+        "必须挑带扩展名的，挑到无扩展名的 sh shim 就是 os error 193"
+      );
+    }
+
+    /// 原生安装器只放 `claude.exe`，候选路径里写的却是无扩展名的形式。
+    #[test]
+    fn an_extensionless_candidate_finds_the_exe_on_disk() {
+      let dir = tempfile::tempdir().unwrap();
+      let exe = touch(dir.path(), "codex.exe");
+      let candidate = dir.path().join("codex").to_string_lossy().to_string();
+      assert_eq!(
+        lower(resolve_binary_with(&[candidate], "codex", WINDOWS)),
+        as_lower(&exe)
+      );
+    }
+
+    /// 只有 sh shim、没有任何可执行扩展名时，宁可报找不到，
+    /// 也不要交给 CreateProcessW 去撞 193。
+    #[test]
+    fn a_lone_shell_shim_is_not_considered_runnable_on_windows() {
+      let dir = tempfile::tempdir().unwrap();
+      touch(dir.path(), "claude");
+      let candidate = dir.path().join("claude").to_string_lossy().to_string();
+      assert_eq!(resolve_binary_with(&[candidate], "claude", WINDOWS), None);
+    }
+
+    /// Unix 侧行为必须一个字节都没变：没有 PATHEXT 就还是裸名匹配。
+    #[test]
+    fn unix_behaviour_is_unchanged_without_pathext() {
+      let dir = tempfile::tempdir().unwrap();
+      let shim = touch(dir.path(), "claude");
+      let candidate = shim.to_string_lossy().to_string();
+      assert_eq!(
+        resolve_binary_with(std::slice::from_ref(&candidate), "claude", UNIX),
+        Some(candidate)
+      );
+      assert_eq!(suffixes_from(UNIX), vec![String::new()]);
+      assert!(extension_allowed(Path::new("/usr/local/bin/claude"), UNIX));
+    }
+
+    #[test]
+    fn pathext_order_is_respected_and_the_bare_name_is_last() {
+      let suffixes = suffixes_from(WINDOWS);
+      assert_eq!(suffixes.first().map(String::as_str), Some(".COM"));
+      assert_eq!(suffixes.last().map(String::as_str), Some(""));
+      assert!(extension_allowed(Path::new("C:\\npm\\claude.CMD"), WINDOWS));
+      assert!(!extension_allowed(
+        Path::new("C:\\npm\\claude.ps1"),
+        WINDOWS
+      ));
+    }
+
+    /// 扩展名闸门现在在所有平台上都被编译 —— 之前它藏在 `cfg(not(unix))` 里，
+    /// macOS 上连类型都不会检查。这里顺带钉住它对本机的判断没变。
+    #[test]
+    fn the_extension_gate_is_compiled_on_every_platform() {
+      let dir = tempfile::tempdir().unwrap();
+      let shim = touch(dir.path(), "claude");
+      // 本机（无 PATHEXT）语义：扩展名不参与判断，x 位说了算。
+      assert!(is_executable_file(&shim));
+      assert!(!is_executable_file(&dir.path().join("nope")));
     }
   }
 }

@@ -39,8 +39,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use utoipa::ToSchema;
@@ -77,10 +78,39 @@ pub enum ProspectError {
     path: PathBuf,
     source: serde_json::Error,
   },
+  #[error("prospect ledger at {path} exists but is empty; refusing to treat it as no records")]
+  EmptyLedger { path: PathBuf },
   #[error("unsupported platform: {0}")]
   UnsupportedPlatform(String),
   #[error("candidate is missing a stable item id")]
   MissingItemId,
+  #[error("prospect not found: {0}")]
+  NotFound(String),
+  #[error("prospect {key} is not currently claimed by profile {profile_id}")]
+  ClaimOwnerMismatch { key: String, profile_id: String },
+}
+
+/// The question id out of a Zhihu answer URL, if it carries one.
+///
+/// `https://www.zhihu.com/question/606932275/answer/2053034914010895538`
+/// → `606932275`. Article URLs (`zhuanlan.zhihu.com/p/…`) have none.
+fn zhihu_question_id(open_url: &str) -> Option<&str> {
+  let rest = open_url.split("/question/").nth(1)?;
+  let id = rest.split(['/', '?', '#']).next()?;
+  (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then_some(id)
+}
+
+/// Whether a failed atomic replace is worth retrying.
+///
+/// `PermissionDenied` is what Windows maps `ERROR_SHARING_VIOLATION` /
+/// `ERROR_ACCESS_DENIED` to when a scanner has the file open; both clear on
+/// their own within milliseconds. Anything else (a full disk, a bad path) will
+/// not fix itself and must surface immediately.
+fn is_transient_replace_error(error: &std::io::Error) -> bool {
+  matches!(
+    error.kind(),
+    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Interrupted
+  )
 }
 
 /// Whether a candidate's `open_url` survives being stored and used later.
@@ -104,15 +134,22 @@ pub enum ProspectState {
   Claimed,
   /// An account posted under it.
   Posted,
+  /// The publish control was clicked, but no authoritative success/failure
+  /// receipt arrived before the observation deadline.
+  ///
+  /// This is conservatively charged as one public footprint.  Treating it as a
+  /// normal failure would let another account publish the same comment target
+  /// even though the first click may already have succeeded.
+  Unconfirmed,
   /// An account looked at it and deliberately passed.
   Skipped,
   /// Draft text was written into the comment box but NOT sent.
   ///
-  /// This is the terminal state of the current debug phase: the pipeline runs
-  /// all the way to "ready to click send" and stops. Kept distinct from
-  /// `Posted` because the two are not interchangeable — a filled draft has no
-  /// public footprint, so counting it as posted would corrupt both the
-  /// per-item account cap and any reporting built on the ledger.
+  /// Terminal state for a fill-only workflow or a platform without a verified
+  /// receipt-backed submit path. Kept distinct from `Posted` because the two
+  /// are not interchangeable — a filled draft has no public footprint, so
+  /// counting it as posted would corrupt both the per-item account cap and any
+  /// reporting built on the ledger.
   Filled,
   /// The attempt failed (risk-control interstitial, editor not found, generate
   /// error…). Recorded rather than retried, per the operating decision that a
@@ -131,7 +168,7 @@ pub enum ProspectState {
   /// without it, all five accounts would each spend a full leg discovering the
   /// same closed video.
   ///
-  /// Deliberately NOT counted by [`ProspectRecord::posted_account_count`]: no
+  /// Deliberately NOT counted by [`ProspectRecord::public_footprint_count`]: no
   /// comment was made, so there is no public footprint to charge against the
   /// per-item cap.
   Blocked,
@@ -169,6 +206,14 @@ pub struct ProspectRecord {
   pub claimed_by: Option<String>,
   #[serde(default)]
   pub claimed_at: Option<u64>,
+  /// The current owner crossed the irreversible-send guard.
+  ///
+  /// Once set, this claim is not reclaimed by TTL: the browser may already
+  /// have published while its settlement response was lost.  The extension
+  /// sets it through the owner-checked `prepare_send` transition immediately
+  /// before clicking.
+  #[serde(default)]
+  pub send_started_at: Option<u64>,
   #[serde(default)]
   pub touches: Vec<AccountTouch>,
 }
@@ -187,6 +232,7 @@ impl ProspectRecord {
         matches!(
           t.state,
           ProspectState::Posted
+            | ProspectState::Unconfirmed
             | ProspectState::Skipped
             | ProspectState::Filled
             | ProspectState::Failed
@@ -202,16 +248,42 @@ impl ProspectRecord {
     self.settled_accounts().any(|p| p == profile_id)
   }
 
-  /// Number of distinct accounts that have PUBLICLY posted under this item.
+  /// The "one place" an operator — and a platform's risk control — perceives.
   ///
-  /// Only `Posted` counts. A `Filled` draft was never sent, so it leaves no
-  /// footprint for a platform to correlate — letting it consume the cap would
-  /// starve the pool during the debug phase for no safety benefit.
-  pub fn posted_account_count(&self) -> usize {
+  /// For every platform but Zhihu that is the item itself: a Bilibili video, a
+  /// Douyin note and a Xiaohongshu note each have exactly one comment section.
+  /// Zhihu nests answers under a question, so two answers to one question are
+  /// two records but **one thread**, and an account that comments under both
+  /// shows up twice in the same place — precisely the pattern this ledger
+  /// exists to prevent. Observed: `question/2050569952449634692` was handed out
+  /// twice, under `answer/2053182600689333370` and `answer/2057478634580063639`.
+  ///
+  /// The answer id has to stay the record key regardless: `open_url` needs it to
+  /// reach the right editor. So the thread is derived, never stored, which also
+  /// means every ledger already on disk gets the new grouping with no migration.
+  pub fn thread_key(&self) -> String {
+    if self.platform != "zhihu" {
+      return self.key.clone();
+    }
+    match zhihu_question_id(&self.open_url) {
+      Some(question) => format!("zhihu:question:{question}"),
+      // Zhuanlan articles have no question above them, and an answer URL that
+      // lost its question id is only ever itself.
+      None => self.key.clone(),
+    }
+  }
+
+  /// Number of distinct accounts that may have left a PUBLIC footprint.
+  ///
+  /// `Posted` and a click with an `Unconfirmed` receipt both count. A `Filled`
+  /// draft or pre-click `Failed` attempt was never sent, so it leaves no
+  /// footprint for a platform to correlate; charging those would starve the
+  /// pool for no safety benefit.
+  pub fn public_footprint_count(&self) -> usize {
     let mut seen: Vec<&str> = self
       .touches
       .iter()
-      .filter(|t| t.state == ProspectState::Posted)
+      .filter(|t| matches!(t.state, ProspectState::Posted | ProspectState::Unconfirmed))
       .map(|t| t.profile_id.as_str())
       .collect();
     seen.sort_unstable();
@@ -230,6 +302,9 @@ impl ProspectRecord {
   }
 
   fn claim_is_stale(&self, ttl: u64, now: u64) -> bool {
+    if self.send_started_at.is_some() {
+      return false;
+    }
     match (self.state, self.claimed_at) {
       // `>=`, not `>`: a TTL of 0 must mean "reclaimable immediately", which is
       // both the sane reading and what makes the behaviour testable without
@@ -335,9 +410,55 @@ impl ProspectLedger {
       source,
     })?;
     if contents.trim().is_empty() {
-      return Ok(Vec::new());
+      // An existing-but-empty ledger is damage, not a fresh start. Treating it
+      // as "no records" silently switches dedup off: every target already
+      // commented on looks new again, and the accounts go post a second time on
+      // content they have already touched. A hard error keeps the evidence.
+      return Err(ProspectError::EmptyLedger { path });
     }
     serde_json::from_str(&contents).map_err(|source| ProspectError::InvalidJson { path, source })
+  }
+
+  /// Replace `path` with `tmp`, retrying while the OS says the file is busy.
+  ///
+  /// Unix replaces an open file happily. Windows does not: `MoveFileExW` needs
+  /// DELETE access on both ends, and Defender's real-time scan, the Search
+  /// indexer, or any backup client holding the ledger open for a few
+  /// milliseconds makes the replace fail with `ERROR_SHARING_VIOLATION` (32).
+  ///
+  /// The ledger is rewritten in full on every ingest / claim / prepare_send /
+  /// settle, so the odds of landing in one of those windows grow with how long
+  /// the run has been going. A failed `settle` throws the in-memory change away
+  /// and leaves the record on disk as `Claimed` with `send_started_at` already
+  /// set — no other account can take it and the stale-claim TTL never releases
+  /// it, because from disk it looks like a send in progress.
+  fn persist_with_retry(mut tmp: NamedTempFile, path: &Path) -> Result<(), ProspectError> {
+    const ATTEMPTS: u32 = 5;
+    let mut backoff = Duration::from_millis(20);
+    for attempt in 1..=ATTEMPTS {
+      match tmp.persist(path) {
+        Ok(_) => return Ok(()),
+        Err(e) if attempt < ATTEMPTS && is_transient_replace_error(&e.error) => {
+          log::warn!(
+            "Prospect ledger replace blocked ({}), attempt {attempt}/{ATTEMPTS}; retrying in {}ms",
+            e.error,
+            backoff.as_millis()
+          );
+          // `persist` gives the temp file back on failure, so the written bytes
+          // survive the retry and we never rebuild the JSON.
+          tmp = e.file;
+          std::thread::sleep(backoff);
+          backoff *= 2;
+        }
+        Err(e) => {
+          return Err(ProspectError::Write {
+            path: path.to_path_buf(),
+            source: e.error,
+          })
+        }
+      }
+    }
+    unreachable!("the loop either returns or exhausts ATTEMPTS with an error")
   }
 
   fn save(&self, records: &[ProspectRecord]) -> Result<(), ProspectError> {
@@ -364,15 +485,20 @@ impl ProspectLedger {
         path: path.clone(),
         source,
       })?;
-    tmp.flush().map_err(|source| ProspectError::Write {
-      path: path.clone(),
-      source,
-    })?;
-    tmp.persist(&path).map_err(|e| ProspectError::Write {
-      path,
-      source: e.error,
-    })?;
-    Ok(())
+    // `flush` on a `File` is a no-op — the bytes are still only in the page
+    // cache. Without `sync_all` a kernel-level crash (power loss, panic) leaves
+    // a file of the right length full of zeros, which `load` then rejects as
+    // invalid JSON and the whole automation stops until someone deletes it by
+    // hand. `history.rs::write_atomic` already does this; the ledger is the one
+    // file where losing dedup evidence is worse.
+    tmp
+      .flush()
+      .and_then(|_| tmp.as_file().sync_all())
+      .map_err(|source| ProspectError::Write {
+        path: path.clone(),
+        source,
+      })?;
+    Self::persist_with_retry(tmp, &path)
   }
 
   fn validate(candidate: &Candidate) -> Result<(), ProspectError> {
@@ -445,6 +571,7 @@ impl ProspectLedger {
             state: ProspectState::Seen,
             claimed_by: None,
             claimed_at: None,
+            send_started_at: None,
             touches: Vec::new(),
           });
           index.insert(key, records.len() - 1);
@@ -473,16 +600,29 @@ impl ProspectLedger {
     let mut records = self.load()?;
     let now = now_secs();
 
+    // Every thread this account has already been seen in on this platform.
+    //
+    // The gate has to be thread-wide, not per-record: on Zhihu the same
+    // question owns several answers, and checking only the record in hand let
+    // one account comment under two answers of one question — from the page,
+    // and from risk control's side, that is the same account posting twice in
+    // the same place.
+    let touched_threads: std::collections::HashSet<String> = records
+      .iter()
+      .filter(|r| r.platform == platform && r.touched_by(profile_id))
+      .map(|r| r.thread_key())
+      .collect();
+
     let pick = records.iter().position(|r| {
       if r.platform != platform {
         return false;
       }
-      // Account-level hard gate.
-      if r.touched_by(profile_id) {
+      // Account-level hard gate, applied to the whole thread.
+      if touched_threads.contains(&r.thread_key()) {
         return false;
       }
       // Content-level cap.
-      if r.posted_account_count() >= opts.per_item_account_cap {
+      if r.public_footprint_count() >= opts.per_item_account_cap {
         return false;
       }
       // A session URL we can no longer trust must be re-resolved by a fresh
@@ -500,6 +640,7 @@ impl ProspectLedger {
         // 谁能拿由上面的账号级判断和 cap 决定，`state` 只拦「别人正在做」。
         ProspectState::Seen
         | ProspectState::Posted
+        | ProspectState::Unconfirmed
         | ProspectState::Skipped
         | ProspectState::Filled
         | ProspectState::Failed => true,
@@ -516,9 +657,35 @@ impl ProspectLedger {
     records[i].state = ProspectState::Claimed;
     records[i].claimed_by = Some(profile_id.to_string());
     records[i].claimed_at = Some(now);
+    records[i].send_started_at = None;
     let claimed = records[i].clone();
     self.save(&records)?;
     Ok(Some(claimed))
+  }
+
+  /// Persist the pre-click, irreversible-send boundary for the current owner.
+  ///
+  /// The extension must receive this acknowledgement before it may click the
+  /// platform publish button.  From that point until terminal settlement, TTL
+  /// reclamation is disabled because the public side effect may already have
+  /// happened even when the local API response is lost.
+  pub fn prepare_send(&self, key: &str, profile_id: &str) -> Result<(), ProspectError> {
+    let _guard = self.lock.lock().expect("prospect ledger mutex poisoned");
+    let mut records = self.load()?;
+    let Some(rec) = records.iter_mut().find(|r| r.key == key) else {
+      return Err(ProspectError::NotFound(key.to_string()));
+    };
+    if rec.state != ProspectState::Claimed || rec.claimed_by.as_deref() != Some(profile_id) {
+      return Err(ProspectError::ClaimOwnerMismatch {
+        key: key.to_string(),
+        profile_id: profile_id.to_string(),
+      });
+    }
+    if rec.send_started_at.is_none() {
+      rec.send_started_at = Some(now_secs());
+      self.save(&records)?;
+    }
+    Ok(())
   }
 
   /// Record a terminal outcome.
@@ -538,17 +705,38 @@ impl ProspectLedger {
     ));
     let _guard = self.lock.lock().expect("prospect ledger mutex poisoned");
     let mut records = self.load()?;
-    if let Some(rec) = records.iter_mut().find(|r| r.key == key) {
-      rec.state = state;
-      rec.claimed_by = None;
-      rec.claimed_at = None;
-      rec.touches.push(AccountTouch {
-        profile_id: profile_id.to_string(),
-        state,
-        at: now_secs(),
-      });
-      self.save(&records)?;
+    let Some(rec) = records.iter_mut().find(|r| r.key == key) else {
+      return Err(ProspectError::NotFound(key.to_string()));
+    };
+    // The API response can be lost after the atomic save has committed.  A
+    // later account may already own the item by the time the original browser
+    // retries (for non-public outcomes), so idempotence is proven by the
+    // append-only account touch rather than mutable owner fields.  Since the
+    // account claim gate forbids a second attempt, a matching touch can only be
+    // this exact committed retry.  A different state still fails ownership.
+    let exact_retry = rec
+      .touches
+      .iter()
+      .any(|touch| touch.profile_id == profile_id && touch.state == state);
+    if exact_retry {
+      return Ok(());
     }
+    if rec.state != ProspectState::Claimed || rec.claimed_by.as_deref() != Some(profile_id) {
+      return Err(ProspectError::ClaimOwnerMismatch {
+        key: key.to_string(),
+        profile_id: profile_id.to_string(),
+      });
+    }
+    rec.state = state;
+    rec.claimed_by = None;
+    rec.claimed_at = None;
+    rec.send_started_at = None;
+    rec.touches.push(AccountTouch {
+      profile_id: profile_id.to_string(),
+      state,
+      at: now_secs(),
+    });
+    self.save(&records)?;
     Ok(())
   }
 
@@ -599,6 +787,9 @@ mod tests {
     let c = vec![cand("bilibili", "BV1", "https://b/1")];
     assert_eq!(l.ingest(&c).unwrap().inserted, 1);
 
+    l.claim_next("p1", "bilibili", &ClaimOptions::default())
+      .unwrap()
+      .unwrap();
     l.settle("bilibili:BV1", "p1", ProspectState::Posted)
       .unwrap();
 
@@ -619,6 +810,42 @@ mod tests {
     let b = l.claim_next("p2", "bilibili", &o).unwrap();
     assert!(a.is_some(), "first profile should get it");
     assert!(b.is_none(), "second profile must not get the same item");
+  }
+
+  #[test]
+  fn only_the_current_claim_owner_can_settle() {
+    let (l, _g) = ledger();
+    l.ingest(&[cand("bilibili", "BV1", "https://b/1")]).unwrap();
+    let claim = l
+      .claim_next("p1", "bilibili", &ClaimOptions::default())
+      .unwrap()
+      .unwrap();
+
+    assert!(matches!(
+      l.settle(&claim.key, "p2", ProspectState::Posted),
+      Err(ProspectError::ClaimOwnerMismatch { .. })
+    ));
+    let still_claimed = &l.list().unwrap()[0];
+    assert_eq!(still_claimed.state, ProspectState::Claimed);
+    assert_eq!(still_claimed.claimed_by.as_deref(), Some("p1"));
+
+    l.settle(&claim.key, "p1", ProspectState::Posted).unwrap();
+    l.settle(&claim.key, "p1", ProspectState::Posted)
+      .expect("an exact retry after a lost response must be idempotent");
+    assert_eq!(l.list().unwrap()[0].touches.len(), 1);
+    assert!(matches!(
+      l.settle(&claim.key, "p1", ProspectState::Failed),
+      Err(ProspectError::ClaimOwnerMismatch { .. })
+    ));
+  }
+
+  #[test]
+  fn settling_an_unknown_key_is_not_silently_accepted() {
+    let (l, _g) = ledger();
+    assert!(matches!(
+      l.settle("bilibili:missing", "p1", ProspectState::Failed),
+      Err(ProspectError::NotFound(_))
+    ));
   }
 
   #[test]
@@ -701,6 +928,65 @@ mod tests {
         .is_some(),
       "a claim past its TTL must be reclaimable"
     );
+  }
+
+  #[test]
+  fn prepared_send_claim_is_never_reclaimed_by_ttl() {
+    let (l, _g) = ledger();
+    l.ingest(&[cand("bilibili", "BV1", "https://b/1")]).unwrap();
+    let claim = l
+      .claim_next("p1", "bilibili", &ClaimOptions::default())
+      .unwrap()
+      .unwrap();
+
+    assert!(matches!(
+      l.prepare_send(&claim.key, "p2"),
+      Err(ProspectError::ClaimOwnerMismatch { .. })
+    ));
+    l.prepare_send(&claim.key, "p1").unwrap();
+    l.prepare_send(&claim.key, "p1")
+      .expect("prepare-send must be idempotent for the active owner");
+
+    let expire_now = ClaimOptions {
+      claim_ttl_secs: 0,
+      ..Default::default()
+    };
+    assert!(
+      l.claim_next("p2", "bilibili", &expire_now)
+        .unwrap()
+        .is_none(),
+      "an irreversible send lease must not be handed to another profile"
+    );
+    let guarded = &l.list().unwrap()[0];
+    assert_eq!(guarded.claimed_by.as_deref(), Some("p1"));
+    assert!(guarded.send_started_at.is_some());
+
+    l.settle(&claim.key, "p1", ProspectState::Posted).unwrap();
+    let settled = &l.list().unwrap()[0];
+    assert!(settled.send_started_at.is_none());
+    assert_eq!(settled.state, ProspectState::Posted);
+  }
+
+  #[test]
+  fn committed_settle_retry_does_not_disturb_a_new_owner() {
+    let (l, _g) = ledger();
+    l.ingest(&[cand("bilibili", "BV1", "https://b/1")]).unwrap();
+    let opts = ClaimOptions {
+      per_item_account_cap: 10,
+      ..Default::default()
+    };
+    let first = l.claim_next("p1", "bilibili", &opts).unwrap().unwrap();
+    l.settle(&first.key, "p1", ProspectState::Skipped).unwrap();
+    l.claim_next("p2", "bilibili", &opts)
+      .unwrap()
+      .expect("a skip should leave the item available to another account");
+
+    l.settle(&first.key, "p1", ProspectState::Skipped)
+      .expect("a lost-response retry must remain idempotent after reassignment");
+    let rec = &l.list().unwrap()[0];
+    assert_eq!(rec.state, ProspectState::Claimed);
+    assert_eq!(rec.claimed_by.as_deref(), Some("p2"));
+    assert_eq!(rec.touches.len(), 1);
   }
 
   #[test]
@@ -831,7 +1117,7 @@ mod tests {
       "填入不等于发布，不该占用 per-item cap"
     );
     assert_eq!(
-      l.list().unwrap()[0].posted_account_count(),
+      l.list().unwrap()[0].public_footprint_count(),
       0,
       "Filled 绝不能被算成 Posted"
     );
@@ -890,7 +1176,7 @@ mod tests {
     let o = ClaimOptions::default();
     let c = l.claim_next("p1", "bilibili", &o).unwrap().unwrap();
     l.settle(&c.key, "p1", ProspectState::Blocked).unwrap();
-    assert_eq!(l.list().unwrap()[0].posted_account_count(), 0);
+    assert_eq!(l.list().unwrap()[0].public_footprint_count(), 0);
   }
 
   #[test]
@@ -913,7 +1199,7 @@ mod tests {
   }
 
   #[test]
-  fn only_posted_consumes_the_public_footprint_cap() {
+  fn drafts_and_pre_click_failures_do_not_consume_the_public_footprint_cap() {
     let (l, _g) = ledger();
     l.ingest(&[cand("bilibili", "BV9", "https://b/9")]).unwrap();
     let o = ClaimOptions {
@@ -925,10 +1211,256 @@ mod tests {
       let c = l.claim_next(p, "bilibili", &o).unwrap().unwrap();
       l.settle(&c.key, p, st).unwrap();
     }
-    assert_eq!(l.list().unwrap()[0].posted_account_count(), 0);
+    assert_eq!(l.list().unwrap()[0].public_footprint_count(), 0);
     assert!(
       l.claim_next("p3", "bilibili", &o).unwrap().is_some(),
       "两次非发布的接触不该吃掉 cap=2 的额度"
+    );
+  }
+
+  #[test]
+  fn an_unconfirmed_click_consumes_the_public_footprint_cap() {
+    let (l, _g) = ledger();
+    l.ingest(&[cand("bilibili", "BV_uncertain", "https://b/uncertain")])
+      .unwrap();
+    let opts = ClaimOptions::default(); // cap = 1
+    let first = l.claim_next("p1", "bilibili", &opts).unwrap().unwrap();
+    l.prepare_send(&first.key, "p1").unwrap();
+    l.settle(&first.key, "p1", ProspectState::Unconfirmed)
+      .unwrap();
+
+    let record = &l.list().unwrap()[0];
+    assert_eq!(record.public_footprint_count(), 1);
+    assert!(record.touched_by("p1"));
+    assert!(
+      l.claim_next("p2", "bilibili", &opts).unwrap().is_none(),
+      "a click without a receipt may already be public and must consume cap=1"
+    );
+  }
+
+  /// 台账文件存在但为空 = 写坏了，不是「还没有记录」。
+  ///
+  /// 当成空台账的后果是**去重静默失效**：所有已经评论过的目标全部重新变成
+  /// 新目标，账号会在同一条内容下二次发言 —— 那正是平台第一眼就会注意到的模式。
+  #[test]
+  fn an_empty_ledger_file_is_damage_not_a_fresh_start() {
+    let (l, _g) = ledger();
+
+    // 先正常写入一条，确认能读回来。
+    l.ingest(&[cand("bilibili", "BV1", "https://b.test/1")])
+      .expect("ingest");
+    assert_eq!(l.list().expect("list").len(), 1);
+
+    // 模拟掉电后留下的零长度文件。
+    std::fs::write(l.path(), b"").expect("truncate");
+
+    let err = l.list().expect_err("空文件必须报错，不能当成空台账");
+    assert!(
+      matches!(err, ProspectError::EmptyLedger { .. }),
+      "应当是 EmptyLedger，实际是 {err:?}"
+    );
+  }
+
+  /// 全空白（不只是零长度）同样算写坏。
+  #[test]
+  fn a_whitespace_only_ledger_is_also_rejected() {
+    let (l, _g) = ledger();
+    l.ingest(&[cand("zhihu", "Z1", "https://z.test/1")])
+      .expect("ingest");
+    std::fs::write(l.path(), b"   \n\t\n").expect("blank");
+    assert!(matches!(
+      l.list().expect_err("空白文件要报错"),
+      ProspectError::EmptyLedger { .. }
+    ));
+  }
+
+  /// 台账**不存在**仍然是合法的空台账 —— 别把首次运行也拒了。
+  #[test]
+  fn a_missing_ledger_is_still_an_empty_one() {
+    let (l, _g) = ledger();
+    assert!(l.list().expect("首次运行不该报错").is_empty());
+  }
+
+  /// 每次写都要落到磁盘，且写完能原样读回。
+  #[test]
+  fn a_saved_ledger_round_trips_through_the_atomic_replace() {
+    let (l, _g) = ledger();
+    l.ingest(&[
+      cand("bilibili", "BV1", "https://b.test/1"),
+      cand("douyin", "D1", "https://d.test/1"),
+    ])
+    .expect("ingest");
+
+    // 反复重写 —— persist_with_retry 的正常路径必须一次成功，不能引入退避延迟。
+    for i in 0..5 {
+      l.ingest(&[cand("zhihu", &format!("Z{i}"), "https://z.test/x")])
+        .expect("ingest again");
+    }
+
+    let on_disk = std::fs::read_to_string(l.path()).expect("read");
+    assert!(!on_disk.trim().is_empty(), "落盘内容不该为空");
+    assert_eq!(l.list().expect("list").len(), 7);
+  }
+
+  /// 只有「文件正被别人占着」这类会自己消失的错误才值得重试。
+  /// 磁盘满、路径不对这些重试多少次都一样，必须立刻报出来。
+  #[test]
+  fn only_self_clearing_replace_failures_are_retried() {
+    use std::io::{Error, ErrorKind};
+    // Windows 把 ERROR_SHARING_VIOLATION / ERROR_ACCESS_DENIED 映射到这里。
+    assert!(is_transient_replace_error(&Error::from(
+      ErrorKind::PermissionDenied
+    )));
+    assert!(is_transient_replace_error(&Error::from(
+      ErrorKind::Interrupted
+    )));
+    for kind in [
+      ErrorKind::NotFound,
+      ErrorKind::AlreadyExists,
+      ErrorKind::InvalidInput,
+      ErrorKind::OutOfMemory,
+    ] {
+      assert!(
+        !is_transient_replace_error(&Error::from(kind)),
+        "{kind:?} 不会自己好，重试只是拖延报错"
+      );
+    }
+  }
+
+  // ---------------------------------------------------------------- 知乎话题级去重
+  //
+  // 实测到的重复：question/2050569952449634692 下面挂着两个回答，
+  // 系统把它们当成两条无关目标，同一个账号在同一个问题里评了两次。
+
+  const Q: &str = "2050569952449634692";
+  fn zhihu_answer(aid: &str) -> Candidate {
+    Candidate {
+      platform: "zhihu".to_string(),
+      item_id: format!("zhihu:answer:{aid}"),
+      title: "到目前为止，你觉得最好用的科研工具是什么？".to_string(),
+      open_url: format!("https://www.zhihu.com/question/{Q}/answer/{aid}"),
+      keyword: Some("科研工具".to_string()),
+    }
+  }
+
+  #[test]
+  fn a_question_id_is_read_out_of_a_zhihu_answer_url() {
+    assert_eq!(
+      zhihu_question_id("https://www.zhihu.com/question/606932275/answer/2053034914010895538"),
+      Some("606932275")
+    );
+    assert_eq!(
+      zhihu_question_id("https://www.zhihu.com/question/606932275/answer/1?utm_id=0"),
+      Some("606932275")
+    );
+    // 专栏文章头上没有问题。
+    assert_eq!(
+      zhihu_question_id("https://zhuanlan.zhihu.com/p/2027315517946442938"),
+      None
+    );
+    // 形态不对时宁可退回按单条去重，也不要凑出一个错的分组把别的内容一起挡掉。
+    assert_eq!(
+      zhihu_question_id("https://www.zhihu.com/question//answer/1"),
+      None
+    );
+    assert_eq!(
+      zhihu_question_id("https://www.zhihu.com/question/abc/answer/1"),
+      None
+    );
+    assert_eq!(
+      zhihu_question_id("https://www.bilibili.com/video/BV1"),
+      None
+    );
+  }
+
+  /// 同一个问题下的第二个回答，同一个账号不能再拿。
+  #[test]
+  fn one_account_cannot_comment_under_two_answers_of_the_same_question() {
+    let (l, _g) = ledger();
+    l.ingest(&[
+      zhihu_answer("2053182600689333370"),
+      zhihu_answer("2057478634580063639"),
+    ])
+    .unwrap();
+    let opts = ClaimOptions::default();
+
+    let first = l.claim_next("p1", "zhihu", &opts).unwrap().unwrap();
+    l.prepare_send(&first.key, "p1").unwrap();
+    l.settle(&first.key, "p1", ProspectState::Posted).unwrap();
+
+    assert!(
+      l.claim_next("p1", "zhihu", &opts).unwrap().is_none(),
+      "同一个问题下的另一个回答不能再发给同一个账号 —— 页面上看就是同一个人在同一个问题里评了两次"
+    );
+  }
+
+  /// 但这是**账号级**闸门：换个账号仍然可以进这个问题（受 cap 约束）。
+  #[test]
+  fn another_account_may_still_take_a_different_answer_in_that_question() {
+    let (l, _g) = ledger();
+    l.ingest(&[
+      zhihu_answer("2053182600689333370"),
+      zhihu_answer("2057478634580063639"),
+    ])
+    .unwrap();
+    let opts = ClaimOptions {
+      per_item_account_cap: 2,
+      ..ClaimOptions::default()
+    };
+
+    let first = l.claim_next("p1", "zhihu", &opts).unwrap().unwrap();
+    l.prepare_send(&first.key, "p1").unwrap();
+    l.settle(&first.key, "p1", ProspectState::Posted).unwrap();
+
+    let second = l
+      .claim_next("p2", "zhihu", &opts)
+      .unwrap()
+      .expect("换账号不该被话题级闸门挡住 —— 那是账号级判据，不是内容级");
+    // 拿到哪一条不重要（按位置取，多半还是第一条）；重要的是它**在这个问题里**：
+    // 话题级闸门只拦同一个账号，跨账号仍由 per_item_account_cap 说了算。
+    assert_eq!(second.thread_key(), format!("zhihu:question:{Q}"));
+  }
+
+  /// 分组只对知乎生效。别的平台一条内容就是一个评论区，
+  /// 误分组会把整批候选一起挡掉。
+  #[test]
+  fn other_platforms_are_grouped_one_record_at_a_time() {
+    let (l, _g) = ledger();
+    l.ingest(&[
+      cand("bilibili", "BV1", "https://www.bilibili.com/video/BV1"),
+      cand("bilibili", "BV2", "https://www.bilibili.com/video/BV2"),
+    ])
+    .unwrap();
+    let opts = ClaimOptions::default();
+
+    let first = l.claim_next("p1", "bilibili", &opts).unwrap().unwrap();
+    l.prepare_send(&first.key, "p1").unwrap();
+    l.settle(&first.key, "p1", ProspectState::Posted).unwrap();
+
+    assert!(
+      l.claim_next("p1", "bilibili", &opts).unwrap().is_some(),
+      "两个不同的视频是两个评论区，同一个账号都能投"
+    );
+  }
+
+  /// 专栏文章没有上级问题，各自独立。
+  #[test]
+  fn zhihu_articles_are_not_grouped_together() {
+    let (l, _g) = ledger();
+    l.ingest(&[
+      cand("zhihu", "zhihu:article:1", "https://zhuanlan.zhihu.com/p/1"),
+      cand("zhihu", "zhihu:article:2", "https://zhuanlan.zhihu.com/p/2"),
+    ])
+    .unwrap();
+    let opts = ClaimOptions::default();
+
+    let first = l.claim_next("p1", "zhihu", &opts).unwrap().unwrap();
+    l.prepare_send(&first.key, "p1").unwrap();
+    l.settle(&first.key, "p1", ProspectState::Posted).unwrap();
+
+    assert!(
+      l.claim_next("p1", "zhihu", &opts).unwrap().is_some(),
+      "两篇专栏文章是两个评论区，不该被归成一组"
     );
   }
 }

@@ -1838,7 +1838,8 @@
     "marineDiscoveryAlreadyRunning": "Đã có một lượt phát hiện đang chạy.",
     "marineDiscoveryEmptyPlan": "Hãy chọn ít nhất một hồ sơ và một nền tảng.",
     "marineDiscoveryEmptyKeyword": "Hãy nhập từ khóa tìm kiếm.",
-    "marineDiscoveryProfileNotFound": "Một trong các hồ sơ đã chọn không còn tồn tại."
+    "marineDiscoveryProfileNotFound": "Một trong các hồ sơ đã chọn không còn tồn tại.",
+    "marineDiscoveryProfileCrossOs": "Hồ sơ \"{{name}}\" được tạo trên một hệ điều hành khác nên không thể chạy ở đây. Hãy tạo hồ sơ mới trên máy này và đăng nhập lại."
   },
   "rail": {
     "profiles": "Profile",
@@ -2207,7 +2208,7 @@
       "run": {
         "label": "Chạy tự động",
         "title": "Chạy phát hiện",
-        "description": "Mở lần lượt từng hồ sơ, xử lý mỗi lần một nền tảng rồi đóng lại trước khi sang cái tiếp theo — không bao giờ mở hai cái cùng lúc. Lượt chạy dừng sau khi điền bản nháp vào ô bình luận: nó không gửi.",
+        "description": "Mở lần lượt từng hồ sơ và chỉ xử lý một nền tảng tại một thời điểm. Sau khi xác minh bản nháp hoàn chỉnh, hệ thống gửi bình luận và chờ biên nhận từ nền tảng.",
         "keyword": "Từ khóa",
         "keywordPlaceholder": "ví dụ: công cụ nghiên cứu",
         "platforms": "Nền tảng",
@@ -2242,7 +2243,8 @@
       },
       "stats": {
         "label": "Tóm tắt sổ",
-        "posted": "Đã đăng"
+        "posted": "Đã đăng",
+        "unconfirmed": "Chờ xác nhận"
       },
       "filters": {
         "label": "Bộ lọc sổ",
@@ -2255,7 +2257,7 @@
         "keywords": "Từ khóa",
         "accounts": "Tài khoản",
         "open": "Mở trong trình duyệt",
-        "postedAt": "Đã đăng lúc"
+        "postedAt": "Đã ghi nhận lúc"
       },
       "empty": {
         "title": "Sổ vẫn còn trống",

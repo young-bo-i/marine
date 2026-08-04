@@ -1838,7 +1838,8 @@
     "marineDiscoveryAlreadyRunning": "이미 발견 작업이 진행 중입니다.",
     "marineDiscoveryEmptyPlan": "프로필과 플랫폼을 각각 하나 이상 선택하세요.",
     "marineDiscoveryEmptyKeyword": "검색 키워드를 입력하세요.",
-    "marineDiscoveryProfileNotFound": "선택한 프로필 중 하나가 더 이상 존재하지 않습니다."
+    "marineDiscoveryProfileNotFound": "선택한 프로필 중 하나가 더 이상 존재하지 않습니다.",
+    "marineDiscoveryProfileCrossOs": "프로필 \"{{name}}\"은(는) 다른 운영 체제에서 만들어져 여기서는 실행할 수 없습니다. 이 컴퓨터에서 새 프로필을 만들고 다시 로그인하세요."
   },
   "rail": {
     "profiles": "프로필",
@@ -2207,7 +2208,7 @@
       "run": {
         "label": "자동 실행",
         "title": "자동으로 한 바퀴 돌리기",
-        "description": "프로필을 차례로 열어 한 번에 한 플랫폼씩 처리하고, 닫은 뒤 다음으로 넘어갑니다. 동시에 두 개를 열지 않습니다. 댓글 입력란에 초안을 채운 뒤 멈추며 전송하지 않습니다.",
+        "description": "프로필을 차례로 열어 한 번에 한 플랫폼씩 처리하며, 동시에 두 개를 열지 않습니다. 완성된 초안을 확인한 뒤 댓글을 전송하고 플랫폼의 수신 확인을 기다립니다.",
         "keyword": "키워드",
         "keywordPlaceholder": "예: 연구 도구",
         "platforms": "플랫폼",
@@ -2242,7 +2243,8 @@
       },
       "stats": {
         "label": "대장 요약",
-        "posted": "게시됨"
+        "posted": "게시됨",
+        "unconfirmed": "확인 대기"
       },
       "filters": {
         "label": "대장 필터",
@@ -2255,7 +2257,7 @@
         "keywords": "키워드",
         "accounts": "계정",
         "open": "브라우저에서 열기",
-        "postedAt": "게시 시각"
+        "postedAt": "기록 시각"
       },
       "empty": {
         "title": "대장이 아직 비어 있습니다",

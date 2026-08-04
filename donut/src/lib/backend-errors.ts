@@ -47,6 +47,7 @@ export type BackendErrorCode =
   | "MARINE_DISCOVERY_EMPTY_PLAN"
   | "MARINE_DISCOVERY_EMPTY_KEYWORD"
   | "MARINE_DISCOVERY_PROFILE_NOT_FOUND"
+  | "MARINE_DISCOVERY_PROFILE_CROSS_OS"
   | "INTERNAL_ERROR";
 
 export interface BackendError {
@@ -187,6 +188,10 @@ export function translateBackendError(t: TFunction, err: unknown): string {
       return t("backendErrors.marineDiscoveryEmptyKeyword");
     case "MARINE_DISCOVERY_PROFILE_NOT_FOUND":
       return t("backendErrors.marineDiscoveryProfileNotFound");
+    case "MARINE_DISCOVERY_PROFILE_CROSS_OS":
+      return t("backendErrors.marineDiscoveryProfileCrossOs", {
+        name: parsed.params?.message ?? "",
+      });
     case "INTERNAL_ERROR":
       return t("backendErrors.internal", {
         detail: parsed.params?.detail ?? "",

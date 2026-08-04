@@ -1400,6 +1400,11 @@ pub async fn run_proxy_server(config: ProxyConfig) -> Result<(), Box<dyn std::er
   // Update config with actual port and local_url (scheme matches the protocol
   // we serve, so the parent's readiness check and any consumer see the truth)
   let mut updated_config = config.clone();
+  // The worker is the sole writer of runtime fields.  Writing its PID together
+  // with the bound URL avoids a parent/child whole-file race where either side
+  // could overwrite the other's fresh value with the pid-less bootstrap
+  // snapshot and make a live worker look permanently unready or unkillable.
+  updated_config.pid = Some(std::process::id());
   updated_config.local_port = Some(actual_port);
   updated_config.local_url = Some(format!(
     "{}://127.0.0.1:{}",

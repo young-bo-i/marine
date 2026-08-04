@@ -1838,7 +1838,8 @@
     "marineDiscoveryAlreadyRunning": "已有一轮任务在进行中。",
     "marineDiscoveryEmptyPlan": "请至少选择一个配置文件和一个平台。",
     "marineDiscoveryEmptyKeyword": "请填写搜索关键词。",
-    "marineDiscoveryProfileNotFound": "所选配置文件中有一个已不存在。"
+    "marineDiscoveryProfileNotFound": "所选配置文件中有一个已不存在。",
+    "marineDiscoveryProfileCrossOs": "配置文件「{{name}}」是在其他操作系统上创建的，无法在这里运行。请在本机新建一个配置文件并重新登录。"
   },
   "rail": {
     "profiles": "配置文件",
@@ -2207,7 +2208,7 @@
       "run": {
         "label": "自动化任务",
         "title": "自动跑一轮",
-        "description": "依次打开每个配置文件，一次只做一个平台，做完关掉再进下一个，绝不同时开两个。当前只把话术填入评论框就停，不会点发送。",
+        "description": "依次打开每个配置文件，一次只做一个平台，绝不同时开两个。完整核对生成草稿后会自动提交评论，并等待平台回执确认。",
         "keyword": "关键词",
         "keywordPlaceholder": "例如：科研工具",
         "platforms": "平台",
@@ -2242,7 +2243,8 @@
       },
       "stats": {
         "label": "台账概览",
-        "posted": "已发布"
+        "posted": "已发布",
+        "unconfirmed": "待确认"
       },
       "filters": {
         "label": "台账筛选",
@@ -2255,7 +2257,7 @@
         "keywords": "关键词",
         "accounts": "涉及账号",
         "open": "在浏览器中打开",
-        "postedAt": "发布时间"
+        "postedAt": "记录时间"
       },
       "empty": {
         "title": "台账还是空的",

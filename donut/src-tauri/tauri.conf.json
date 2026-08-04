@@ -17,9 +17,18 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg", "nsis", "deb", "rpm", "appimage"],
+    "targets": [
+      "app",
+      "dmg",
+      "nsis",
+      "deb",
+      "rpm",
+      "appimage"
+    ],
     "category": "Productivity",
-    "externalBin": ["binaries/donut-proxy"],
+    "externalBin": [
+      "binaries/donut-proxy"
+    ],
     "resources": {
       "../marine-extension": "marine-extension",
       "../rime-plugin/manifest.json": "rime-plugin/manifest.json"
@@ -46,11 +55,19 @@
     "linux": {
       "deb": {
         "desktopTemplate": "donutbrowser.desktop",
-        "depends": ["xdg-utils", "libxdo3", "libayatana-appindicator3-1"]
+        "depends": [
+          "xdg-utils",
+          "libxdo3",
+          "libayatana-appindicator3-1"
+        ]
       },
       "rpm": {
         "desktopTemplate": "donutbrowser.desktop",
-        "depends": ["xdg-utils", "libxdo", "libayatana-appindicator-gtk3"]
+        "depends": [
+          "xdg-utils",
+          "libxdo",
+          "libayatana-appindicator-gtk3"
+        ]
       },
       "appimage": {
         "files": {
@@ -61,13 +78,20 @@
     "windows": {
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
-      "timestampUrl": ""
+      "timestampUrl": "",
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
+      }
     }
   },
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["http", "https"]
+        "schemes": [
+          "http",
+          "https"
+        ]
       }
     }
   }

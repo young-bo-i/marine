@@ -1838,7 +1838,8 @@
     "marineDiscoveryAlreadyRunning": "A discovery run is already in progress.",
     "marineDiscoveryEmptyPlan": "Pick at least one profile and one platform.",
     "marineDiscoveryEmptyKeyword": "Enter a search keyword.",
-    "marineDiscoveryProfileNotFound": "One of the selected profiles no longer exists."
+    "marineDiscoveryProfileNotFound": "One of the selected profiles no longer exists.",
+    "marineDiscoveryProfileCrossOs": "Profile \"{{name}}\" was created on a different operating system and cannot run here. Create a new profile on this machine and sign in again."
   },
   "rail": {
     "profiles": "Profiles",
@@ -2207,7 +2208,7 @@
       "run": {
         "label": "Automation run",
         "title": "Run discovery",
-        "description": "Opens each profile in turn, works one platform at a time, then closes it before moving on — never two at once. The run stops after writing the draft into the comment box; it does not send.",
+        "description": "Opens each profile in turn and works one platform at a time — never two at once. After verifying the completed draft, it submits the comment and waits for the platform receipt.",
         "keyword": "Keyword",
         "keywordPlaceholder": "e.g. research tools",
         "platforms": "Platforms",
@@ -2242,7 +2243,8 @@
       },
       "stats": {
         "label": "Ledger summary",
-        "posted": "Posted"
+        "posted": "Posted",
+        "unconfirmed": "Pending confirmation"
       },
       "filters": {
         "label": "Ledger filters",
@@ -2255,7 +2257,7 @@
         "keywords": "Keyword",
         "accounts": "Accounts",
         "open": "Open in browser",
-        "postedAt": "Posted at"
+        "postedAt": "Recorded at"
       },
       "empty": {
         "title": "Nothing in the ledger yet",

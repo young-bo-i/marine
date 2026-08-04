@@ -16,7 +16,7 @@ import vm from "node:vm";
 const here = path.dirname(fileURLToPath(import.meta.url));
 // vm 沙箱默认没有 URL/URLSearchParams（浏览器里是有的），不补进去
 // platformOfSearchPage 会因为 new URL 抛错而一律返回 null。
-const ctx = { console, URL, URLSearchParams };
+const ctx = { console, URL, URLSearchParams, setTimeout, clearTimeout };
 vm.createContext(ctx);
 vm.runInContext(
   fs.readFileSync(path.resolve(here, "../src/platforms/prospect-run.js"), "utf8"),
@@ -70,7 +70,7 @@ assert.equal(R.platformOfSearchPage("not a url"), null, "坏 URL 不该抛");
   {
     // 终局：落标记，不再重跑
     const storage = mk();
-    for (const terminal of ["claimed", "nothing_to_claim", "not_logged_in"]) {
+    for (const terminal of ["claimed", "nothing_to_claim", "not_logged_in", "target_navigation_stalled"]) {
       const s2 = mk();
       assert.equal(R.isTerminal(terminal), true, `${terminal} 应当是终局`);
       assert.equal(R.markDone(SEARCH.zhihu, terminal, s2), true);
@@ -150,6 +150,8 @@ function deps(over) {
       return null;
     },
     navigate: (u) => calls.navigated.push(u),
+    // Phase A 正常空读在单测里不需要真实等待；瞬时恢复由专门用例覆盖。
+    handoffReadDelays: [0],
     // 交接单在 SW 侧（按 tab），不是 sessionStorage —— B 站搜索页和靶子页不同源。
     handoffStore: (() => {
       let cell = null;
@@ -161,6 +163,30 @@ function deps(over) {
     })(),
   };
   return [Object.assign(base, over || {}), calls];
+}
+
+// ------------------------------------------- Phase A handoff 空读也要容忍 MV3 瞬时抖动
+{
+  let reads = 0;
+  const [d, calls] = deps({
+    handoffReadDelays: [0, 0],
+    sleep: async () => {},
+    handoffStore: {
+      read: async () => {
+        reads += 1;
+        if (reads === 1) throw new Error("worker waking");
+        return null;
+      },
+      write: async () => true,
+      clear: async () => {},
+    },
+  });
+  const result = await R.run(d);
+  assert.equal(result.status, "claimed",
+    "首次 read 异常、随后成功确认为空时 Phase A 应继续，不能误报 handoff_read_failed");
+  assert.equal(reads, 3,
+    "恢复预检成功空读后仍要完成确认窗口，并把历史异常清掉");
+  assert.equal(calls.api.filter(call => call.route === "prospects/claim").length, 1);
 }
 
 // ---------------------------------------------------------------- 正常路径
@@ -177,6 +203,33 @@ function deps(over) {
     ["https://www.bilibili.com/video/BV1aaaaaaaaa/"], "应当导航到领到的靶子");
 }
 
+// ------------------------------------------------- 导航 watchdog 终局不能伪装成 claimed
+{
+  let navigationMeta = null;
+  const [d] = deps({
+    navigate: async (url, meta) => {
+      navigationMeta = meta;
+      return {
+        status: "target_navigation_stalled",
+        expected: url,
+        // 刻意让 href 已是目标：字符串变了不代表旧 document 已卸载。
+        got: url,
+        key: meta.key,
+        attempts: 2,
+      };
+    },
+  });
+  const r = await R.run(d);
+  assert.equal(r.status, "target_navigation_stalled");
+  assert.equal(r.expected, "https://www.bilibili.com/video/BV1aaaaaaaaa/");
+  assert.equal(r.got, r.expected);
+  assert.equal(r.key, "bilibili:BV1aaaaaaaaa");
+  assert.equal(navigationMeta.key, "bilibili:BV1aaaaaaaaa");
+  assert.equal(navigationMeta.platform, "bilibili");
+  assert.equal(navigationMeta.reason, "claim");
+  assert.equal(R.isTerminal(r.status), true, "导航停滞已 claim，Phase A 不能再领一条");
+}
+
 // ------------------------------------------- 交接单写不下就绝不能导航
 {
   // 导航了但交接单没写成 = 打开一个没人接手的页面，还把这条靶子卡在 claimed
@@ -187,6 +240,9 @@ function deps(over) {
   const r = await R.run(d);
   assert.equal(r.status, "handoff_write_failed");
   assert.deepStrictEqual([...calls.navigated], [], "交接单没写成就不该导航");
+  assert.equal(calls.api.filter((call) => call.route === "prospects/claim").length, 1);
+  assert.equal(R.isTerminal(r.status), true,
+    "claim 已发生后写 handoff 失败必须终局，不能整轮重跑再 claim 一条");
 }
 
 // ------------------------------------------- 交接单必须在导航之前写完
@@ -206,6 +262,211 @@ function deps(over) {
     "交接单必须先落定再导航");
 }
 
+// ------------------------------------------- Phase A 先恢复旧 settlement，再决定是否 login/claim
+{
+  const old = {
+    key: "zhihu:OLD_POSTED",
+    platform: "zhihu",
+    open_url: "https://www.zhihu.com/question/1/answer/OLD_POSTED",
+    profileId: "old-profile",
+    stopAfter: "send",
+    at: Date.now() - 60_000,
+    sendStarted: true,
+    pendingSettlement: "posted",
+  };
+  let cell = old;
+  const order = [];
+  const store = {
+    read: async () => cell,
+    write: async (value) => { cell = value; return true; },
+    clear: async () => { cell = null; },
+  };
+  const [d] = deps({
+    handoffStore: store,
+    settlementRetryDelays: [0, 0, 0],
+    settlementMaxAttempts: 3,
+    settlementSleep: async () => {},
+    login: async () => { order.push("login"); return { loggedIn: true }; },
+    api: async (route, body) => {
+      order.push(route);
+      if (route === "prospects/settle") {
+        assert.equal(cell.key, old.key, "API 成功前必须保留旧 pending handoff");
+        assert.equal(cell.pendingSettlement, "posted");
+        assert.equal(body.key, old.key);
+        return {};
+      }
+      if (route === "prospects/ingest") return { inserted: 2 };
+      if (route === "prospects/claim") {
+        return {
+          key: "bilibili:AFTER_RECOVERY",
+          platform: "bilibili",
+          open_url: "https://www.bilibili.com/video/AFTER_RECOVERY/",
+        };
+      }
+      return null;
+    },
+  });
+  const result = await R.run(d);
+  assert.equal(result.status, "claimed", "跨平台补 settle 不会结束当前 leg，可继续搜索任务");
+  assert.deepStrictEqual(order.slice(0, 2), ["prospects/settle", "login"],
+    "旧 settlement 必须早于当前平台登录闸");
+  assert.equal(cell.key, "bilibili:AFTER_RECOVERY", "恢复清理后才能写新 handoff");
+}
+
+// 同平台 terminal touch 会让 scheduler 立刻结束当前 leg；绝不能在它之后又 claim。
+{
+  const old = {
+    key: "bilibili:SAME_PLATFORM_POSTED",
+    platform: "bilibili",
+    open_url: "https://www.bilibili.com/video/SAME_PLATFORM_POSTED/",
+    profileId: "p1",
+    stopAfter: "send",
+    at: Date.now() - 60_000,
+    sendStarted: true,
+    pendingSettlement: "posted",
+  };
+  let cell = old;
+  let loginCalls = 0;
+  const apiRoutes = [];
+  const [d] = deps({
+    handoffStore: {
+      read: async () => cell,
+      write: async value => { cell = value; return true; },
+      clear: async () => { cell = null; },
+    },
+    login: async () => { loginCalls += 1; return { loggedIn: true }; },
+    api: async route => { apiRoutes.push(route); return {}; },
+    settlementRetryDelays: [0],
+    settlementMaxAttempts: 1,
+  });
+  const result = await R.run(d);
+  assert.equal(result.status, "settled_before_claim");
+  assert.equal(result.key, old.key);
+  assert.equal(result.state, "posted");
+  assert.deepStrictEqual(apiRoutes, ["prospects/settle"]);
+  assert.equal(loginCalls, 0, "同平台恢复后不能再进入 login/ingest/claim");
+  assert.equal(cell, null);
+  const flags = new Map();
+  const flagStore = {
+    getItem: key => flags.get(key) ?? null,
+    setItem: (key, value) => flags.set(key, value),
+  };
+  assert.equal(R.isTerminal(result.status), true);
+  assert.equal(R.markDone(SEARCH.bilibili, result.status, flagStore), true,
+    "settled_before_claim 必须立刻落 document terminal，不能在 scheduler poll 前重跑");
+}
+
+// blocked 不计 scheduler 的当前平台完成 touch，补记后仍应继续 claim 下一条。
+{
+  const old = {
+    key: "bilibili:SAME_PLATFORM_BLOCKED",
+    platform: "bilibili",
+    open_url: "https://www.bilibili.com/video/SAME_PLATFORM_BLOCKED/",
+    profileId: "p1",
+    stopAfter: "send",
+    at: Date.now() - 60_000,
+    pendingSettlement: "blocked",
+  };
+  let cell = old;
+  const [d] = deps({
+    handoffStore: {
+      read: async () => cell,
+      write: async value => { cell = value; return true; },
+      clear: async () => { cell = null; },
+    },
+    api: async (route) => {
+      if (route === "prospects/settle") return {};
+      if (route === "prospects/ingest") return { inserted: 1 };
+      if (route === "prospects/claim") {
+        return {
+          key: "bilibili:AFTER_BLOCKED_RECOVERY",
+          platform: "bilibili",
+          open_url: "https://www.bilibili.com/video/AFTER_BLOCKED_RECOVERY/",
+        };
+      }
+      return null;
+    },
+    settlementRetryDelays: [0],
+    settlementMaxAttempts: 1,
+  });
+  const result = await R.run(d);
+  assert.equal(result.status, "claimed");
+  assert.equal(cell.key, "bilibili:AFTER_BLOCKED_RECOVERY");
+}
+
+// unconfirmed 与 posted 一样会结束 scheduler leg，恢复后也必须直接终局。
+{
+  const old = {
+    key: "bilibili:SAME_PLATFORM_UNCONFIRMED",
+    platform: "bilibili",
+    open_url: "https://www.bilibili.com/video/SAME_PLATFORM_UNCONFIRMED/",
+    profileId: "p1",
+    stopAfter: "send",
+    at: Date.now() - 60_000,
+    sendStarted: true,
+    pendingSettlement: "unconfirmed",
+  };
+  let cell = old;
+  let loginCalls = 0;
+  const [d] = deps({
+    handoffStore: {
+      read: async () => cell,
+      write: async value => { cell = value; return true; },
+      clear: async () => { cell = null; },
+    },
+    login: async () => { loginCalls += 1; return { loggedIn: true }; },
+    api: async route => {
+      assert.equal(route, "prospects/settle");
+      return {};
+    },
+    settlementRetryDelays: [0],
+    settlementMaxAttempts: 1,
+  });
+  const result = await R.run(d);
+  assert.equal(result.status, "settled_before_claim");
+  assert.equal(result.state, "unconfirmed");
+  assert.equal(loginCalls, 0);
+  assert.equal(R.isTerminal(result.status), true);
+}
+
+{
+  const old = {
+    key: "bilibili:OLD_FAILED_SETTLE",
+    platform: "bilibili",
+    open_url: "https://www.bilibili.com/video/OLD_FAILED_SETTLE/",
+    profileId: "old-profile",
+    stopAfter: "send",
+    at: Date.now() - 60_000,
+    sendStarted: true,
+    pendingSettlement: "posted",
+  };
+  let cell = old;
+  let loginCalls = 0;
+  let claimCalls = 0;
+  const [d] = deps({
+    handoffStore: {
+      read: async () => cell,
+      write: async (value) => { cell = value; return true; },
+      clear: async () => { cell = null; },
+    },
+    settlementRetryDelays: [0, 0, 0],
+    settlementMaxAttempts: 3,
+    settlementSleep: async () => {},
+    login: async () => { loginCalls += 1; return { loggedIn: false }; },
+    api: async (route) => {
+      if (route === "prospects/claim") claimCalls += 1;
+      throw new Error("settle API unavailable");
+    },
+  });
+  const result = await R.run(d);
+  assert.equal(result.status, "settle_failed");
+  assert.equal(result.recoverable, true);
+  assert.deepStrictEqual([loginCalls, claimCalls], [0, 0],
+    "恢复失败时不能被当前平台掉登录截断，更不能 claim");
+  assert.equal(cell.key, old.key);
+  assert.equal(cell.pendingSettlement, "posted", "旧 pending 绝不能被新 handoff 覆盖");
+}
+
 // ---------------------------------------------------------------- 未登录必须停
 {
   const [d, calls] = deps({ login: async () => ({ loggedIn: false, evidence: "platform_rejected" }) });
@@ -213,6 +474,95 @@ function deps(over) {
   assert.equal(r.status, "not_logged_in");
   assert.deepStrictEqual([...calls.api], [], "未登录时不该产生任何台账写入");
   assert.deepStrictEqual([...calls.navigated], [], "也不该导航");
+}
+
+// ------------------------------------------- 普通旧 handoff 要恢复导航，不能短路后续平台
+{
+  const old = {
+    key: "bilibili:RESUME_OLD_HANDOFF",
+    platform: "bilibili",
+    open_url: "https://www.bilibili.com/video/RESUME_OLD_HANDOFF/",
+    profileId: "p1",
+    stopAfter: "send",
+    at: Date.now(),
+  };
+  let loginCalls = 0;
+  let apiCalls = 0;
+  let navigationMeta = null;
+  const [d] = deps({
+    handoffReadDelays: [0],
+    handoffStore: {
+      read: async () => old,
+      write: async () => true,
+      clear: async () => { throw new Error("普通 handoff 不得清掉"); },
+    },
+    login: async () => { loginCalls += 1; return { loggedIn: true }; },
+    api: async () => { apiCalls += 1; return null; },
+    navigate: async (url, meta) => {
+      assert.equal(url, old.open_url);
+      navigationMeta = meta;
+      return {
+        status: "target_navigation_stalled",
+        expected: url,
+        got: url,
+        key: old.key,
+        attempts: 2,
+      };
+    },
+  });
+  const result = await R.run(d);
+  assert.equal(result.status, "target_navigation_stalled");
+  assert.equal(result.resumed, true);
+  assert.equal(navigationMeta.reason, "handoff_resume");
+  assert.deepStrictEqual([loginCalls, apiCalls], [0, 0],
+    "恢复旧 handoff 时不能登录/ingest/claim 新任务");
+}
+
+// 已进入下一平台 search 时，旧平台 plain handoff 不得把当前 leg 劫回去。
+{
+  const old = {
+    key: "bilibili:STALE_BEFORE_ZHIHU",
+    platform: "bilibili",
+    open_url: "https://www.bilibili.com/video/STALE_BEFORE_ZHIHU/",
+    profileId: "p1",
+    stopAfter: "send",
+    at: Date.now() - 60_000,
+  };
+  let cell = old;
+  const routes = [];
+  const navigated = [];
+  const target = {
+    key: "zhihu:CURRENT_LEG_TARGET",
+    platform: "zhihu",
+    open_url: "https://www.zhihu.com/question/1/answer/CURRENT_LEG_TARGET",
+  };
+  const [d] = deps({
+    href: SEARCH.zhihu,
+    handoffReadDelays: [0],
+    handoffStore: {
+      read: async () => cell,
+      write: async value => { cell = value; return true; },
+      clear: async () => { cell = null; },
+    },
+    api: async (route, body) => {
+      routes.push({ route, body });
+      if (route === "prospects/settle") return {};
+      if (route === "prospects/ingest") return { inserted: 1 };
+      if (route === "prospects/claim") return target;
+      return null;
+    },
+    navigate: async url => { navigated.push(url); },
+    settlementRetryDelays: [0],
+    settlementMaxAttempts: 1,
+  });
+  const result = await R.run(d);
+  assert.equal(result.status, "claimed");
+  assert.equal(routes[0].route, "prospects/settle");
+  assert.equal(routes[0].body.key, old.key);
+  assert.equal(routes[0].body.state, "failed");
+  assert.deepStrictEqual(navigated, [target.open_url],
+    "Bili plain handoff 应安全终结，Zhihu leg 只能导航自己的新目标");
+  assert.equal(cell.key, target.key);
 }
 
 // ---------------------------------------------------------------- 未知 ≠ 未登录
@@ -287,20 +637,22 @@ function deps(over) {
   // 运营会去重新登录一个其实健康的账号。
   {
     const reported = [];
-    const [d] = deps();
-    d.reportLogin = (r) => { reported.push(r); };
+    const runLogin = async (login) => {
+      const [d] = deps({
+        login: async () => login,
+        reportLogin: (r) => { reported.push(r); },
+      });
+      return await R.run(d);
+    };
 
-    d.login = async () => ({ loggedIn: true, evidence: "platform_confirmed" });
-    await R.run(d);
+    await runLogin({ loggedIn: true, evidence: "platform_confirmed" });
     assert.equal(reported.length, 0, "已登录不该上报");
 
-    d.login = async () => ({ platform: "zhihu", loggedIn: false, evidence: "platform_rejected" });
-    await R.run(d);
+    await runLogin({ platform: "zhihu", loggedIn: false, evidence: "platform_rejected" });
     assert.equal(reported.length, 1, "确认登出必须上报");
     assert.equal(reported[0].loggedIn, false);
 
-    d.login = async () => ({ platform: "zhihu", loggedIn: null, evidence: "verify_failed" });
-    await R.run(d);
+    await runLogin({ platform: "zhihu", loggedIn: null, evidence: "verify_failed" });
     assert.equal(reported.length, 2, "判断不了也要上报 —— 它不是「正常」，只是还没定论");
     assert.equal(reported[1].loggedIn, null, "三态不能在上报时被压成两态");
   }
@@ -340,7 +692,7 @@ function deps(over) {
   const CLAIM = { key: "bilibili:BV1", platform: "bilibili", open_url: "https://www.bilibili.com/video/BV1/" };
   const handoffFor = (stopAfter, hops) => ({
     key: CLAIM.key, platform: CLAIM.platform, open_url: CLAIM.open_url,
-    profileId: "p1", stopAfter: stopAfter || "fill", at: 0, hops: hops || 0,
+    profileId: "p1", stopAfter: stopAfter || "fill", at: Date.now(), hops: hops || 0,
   });
 
   const tdeps = (over) => {
@@ -352,6 +704,9 @@ function deps(over) {
       href: CLAIM.open_url,
       generateAndFill: async () => ({ ok: true, text: "一条直评" }),
       send: async () => ({ ok: true }),
+      settlementRetryDelays: [0, 0, 0],
+      settlementMaxAttempts: 3,
+      settlementSleep: async () => {},
       api: async (route, body) => { calls.push({ route, state: body && body.state }); return {}; },
     }, over || {}), calls, storage];
   };
@@ -372,6 +727,169 @@ function deps(over) {
     const r = await R.runOnTarget({ handoffStore: mkStore(), api: async (route) => { calls.push(route); } });
     assert.equal(r.status, "no_handoff");
     assert.deepStrictEqual([...calls], [], "非编排页面不该产生任何记录");
+  }
+
+  // 还没进入发送阶段的旧/坏交接单必须在任何生成前清理。tab 恢复时
+  // 把数小时前的详情页当成当前任务，比放弃这张未开始的交接单危险得多。
+  {
+    const invalidTimes = [
+      ["超时", Date.now() - R.HANDOFF_TTL_MS - 1],
+      ["缺失", undefined],
+      ["非法", "not-a-timestamp"],
+    ];
+    for (const [label, at] of invalidTimes) {
+      const handoff = { ...handoffFor("send"), key: `bilibili:expired-${label}`, at };
+      const storage = mkStore(handoff);
+      let generated = 0;
+      let sent = 0;
+      let settled = 0;
+      const r = await R.runOnTarget({
+        handoffStore: storage,
+        href: handoff.open_url,
+        generateAndFill: async () => { generated += 1; return { ok: true, text: "不该生成" }; },
+        send: async () => { sent += 1; return { ok: true }; },
+        api: async () => { settled += 1; return {}; },
+      });
+      assert.equal(r.status, "handoff_expired", `${label}的预发送交接单应过期`);
+      assert.equal(await storage.read(), null, `${label}的交接单应被清理`);
+      assert.deepStrictEqual([generated, sent, settled], [0, 0, 0],
+        "过期交接单不能生成、发送或改写台账");
+    }
+  }
+
+  // TTL 只能清预发送交接单。旧 pending settlement 是防重凭据，必须只补
+  // settle；即使没有 sendStarted，pendingSettlement 本身也足以禁止过期清理。
+  {
+    const handoff = {
+      ...handoffFor("send"),
+      key: "bilibili:old-pending-settlement",
+      at: Date.now() - R.HANDOFF_TTL_MS - 1,
+      pendingSettlement: "posted",
+    };
+    const storage = mkStore(handoff);
+    let generated = 0;
+    let sent = 0;
+    let settled = 0;
+    const r = await R.runOnTarget({
+      handoffStore: storage,
+      href: handoff.open_url,
+      generateAndFill: async () => { generated += 1; return { ok: true, text: "不应重生成" }; },
+      send: async () => { sent += 1; return { ok: true }; },
+      api: async (route, body) => {
+        assert.equal(route, "prospects/settle");
+        assert.equal(body.state, "posted");
+        settled += 1;
+        return {};
+      },
+    });
+    assert.equal(r.status, "settled_after_retry");
+    assert.deepStrictEqual([generated, sent, settled], [0, 0, 1],
+      "旧 pending settlement 只能补记，不能重新生成或点击");
+    assert.equal(await storage.read(), null, "补记成功后才清交接单");
+  }
+
+  // sendStarted 即使暂时没有 pending state 也不能被 TTL 清掉。
+  {
+    const handoff = {
+      ...handoffFor("send"),
+      key: "bilibili:old-send-started",
+      at: Date.now() - R.HANDOFF_TTL_MS - 1,
+      sendStarted: true,
+    };
+    const storage = mkStore(handoff);
+    const r = await R.runOnTarget({ handoffStore: storage, href: handoff.open_url });
+    assert.equal(r.status, "send_already_started");
+    assert.ok(await storage.read(), "已开始发送的旧交接单必须保留");
+  }
+
+  // 新文档与 MV3 worker 启动有竞态：瞬时异常/空读都要在短窗口内恢复。
+  {
+    let reads = 0;
+    let generated = 0;
+    let began = 0;
+    let ended = 0;
+    const handoff = {
+      ...handoffFor("fill"),
+      key: "bilibili:single-flight",
+      open_url: "https://www.bilibili.com/video/SINGLE_FLIGHT/",
+    };
+    const store = {
+      read: async () => {
+        reads += 1;
+        if (reads === 1) throw new Error("worker waking");
+        if (reads === 2) return null;
+        return handoff;
+      },
+      write: async () => true,
+      // 模拟 clear 瞬时失败后交接单仍在；document 内的 started-key 仍要挡住重跑。
+      clear: async () => { throw new Error("storage busy"); },
+    };
+    const d = {
+      handoffStore: store,
+      handoffReadDelays: [0, 0, 0],
+      sleep: async () => {},
+      href: handoff.open_url,
+      settlementRetryDelays: [0, 0, 0],
+      settlementMaxAttempts: 3,
+      settlementSleep: async () => {},
+      beginTarget: async () => { began += 1; },
+      endTarget: async () => { ended += 1; },
+      generateAndFill: async () => { generated += 1; return { ok: true, text: "只生成一次" }; },
+      api: async () => ({}),
+    };
+
+    const [a, b] = await Promise.all([
+      R.runOnTargetSingleFlight(d),
+      R.runOnTargetSingleFlight(d),
+    ]);
+    assert.equal(a.status, "settle_failed");
+    assert.equal(b.status, "settle_failed");
+    assert.equal(a.stage, "clear", "API 成功但 handoff 未清理时不能误报 filled");
+    assert.equal(reads, 3, "并发 bootstrap 必须共用同一条 handoff 重试链");
+    assert.equal(generated, 1, "single-flight 只能驱动一次真实生成");
+    assert.equal(began, 1);
+    assert.equal(ended, 1, "成功或失败都必须成对退出编排模式");
+
+    const duplicate = await R.runOnTargetSingleFlight(d);
+    assert.equal(duplicate.status, "target_already_started",
+      "交接单清理失败时，同一 document 也不能再次执行不可逆动作");
+    assert.equal(generated, 1);
+  }
+
+  // 重试窗口耗尽后要给出可区分的 transport/storage 状态，且不能把 flight 永久锁死。
+  {
+    let value = null;
+    let fail = true;
+    const handoff = {
+      ...handoffFor("fill"),
+      key: "bilibili:retry-after-failure",
+      open_url: "https://www.bilibili.com/video/RETRY_AFTER_FAILURE/",
+    };
+    const store = {
+      read: async () => {
+        if (fail) throw new Error("storage unavailable");
+        return value;
+      },
+      write: async () => true,
+      clear: async () => { value = null; },
+    };
+    const d = {
+      handoffStore: store,
+      handoffReadDelays: [0, 0],
+      sleep: async () => {},
+      href: handoff.open_url,
+      generateAndFill: async () => ({ ok: true, text: "恢复后执行" }),
+      api: async () => ({}),
+    };
+    const failed = await R.runOnTargetSingleFlight(d);
+    assert.equal(failed.status, "handoff_read_failed");
+    assert.equal(failed.attempts, 2);
+    assert.match(failed.error, /storage unavailable/);
+
+    fail = false;
+    value = handoff;
+    assert.equal((await R.runOnTargetSingleFlight(d)).status, "filled",
+      "前一次读取耗尽不能永久锁住后续恢复");
   }
 
   // 正常路径：填入 -> settle(filled)
@@ -411,19 +929,155 @@ function deps(over) {
     assert.deepStrictEqual([...calls], [{ route: "prospects/settle", state: "failed" }]);
   }
 
-  // settle 自身失败不该改变结论 —— 已经填进去的事实不会因此撤销
+  // settle 失败必须显式返回且保留 handoff；吞掉后清理会让调度器看不到终态。
   {
-    const [d] = tdeps({ api: async () => { throw new Error("台账不可达"); } });
+    const [d, , storage] = tdeps({ api: async () => { throw new Error("台账不可达"); } });
     const r = await R.runOnTarget(d);
-    assert.equal(r.status, "filled", "记录失败只影响台账，不改变本轮判定");
+    assert.equal(r.status, "settle_failed");
+    assert.equal(r.state, "filled");
+    assert.match(r.error, /台账不可达/);
+    assert.equal((await storage.read()).pendingSettlement, "filled",
+      "第一次 settle API 之前就必须持久化 terminal state");
   }
 
-  // 页面已经不是那条靶子了（用户/脚本点走了）
+  // 短暂 settle 失败在同 document 只补记：不退回 runOnTarget 重生成。
   {
-    const [d, calls] = tdeps({ href: "https://www.bilibili.com/video/BV_OTHER/" });
-    const r = await R.runOnTarget(d);
-    assert.equal(r.status, "handoff_url_mismatch");
+    let generated = 0;
+    let settleCalls = 0;
+    let cell = handoffFor("fill");
+    const store = {
+      read: async () => cell,
+      write: async (value) => { cell = value; return true; },
+      clear: async () => { cell = null; },
+    };
+    const result = await R.runOnTarget({
+      handoffStore: store,
+      href: CLAIM.open_url,
+      generateAndFill: async () => { generated += 1; return { ok: true, text: "只生成一次" }; },
+      settlementRetryDelays: [0, 0, 0],
+      settlementMaxAttempts: 3,
+      settlementSleep: async () => {},
+      api: async (route, body) => {
+        assert.equal(route, "prospects/settle");
+        assert.equal(cell.pendingSettlement, "filled", "API 前必须看得见可恢复状态");
+        assert.equal(body.state, "filled");
+        settleCalls += 1;
+        if (settleCalls < 3) throw new Error("transient settle failure");
+        return {};
+      },
+    });
+    assert.equal(result.status, "filled");
+    assert.deepStrictEqual([generated, settleCalls], [1, 3],
+      "同 document 恢复只重试 settle，不重复生成");
+    assert.equal(cell, null, "API 成功后才清 handoff");
+  }
+
+  // 明确 4xx 不是传输抖动，持续 settlement-only 只会白等整条腿。
+  {
+    const [d, , storage] = tdeps({
+      api: async () => { throw new Error("prospects/settle 返回 409"); },
+    });
+    const result = await R.runOnTarget(d);
+    assert.equal(result.status, "settle_failed");
+    assert.equal(result.recoverable, false);
+    assert.equal(result.attempts, 1, "明确 409 应立即停，不进退避循环");
+    assert.equal(await storage.read(), null,
+      "nonrecoverable 必须移出 active outbox，否则会永久阻塞该 profile 的新 key");
+  }
+
+  // 4xx 已不可恢复，但 durable/local clear 若失败仍不能虚报 nonrecoverable 已清。
+  {
+    let cell = handoffFor("fill");
+    const store = {
+      read: async () => cell,
+      write: async value => { cell = value; return true; },
+      clear: async () => { throw new Error("local storage busy"); },
+    };
+    const result = await R.runOnTarget({
+      handoffStore: store,
+      href: CLAIM.open_url,
+      generateAndFill: async () => ({ ok: true, text: "已填" }),
+      api: async () => { throw new Error("prospects/settle 返回 404"); },
+      settlementRetryDelays: [0],
+      settlementMaxAttempts: 1,
+    });
+    assert.equal(result.status, "settle_failed");
+    assert.equal(result.recoverable, true,
+      "local-first 清理失败时必须保留恢复语义");
+    assert.equal(result.stage, "dead_letter");
+    assert.equal(cell.pendingSettlement, "filled");
+  }
+
+  // dead-letter mutation 自身也可能遇到 MV3/storage 瞬时抖动；正式 document 要留在
+  // 同一 settlement-only 循环，只重试 move，不得静置，更不能重复 settle API。
+  {
+    let cell = handoffFor("fill");
+    let apiCalls = 0;
+    let deadLetterCalls = 0;
+    let generated = 0;
+    const store = {
+      read: async () => cell,
+      write: async value => { cell = value; return true; },
+      clear: async () => { cell = null; },
+      deadLetter: async () => {
+        deadLetterCalls += 1;
+        if (deadLetterCalls === 1) throw new Error("storage waking");
+        cell = null;
+      },
+    };
+    const result = await R.runOnTarget({
+      handoffStore: store,
+      href: CLAIM.open_url,
+      generateAndFill: async () => { generated += 1; return { ok: true, text: "已填" }; },
+      api: async () => {
+        apiCalls += 1;
+        throw new Error("prospects/settle 返回 409");
+      },
+      settlementRetryDelays: [0, 0],
+      settlementMaxAttempts: 2,
+      settlementSleep: async () => {},
+    });
+    assert.equal(result.status, "settle_failed");
+    assert.equal(result.recoverable, false);
+    assert.equal(result.deadLetterAttempts, 2);
+    assert.deepStrictEqual([generated, apiCalls, deadLetterCalls], [1, 1, 2],
+      "第一次 move 失败后只重试 dead-letter，不重复生成/settle API");
+    assert.equal(cell, null);
+  }
+
+  // 页面已经不是那条靶子了：精确拉回一次，次数先持久化；再错就明确结束。
+  {
+    const navigated = [];
+    const [d, calls, storage] = tdeps({
+      href: "https://www.bilibili.com/video/BV_OTHER/",
+      navigate: (url) => navigated.push(url),
+    });
+    const first = await R.runOnTarget(d);
+    assert.equal(first.status, "handoff_redirected");
+    assert.deepStrictEqual([...navigated], [CLAIM.open_url], "只能精确回到 claim 给出的 URL");
+    assert.equal((await storage.read()).mismatchRedirects, 1,
+      "必须在导航前持久化次数，否则新 document 会无限重定向");
+
+    const second = await R.runOnTarget(d);
+    assert.equal(second.status, "handoff_url_mismatch");
+    assert.equal(second.redirects, 1);
+    assert.deepStrictEqual([...navigated], [CLAIM.open_url], "同一交接单最多纠正一次");
     assert.deepStrictEqual([...calls], [], "认错页面时不该乱记");
+    assert.equal(await storage.read(), null, "纠正一次仍错就是终局，不能把旧 handoff 留在 tab 上");
+  }
+
+  // 次数写不下时不能先导航，否则新页面看不到次数，会形成重定向死循环。
+  {
+    const navigated = [];
+    const handoff = handoffFor("fill");
+    const r = await R.runOnTarget({
+      handoff,
+      handoffStore: { read: async () => handoff, write: async () => false, clear: async () => {} },
+      href: "https://www.bilibili.com/video/BV_OTHER/",
+      navigate: (url) => navigated.push(url),
+    });
+    assert.equal(r.status, "handoff_redirect_persist_failed");
+    assert.deepStrictEqual([...navigated], []);
   }
 
   // 平台会往 URL 追加追踪参数，不能因此判成换了页面
@@ -434,33 +1088,262 @@ function deps(over) {
     assert.equal(R.sameTarget("https://x.com/a", "https://x.com/b"), false);
   }
 
-  // stopAfter=send 时才走发送（当前不启用，但路径要是对的）
+  // 抖音同一内容会在详情页和精选抽屉之间改写 URL；只认内容 id，不认页面壳。
+  {
+    const id = "7667516480883379508";
+    const modal = `https://www.douyin.com/jingxuan?modal_id=${id}`;
+    assert.equal(R.sameTarget(`https://www.douyin.com/video/${id}`, modal), true);
+    assert.equal(R.sameTarget(`https://www.douyin.com/note/${id}?from=search`, modal), true);
+    assert.equal(
+      R.sameTarget(`https://www.douyin.com/video/${id}`, "https://www.douyin.com/jingxuan?modal_id=7667548040672120064"),
+      false,
+      "精选页展示了另一条内容时仍必须判成真正错页",
+    );
+    assert.equal(R.sameTarget(modal, "https://www.douyin.com/jingxuan"), false,
+      "精选抽屉关闭后没有 target id，不能靠忽略 query 误认成原内容");
+    assert.equal(R.sameTarget(modal, "https://www.douyin.com/jingxuan?modal_id=bad"), false,
+      "畸形 modal_id 不能被当成同靶子");
+  }
+
+  // stopAfter=send 时才走发送；当前四个自动化平台都依赖这条路径。
   {
     const [d, calls] = tdeps({ stopAfter: "send" });
     const r = await R.runOnTarget(d);
     assert.equal(r.status, "posted");
-    assert.deepStrictEqual([...calls], [{ route: "prospects/settle", state: "posted" }]);
+    assert.deepStrictEqual([...calls], [
+      { route: "prospects/prepare-send", state: undefined },
+      { route: "prospects/settle", state: "posted" },
+    ]);
+  }
+  {
+    // prepare-send 报错/响应丢失时不能猜成功后点击；guard 已 durable，随后只 settle。
+    let cell = handoffFor("send");
+    let sent = 0;
+    const routes = [];
+    const result = await R.runOnTarget({
+      handoffStore: {
+        read: async () => cell,
+        write: async value => { cell = value; return true; },
+        clear: async () => { cell = null; },
+      },
+      href: CLAIM.open_url,
+      generateAndFill: async () => ({ ok: true, text: "不会被点击" }),
+      send: async () => { sent += 1; return { ok: true }; },
+      api: async (route, body) => {
+        routes.push(route);
+        if (route === "prospects/prepare-send") {
+          assert.equal(cell.sendStarted, true, "prepare 前 durable send guard 必须已落定");
+          assert.equal(cell.pendingSettlement, "failed");
+          assert.equal(body.key, CLAIM.key);
+          throw new Error("prepare response lost");
+        }
+        assert.equal(route, "prospects/settle");
+        assert.equal(body.state, "failed");
+        return {};
+      },
+      settlementRetryDelays: [0],
+      settlementMaxAttempts: 1,
+    });
+    assert.equal(result.status, "prepare_send_failed");
+    assert.equal(sent, 0, "prepare 失败绝不能调用 send/click");
+    assert.deepStrictEqual(routes, ["prospects/prepare-send", "prospects/settle"]);
+    assert.equal(cell, null, "failed settle 成功后才清 durable guard");
   }
   {
     // 发送实现必须拿到生成出来的文本 —— 它要用来核对输入框里的实际内容，
     // 挡住「只敲了一半就点发布」（实测在知乎发出过一条只有两个字的评论）。
     let gotArgs = null;
-    const [d] = tdeps({
+    const [d, , storage] = tdeps({
       stopAfter: "send",
       generateAndFill: async () => ({ ok: true, text: "完整的一条直评文案" }),
-      send: async (platform, text, key) => { gotArgs = [platform, text, key]; return { ok: true }; },
+      send: async (platform, text, key, expectedTargetUrl, markAttempted) => {
+        assert.equal(typeof markAttempted, "function");
+        await markAttempted();
+        assert.equal((await storage.read()).pendingSettlement, "unconfirmed",
+          "真实 click 紧前必须先 durable unconfirmed");
+        gotArgs = [platform, text, key, expectedTargetUrl];
+        return { ok: true };
+      },
     });
     await R.runOnTarget(d);
-    assert.deepStrictEqual(gotArgs, ["bilibili", "完整的一条直评文案", "bilibili:BV1"],
-      "send 要收到平台、生成文本和交接单 key —— 文本用来核对草稿完整性，" +
+    assert.deepStrictEqual(gotArgs, [
+      "bilibili",
+      "完整的一条直评文案",
+      "bilibili:BV1",
+      CLAIM.open_url,
+    ],
+      "send 要收到平台、生成文本、交接单 key 和权威目标 URL：文本核对草稿，" +
       "key 用来保证同一条只点一次（小红书发完不清空草稿，重试会重复发送）");
+  }
+
+  // 生成期间 SPA 从 A 切到 B：在持久化 send guard/调用 send 前就终止。
+  {
+    let href = CLAIM.open_url;
+    let generated = 0;
+    let sent = 0;
+    let cell = handoffFor("send");
+    const result = await R.runOnTarget({
+      handoffStore: {
+        read: async () => cell,
+        write: async (value) => { cell = value; return true; },
+        clear: async () => { cell = null; },
+      },
+      href,
+      currentHref: () => href,
+      generateAndFill: async () => {
+        generated += 1;
+        href = "https://www.bilibili.com/video/BV_CHANGED_DURING_GENERATION/";
+        return { ok: true, text: "A 的文案" };
+      },
+      send: async () => { sent += 1; return { ok: true }; },
+      settlementRetryDelays: [0, 0, 0],
+      settlementMaxAttempts: 3,
+      settlementSleep: async () => {},
+      api: async (route, body) => {
+        assert.equal(route, "prospects/settle");
+        assert.equal(body.state, "failed");
+        assert.equal(cell.pendingSettlement, "failed");
+        assert.equal(cell.sendStarted, undefined, "靶子已换时连 send guard 都不该进入");
+        return {};
+      },
+    });
+    assert.equal(result.status, "target_changed_before_send");
+    assert.equal(result.expected, CLAIM.open_url);
+    assert.equal(result.got, href);
+    assert.deepStrictEqual([generated, sent], [1, 0], "A→B 后绝不能调用发送/点击链路");
+    assert.equal(cell, null, "目标变更作为 failed 落账后才清交接单");
   }
   {
     const [d, calls] = tdeps({ stopAfter: "send", send: async () => ({ ok: false, error: "风控拦截" }) });
     const r = await R.runOnTarget(d);
     assert.equal(r.status, "send_failed");
-    assert.deepStrictEqual([...calls], [{ route: "prospects/settle", state: "failed" }],
+    assert.deepStrictEqual([...calls], [
+      { route: "prospects/prepare-send", state: undefined },
+      { route: "prospects/settle", state: "failed" },
+    ],
       "发送失败要记 failed，而不是 posted");
+  }
+
+  // click 已成功返回但回执超时：这是一次真实外部动作，必须记 unconfirmed；
+  // 新 document 只补 settle，不能把它当 failed 后再点一次。
+  {
+    const handoff = { ...handoffFor("send"), key: "bilibili:receipt-timeout" };
+    let cell = handoff;
+    let generated = 0;
+    let sent = 0;
+    let settleCalls = 0;
+    const d = {
+      handoffStore: {
+        read: async () => cell,
+        write: async value => { cell = value; return true; },
+        clear: async () => { cell = null; },
+      },
+      href: handoff.open_url,
+      generateAndFill: async () => { generated += 1; return { ok: true, text: "已点击但回执未知" }; },
+      send: async () => {
+        sent += 1;
+        return { ok: false, attempted: true, error: "已点发送但未收到平台回执" };
+      },
+      api: async route => {
+        if (route === "prospects/prepare-send") return {};
+        settleCalls += 1;
+        if (settleCalls === 1) throw new Error("settle transport lost");
+        return {};
+      },
+      settlementRetryDelays: [0],
+      settlementMaxAttempts: 1,
+    };
+    const first = await R.runOnTarget(d);
+    assert.equal(first.status, "settle_failed");
+    assert.equal(first.state, "unconfirmed");
+    assert.equal(cell.pendingSettlement, "unconfirmed");
+    const recovered = await R.runOnTarget(d);
+    assert.equal(recovered.status, "settled_after_retry");
+    assert.equal(recovered.state, "unconfirmed");
+    assert.deepStrictEqual([generated, sent], [1, 1],
+      "receipt timeout 跨 document 只能补 settle，绝不能二次生成/点击");
+    assert.equal(cell, null);
+  }
+
+  // send adapter reject 无法证明异常在 click 前还是后，同样必须保守 unconfirmed；
+  // content wiring 另验证 btn.click catch 分支确实带 attempted:true。
+  {
+    const [d, calls] = tdeps({
+      stopAfter: "send",
+      send: async () => { throw new Error("adapter rejected after unknown click state"); },
+    });
+    const result = await R.runOnTarget(d);
+    assert.equal(result.status, "send_unconfirmed");
+    assert.deepStrictEqual([...calls], [
+      { route: "prospects/prepare-send", state: undefined },
+      { route: "prospects/settle", state: "unconfirmed" },
+    ]);
+  }
+
+  // sendStarted/pendingSettlement 存在 SW store：跨 document 只能补记，不能再点。
+  {
+    const handoff = { ...handoffFor("send"), key: "bilibili:cross-document-send" };
+    let cell = handoff;
+    let generated = 0;
+    let sent = 0;
+    let settleAttempts = 0;
+    let guardSeenBeforeSend = false;
+    const store = {
+      read: async () => cell,
+      write: async (value) => { cell = value; return true; },
+      clear: async () => { cell = null; },
+    };
+    const d = {
+      handoffStore: store,
+      href: handoff.open_url,
+      generateAndFill: async () => { generated += 1; return { ok: true, text: "不可重复" }; },
+      send: async () => {
+        sent += 1;
+        guardSeenBeforeSend = !!(cell && cell.sendStarted && cell.pendingSettlement === "failed");
+        return { ok: true };
+      },
+      settlementRetryDelays: [0, 0, 0],
+      settlementMaxAttempts: 3,
+      settlementSleep: async () => {},
+      api: async (route) => {
+        if (route === "prospects/prepare-send") return {};
+        settleAttempts += 1;
+        if (settleAttempts <= 3) throw new Error("settle transport lost");
+        return {};
+      },
+    };
+
+    const first = await R.runOnTarget(d);
+    assert.equal(first.status, "settle_failed");
+    assert.equal(first.state, "posted");
+    assert.equal(first.recoverable, true, "pending 仍可由当前/新 document 继续补记");
+    assert.equal(first.attempts, 3);
+    assert.equal(guardSeenBeforeSend, true, "必须先持久化不可逆动作闸再调用 send");
+    assert.equal(cell.pendingSettlement, "posted", "回执成功后要留下可补记的 posted 状态");
+
+    // 模拟页面重建后的新 document：直接读同一个 SW store，不共享任何内存 guard。
+    const recovered = await R.runOnTarget(d);
+    assert.equal(recovered.status, "settled_after_retry");
+    assert.equal(recovered.state, "posted");
+    assert.equal(sent, 1, "跨 document 恢复只允许补 settle，绝不能再次点击发送");
+    assert.equal(generated, 1, "补记台账不应重新生成草稿");
+    assert.equal(cell, null, "补记成功后才清 handoff");
+  }
+
+  // 不可逆动作闸写不下时宁可不发，也不能依赖当前 document 的内存标记。
+  {
+    const handoff = { ...handoffFor("send"), key: "bilibili:guard-write-failed" };
+    let sent = 0;
+    const r = await R.runOnTarget({
+      handoff,
+      handoffStore: { read: async () => handoff, write: async () => false, clear: async () => {} },
+      href: handoff.open_url,
+      generateAndFill: async () => ({ ok: true, text: "不能冒险发送" }),
+      send: async () => { sent += 1; return { ok: true }; },
+      api: async () => ({}),
+    });
+    assert.equal(r.status, "send_guard_persist_failed");
+    assert.equal(sent, 0);
   }
 }
 
@@ -505,7 +1388,7 @@ function deps(over) {
     const navigated = [];
     const storage = mkStore({
       key: CLAIM.key, platform: CLAIM.platform, open_url: CLAIM.open_url,
-      profileId: "p1", stopAfter: "fill", at: 0, hops: (over && over.hops) || 0,
+      profileId: "p1", stopAfter: "fill", at: Date.now(), hops: (over && over.hops) || 0,
     });
     const handoffStore = storage;
     return [Object.assign({
