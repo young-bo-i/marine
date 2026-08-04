@@ -25,24 +25,46 @@ pub mod chrome_decrypt {
   /// macOS uses 1003 iterations, Linux uses 1. Getting this wrong produces a
   /// different AES key → silent decryption failure → empty cookie values.
   /// See `components/os_crypt/sync/os_crypt_{mac.mm,linux.cc}` in Chromium.
-  #[cfg(target_os = "macos")]
-  const PBKDF2_ITERATIONS: u32 = 1003;
-  #[cfg(not(target_os = "macos"))]
-  const PBKDF2_ITERATIONS: u32 = 1;
+  /// macOS Chromium derives with 1003 iterations, Linux with 1.
+  pub(crate) const ITERATIONS_MACOS: u32 = 1003;
+  pub(crate) const ITERATIONS_OTHER: u32 = 1;
+
+  /// Iteration count for a store that was written on `source_os`.
+  ///
+  /// The count belongs to **whoever encrypted the cookies**, not to whoever is
+  /// reading them. As a `#[cfg]` constant it silently meant "the machine running
+  /// this build", which is the same thing right up until a profile moves between
+  /// machines — and then a Windows host would derive with 1 iteration against a
+  /// store macOS wrote with 1003, get a wrong key, and decrypt nothing. Passing
+  /// `None` falls back to the host's own convention, which is correct for a
+  /// profile with no recorded origin.
+  pub(crate) fn iterations_for(source_os: Option<&str>) -> u32 {
+    match source_os {
+      Some("macos") => ITERATIONS_MACOS,
+      Some(_) => ITERATIONS_OTHER,
+      None => {
+        if cfg!(target_os = "macos") {
+          ITERATIONS_MACOS
+        } else {
+          ITERATIONS_OTHER
+        }
+      }
+    }
+  }
 
   const KEY_LEN: usize = 16; // AES-128
   const SALT: &[u8] = b"saltysalt";
   const IV: [u8; 16] = [b' '; 16]; // 16 spaces
   const HOST_HASH_LEN: usize = 32; // SHA-256 output length
 
-  fn derive_key(password: &[u8]) -> [u8; KEY_LEN] {
+  fn derive_key(password: &[u8], iterations: u32) -> [u8; KEY_LEN] {
     let mut key = [0u8; KEY_LEN];
     // Using ring::pbkdf2 instead of the `pbkdf2` crate to avoid digest
     // version conflicts between sha1 0.11 (digest 0.11) and pbkdf2 0.12
     // (digest 0.10). ring's implementation is self-contained.
     pbkdf2::derive(
       pbkdf2::PBKDF2_HMAC_SHA1,
-      NonZeroU32::new(PBKDF2_ITERATIONS).expect("iterations must be non-zero"),
+      NonZeroU32::new(iterations).expect("iterations must be non-zero"),
       SALT,
       password,
       &mut key,
@@ -50,7 +72,12 @@ pub mod chrome_decrypt {
     key
   }
 
-  pub fn get_encryption_key(profile_data_path: &Path) -> Option<[u8; KEY_LEN]> {
+  /// `source_os` is the profile's recorded `host_os` — the OS whose Chromium
+  /// wrote this cookie store. See [`iterations_for`].
+  pub fn get_encryption_key(
+    profile_data_path: &Path,
+    source_os: Option<&str>,
+  ) -> Option<[u8; KEY_LEN]> {
     let key_file = profile_data_path.join("os_crypt_key");
     // Read as raw bytes and do NOT trim — Chromium's `ReadFileToString`
     // passes the exact file contents to `Pbkdf2(file_contents)`. Any
@@ -59,7 +86,7 @@ pub mod chrome_decrypt {
     if contents.is_empty() {
       return None;
     }
-    Some(derive_key(&contents))
+    Some(derive_key(&contents, iterations_for(source_os)))
   }
 
   /// Decrypt a Chrome encrypted cookie value.
@@ -132,6 +159,16 @@ pub struct CookieReadResult {
   pub browser_type: String,
   pub domains: Vec<DomainCookies>,
   pub total_count: usize,
+  /// Rows that had an encrypted value we could not turn back into text.
+  ///
+  /// Counted rather than swallowed. A failed decrypt used to become an empty
+  /// string, which is indistinguishable from a genuinely empty cookie: the read
+  /// reported the full row count, the export wrote every name and domain, and
+  /// the only thing missing was the part that carries the session. Whoever
+  /// imported that file got a profile that looks completely logged in and is
+  /// 401 on every request. Any non-zero value here means the key was wrong.
+  #[serde(default)]
+  pub undecryptable_count: usize,
 }
 
 /// Lightweight cookie metadata for the profile-info dialog. Computed without
@@ -192,19 +229,36 @@ impl CookieManager {
 
   fn get_chrome_encryption_key(profile: &BrowserProfile, profiles_dir: &Path) -> Option<[u8; 16]> {
     let profile_data_path = profile.get_profile_data_path(profiles_dir);
-    chrome_decrypt::get_encryption_key(&profile_data_path)
+    // Derive with the convention of the OS that wrote the store, not this one.
+    chrome_decrypt::get_encryption_key(&profile_data_path, profile.resolved_os())
   }
 
+  /// Where this profile actually keeps its cookie database.
+  ///
+  /// Probed, not derived from the host OS. Which of the two layouts Chromium
+  /// uses is a property of **the profile** (the build that created it), not of
+  /// the machine reading it — and once profiles move between machines those two
+  /// stop agreeing. Keying it on `cfg!(windows)` meant a Windows host looked in
+  /// `Default/Network/Cookies` for a profile whose cookies are in
+  /// `Default/Cookies` (all five real profiles here are the latter), found an
+  /// empty path, and reported "0 cookies" instead of an error.
+  ///
+  /// Same probe order as `wayfern_manager`'s launch diagnostic — this predicate
+  /// must not exist in two versions.
   fn wayfern_cookie_path(profile_data_path: &Path) -> PathBuf {
     let default_dir = profile_data_path.join("Default");
-    #[cfg(target_os = "windows")]
-    {
-      default_dir.join("Network").join("Cookies")
+    let network = default_dir.join("Network").join("Cookies");
+    if network.exists() {
+      return network;
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-      default_dir.join("Cookies")
+    let flat = default_dir.join("Cookies");
+    if flat.exists() {
+      return flat;
     }
+    // Neither exists yet (profile never launched). Hand back the layout current
+    // Chromium would create so the caller's "missing" error names the right
+    // path; `import_cookies` refuses this case outright anyway.
+    network
   }
 
   /// Get the cookie database path for a profile (read-side: errors if missing).
@@ -249,7 +303,18 @@ impl CookieManager {
       "wayfern" => {
         let path = Self::wayfern_cookie_path(&profile_data_path);
         if !path.exists() {
-          Self::create_empty_chrome_cookies_db(&path)?;
+          // Refuse instead of hand-rolling the store.
+          //
+          // `create_empty_chrome_cookies_db` writes schema version 23, while the
+          // Wayfern builds in use here create version 24 (verified against every
+          // real profile on this machine). On first launch Chromium runs its
+          // 23→24 migration, the `ALTER TABLE` collides with columns the table
+          // already has, and the recovery path **razes the whole database** —
+          // so the import reports success, the browser starts fine, and every
+          // cookie is gone. Chasing the version number just moves the problem to
+          // the next schema bump; letting the browser create its own store is
+          // the only version-proof answer.
+          return Err(serde_json::json!({ "code": "PROFILE_NEVER_LAUNCHED" }).to_string());
         }
         Ok(path)
       }
@@ -265,57 +330,6 @@ impl CookieManager {
         profile.browser
       )),
     }
-  }
-
-  /// Create an empty Chromium-format Cookies SQLite database at `path`.
-  ///
-  /// Schema matches what recent Chromium versions write on first launch:
-  /// the `cookies` table, the `meta` table with version info, and the
-  /// `host_key/top_frame_site_key/name/path` unique index. Chromium's cookie
-  /// store migration code will upgrade this forward when Wayfern first
-  /// launches the profile.
-  fn create_empty_chrome_cookies_db(path: &Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-      std::fs::create_dir_all(parent)
-        .map_err(|e| format!("Failed to create cookie directory: {e}"))?;
-    }
-    let conn =
-      Connection::open(path).map_err(|e| format!("Failed to create cookie database: {e}"))?;
-    conn
-      .execute_batch(
-        "CREATE TABLE cookies(
-          creation_utc INTEGER NOT NULL,
-          host_key TEXT NOT NULL,
-          top_frame_site_key TEXT NOT NULL,
-          name TEXT NOT NULL,
-          value TEXT NOT NULL,
-          encrypted_value BLOB NOT NULL DEFAULT '',
-          path TEXT NOT NULL,
-          expires_utc INTEGER NOT NULL,
-          is_secure INTEGER NOT NULL,
-          is_httponly INTEGER NOT NULL,
-          last_access_utc INTEGER NOT NULL,
-          has_expires INTEGER NOT NULL DEFAULT 1,
-          is_persistent INTEGER NOT NULL DEFAULT 1,
-          priority INTEGER NOT NULL DEFAULT 1,
-          samesite INTEGER NOT NULL DEFAULT -1,
-          source_scheme INTEGER NOT NULL DEFAULT 0,
-          source_port INTEGER NOT NULL DEFAULT -1,
-          last_update_utc INTEGER NOT NULL DEFAULT 0,
-          source_type INTEGER NOT NULL DEFAULT 0,
-          has_cross_site_ancestor INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE UNIQUE INDEX cookies_unique_index
-          ON cookies(host_key, top_frame_site_key, name, path);
-        CREATE TABLE meta(
-          key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY,
-          value LONGVARCHAR
-        );
-        INSERT INTO meta VALUES('version', '23');
-        INSERT INTO meta VALUES('last_compatible_version', '23');",
-      )
-      .map_err(|e| format!("Failed to initialize cookie database schema: {e}"))?;
-    Ok(())
   }
 
   /// Create an empty Firefox-format cookies.sqlite database at `path`.
@@ -403,11 +417,20 @@ impl CookieManager {
 
   /// Read cookies from a Chrome/Wayfern profile.
   /// Handles encrypted cookies by decrypting encrypted_value using the profile's encryption key.
+  /// Returns the cookies plus **how many encrypted values could not be
+  /// decrypted**.
+  ///
+  /// The count is part of the return type on purpose: a failed decrypt used to
+  /// collapse into an empty string, which reads exactly like a cookie that is
+  /// legitimately empty. Callers therefore had no way to tell "541 cookies" from
+  /// "541 cookie names with the sessions missing", and the second one only
+  /// surfaces as every request 401-ing on whatever machine imported the file.
   fn read_chrome_cookies(
     db_path: &Path,
     encryption_key: Option<&[u8; 16]>,
-  ) -> Result<Vec<UnifiedCookie>, String> {
+  ) -> Result<(Vec<UnifiedCookie>, usize), String> {
     let conn = Connection::open(db_path).map_err(|e| format!("Failed to open database: {e}"))?;
+    let undecryptable = std::cell::Cell::new(0usize);
 
     let mut stmt = conn
       .prepare(
@@ -437,9 +460,17 @@ impl CookieManager {
         let value = if !plaintext_value.is_empty() {
           plaintext_value
         } else if !encrypted_value.is_empty() {
-          encryption_key
+          match encryption_key
             .and_then(|key| chrome_decrypt::decrypt(&encrypted_value, &domain, key))
-            .unwrap_or_default()
+          {
+            Some(v) => v,
+            None => {
+              // Still yields an empty string so one bad row cannot fail the whole
+              // read, but it is now counted — see this function's doc comment.
+              undecryptable.set(undecryptable.get() + 1);
+              String::new()
+            }
+          }
         } else {
           String::new()
         };
@@ -461,7 +492,7 @@ impl CookieManager {
       .collect::<Result<Vec<_>, _>>()
       .map_err(|e| format!("Failed to collect cookies: {e}"))?;
 
-    Ok(cookies)
+    Ok((cookies, undecryptable.get()))
   }
 
   /// Write cookies to a Firefox/Camoufox profile.
@@ -673,14 +704,22 @@ impl CookieManager {
 
     let db_path = Self::get_cookie_db_path(profile, &profiles_dir)?;
 
-    let cookies = match profile.browser.as_str() {
-      "camoufox" => Self::read_firefox_cookies(&db_path)?,
+    let (cookies, undecryptable_count) = match profile.browser.as_str() {
+      // Firefox keeps cookie values in the clear, so nothing can fail to decrypt.
+      "camoufox" => (Self::read_firefox_cookies(&db_path)?, 0),
       "wayfern" => {
         let key = Self::get_chrome_encryption_key(profile, &profiles_dir);
         Self::read_chrome_cookies(&db_path, key.as_ref())?
       }
       _ => return Err(format!("Unsupported browser type: {}", profile.browser)),
     };
+    if undecryptable_count > 0 {
+      log::warn!(
+        "Profile {profile_id}: {undecryptable_count} cookie value(s) failed to decrypt — the \
+         os_crypt key does not match this cookie store. Any export from this read would carry \
+         names and domains with no sessions behind them."
+      );
+    }
 
     let mut domain_map: HashMap<String, Vec<UnifiedCookie>> = HashMap::new();
 
@@ -707,6 +746,7 @@ impl CookieManager {
     Ok(CookieReadResult {
       profile_id: profile_id.to_string(),
       browser_type: profile.browser.clone(),
+      undecryptable_count,
       domains,
       total_count,
     })
@@ -858,14 +898,27 @@ impl CookieManager {
       .ok_or_else(|| format!("Source profile not found: {}", request.source_profile_id))?;
 
     let source_db_path = Self::get_cookie_db_path(source, &profiles_dir)?;
-    let all_cookies = match source.browser.as_str() {
-      "camoufox" => Self::read_firefox_cookies(&source_db_path)?,
+    let (all_cookies, undecryptable_count) = match source.browser.as_str() {
+      "camoufox" => (Self::read_firefox_cookies(&source_db_path)?, 0),
       "wayfern" => {
         let key = Self::get_chrome_encryption_key(source, &profiles_dir);
         Self::read_chrome_cookies(&source_db_path, key.as_ref())?
       }
       _ => return Err(format!("Unsupported browser type: {}", source.browser)),
     };
+    // Refuse rather than copy blanks. This writes into a *second* profile, so
+    // carrying on would put cookie names with empty values into a store that had
+    // nothing wrong with it, and the target would then look logged in while
+    // every request 401s. A copy that cannot carry the sessions is not a copy.
+    if undecryptable_count > 0 {
+      return Err(
+        serde_json::json!({
+          "code": "COOKIE_DECRYPT_FAILED",
+          "params": { "count": undecryptable_count.to_string() }
+        })
+        .to_string(),
+      );
+    }
 
     let cookies_to_copy: Vec<UnifiedCookie> = if request.selected_cookies.is_empty() {
       all_cookies
@@ -1215,6 +1268,18 @@ impl CookieManager {
   /// Public API: Export cookies from a profile in the specified format
   pub fn export_cookies(profile_id: &str, format: &str) -> Result<String, String> {
     let result = Self::read_cookies(profile_id)?;
+    // An export exists to be imported somewhere else, so a file full of names
+    // with no values is worse than no file: it imports cleanly, reports the full
+    // count, and the sessions are simply gone. Fail here instead.
+    if result.undecryptable_count > 0 {
+      return Err(
+        serde_json::json!({
+          "code": "COOKIE_DECRYPT_FAILED",
+          "params": { "count": result.undecryptable_count.to_string() }
+        })
+        .to_string(),
+      );
+    }
     let all_cookies: Vec<UnifiedCookie> =
       result.domains.into_iter().flat_map(|d| d.cookies).collect();
 
@@ -1709,7 +1774,9 @@ mod tests {
     CookieManager::write_chrome_cookies(&chrome_db, &source_cookies).unwrap();
 
     // Read back from the Chrome DB (as if reading from the Wayfern profile).
-    let from_chrome = CookieManager::read_chrome_cookies(&chrome_db, None).unwrap();
+    let (from_chrome, undecryptable) =
+      CookieManager::read_chrome_cookies(&chrome_db, None).unwrap();
+    assert_eq!(undecryptable, 0, "明文 fixture 不该有解不开的行");
     assert_eq!(from_chrome.len(), 2);
     let c_user_src = from_chrome.iter().find(|c| c.name == "c_user").unwrap();
     assert_eq!(c_user_src.value, "100012345678");
@@ -1805,7 +1872,9 @@ mod tests {
 
     CookieManager::write_chrome_cookies(&chrome_db, &from_ff).unwrap();
 
-    let from_chrome = CookieManager::read_chrome_cookies(&chrome_db, None).unwrap();
+    let (from_chrome, undecryptable) =
+      CookieManager::read_chrome_cookies(&chrome_db, None).unwrap();
+    assert_eq!(undecryptable, 0, "明文 fixture 不该有解不开的行");
     assert_eq!(from_chrome.len(), 1);
     assert_eq!(from_chrome[0].value, "abc123def456");
 
@@ -1853,7 +1922,7 @@ mod tests {
     )
     .unwrap();
 
-    let key = chrome_decrypt::get_encryption_key(&profile_dir)
+    let key = chrome_decrypt::get_encryption_key(&profile_dir, None)
       .expect("should derive key from os_crypt_key file");
 
     let encrypted_hex = "76313077ad5b27e78f685a6ccc7b92a8a242e279e54b8d2ba8e55b433ca7e2421bec52369e29a57b593c02c839f50962245da3ed8617dce142fff67778950a271d2c07";
@@ -1885,7 +1954,7 @@ mod tests {
     )
     .unwrap();
 
-    let key = chrome_decrypt::get_encryption_key(&profile_dir).unwrap();
+    let key = chrome_decrypt::get_encryption_key(&profile_dir, None).unwrap();
     let encrypted_hex = "76313077ad5b27e78f685a6ccc7b92a8a242e279e54b8d2ba8e55b433ca7e2421bec52369e29a57b593c02c839f50962245da3ed8617dce142fff67778950a271d2c07";
     let encrypted: Vec<u8> = (0..encrypted_hex.len())
       .step_by(2)
@@ -1903,52 +1972,6 @@ mod tests {
     );
 
     let _ = std::fs::remove_dir_all(&profile_dir);
-  }
-
-  /// Regression: a brand-new Wayfern profile has no `Default/Cookies` file
-  /// yet (Chromium only writes it on first launch). Copying/importing into
-  /// such a profile must create the file on demand.
-  #[test]
-  fn test_create_empty_chrome_cookies_db_then_write() {
-    let dir = std::env::temp_dir().join(format!("donut_empty_chrome_{}", uuid::Uuid::new_v4()));
-    let db_path = dir.join("Default").join("Cookies");
-    assert!(!db_path.exists());
-
-    CookieManager::create_empty_chrome_cookies_db(&db_path).unwrap();
-    assert!(db_path.exists());
-
-    // Round-trip: write a cookie into the freshly created DB, read it back.
-    let cookies = vec![UnifiedCookie {
-      name: "auth".to_string(),
-      value: "token123".to_string(),
-      domain: ".example.com".to_string(),
-      path: "/".to_string(),
-      expires: 1900000000,
-      is_secure: true,
-      is_http_only: true,
-      same_site: 0,
-      creation_time: 1700000000,
-      last_accessed: 1700000000,
-    }];
-    let (inserted, replaced) = CookieManager::write_chrome_cookies(&db_path, &cookies).unwrap();
-    assert_eq!(inserted, 1);
-    assert_eq!(replaced, 0);
-
-    let read = CookieManager::read_chrome_cookies(&db_path, None).unwrap();
-    assert_eq!(read.len(), 1);
-    assert_eq!(read[0].value, "token123");
-
-    // Schema sanity: `meta` table with version row exists so Chromium's
-    // cookie store migration code can upgrade this on first launch.
-    let conn = Connection::open(&db_path).unwrap();
-    let version: String = conn
-      .query_row("SELECT value FROM meta WHERE key = 'version'", [], |row| {
-        row.get(0)
-      })
-      .unwrap();
-    assert!(!version.is_empty());
-
-    let _ = std::fs::remove_dir_all(&dir);
   }
 
   /// Same regression, Firefox side: a fresh Camoufox profile has no
@@ -1980,6 +2003,106 @@ mod tests {
     let read = CookieManager::read_firefox_cookies(&db_path).unwrap();
     assert_eq!(read.len(), 1);
     assert_eq!(read[0].value, "ff-session");
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  // ---------------------------------------------------------------- 跨 OS 修复
+  //
+  // 这四条钉住的都是「静默给出错误答案」的路径：跑不出错、报告成功、
+  // 而登录态已经没了。全部来自 mac→Windows profile 迁移的实测调查。
+
+  /// 派生迭代数属于**写这份 cookie 的那个 OS**，不属于正在读它的这台机器。
+  /// 以前它是 `#[cfg]` 编译期常量，profile 一跨机就必然算出错误的密钥。
+  #[test]
+  fn key_derivation_follows_the_store_not_the_host() {
+    use chrome_decrypt::*;
+    // macOS 写的库永远按 1003 解，哪怕在 Windows 上读。
+    assert_eq!(iterations_for(Some("macos")), ITERATIONS_MACOS);
+    // 其余平台按 1。
+    assert_eq!(iterations_for(Some("windows")), ITERATIONS_OTHER);
+    assert_eq!(iterations_for(Some("linux")), ITERATIONS_OTHER);
+    // 来源未记录时才回落到本机惯例。
+    let host = if cfg!(target_os = "macos") {
+      ITERATIONS_MACOS
+    } else {
+      ITERATIONS_OTHER
+    };
+    assert_eq!(iterations_for(None), host);
+    // 两个常量必须不同，否则这条修复没有意义。
+    assert_ne!(ITERATIONS_MACOS, ITERATIONS_OTHER);
+  }
+
+  /// 同一份密码 + 不同迭代数 = 不同密钥。这是上一条为什么要紧的原因。
+  #[test]
+  fn a_wrong_iteration_count_yields_a_different_key() {
+    let dir = std::env::temp_dir().join(format!("marine-key-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("os_crypt_key"), b"pretend-passphrase").unwrap();
+
+    let mac = chrome_decrypt::get_encryption_key(&dir, Some("macos")).unwrap();
+    let win = chrome_decrypt::get_encryption_key(&dir, Some("windows")).unwrap();
+    assert_ne!(mac, win, "迭代数不同就必须得到不同的密钥");
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// cookie 库的位置是 **profile 的属性**，不是宿主机的属性。
+  /// 以前按 `cfg!(windows)` 硬编码，Windows 上读 mac 来的 profile 会找错地方，
+  /// 然后报告「0 条 cookie」而不是报错。
+  #[test]
+  fn the_cookie_store_is_located_by_probing_not_by_host_os() {
+    let base = std::env::temp_dir().join(format!("marine-probe-{}", std::process::id()));
+    let flat = base.join("flat");
+    let nested = base.join("nested");
+    std::fs::create_dir_all(flat.join("Default")).unwrap();
+    std::fs::create_dir_all(nested.join("Default").join("Network")).unwrap();
+    std::fs::write(flat.join("Default").join("Cookies"), b"").unwrap();
+    std::fs::write(nested.join("Default").join("Network").join("Cookies"), b"").unwrap();
+
+    // 两种布局都要认出来，且与本机是什么系统无关。
+    assert_eq!(
+      CookieManager::wayfern_cookie_path(&flat),
+      flat.join("Default").join("Cookies")
+    );
+    assert_eq!(
+      CookieManager::wayfern_cookie_path(&nested),
+      nested.join("Default").join("Network").join("Cookies")
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
+  /// 解不开的行必须被数出来，不能塌成空字符串。
+  /// 空字符串和「这条 cookie 本来就是空的」长得一模一样 ——
+  /// 于是导出 541 条名字齐全、值全空的文件，导入方全平台 401。
+  #[test]
+  fn undecryptable_rows_are_counted_not_silently_emptied() {
+    let dir = std::env::temp_dir().join(format!("marine-undec-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("Cookies");
+    let conn = Connection::open(&db).unwrap();
+    conn
+      .execute_batch(
+        "CREATE TABLE cookies (name TEXT, value TEXT, host_key TEXT, path TEXT,
+           expires_utc INTEGER, is_secure INTEGER, is_httponly INTEGER, samesite INTEGER,
+           creation_utc INTEGER, last_access_utc INTEGER, encrypted_value BLOB);",
+      )
+      .unwrap();
+    // v10 前缀但密文是垃圾 —— 任何密钥都解不开。
+    conn
+      .execute(
+        "INSERT INTO cookies VALUES ('sess','', '.example.com','/',0,1,1,0,0,0, ?1)",
+        [&b"v10\x00\x01\x02\x03".to_vec()],
+      )
+      .unwrap();
+    drop(conn);
+
+    let key = [0u8; 16];
+    let (cookies, undecryptable) = CookieManager::read_chrome_cookies(&db, Some(&key)).unwrap();
+    assert_eq!(cookies.len(), 1, "行本身还在，不因为解不开就丢掉");
+    assert_eq!(cookies[0].value, "", "值确实是空的");
+    assert_eq!(undecryptable, 1, "但必须被数出来 —— 这是导出硬失败的依据");
 
     let _ = std::fs::remove_dir_all(&dir);
   }

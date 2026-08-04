@@ -1384,6 +1384,28 @@ async fn marine_claim_prospect(
   Json(req): Json<MarineProspectClaimRequest>,
 ) -> Result<Json<Option<crate::marine::prospect::ProspectRecord>>, (StatusCode, String)> {
   use crate::marine::prospect::{ClaimOptions, PROSPECTS};
+
+  // Another device holds this profile's lease — do not hand it a target.
+  //
+  // The ledger's account-level gate can only see the touches that reached this
+  // machine's disk. Sync is asynchronous, so while a second device is driving
+  // this profile there is a window where its touches have not arrived and the
+  // gate is blind: both machines would happily claim, and both would post. That
+  // is the one failure the ledger exists to prevent, and no merge rule can undo
+  // a comment that is already public.
+  //
+  // Refusing here turns that into a visible skipped leg. `is_locked_by_another`
+  // is an in-memory read of the lease table, so this costs nothing per claim.
+  if crate::team_lock::PROFILE_LOCK
+    .is_locked_by_another(&req.profile_id)
+    .await
+  {
+    return Err((
+      StatusCode::CONFLICT,
+      serde_json::json!({ "code": "MARINE_PROFILE_LEASED_ELSEWHERE" }).to_string(),
+    ));
+  }
+
   let mut opts = ClaimOptions::default();
   if let Some(v) = req.per_item_account_cap {
     opts.per_item_account_cap = v;
@@ -1494,7 +1516,7 @@ async fn marine_settle_prospect(
 async fn marine_list_prospects(
   State(_state): State<ApiServerState>,
 ) -> Result<Json<Vec<crate::marine::prospect::ProspectRecord>>, (StatusCode, String)> {
-  let all = tokio::task::spawn_blocking(|| crate::marine::prospect::PROSPECTS.list())
+  let all = tokio::task::spawn_blocking(|| crate::marine::prospect::PROSPECTS.list_local())
     .await
     .map_err(|e| {
       (

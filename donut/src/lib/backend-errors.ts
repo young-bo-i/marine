@@ -48,6 +48,8 @@ export type BackendErrorCode =
   | "MARINE_DISCOVERY_EMPTY_KEYWORD"
   | "MARINE_DISCOVERY_PROFILE_NOT_FOUND"
   | "MARINE_DISCOVERY_PROFILE_CROSS_OS"
+  | "COOKIE_DECRYPT_FAILED"
+  | "PROFILE_NEVER_LAUNCHED"
   | "INTERNAL_ERROR";
 
 export interface BackendError {
@@ -188,6 +190,12 @@ export function translateBackendError(t: TFunction, err: unknown): string {
       return t("backendErrors.marineDiscoveryEmptyKeyword");
     case "MARINE_DISCOVERY_PROFILE_NOT_FOUND":
       return t("backendErrors.marineDiscoveryProfileNotFound");
+    case "COOKIE_DECRYPT_FAILED":
+      return t("backendErrors.cookieDecryptFailed", {
+        count: parsed.params?.count ?? "",
+      });
+    case "PROFILE_NEVER_LAUNCHED":
+      return t("backendErrors.profileNeverLaunched");
     case "MARINE_DISCOVERY_PROFILE_CROSS_OS":
       return t("backendErrors.marineDiscoveryProfileCrossOs", {
         name: parsed.params?.message ?? "",

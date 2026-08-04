@@ -1839,7 +1839,9 @@
     "marineDiscoveryEmptyPlan": "Elige al menos un perfil y una plataforma.",
     "marineDiscoveryEmptyKeyword": "Introduce una palabra clave de búsqueda.",
     "marineDiscoveryProfileNotFound": "Uno de los perfiles seleccionados ya no existe.",
-    "marineDiscoveryProfileCrossOs": "El perfil «{{name}}» se creó en otro sistema operativo y no puede ejecutarse aquí. Crea un perfil nuevo en este equipo y vuelve a iniciar sesión."
+    "marineDiscoveryProfileCrossOs": "El perfil «{{name}}» se creó en otro sistema operativo y no puede ejecutarse aquí. Crea un perfil nuevo en este equipo y vuelve a iniciar sesión.",
+    "cookieDecryptFailed": "No se pudieron descifrar {{count}} cookie(s): la clave de cifrado no corresponde a este almacén. Exportar solo produciría nombres de cookies sin sesión detrás, así que se detuvo la operación.",
+    "profileNeverLaunched": "Este perfil nunca se ha iniciado, así que aún no tiene almacén de cookies. Inicia el navegador una vez y ciérralo, luego inténtalo de nuevo."
   },
   "rail": {
     "profiles": "Perfiles",
@@ -2222,7 +2224,15 @@
         "startFailed": "No se pudo iniciar la ejecución",
         "stopFailed": "No se pudo detener la ejecución",
         "cycleGap": "Intervalo (min)",
-        "cycleGapPlaceholder": "p. ej. 30 — vacío ejecuta una vez"
+        "cycleGapPlaceholder": "p. ej. 30 — vacío ejecuta una vez",
+        "logs": {
+          "label": "Registros",
+          "open": "Abrir carpeta",
+          "appHint": "Vista del planificador: qué perfil, qué tramo, por qué se cerró un navegador",
+          "extensionHint": "Vista en página: qué vio la extensión, qué selector falló",
+          "exportShard": "Exportar fragmento del registro",
+          "exported": "Fragmento del registro exportado"
+        }
       },
       "phase": {
         "idle": "Inactivo",
@@ -2238,6 +2248,7 @@
         "timed_out": "Nada registrado",
         "no_slot": "Plataforma no admitida",
         "already_open": "Ya abierto: omitido",
+        "skipped": "Omitido",
         "failed": "Error",
         "cancelled": "Cancelado"
       },

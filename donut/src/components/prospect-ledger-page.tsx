@@ -79,6 +79,7 @@ type LegOutcome =
   | "timed_out"
   | "no_slot"
   | "already_open"
+  | "skipped"
   | "failed"
   | "cancelled";
 
@@ -101,6 +102,12 @@ type RunPhase =
   | "cancelled";
 
 /** Mirrors `marine::scheduler::RunProgress`. */
+interface MarineLogLocations {
+  app_log_dir: string;
+  app_log_file: string;
+  extension_log_file: string;
+}
+
 interface RunProgress {
   running: boolean;
   leg_index: number;
@@ -136,6 +143,8 @@ const OUTCOME_CLASS: Record<LegOutcome, string> = {
   // Not a failure, but the operator has to act on it (close the window and
   // re-run), so it does not get the same grey as "nothing to do".
   already_open: "text-warning",
+  // 前置条件没满足（比如租约在别的设备上）——要人处理，但不是"跑失败了"。
+  skipped: "text-warning",
   failed: "text-destructive",
   cancelled: "text-muted-foreground",
 };
@@ -180,6 +189,15 @@ export function ProspectLedgerPage() {
   const [selectedProfiles, setSelectedProfiles] = useState<string[]>([]);
   const [progress, setProgress] = useState<RunProgress>(idleProgress);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [logs, setLogs] = useState<MarineLogLocations | null>(null);
+
+  // 路径在进程生命周期内不变，挂载取一次即可。取不到就不显示这一块 ——
+  // 排查入口本身不该成为新的报错来源。
+  useEffect(() => {
+    void invoke<MarineLogLocations>("marine_log_locations")
+      .then(setLogs)
+      .catch(() => setLogs(null));
+  }, []);
 
   const requestSequenceRef = useRef(0);
 
@@ -609,6 +627,82 @@ export function ProspectLedgerPage() {
                 </li>
               ))}
             </ul>
+          )}
+
+          {/* 排查入口。两个日志缺一不可，而且有用的那个不在「日志目录」里：
+              应用日志是调度器的视角（哪个 profile、哪条腿、为什么关了浏览器），
+              扩展日志是页内视角（选择器为什么没命中、草稿核对比了什么）。
+              后者落在数据目录下，不写出来没人找得到。 */}
+          {logs && (
+            <div className="flex flex-col gap-1.5 border-t border-border pt-2">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
+                  {t("marine.prospects.run.logs.label")}
+                </p>
+                <div className="flex items-center gap-1">
+                  {/* 跨设备去重靠这个：导出本机分片，拷到另一台的
+                      prospects/remote/ 下，那台机器就不会再把本机已经用掉的
+                      话题发出去。同步层自动搬运之前，这是唯一的路径。 */}
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    className="h-6 px-2 text-xs"
+                    onClick={() => {
+                      void invoke<string>("marine_export_ledger_shard")
+                        .then((path) => {
+                          showToast({
+                            type: "success",
+                            title: t("marine.prospects.run.logs.exported"),
+                            description: path,
+                          });
+                        })
+                        .catch((error) => {
+                          showToast({
+                            type: "error",
+                            title: translateBackendError(t, error),
+                          });
+                        });
+                    }}
+                  >
+                    {t("marine.prospects.run.logs.exportShard")}
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    className="h-6 px-2 text-xs"
+                    onClick={() => {
+                      void invoke("open_log_directory").catch(() => {});
+                    }}
+                  >
+                    {t("marine.prospects.run.logs.open")}
+                  </Button>
+                </div>
+              </div>
+              {[
+                {
+                  key: "app",
+                  hint: t("marine.prospects.run.logs.appHint"),
+                  path: logs.app_log_file,
+                },
+                {
+                  key: "extension",
+                  hint: t("marine.prospects.run.logs.extensionHint"),
+                  path: logs.extension_log_file,
+                },
+              ].map((entry) => (
+                <div key={entry.key} className="flex flex-col gap-0.5">
+                  <span className="text-[11px] text-muted-foreground">
+                    {entry.hint}
+                  </span>
+                  {/* 可选中复制：排查时多半是要把路径贴进终端。 */}
+                  <code className="rounded bg-muted px-1.5 py-1 font-mono text-[10px] break-all select-all">
+                    {entry.path}
+                  </code>
+                </div>
+              ))}
+            </div>
           )}
         </section>
 

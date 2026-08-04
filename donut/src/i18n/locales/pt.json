@@ -1839,7 +1839,9 @@
     "marineDiscoveryEmptyPlan": "Escolha ao menos um perfil e uma plataforma.",
     "marineDiscoveryEmptyKeyword": "Digite uma palavra-chave de busca.",
     "marineDiscoveryProfileNotFound": "Um dos perfis selecionados não existe mais.",
-    "marineDiscoveryProfileCrossOs": "O perfil \"{{name}}\" foi criado em outro sistema operacional e não pode ser executado aqui. Crie um novo perfil nesta máquina e entre novamente."
+    "marineDiscoveryProfileCrossOs": "O perfil \"{{name}}\" foi criado em outro sistema operacional e não pode ser executado aqui. Crie um novo perfil nesta máquina e entre novamente.",
+    "cookieDecryptFailed": "Não foi possível descriptografar {{count}} cookie(s) — a chave de criptografia não corresponde a este armazenamento. Exportar produziria apenas nomes de cookies sem sessão, então a operação foi interrompida.",
+    "profileNeverLaunched": "Este perfil nunca foi iniciado, portanto ainda não tem armazenamento de cookies. Inicie o navegador uma vez e feche-o, depois tente novamente."
   },
   "rail": {
     "profiles": "Perfis",
@@ -2222,7 +2224,15 @@
         "startFailed": "Não foi possível iniciar a execução",
         "stopFailed": "Não foi possível parar a execução",
         "cycleGap": "Intervalo (min)",
-        "cycleGapPlaceholder": "ex.: 30 — vazio executa uma vez"
+        "cycleGapPlaceholder": "ex.: 30 — vazio executa uma vez",
+        "logs": {
+          "label": "Registros",
+          "open": "Abrir pasta",
+          "appHint": "Visão do agendador — qual perfil, qual etapa, por que um navegador fechou",
+          "extensionHint": "Visão na página — o que a extensão viu, qual seletor falhou",
+          "exportShard": "Exportar fragmento do registro",
+          "exported": "Fragmento do registro exportado"
+        }
       },
       "phase": {
         "idle": "Ocioso",
@@ -2238,6 +2248,7 @@
         "timed_out": "Nada registrado",
         "no_slot": "Plataforma sem suporte",
         "already_open": "Já aberto — ignorado",
+        "skipped": "Ignorado",
         "failed": "Falhou",
         "cancelled": "Cancelado"
       },

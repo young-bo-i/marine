@@ -1839,7 +1839,9 @@
     "marineDiscoveryEmptyPlan": "Hãy chọn ít nhất một hồ sơ và một nền tảng.",
     "marineDiscoveryEmptyKeyword": "Hãy nhập từ khóa tìm kiếm.",
     "marineDiscoveryProfileNotFound": "Một trong các hồ sơ đã chọn không còn tồn tại.",
-    "marineDiscoveryProfileCrossOs": "Hồ sơ \"{{name}}\" được tạo trên một hệ điều hành khác nên không thể chạy ở đây. Hãy tạo hồ sơ mới trên máy này và đăng nhập lại."
+    "marineDiscoveryProfileCrossOs": "Hồ sơ \"{{name}}\" được tạo trên một hệ điều hành khác nên không thể chạy ở đây. Hãy tạo hồ sơ mới trên máy này và đăng nhập lại.",
+    "cookieDecryptFailed": "Không giải mã được {{count}} cookie — khóa mã hóa không khớp với kho cookie này. Xuất ra sẽ chỉ có tên cookie mà không có phiên đăng nhập, nên thao tác đã dừng.",
+    "profileNeverLaunched": "Hồ sơ này chưa từng được khởi chạy nên chưa có kho cookie. Hãy mở trình duyệt một lần rồi đóng lại, sau đó thử lại."
   },
   "rail": {
     "profiles": "Profile",
@@ -2222,7 +2224,15 @@
         "startFailed": "Không thể bắt đầu lượt chạy",
         "stopFailed": "Không thể dừng lượt chạy",
         "cycleGap": "Khoảng lặp (phút)",
-        "cycleGapPlaceholder": "vd. 30 — để trống chạy một lần"
+        "cycleGapPlaceholder": "vd. 30 — để trống chạy một lần",
+        "logs": {
+          "label": "Nhật ký",
+          "open": "Mở thư mục",
+          "appHint": "Góc nhìn bộ lập lịch — hồ sơ nào, chặng nào, vì sao trình duyệt đóng",
+          "extensionHint": "Góc nhìn trong trang — tiện ích thấy gì, bộ chọn nào trượt",
+          "exportShard": "Xuất phân mảnh sổ cái",
+          "exported": "Đã xuất phân mảnh sổ cái"
+        }
       },
       "phase": {
         "idle": "Rảnh",
@@ -2238,6 +2248,7 @@
         "timed_out": "Không ghi được gì",
         "no_slot": "Nền tảng không hỗ trợ",
         "already_open": "Đang mở — đã bỏ qua",
+        "skipped": "Đã bỏ qua",
         "failed": "Thất bại",
         "cancelled": "Đã hủy"
       },

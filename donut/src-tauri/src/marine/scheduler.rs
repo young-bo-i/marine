@@ -192,6 +192,14 @@ pub enum LegOutcome {
   /// The profile was already running, so the leg was skipped rather than
   /// hijacking — and later closing — a window the operator opened themselves.
   AlreadyOpen,
+  /// A precondition for running this leg was not met, so nothing was attempted.
+  ///
+  /// Deliberately separate from `TimedOut`, which already means three different
+  /// things (not logged in / nothing eligible left / genuinely stuck). Folding a
+  /// fourth in would bury the one outcome the operator can actually act on —
+  /// e.g. another device holds this profile's lease, or a cross-device ledger
+  /// shard could not be read. `error` carries the reason.
+  Skipped,
   /// Launching or closing the browser failed.
   Failed,
   /// The run was cancelled before this leg finished.
@@ -416,9 +424,13 @@ fn count_leg_touches(
 async fn read_touch_count(profile_id: &str, platform: &str) -> Result<usize, String> {
   let id = profile_id.to_string();
   let plat = platform.to_string();
+  // `list_local`, deliberately: this counts *our* progress on the leg that is
+  // running right now. A touch that arrived over sync belongs to another
+  // machine's work, and counting it would end this leg without a comment having
+  // been posted here — the same shape of bug the platform filter above fixes.
   let counted = tokio::task::spawn_blocking(move || {
     super::prospect::PROSPECTS
-      .list()
+      .list_local()
       .map(|records| count_leg_touches(&records, &id, &plat))
   })
   .await;
@@ -854,6 +866,23 @@ async fn run_profile_session(
     settled_count: 0,
     error,
   };
+
+  // 另一台设备正握着这个 profile 的租约 —— 不要碰它。
+  //
+  // 两台机器同时驱动同一个账号，是这套系统里唯一能真正造成重复发送的形态：
+  // 台账的账号级闸门只看得见本机磁盘上那一份，对端的 touch 还没同步过来时它是
+  // 瞎的。这里挡掉，比事后合并有意义 —— 已经公开的评论没有任何合并能撤销。
+  if crate::team_lock::PROFILE_LOCK
+    .is_locked_by_another(&profile.id.to_string())
+    .await
+  {
+    let reason = "another device holds this profile's lease".to_string();
+    log::warn!("Skipping {} — {reason}", profile.name);
+    for platform in platforms {
+      finished.push(base(platform, LegOutcome::Skipped, Some(reason.clone())));
+    }
+    return !scheduler.cancel.load(Ordering::SeqCst);
+  }
 
   // 会话级：只问一次「操作员是不是已经开着这个 profile」。
   if let Some(err) = profile_is_occupied(app_handle, profile).await {
@@ -1920,6 +1949,7 @@ mod tests {
       key: format!("{platform}:x"),
       platform: platform.to_string(),
       item_id: "x".to_string(),
+      thread_hint: None,
       title: String::new(),
       open_url: "https://example.test/x".to_string(),
       open_url_durability: super::super::prospect::Durability::Permanent,
@@ -2273,6 +2303,7 @@ mod tests {
       (LegOutcome::TimedOut, "\"timed_out\""),
       (LegOutcome::NoSlot, "\"no_slot\""),
       (LegOutcome::AlreadyOpen, "\"already_open\""),
+      (LegOutcome::Skipped, "\"skipped\""),
       (LegOutcome::Failed, "\"failed\""),
       (LegOutcome::Cancelled, "\"cancelled\""),
     ] {

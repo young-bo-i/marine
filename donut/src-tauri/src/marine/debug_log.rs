@@ -104,6 +104,11 @@ impl DebugLog {
     crate::app_dirs::data_dir().join(LOG_FILE)
   }
 
+  /// Same path, for showing the operator where to look.
+  pub fn file_path(&self) -> PathBuf {
+    self.path()
+  }
+
   /// Append a batch.
   ///
   /// Errors are returned rather than swallowed, but the caller is expected to

@@ -168,7 +168,7 @@ pub enum ProspectState {
   /// without it, all five accounts would each spend a full leg discovering the
   /// same closed video.
   ///
-  /// Deliberately NOT counted by [`ProspectRecord::public_footprint_count`]: no
+  /// Deliberately NOT counted by [`ProspectRecord::public_footprint_accounts`]: no
   /// comment was made, so there is no public footprint to charge against the
   /// per-item cap.
   Blocked,
@@ -202,6 +202,15 @@ pub struct ProspectRecord {
   #[serde(default)]
   pub keywords: Vec<String>,
   pub state: ProspectState,
+  /// The thread this item hangs under, as reported by the parser.
+  ///
+  /// Authoritative when present; [`Self::thread_key`] only falls back to
+  /// picking it out of `open_url` when it is missing. Stored because URL shape
+  /// is not something the ledger controls: a Zhihu answer that was surfaced
+  /// without its question id gets a bare `/answer/<id>`, and a grouping derived
+  /// from that silently degrades to per-answer.
+  #[serde(default)]
+  pub thread_hint: Option<String>,
   #[serde(default)]
   pub claimed_by: Option<String>,
   #[serde(default)]
@@ -265,6 +274,10 @@ impl ProspectRecord {
     if self.platform != "zhihu" {
       return self.key.clone();
     }
+    // Whatever the parser knew beats whatever the URL happens to show.
+    if let Some(hint) = self.thread_hint.as_deref().filter(|h| !h.trim().is_empty()) {
+      return format!("zhihu:question:{hint}");
+    }
     match zhihu_question_id(&self.open_url) {
       Some(question) => format!("zhihu:question:{question}"),
       // Zhuanlan articles have no question above them, and an answer URL that
@@ -279,7 +292,11 @@ impl ProspectRecord {
   /// draft or pre-click `Failed` attempt was never sent, so it leaves no
   /// footprint for a platform to correlate; charging those would starve the
   /// pool for no safety benefit.
-  pub fn public_footprint_count(&self) -> usize {
+  /// The distinct accounts that may have left a PUBLIC footprint.
+  ///
+  /// Exposed separately so the cap can be summed across devices without
+  /// double-counting an account that appears in both ledgers.
+  pub fn public_footprint_accounts(&self) -> Vec<&str> {
     let mut seen: Vec<&str> = self
       .touches
       .iter()
@@ -288,7 +305,7 @@ impl ProspectRecord {
       .collect();
     seen.sort_unstable();
     seen.dedup();
-    seen.len()
+    seen
   }
 
   /// Whether a stored `open_url` is too old to trust. Permanent URLs never are.
@@ -328,6 +345,16 @@ pub struct Candidate {
   pub open_url: String,
   #[serde(default)]
   pub keyword: Option<String>,
+  /// The thread this item hangs under, when the parser already knows it.
+  ///
+  /// On Zhihu that is the question id. Deriving it from `open_url` works only
+  /// while the URL carries `/question/<id>/`, and the search parsers do fall
+  /// back to a bare `/answer/<id>` when they cannot resolve the question — at
+  /// which point the grouping silently degrades to per-answer and the same
+  /// account can take a second answer under a question it already commented on.
+  /// Passing it explicitly removes that dependency on URL shape.
+  #[serde(default)]
+  pub thread_hint: Option<String>,
 }
 
 /// Platforms the ledger accepts. Rejecting unknown platforms here keeps a typo
@@ -377,6 +404,121 @@ pub struct IngestReport {
   pub inserted: usize,
   pub refreshed: usize,
   pub already_known: usize,
+  /// Sightings whose `open_url` was rejected because taking it would have
+  /// dropped the record out of its thread. Non-zero is normal on Zhihu.
+  #[serde(default)]
+  pub already_known_kept_url: usize,
+}
+
+/// Directory holding other devices' ledger shards, one JSON file per device.
+///
+/// Populated by the sync layer; this module only ever reads it.
+const REMOTE_DIR: &str = "remote";
+
+/// What another device has already done, folded into the two questions
+/// [`ProspectLedger::claim_next`] needs to answer.
+///
+/// Built fresh per claim rather than cached across calls: a stale index is
+/// indistinguishable from an empty one, and the failure it produces — an
+/// account posting twice under one thread — is exactly what this exists to
+/// prevent. Reading a handful of small JSON files is far cheaper than that.
+#[derive(Debug, Default)]
+pub struct ForeignIndex {
+  /// `(platform, profile_id) → thread keys that account has already spent`.
+  spent_threads: std::collections::HashSet<(String, String, String)>,
+  /// `key → how many distinct accounts left a public footprint elsewhere`.
+  foreign_footprints: HashMap<String, std::collections::HashSet<String>>,
+  /// Content that another device found to have commenting switched off.
+  blocked: std::collections::HashSet<String>,
+}
+
+impl ForeignIndex {
+  /// Read every shard under `prospects/remote/`.
+  ///
+  /// A missing directory is fine — it just means nothing has synced yet. A file
+  /// that is present but unreadable is **not** fine and returns an error: the
+  /// whole point of the index is to withhold targets other devices already
+  /// took, so silently treating a damaged shard as "no records" would restore
+  /// precisely the duplicate-posting behaviour it prevents. Same reasoning as
+  /// [`ProspectError::EmptyLedger`].
+  pub fn load() -> Result<Self, ProspectError> {
+    let dir = crate::app_dirs::prospects_dir().join(REMOTE_DIR);
+    let mut index = Self::default();
+    let entries = match fs::read_dir(&dir) {
+      Ok(entries) => entries,
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(index),
+      Err(source) => return Err(ProspectError::Read { path: dir, source }),
+    };
+
+    for entry in entries.flatten() {
+      let path = entry.path();
+      if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        continue;
+      }
+      let raw = fs::read_to_string(&path).map_err(|source| ProspectError::Read {
+        path: path.clone(),
+        source,
+      })?;
+      if raw.trim().is_empty() {
+        return Err(ProspectError::EmptyLedger { path });
+      }
+      let records: Vec<ProspectRecord> =
+        serde_json::from_str(&raw).map_err(|source| ProspectError::InvalidJson {
+          path: path.clone(),
+          source,
+        })?;
+      index.absorb(&records);
+    }
+    Ok(index)
+  }
+
+  fn absorb(&mut self, records: &[ProspectRecord]) {
+    for r in records {
+      if r.state == ProspectState::Blocked {
+        self.blocked.insert(r.key.clone());
+      }
+      let thread = r.thread_key();
+      for profile in r.settled_accounts() {
+        self
+          .spent_threads
+          .insert((r.platform.clone(), profile.to_string(), thread.clone()));
+      }
+      for profile in r.public_footprint_accounts() {
+        self
+          .foreign_footprints
+          .entry(r.key.clone())
+          .or_default()
+          .insert(profile.to_string());
+      }
+    }
+  }
+
+  fn thread_is_spent(&self, platform: &str, profile_id: &str, thread: &str) -> bool {
+    self.spent_threads.contains(&(
+      platform.to_string(),
+      profile_id.to_string(),
+      thread.to_string(),
+    ))
+  }
+
+  fn is_blocked(&self, key: &str) -> bool {
+    self.blocked.contains(key)
+  }
+
+  /// Accounts with a public footprint on `key` that are not already counted
+  /// locally — added to the local count so the cap is global, not per-machine.
+  fn extra_footprints(&self, key: &str, local: &[&str]) -> usize {
+    self
+      .foreign_footprints
+      .get(key)
+      .map(|accounts| {
+        accounts
+          .iter()
+          .filter(|a| !local.contains(&a.as_str()))
+          .count()
+      })
+      .unwrap_or(0)
+  }
 }
 
 pub struct ProspectLedger {
@@ -539,7 +681,28 @@ impl ProspectLedger {
         Some(&i) => {
           let rec = &mut records[i];
           report.already_known += 1;
-          if rec.open_url != c.open_url {
+          // Grouping only ever gets sharper, never blunter.
+          //
+          // A later sighting can arrive without the question id (the search
+          // parsers fall back to a bare `/answer/<id>`). Letting that overwrite
+          // a URL that *did* carry it would silently drop the record out of its
+          // thread, and the account that already commented under that question
+          // would immediately be allowed to take another answer in it.
+          let had_thread = rec.thread_key() != rec.key;
+          if c.thread_hint.is_some() && rec.thread_hint.is_none() {
+            rec.thread_hint = c.thread_hint.clone();
+          }
+          let would_lose_thread = had_thread && {
+            let mut probe = rec.clone();
+            probe.open_url = c.open_url.clone();
+            probe.thread_key() == probe.key
+          };
+          if would_lose_thread {
+            // Keep the older, better-formed URL. Its token may be staler, and
+            // `url_is_stale` already handles that; losing the grouping is not
+            // recoverable the same way.
+            report.already_known_kept_url += 1;
+          } else if rec.open_url != c.open_url {
             rec.open_url = c.open_url.clone();
             rec.resolved_at = now;
             report.refreshed += 1;
@@ -569,6 +732,7 @@ impl ProspectLedger {
             first_seen_at: now,
             keywords: c.keyword.clone().into_iter().collect(),
             state: ProspectState::Seen,
+            thread_hint: c.thread_hint.clone(),
             claimed_by: None,
             claimed_at: None,
             send_started_at: None,
@@ -599,6 +763,9 @@ impl ProspectLedger {
     let _guard = self.lock.lock().expect("prospect ledger mutex poisoned");
     let mut records = self.load()?;
     let now = now_secs();
+    // What other devices already did. Errors propagate on purpose: running
+    // blind is how the same account ends up posting twice under one thread.
+    let foreign = ForeignIndex::load()?;
 
     // Every thread this account has already been seen in on this platform.
     //
@@ -613,16 +780,27 @@ impl ProspectLedger {
       .map(|r| r.thread_key())
       .collect();
 
-    let pick = records.iter().position(|r| {
+    let eligible = |r: &ProspectRecord| -> bool {
       if r.platform != platform {
         return false;
       }
-      // Account-level hard gate, applied to the whole thread.
-      if touched_threads.contains(&r.thread_key()) {
+      // Account-level hard gate, applied to the whole thread — here and on
+      // every other device that has synced its shard to us.
+      let thread = r.thread_key();
+      if touched_threads.contains(&thread) || foreign.thread_is_spent(platform, profile_id, &thread)
+      {
         return false;
       }
-      // Content-level cap.
-      if r.public_footprint_count() >= opts.per_item_account_cap {
+      // Content-level cap, counted across devices. An account present in both
+      // ledgers is counted once.
+      let local_accounts = r.public_footprint_accounts();
+      let footprints = local_accounts.len() + foreign.extra_footprints(&r.key, &local_accounts);
+      if footprints >= opts.per_item_account_cap {
+        return false;
+      }
+      // Commenting being switched off is a property of the content, so another
+      // device discovering it spares this one a wasted leg.
+      if foreign.is_blocked(&r.key) {
         return false;
       }
       // A session URL we can no longer trust must be re-resolved by a fresh
@@ -651,7 +829,33 @@ impl ProspectLedger {
         // rediscover the same fact.
         ProspectState::Blocked => false,
       }
-    });
+    };
+
+    // Spread the choice across devices instead of taking the first match.
+    //
+    // Two machines running the same plan hold ledgers in the same order, so
+    // "first eligible" makes them deterministically reach for the *same*
+    // record — the one case where a claim collision is guaranteed rather than
+    // unlikely. Ordering by a per-device hash keeps each machine's own choice
+    // stable and reproducible while making the two disagree. With ~190 eligible
+    // candidates in practice this turns a near-certain collision into ~1/190.
+    //
+    // Not a substitute for a cross-device lock: it lowers the odds, it does not
+    // make double-claiming impossible. See `claim_next`'s caller in
+    // `api_server`, which refuses to claim unless this device holds the
+    // profile's lease.
+    let device = crate::team_lock::device_id();
+    let pick = records
+      .iter()
+      .enumerate()
+      .filter(|(_, r)| eligible(r))
+      .min_by_key(|(_, r)| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&device, &mut hasher);
+        std::hash::Hash::hash(&r.key, &mut hasher);
+        std::hash::Hasher::finish(&hasher)
+      })
+      .map(|(i, _)| i);
 
     let Some(i) = pick else { return Ok(None) };
     records[i].state = ProspectState::Claimed;
@@ -740,7 +944,49 @@ impl ProspectLedger {
     Ok(())
   }
 
-  pub fn list(&self) -> Result<Vec<ProspectRecord>, ProspectError> {
+  /// This device's ledger, serialized the way a sync shard must be.
+  ///
+  /// Canonical on purpose: records sorted by key, touches sorted, compact
+  /// (never pretty). The upload decision is "did these bytes change", so two
+  /// runs that produced the same facts have to produce the same bytes — a
+  /// formatting difference would look like new data and two machines would
+  /// push at each other forever, breaking the "no change means no PUT"
+  /// invariant the sync layer relies on.
+  pub fn shard_bytes(&self) -> Result<String, ProspectError> {
+    let _guard = self.lock.lock().expect("prospect ledger mutex poisoned");
+    let mut records = self.load()?;
+    records.sort_by(|a, b| a.key.cmp(&b.key));
+    for r in &mut records {
+      r.touches.sort_by(|a, b| {
+        (a.at, &a.profile_id, format!("{:?}", a.state)).cmp(&(
+          b.at,
+          &b.profile_id,
+          format!("{:?}", b.state),
+        ))
+      });
+      r.touches.dedup();
+      // Claims are this machine's current business, not a fact about the
+      // content. Shipping them would let a lease that is about to expire here
+      // look active everywhere.
+      r.claimed_by = None;
+      r.claimed_at = None;
+      r.send_started_at = None;
+    }
+    serde_json::to_string(&records).map_err(|source| ProspectError::InvalidJson {
+      path: self.path(),
+      source,
+    })
+  }
+
+  /// This machine's own ledger, and nothing else.
+  ///
+  /// Named `list_local` rather than `list` so the compiler is the thing that
+  /// stops foreign records leaking into callers that must only ever count what
+  /// happened here — `scheduler::count_leg_touches` in particular decides when
+  /// a leg is finished, and a touch that arrived over sync would end the leg
+  /// on someone else's work. A comment saying so has already failed to hold
+  /// once; a rename cannot be ignored.
+  pub fn list_local(&self) -> Result<Vec<ProspectRecord>, ProspectError> {
     let _guard = self.lock.lock().expect("prospect ledger mutex poisoned");
     self.load()
   }
@@ -761,6 +1007,7 @@ mod tests {
       title: format!("t-{id}"),
       open_url: url.to_string(),
       keyword: Some("科研工具".to_string()),
+      thread_hint: None,
     }
   }
 
@@ -797,7 +1044,7 @@ mod tests {
     let r = l.ingest(&c).unwrap();
     assert_eq!(r.inserted, 0);
     assert_eq!(r.already_known, 1);
-    assert_eq!(l.list().unwrap()[0].state, ProspectState::Posted);
+    assert_eq!(l.list_local().unwrap()[0].state, ProspectState::Posted);
   }
 
   #[test]
@@ -825,14 +1072,14 @@ mod tests {
       l.settle(&claim.key, "p2", ProspectState::Posted),
       Err(ProspectError::ClaimOwnerMismatch { .. })
     ));
-    let still_claimed = &l.list().unwrap()[0];
+    let still_claimed = &l.list_local().unwrap()[0];
     assert_eq!(still_claimed.state, ProspectState::Claimed);
     assert_eq!(still_claimed.claimed_by.as_deref(), Some("p1"));
 
     l.settle(&claim.key, "p1", ProspectState::Posted).unwrap();
     l.settle(&claim.key, "p1", ProspectState::Posted)
       .expect("an exact retry after a lost response must be idempotent");
-    assert_eq!(l.list().unwrap()[0].touches.len(), 1);
+    assert_eq!(l.list_local().unwrap()[0].touches.len(), 1);
     assert!(matches!(
       l.settle(&claim.key, "p1", ProspectState::Failed),
       Err(ProspectError::ClaimOwnerMismatch { .. })
@@ -957,12 +1204,12 @@ mod tests {
         .is_none(),
       "an irreversible send lease must not be handed to another profile"
     );
-    let guarded = &l.list().unwrap()[0];
+    let guarded = &l.list_local().unwrap()[0];
     assert_eq!(guarded.claimed_by.as_deref(), Some("p1"));
     assert!(guarded.send_started_at.is_some());
 
     l.settle(&claim.key, "p1", ProspectState::Posted).unwrap();
-    let settled = &l.list().unwrap()[0];
+    let settled = &l.list_local().unwrap()[0];
     assert!(settled.send_started_at.is_none());
     assert_eq!(settled.state, ProspectState::Posted);
   }
@@ -983,7 +1230,7 @@ mod tests {
 
     l.settle(&first.key, "p1", ProspectState::Skipped)
       .expect("a lost-response retry must remain idempotent after reassignment");
-    let rec = &l.list().unwrap()[0];
+    let rec = &l.list_local().unwrap()[0];
     assert_eq!(rec.state, ProspectState::Claimed);
     assert_eq!(rec.claimed_by.as_deref(), Some("p2"));
     assert_eq!(rec.touches.len(), 1);
@@ -999,7 +1246,7 @@ mod tests {
     )])
     .unwrap();
 
-    let rec = &l.list().unwrap()[0];
+    let rec = &l.list_local().unwrap()[0];
     assert_eq!(rec.open_url_durability, Durability::Session);
 
     let fresh = ClaimOptions::default();
@@ -1051,7 +1298,7 @@ mod tests {
     )];
     let r = l.ingest(&updated).unwrap();
     assert_eq!(r.refreshed, 1);
-    assert!(l.list().unwrap()[0].open_url.ends_with("NEW"));
+    assert!(l.list_local().unwrap()[0].open_url.ends_with("NEW"));
   }
 
   #[test]
@@ -1064,7 +1311,7 @@ mod tests {
     l.ingest(&[a]).unwrap();
     l.ingest(&[b]).unwrap();
 
-    let all = l.list().unwrap();
+    let all = l.list_local().unwrap();
     assert_eq!(
       all.len(),
       1,
@@ -1117,7 +1364,7 @@ mod tests {
       "填入不等于发布，不该占用 per-item cap"
     );
     assert_eq!(
-      l.list().unwrap()[0].public_footprint_count(),
+      l.list_local().unwrap()[0].public_footprint_accounts().len(),
       0,
       "Filled 绝不能被算成 Posted"
     );
@@ -1138,7 +1385,7 @@ mod tests {
       l.claim_next("p1", "zhihu", &o).unwrap().is_none(),
       "失败不重试 —— 同一账号不该再拿到它"
     );
-    let rec = &l.list().unwrap()[0];
+    let rec = &l.list_local().unwrap()[0];
     assert_eq!(rec.state, ProspectState::Failed);
     assert_eq!(rec.touches.len(), 1, "失败要留下可追溯的记录");
     assert_eq!(rec.touches[0].profile_id, "p1");
@@ -1162,7 +1409,7 @@ mod tests {
         "评论区关闭后 {who} 也不该再拿到它"
       );
     }
-    let rec = &l.list().unwrap()[0];
+    let rec = &l.list_local().unwrap()[0];
     assert_eq!(rec.state, ProspectState::Blocked);
     assert_eq!(rec.touches.len(), 1, "谁发现的要留痕");
   }
@@ -1176,7 +1423,10 @@ mod tests {
     let o = ClaimOptions::default();
     let c = l.claim_next("p1", "bilibili", &o).unwrap().unwrap();
     l.settle(&c.key, "p1", ProspectState::Blocked).unwrap();
-    assert_eq!(l.list().unwrap()[0].public_footprint_count(), 0);
+    assert_eq!(
+      l.list_local().unwrap()[0].public_footprint_accounts().len(),
+      0
+    );
   }
 
   #[test]
@@ -1211,7 +1461,10 @@ mod tests {
       let c = l.claim_next(p, "bilibili", &o).unwrap().unwrap();
       l.settle(&c.key, p, st).unwrap();
     }
-    assert_eq!(l.list().unwrap()[0].public_footprint_count(), 0);
+    assert_eq!(
+      l.list_local().unwrap()[0].public_footprint_accounts().len(),
+      0
+    );
     assert!(
       l.claim_next("p3", "bilibili", &o).unwrap().is_some(),
       "两次非发布的接触不该吃掉 cap=2 的额度"
@@ -1229,8 +1482,8 @@ mod tests {
     l.settle(&first.key, "p1", ProspectState::Unconfirmed)
       .unwrap();
 
-    let record = &l.list().unwrap()[0];
-    assert_eq!(record.public_footprint_count(), 1);
+    let record = &l.list_local().unwrap()[0];
+    assert_eq!(record.public_footprint_accounts().len(), 1);
     assert!(record.touched_by("p1"));
     assert!(
       l.claim_next("p2", "bilibili", &opts).unwrap().is_none(),
@@ -1249,12 +1502,12 @@ mod tests {
     // 先正常写入一条，确认能读回来。
     l.ingest(&[cand("bilibili", "BV1", "https://b.test/1")])
       .expect("ingest");
-    assert_eq!(l.list().expect("list").len(), 1);
+    assert_eq!(l.list_local().expect("list").len(), 1);
 
     // 模拟掉电后留下的零长度文件。
     std::fs::write(l.path(), b"").expect("truncate");
 
-    let err = l.list().expect_err("空文件必须报错，不能当成空台账");
+    let err = l.list_local().expect_err("空文件必须报错，不能当成空台账");
     assert!(
       matches!(err, ProspectError::EmptyLedger { .. }),
       "应当是 EmptyLedger，实际是 {err:?}"
@@ -1269,7 +1522,7 @@ mod tests {
       .expect("ingest");
     std::fs::write(l.path(), b"   \n\t\n").expect("blank");
     assert!(matches!(
-      l.list().expect_err("空白文件要报错"),
+      l.list_local().expect_err("空白文件要报错"),
       ProspectError::EmptyLedger { .. }
     ));
   }
@@ -1278,7 +1531,7 @@ mod tests {
   #[test]
   fn a_missing_ledger_is_still_an_empty_one() {
     let (l, _g) = ledger();
-    assert!(l.list().expect("首次运行不该报错").is_empty());
+    assert!(l.list_local().expect("首次运行不该报错").is_empty());
   }
 
   /// 每次写都要落到磁盘，且写完能原样读回。
@@ -1299,7 +1552,7 @@ mod tests {
 
     let on_disk = std::fs::read_to_string(l.path()).expect("read");
     assert!(!on_disk.trim().is_empty(), "落盘内容不该为空");
-    assert_eq!(l.list().expect("list").len(), 7);
+    assert_eq!(l.list_local().expect("list").len(), 7);
   }
 
   /// 只有「文件正被别人占着」这类会自己消失的错误才值得重试。
@@ -1340,6 +1593,7 @@ mod tests {
       title: "到目前为止，你觉得最好用的科研工具是什么？".to_string(),
       open_url: format!("https://www.zhihu.com/question/{Q}/answer/{aid}"),
       keyword: Some("科研工具".to_string()),
+      thread_hint: None,
     }
   }
 
@@ -1462,5 +1716,236 @@ mod tests {
       l.claim_next("p1", "zhihu", &opts).unwrap().is_some(),
       "两篇专栏文章是两个评论区，不该被归成一组"
     );
+  }
+
+  /// 解析器给了 question_id 就以它为准，不再依赖 URL 长什么样。
+  ///
+  /// 知乎搜索拿不到 questionId 时给的是裸 `/answer/<id>`，从 URL 抠分组会当场
+  /// 退化成按回答算 —— 同一个账号立刻能领走同问题下的另一个回答。
+  #[test]
+  fn a_parser_supplied_thread_hint_beats_the_url_shape() {
+    let (l, _g) = ledger();
+    let mut c = zhihu_answer("2053182600689333370");
+    c.open_url = "https://www.zhihu.com/answer/2053182600689333370".to_string(); // 裸链接
+    c.thread_hint = Some(Q.to_string());
+    l.ingest(&[c]).unwrap();
+
+    let rec = &l.list_local().unwrap()[0];
+    assert_eq!(
+      rec.thread_key(),
+      format!("zhihu:question:{Q}"),
+      "有 hint 就不该退回按回答分组"
+    );
+  }
+
+  /// 后来的一次抓取没带 question_id 时，不能把已经分好组的记录打散。
+  #[test]
+  fn a_later_bare_url_cannot_dissolve_an_existing_thread() {
+    let (l, _g) = ledger();
+    let aid = "2053182600689333370";
+    l.ingest(&[zhihu_answer(aid)]).unwrap(); // 带 /question/<Q>/ 的完整 URL
+    let before = l.list_local().unwrap()[0].thread_key();
+    assert_eq!(before, format!("zhihu:question:{Q}"));
+
+    // 同一条内容再次被发现，这次只有裸链接、也没有 hint。
+    let mut bare = zhihu_answer(aid);
+    bare.open_url = format!("https://www.zhihu.com/answer/{aid}");
+    bare.thread_hint = None;
+    let report = l.ingest(&[bare]).unwrap();
+
+    let rec = &l.list_local().unwrap()[0];
+    assert_eq!(rec.thread_key(), before, "分组只能变细，不能被打散");
+    assert_eq!(report.already_known_kept_url, 1, "应当明确记下这次拒绝");
+    assert!(
+      rec.open_url.contains("/question/"),
+      "保留信息更全的那个 URL"
+    );
+  }
+
+  /// 两台机器的台账收敛后顺序相同，「取第一个合格项」会让它们确定性地抢同一条。
+  /// 换成按设备散列取之后，同一台机器的选择依然稳定，两台机器则会分开。
+  #[test]
+  fn two_devices_do_not_deterministically_reach_for_the_same_record() {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let keys: Vec<String> = (0..190).map(|i| format!("bilibili:BV{i}")).collect();
+    let pick_for = |device: &str| -> String {
+      keys
+        .iter()
+        .min_by_key(|k| {
+          let mut h = DefaultHasher::new();
+          device.hash(&mut h);
+          k.hash(&mut h);
+          h.finish()
+        })
+        .unwrap()
+        .clone()
+    };
+
+    // 同一台机器反复算必须得到同一个答案（可复现，便于排查）。
+    assert_eq!(pick_for("device-a"), pick_for("device-a"));
+    // 不同机器应当分开。190 个候选里撞上的概率约 1/190。
+    assert_ne!(
+      pick_for("device-a"),
+      pick_for("device-b"),
+      "两台设备不该确定性地选中同一条"
+    );
+  }
+
+  // ---------------------------------------------------------------- 跨设备去重
+  //
+  // 别的机器的历史通过 prospects/remote/<device>.json 参与判断。
+  // 这些用例钉的是：外来历史真的挡得住，而且**读不动时必须报错而不是当成没有**。
+
+  fn write_remote_shard(name: &str, records: &[ProspectRecord]) {
+    let dir = crate::app_dirs::prospects_dir().join("remote");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+      dir.join(format!("{name}.json")),
+      serde_json::to_string(records).unwrap(),
+    )
+    .unwrap();
+  }
+
+  /// 别的机器上同一个账号已经在这个问题下评过 —— 本机不能再发给它。
+  #[test]
+  fn a_thread_spent_on_another_device_is_withheld_here() {
+    let (l, _g) = ledger();
+    l.ingest(&[zhihu_answer("2053182600689333370")]).unwrap();
+
+    // 远端分片：p1 已经在同一个问题下的**另一个回答**上发过。
+    let mut other = l.list_local().unwrap()[0].clone();
+    other.key = "zhihu:zhihu:answer:2057478634580063639".to_string();
+    other.item_id = "zhihu:answer:2057478634580063639".to_string();
+    other.touches = vec![AccountTouch {
+      profile_id: "p1".to_string(),
+      state: ProspectState::Posted,
+      at: 1,
+    }];
+    write_remote_shard("device-b", &[other]);
+
+    let opts = ClaimOptions::default();
+    assert!(
+      l.claim_next("p1", "zhihu", &opts).unwrap().is_none(),
+      "同一账号在别的机器上已经进过这个问题，本机必须挡住"
+    );
+    // 换个账号仍然可以（这是账号级闸门，不是内容级）。
+    assert!(l.claim_next("p2", "zhihu", &opts).unwrap().is_some());
+  }
+
+  /// cap 是全局的：本机 0 个足迹 + 远端 1 个，cap=1 就该挡住。
+  #[test]
+  fn the_per_item_cap_counts_across_devices() {
+    let (l, _g) = ledger();
+    l.ingest(&[cand("bilibili", "BV1", "https://b/1")]).unwrap();
+
+    let mut remote = l.list_local().unwrap()[0].clone();
+    remote.touches = vec![AccountTouch {
+      profile_id: "p9".to_string(),
+      state: ProspectState::Posted,
+      at: 1,
+    }];
+    write_remote_shard("device-b", &[remote]);
+
+    let opts = ClaimOptions::default(); // cap = 1
+    assert!(
+      l.claim_next("p1", "bilibili", &opts).unwrap().is_none(),
+      "远端已经用掉了唯一的名额"
+    );
+  }
+
+  /// 别的机器发现关了评论，本机不必再白跑一条腿去重新发现。
+  #[test]
+  fn blocked_content_discovered_elsewhere_is_not_handed_out_again() {
+    let (l, _g) = ledger();
+    l.ingest(&[cand("bilibili", "BV1", "https://b/1")]).unwrap();
+
+    let mut remote = l.list_local().unwrap()[0].clone();
+    remote.state = ProspectState::Blocked;
+    write_remote_shard("device-b", &[remote]);
+
+    assert!(l
+      .claim_next("p1", "bilibili", &ClaimOptions::default())
+      .unwrap()
+      .is_none());
+  }
+
+  /// 分片读不动时必须报错。当成「没有记录」等于静默失去跨机去重 ——
+  /// 和把空台账当成空记录是同一类事故。
+  #[test]
+  fn an_unreadable_shard_is_an_error_not_an_empty_index() {
+    let (l, _g) = ledger();
+    l.ingest(&[cand("bilibili", "BV1", "https://b/1")]).unwrap();
+    let dir = crate::app_dirs::prospects_dir().join("remote");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    std::fs::write(dir.join("broken.json"), b"{ not json").unwrap();
+    assert!(matches!(
+      l.claim_next("p1", "bilibili", &ClaimOptions::default()),
+      Err(ProspectError::InvalidJson { .. })
+    ));
+
+    std::fs::write(dir.join("broken.json"), b"").unwrap();
+    assert!(matches!(
+      l.claim_next("p1", "bilibili", &ClaimOptions::default()),
+      Err(ProspectError::EmptyLedger { .. })
+    ));
+  }
+
+  /// 还没同步过任何东西是合法状态，不能因此报错。
+  #[test]
+  fn no_remote_directory_means_no_foreign_history_not_an_error() {
+    let (l, _g) = ledger();
+    l.ingest(&[cand("bilibili", "BV1", "https://b/1")]).unwrap();
+    assert!(l
+      .claim_next("p1", "bilibili", &ClaimOptions::default())
+      .unwrap()
+      .is_some());
+  }
+
+  /// 分片必须是规范形式：同样的事实必须产出同样的字节。
+  ///
+  /// 上传判据是「这些字节变了没有」，格式差异会被当成新数据，
+  /// 两台机器就会互相推送、永不停止 —— 直接违反「没变化必须零 PUT」。
+  #[test]
+  fn a_shard_is_byte_stable_for_the_same_facts() {
+    let (l, _g) = ledger();
+    l.ingest(&[
+      cand("bilibili", "BV2", "https://b/2"),
+      cand("bilibili", "BV1", "https://b/1"),
+    ])
+    .unwrap();
+    let a = l.shard_bytes().unwrap();
+    let b = l.shard_bytes().unwrap();
+    assert_eq!(a, b, "同样的台账必须产出同样的字节");
+    assert!(!a.contains("\n  "), "必须是紧凑格式，不能是 pretty");
+    // 按 key 排序，与 ingest 顺序无关。
+    assert!(a.find("BV1").unwrap() < a.find("BV2").unwrap());
+  }
+
+  /// claim 是本机当下的事，不是关于内容的事实，不能进分片 ——
+  /// 否则一个即将过期的租约在别的机器上会显得还活着。
+  #[test]
+  fn a_shard_carries_history_but_not_this_machines_claims() {
+    let (l, _g) = ledger();
+    l.ingest(&[cand("bilibili", "BV1", "https://b/1")]).unwrap();
+    let claimed = l
+      .claim_next("p1", "bilibili", &ClaimOptions::default())
+      .unwrap()
+      .unwrap();
+    l.prepare_send(&claimed.key, "p1").unwrap();
+
+    let shard = l.shard_bytes().unwrap();
+    assert!(!shard.contains("\"claimed_by\":\"p1\""), "claim 不进分片");
+    assert!(
+      !shard.contains("\"send_started_at\":1"),
+      "send_started_at 不进分片"
+    );
+
+    l.settle(&claimed.key, "p1", ProspectState::Posted).unwrap();
+    let after = l.shard_bytes().unwrap();
+    assert!(after.contains("posted"), "但已发生的历史必须在");
+    assert!(after.contains("p1"));
   }
 }

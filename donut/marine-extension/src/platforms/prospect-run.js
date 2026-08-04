@@ -163,6 +163,11 @@ var marineProspectRun = marineProspectRun || {};
       title: i.title || '',
       open_url: i.open_url,
       keyword,
+      // 知乎解析器本来就解出了 question_id，只是以前没往上传。
+      // 台账靠它把同一问题下的多个回答归成一组；不传的话就只能从 open_url 里
+      // 抠，而搜索结果拿不到 questionId 时给的是裸 /answer/<id>，
+      // 分组当场退化成按回答算 —— 同一个账号立刻能领走同问题下的另一个回答。
+      thread_hint: i.question_id ? String(i.question_id) : null,
     }));
     const ingested = await deps.api('prospects/ingest', { candidates });
 

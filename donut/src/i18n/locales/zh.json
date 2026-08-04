@@ -1839,7 +1839,9 @@
     "marineDiscoveryEmptyPlan": "请至少选择一个配置文件和一个平台。",
     "marineDiscoveryEmptyKeyword": "请填写搜索关键词。",
     "marineDiscoveryProfileNotFound": "所选配置文件中有一个已不存在。",
-    "marineDiscoveryProfileCrossOs": "配置文件「{{name}}」是在其他操作系统上创建的，无法在这里运行。请在本机新建一个配置文件并重新登录。"
+    "marineDiscoveryProfileCrossOs": "配置文件「{{name}}」是在其他操作系统上创建的，无法在这里运行。请在本机新建一个配置文件并重新登录。",
+    "cookieDecryptFailed": "有 {{count}} 条 cookie 解密失败——加密密钥和这个 cookie 库对不上。继续导出只会得到一堆有名字没有登录态的 cookie，所以已中止。",
+    "profileNeverLaunched": "这个配置文件从未启动过，还没有 cookie 库。请先启动一次浏览器并关闭，然后重试。"
   },
   "rail": {
     "profiles": "配置文件",
@@ -2222,7 +2224,15 @@
         "startFailed": "无法启动任务",
         "stopFailed": "无法停止任务",
         "cycleGap": "循环间隔（分钟）",
-        "cycleGapPlaceholder": "例如 30，留空只跑一轮"
+        "cycleGapPlaceholder": "例如 30，留空只跑一轮",
+        "logs": {
+          "label": "日志",
+          "open": "打开目录",
+          "appHint": "调度器视角 —— 哪个 profile、哪条腿、为什么关了浏览器",
+          "extensionHint": "页内视角 —— 扩展看到了什么、哪个选择器没命中",
+          "exportShard": "导出台账分片",
+          "exported": "台账分片已导出"
+        }
       },
       "phase": {
         "idle": "空闲",
@@ -2238,6 +2248,7 @@
         "timed_out": "未落账",
         "no_slot": "平台不支持",
         "already_open": "已在运行，已跳过",
+        "skipped": "已跳过",
         "failed": "失败",
         "cancelled": "已取消"
       },

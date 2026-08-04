@@ -1839,7 +1839,9 @@
     "marineDiscoveryEmptyPlan": "Pick at least one profile and one platform.",
     "marineDiscoveryEmptyKeyword": "Enter a search keyword.",
     "marineDiscoveryProfileNotFound": "One of the selected profiles no longer exists.",
-    "marineDiscoveryProfileCrossOs": "Profile \"{{name}}\" was created on a different operating system and cannot run here. Create a new profile on this machine and sign in again."
+    "marineDiscoveryProfileCrossOs": "Profile \"{{name}}\" was created on a different operating system and cannot run here. Create a new profile on this machine and sign in again.",
+    "cookieDecryptFailed": "Could not decrypt {{count}} cookie value(s) — the encryption key does not match this cookie store. Exporting would produce cookie names with no sessions behind them, so the operation was stopped.",
+    "profileNeverLaunched": "This profile has never been launched, so it has no cookie store yet. Start the browser once and close it, then try again."
   },
   "rail": {
     "profiles": "Profiles",
@@ -2222,7 +2224,15 @@
         "startFailed": "Could not start the run",
         "stopFailed": "Could not stop the run",
         "cycleGap": "Cycle gap (min)",
-        "cycleGapPlaceholder": "e.g. 30 — blank runs once"
+        "cycleGapPlaceholder": "e.g. 30 — blank runs once",
+        "logs": {
+          "label": "Logs",
+          "open": "Open folder",
+          "appHint": "Scheduler view — which profile, which leg, why a browser closed",
+          "extensionHint": "In-page view — what the extension saw, which selector missed",
+          "exportShard": "Export ledger shard",
+          "exported": "Ledger shard exported"
+        }
       },
       "phase": {
         "idle": "Idle",
@@ -2238,6 +2248,7 @@
         "timed_out": "Nothing settled",
         "no_slot": "Platform not supported",
         "already_open": "Already open — skipped",
+        "skipped": "Skipped",
         "failed": "Failed",
         "cancelled": "Cancelled"
       },

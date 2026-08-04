@@ -1839,7 +1839,9 @@
     "marineDiscoveryEmptyPlan": "프로필과 플랫폼을 각각 하나 이상 선택하세요.",
     "marineDiscoveryEmptyKeyword": "검색 키워드를 입력하세요.",
     "marineDiscoveryProfileNotFound": "선택한 프로필 중 하나가 더 이상 존재하지 않습니다.",
-    "marineDiscoveryProfileCrossOs": "프로필 \"{{name}}\"은(는) 다른 운영 체제에서 만들어져 여기서는 실행할 수 없습니다. 이 컴퓨터에서 새 프로필을 만들고 다시 로그인하세요."
+    "marineDiscoveryProfileCrossOs": "프로필 \"{{name}}\"은(는) 다른 운영 체제에서 만들어져 여기서는 실행할 수 없습니다. 이 컴퓨터에서 새 프로필을 만들고 다시 로그인하세요.",
+    "cookieDecryptFailed": "{{count}}개의 쿠키를 복호화하지 못했습니다. 암호화 키가 이 쿠키 저장소와 일치하지 않습니다. 내보내도 세션 없는 쿠키 이름만 생기므로 작업을 중단했습니다.",
+    "profileNeverLaunched": "이 프로필은 한 번도 실행된 적이 없어 쿠키 저장소가 아직 없습니다. 브라우저를 한 번 실행한 뒤 닫고 다시 시도하세요."
   },
   "rail": {
     "profiles": "프로필",
@@ -2222,7 +2224,15 @@
         "startFailed": "실행을 시작할 수 없습니다",
         "stopFailed": "실행을 중지할 수 없습니다",
         "cycleGap": "반복 간격(분)",
-        "cycleGapPlaceholder": "예: 30, 비우면 1회만"
+        "cycleGapPlaceholder": "예: 30, 비우면 1회만",
+        "logs": {
+          "label": "로그",
+          "open": "폴더 열기",
+          "appHint": "스케줄러 관점 — 어떤 프로필, 어떤 구간, 브라우저를 왜 닫았는지",
+          "extensionHint": "페이지 내 관점 — 확장이 무엇을 봤는지, 어떤 선택자가 빗나갔는지",
+          "exportShard": "원장 샤드 내보내기",
+          "exported": "원장 샤드를 내보냈습니다"
+        }
       },
       "phase": {
         "idle": "대기 중",
@@ -2238,6 +2248,7 @@
         "timed_out": "기록 없음",
         "no_slot": "지원하지 않는 플랫폼",
         "already_open": "이미 실행 중이라 건너뜀",
+        "skipped": "건너뜀",
         "failed": "실패",
         "cancelled": "취소됨"
       },

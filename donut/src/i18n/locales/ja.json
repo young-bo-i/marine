@@ -1839,7 +1839,9 @@
     "marineDiscoveryEmptyPlan": "プロファイルとプラットフォームを 1 つ以上選んでください。",
     "marineDiscoveryEmptyKeyword": "検索キーワードを入力してください。",
     "marineDiscoveryProfileNotFound": "選択したプロファイルの 1 つが存在しません。",
-    "marineDiscoveryProfileCrossOs": "プロファイル「{{name}}」は別のオペレーティングシステムで作成されたため、ここでは実行できません。このマシンで新しいプロファイルを作成し、再度サインインしてください。"
+    "marineDiscoveryProfileCrossOs": "プロファイル「{{name}}」は別のオペレーティングシステムで作成されたため、ここでは実行できません。このマシンで新しいプロファイルを作成し、再度サインインしてください。",
+    "cookieDecryptFailed": "{{count}} 件の Cookie を復号できませんでした。暗号化キーがこの Cookie ストアと一致しません。書き出してもセッションのない Cookie 名だけになるため、処理を中止しました。",
+    "profileNeverLaunched": "このプロファイルは一度も起動されていないため、Cookie ストアがまだありません。ブラウザを一度起動して閉じてから、もう一度お試しください。"
   },
   "rail": {
     "profiles": "プロファイル",
@@ -2222,7 +2224,15 @@
         "startFailed": "実行を開始できませんでした",
         "stopFailed": "実行を停止できませんでした",
         "cycleGap": "巡回間隔（分）",
-        "cycleGapPlaceholder": "例: 30、空欄なら1回のみ"
+        "cycleGapPlaceholder": "例: 30、空欄なら1回のみ",
+        "logs": {
+          "label": "ログ",
+          "open": "フォルダを開く",
+          "appHint": "スケジューラ視点 — どのプロファイル、どの区間、なぜブラウザを閉じたか",
+          "extensionHint": "ページ内視点 — 拡張機能が何を見たか、どのセレクタが外れたか",
+          "exportShard": "台帳シャードを書き出す",
+          "exported": "台帳シャードを書き出しました"
+        }
       },
       "phase": {
         "idle": "待機中",
@@ -2238,6 +2248,7 @@
         "timed_out": "記録なし",
         "no_slot": "未対応のプラットフォーム",
         "already_open": "すでに起動中のためスキップ",
+        "skipped": "スキップ",
         "failed": "失敗",
         "cancelled": "キャンセル済み"
       },

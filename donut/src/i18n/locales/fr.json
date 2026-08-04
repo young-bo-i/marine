@@ -1839,7 +1839,9 @@
     "marineDiscoveryEmptyPlan": "Choisissez au moins un profil et une plateforme.",
     "marineDiscoveryEmptyKeyword": "Saisissez un mot-clé de recherche.",
     "marineDiscoveryProfileNotFound": "L'un des profils sélectionnés n'existe plus.",
-    "marineDiscoveryProfileCrossOs": "Le profil « {{name}} » a été créé sur un autre système d'exploitation et ne peut pas s'exécuter ici. Créez un nouveau profil sur cette machine et reconnectez-vous."
+    "marineDiscoveryProfileCrossOs": "Le profil « {{name}} » a été créé sur un autre système d'exploitation et ne peut pas s'exécuter ici. Créez un nouveau profil sur cette machine et reconnectez-vous.",
+    "cookieDecryptFailed": "Impossible de déchiffrer {{count}} cookie(s) : la clé de chiffrement ne correspond pas à ce magasin. L'export ne produirait que des noms de cookies sans session, l'opération a donc été interrompue.",
+    "profileNeverLaunched": "Ce profil n'a jamais été lancé, il n'a donc pas encore de magasin de cookies. Lancez le navigateur une fois puis fermez-le, et réessayez."
   },
   "rail": {
     "profiles": "Profils",
@@ -2222,7 +2224,15 @@
         "startFailed": "Impossible de lancer l'exécution",
         "stopFailed": "Impossible d'arrêter l'exécution",
         "cycleGap": "Intervalle (min)",
-        "cycleGapPlaceholder": "ex. 30 — vide = une seule fois"
+        "cycleGapPlaceholder": "ex. 30 — vide = une seule fois",
+        "logs": {
+          "label": "Journaux",
+          "open": "Ouvrir le dossier",
+          "appHint": "Vue de l'ordonnanceur : quel profil, quelle étape, pourquoi un navigateur s'est fermé",
+          "extensionHint": "Vue dans la page : ce que l'extension a vu, quel sélecteur a échoué",
+          "exportShard": "Exporter le fragment du registre",
+          "exported": "Fragment du registre exporté"
+        }
       },
       "phase": {
         "idle": "Inactif",
@@ -2238,6 +2248,7 @@
         "timed_out": "Rien enregistré",
         "no_slot": "Plateforme non prise en charge",
         "already_open": "Déjà ouvert — ignoré",
+        "skipped": "Ignoré",
         "failed": "Échec",
         "cancelled": "Annulé"
       },

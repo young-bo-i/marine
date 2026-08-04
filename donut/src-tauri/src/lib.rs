@@ -1353,7 +1353,7 @@ async fn marine_login_status_all(
 #[tauri::command]
 async fn marine_list_prospects() -> Result<Vec<marine::prospect::ProspectRecord>, String> {
   tauri::async_runtime::spawn_blocking(|| {
-    marine::prospect::PROSPECTS.list().map_err(|error| {
+    marine::prospect::PROSPECTS.list_local().map_err(|error| {
       log::error!("Failed to list Marine prospects: {error}");
       marine::err("INTERNAL_ERROR")
     })
@@ -1394,6 +1394,71 @@ async fn marine_start_discovery(
 fn marine_stop_discovery() -> Result<(), String> {
   marine::scheduler::SCHEDULER.request_cancel();
   Ok(())
+}
+
+/// Write this device's ledger shard out for another machine to consume.
+///
+/// The cross-device gates in `claim_next` read every JSON file under
+/// `prospects/remote/`. Until the sync layer moves those files by itself, this
+/// command is how a shard gets produced: export here, drop the file into the
+/// other machine's `prospects/remote/`, and that machine will stop handing out
+/// threads this one has already spent.
+///
+/// Deliberately a plain file rather than a network call — it makes the whole
+/// mechanism verifiable with a copy-paste before any of it depends on the sync
+/// server being reachable.
+#[tauri::command]
+async fn marine_export_ledger_shard() -> Result<String, String> {
+  tokio::task::spawn_blocking(|| {
+    let json = marine::prospect::PROSPECTS
+      .shard_bytes()
+      .map_err(|e| marine::err_with("INTERNAL_ERROR", e.to_string()))?;
+    let dir = app_dirs::prospects_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| marine::err_with("INTERNAL_ERROR", e.to_string()))?;
+    let path = dir.join(format!("shard-{}.json", crate::team_lock::device_id()));
+    std::fs::write(&path, json).map_err(|e| marine::err_with("INTERNAL_ERROR", e.to_string()))?;
+    Ok(path.to_string_lossy().to_string())
+  })
+  .await
+  .map_err(|e| {
+    log::error!("Marine ledger shard export task failed: {e}");
+    marine::err("INTERNAL_ERROR")
+  })?
+}
+
+/// Where the two logs an automation run writes to actually live.
+///
+/// Two of them, and the useful one is not the obvious one: the app log has the
+/// scheduler's view (which profile, which leg, why a browser was closed), while
+/// `marine-debug.jsonl` has the in-page view (what the extension saw, which
+/// selector missed, what the draft check compared). Diagnosing a leg almost
+/// always needs the second one, and it lives under the *data* directory rather
+/// than the log directory — nobody finds it by guessing.
+#[derive(serde::Serialize)]
+struct MarineLogLocations {
+  /// Directory holding the rotated app logs; what `open_log_directory` opens.
+  app_log_dir: String,
+  /// Today's app log file inside `app_log_dir`.
+  app_log_file: String,
+  /// The extension's per-leg JSONL trace.
+  extension_log_file: String,
+}
+
+#[tauri::command]
+fn marine_log_locations(app_handle: tauri::AppHandle) -> Result<MarineLogLocations, String> {
+  let dir = app_dirs::log_dir(&app_handle);
+  let stem = app_dirs::app_name();
+  Ok(MarineLogLocations {
+    app_log_file: dir
+      .join(format!("{stem}.log"))
+      .to_string_lossy()
+      .to_string(),
+    app_log_dir: dir.to_string_lossy().to_string(),
+    extension_log_file: marine::debug_log::DEBUG_LOG
+      .file_path()
+      .to_string_lossy()
+      .to_string(),
+  })
 }
 
 /// Current run progress. The page calls this once on mount; live updates arrive
@@ -2598,6 +2663,8 @@ pub fn run() {
       marine_start_discovery,
       marine_stop_discovery,
       marine_discovery_status,
+      marine_log_locations,
+      marine_export_ledger_shard,
       get_all_traffic_snapshots,
       get_profile_traffic_snapshot,
       clear_all_traffic_stats,

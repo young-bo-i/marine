@@ -771,9 +771,10 @@ impl WayfernManager {
           );
 
           // Try decrypting one cookie using the cookie_manager
-          if let Some(encryption_key) =
-            crate::cookie_manager::chrome_decrypt::get_encryption_key(&profile_path_buf)
-          {
+          if let Some(encryption_key) = crate::cookie_manager::chrome_decrypt::get_encryption_key(
+            &profile_path_buf,
+            profile.resolved_os(),
+          ) {
             if let Ok(mut stmt) = conn.prepare(
               "SELECT name, host_key, encrypted_value FROM cookies WHERE length(encrypted_value) > 0 LIMIT 1",
             ) {
