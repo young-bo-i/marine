@@ -289,6 +289,46 @@ impl CookieManager {
     }
   }
 
+  /// Copy the cookie store and its key aside before something irreversible.
+  ///
+  /// Returns the backup directory, or `None` when the profile has no cookie
+  /// store yet (nothing to lose). Existing backups are never overwritten —
+  /// each call lands in its own timestamped directory, because the case this
+  /// exists for is "the first attempt destroyed them" and a second attempt must
+  /// not destroy the evidence of the first.
+  ///
+  /// Both files are needed: the database is meaningless without `os_crypt_key`,
+  /// which is the passphrase its values were encrypted under.
+  pub fn back_up_cookie_store(
+    profile: &BrowserProfile,
+    profiles_dir: &Path,
+  ) -> Result<Option<String>, String> {
+    let data = profile.get_profile_data_path(profiles_dir);
+    let cookies = Self::wayfern_cookie_path(&data);
+    if !cookies.exists() {
+      return Ok(None);
+    }
+    let stamp = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map(|d| d.as_secs())
+      .unwrap_or(0);
+    // Outside `profiles/`: anything inside it is profile data and would be
+    // picked up by sync and by profile deletion.
+    let dir = crate::app_dirs::data_dir()
+      .join("cookie-backups")
+      .join(format!("{}-{stamp}", profile.id));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create backup dir: {e}"))?;
+
+    std::fs::copy(&cookies, dir.join("Cookies"))
+      .map_err(|e| format!("failed to back up the cookie store: {e}"))?;
+    let key = data.join("os_crypt_key");
+    if key.exists() {
+      std::fs::copy(&key, dir.join("os_crypt_key"))
+        .map_err(|e| format!("failed to back up os_crypt_key: {e}"))?;
+    }
+    Ok(Some(dir.to_string_lossy().to_string()))
+  }
+
   /// Get the cookie database path for a profile, creating an empty
   /// browser-compatible database if it doesn't exist yet. Use this for write
   /// paths (copy / import) so we can populate the cookie store of a profile

@@ -257,7 +257,10 @@
       "launchHook": "URL du hook de lancement",
       "setPassword": "Définir un mot de passe",
       "changePassword": "Changer le mot de passe",
-      "removePassword": "Supprimer le mot de passe"
+      "removePassword": "Supprimer le mot de passe",
+      "adoptHere": "Adopter sur cette machine",
+      "adoptedWithBackup": "Cookies sauvegardés dans {{path}} avant l'adoption.",
+      "adoptedNoCookies": "Aucun magasin de cookies à sauvegarder pour l'instant."
     },
     "synchronizer": {
       "launchWithSync": "Lancer avec le synchroniseur",
@@ -1841,7 +1844,10 @@
     "marineDiscoveryProfileNotFound": "L'un des profils sélectionnés n'existe plus.",
     "marineDiscoveryProfileCrossOs": "Le profil « {{name}} » a été créé sur un autre système d'exploitation et ne peut pas s'exécuter ici. Créez un nouveau profil sur cette machine et reconnectez-vous.",
     "cookieDecryptFailed": "Impossible de déchiffrer {{count}} cookie(s) : la clé de chiffrement ne correspond pas à ce magasin. L'export ne produirait que des noms de cookies sans session, l'opération a donc été interrompue.",
-    "profileNeverLaunched": "Ce profil n'a jamais été lancé, il n'a donc pas encore de magasin de cookies. Lancez le navigateur une fois puis fermez-le, et réessayez."
+    "profileNeverLaunched": "Ce profil n'a jamais été lancé, il n'a donc pas encore de magasin de cookies. Lancez le navigateur une fois puis fermez-le, et réessayez.",
+    "profileIsRunning": "Fermez le navigateur avant d'adopter ce profil.",
+    "profileAlreadyLocal": "Ce profil appartient déjà à cette machine.",
+    "marineProfileLeasedElsewhere": "Un autre appareil pilote actuellement ce profil. L'exécuter ici aussi ferait publier les deux sous le même contenu."
   },
   "rail": {
     "profiles": "Profils",

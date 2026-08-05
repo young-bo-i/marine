@@ -257,7 +257,10 @@
       "launchHook": "起動フックURL",
       "setPassword": "パスワードを設定",
       "changePassword": "パスワードを変更",
-      "removePassword": "パスワードを削除"
+      "removePassword": "パスワードを削除",
+      "adoptHere": "このマシンで引き継ぐ",
+      "adoptedWithBackup": "引き継ぐ前に Cookie を {{path}} にバックアップしました。",
+      "adoptedNoCookies": "バックアップする Cookie ストアはまだありません。"
     },
     "synchronizer": {
       "launchWithSync": "シンクロナイザーで起動",
@@ -1841,7 +1844,10 @@
     "marineDiscoveryProfileNotFound": "選択したプロファイルの 1 つが存在しません。",
     "marineDiscoveryProfileCrossOs": "プロファイル「{{name}}」は別のオペレーティングシステムで作成されたため、ここでは実行できません。このマシンで新しいプロファイルを作成し、再度サインインしてください。",
     "cookieDecryptFailed": "{{count}} 件の Cookie を復号できませんでした。暗号化キーがこの Cookie ストアと一致しません。書き出してもセッションのない Cookie 名だけになるため、処理を中止しました。",
-    "profileNeverLaunched": "このプロファイルは一度も起動されていないため、Cookie ストアがまだありません。ブラウザを一度起動して閉じてから、もう一度お試しください。"
+    "profileNeverLaunched": "このプロファイルは一度も起動されていないため、Cookie ストアがまだありません。ブラウザを一度起動して閉じてから、もう一度お試しください。",
+    "profileIsRunning": "この プロファイルを引き継ぐ前にブラウザを閉じてください。",
+    "profileAlreadyLocal": "このプロファイルはすでにこのマシンのものです。",
+    "marineProfileLeasedElsewhere": "別のデバイスがこのプロファイルを使用中です。ここでも実行すると同じ内容に二重投稿されます。"
   },
   "rail": {
     "profiles": "プロファイル",

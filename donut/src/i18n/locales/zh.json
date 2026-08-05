@@ -257,7 +257,10 @@
       "launchHook": "启动钩子 URL",
       "setPassword": "设置密码",
       "changePassword": "更改密码",
-      "removePassword": "移除密码"
+      "removePassword": "移除密码",
+      "adoptHere": "在本机接管",
+      "adoptedWithBackup": "接管前已把 cookie 备份到 {{path}}。",
+      "adoptedNoCookies": "还没有 cookie 库，无需备份。"
     },
     "synchronizer": {
       "launchWithSync": "使用同步器启动",
@@ -1841,7 +1844,10 @@
     "marineDiscoveryProfileNotFound": "所选配置文件中有一个已不存在。",
     "marineDiscoveryProfileCrossOs": "配置文件「{{name}}」是在其他操作系统上创建的，无法在这里运行。请在本机新建一个配置文件并重新登录。",
     "cookieDecryptFailed": "有 {{count}} 条 cookie 解密失败——加密密钥和这个 cookie 库对不上。继续导出只会得到一堆有名字没有登录态的 cookie，所以已中止。",
-    "profileNeverLaunched": "这个配置文件从未启动过，还没有 cookie 库。请先启动一次浏览器并关闭，然后重试。"
+    "profileNeverLaunched": "这个配置文件从未启动过，还没有 cookie 库。请先启动一次浏览器并关闭，然后重试。",
+    "profileIsRunning": "接管前请先关闭浏览器。",
+    "profileAlreadyLocal": "这个配置文件已经属于本机了。",
+    "marineProfileLeasedElsewhere": "另一台设备正在驱动这个配置文件。本机同时跑会导致两边在同一条内容下重复发言。"
   },
   "rail": {
     "profiles": "配置文件",

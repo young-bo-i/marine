@@ -257,7 +257,10 @@
       "launchHook": "실행 후크 URL",
       "setPassword": "비밀번호 설정",
       "changePassword": "비밀번호 변경",
-      "removePassword": "비밀번호 제거"
+      "removePassword": "비밀번호 제거",
+      "adoptHere": "이 컴퓨터에서 인계",
+      "adoptedWithBackup": "인계 전에 쿠키를 {{path}}에 백업했습니다.",
+      "adoptedNoCookies": "아직 백업할 쿠키 저장소가 없습니다."
     },
     "synchronizer": {
       "launchWithSync": "동기화 모드로 실행",
@@ -1841,7 +1844,10 @@
     "marineDiscoveryProfileNotFound": "선택한 프로필 중 하나가 더 이상 존재하지 않습니다.",
     "marineDiscoveryProfileCrossOs": "프로필 \"{{name}}\"은(는) 다른 운영 체제에서 만들어져 여기서는 실행할 수 없습니다. 이 컴퓨터에서 새 프로필을 만들고 다시 로그인하세요.",
     "cookieDecryptFailed": "{{count}}개의 쿠키를 복호화하지 못했습니다. 암호화 키가 이 쿠키 저장소와 일치하지 않습니다. 내보내도 세션 없는 쿠키 이름만 생기므로 작업을 중단했습니다.",
-    "profileNeverLaunched": "이 프로필은 한 번도 실행된 적이 없어 쿠키 저장소가 아직 없습니다. 브라우저를 한 번 실행한 뒤 닫고 다시 시도하세요."
+    "profileNeverLaunched": "이 프로필은 한 번도 실행된 적이 없어 쿠키 저장소가 아직 없습니다. 브라우저를 한 번 실행한 뒤 닫고 다시 시도하세요.",
+    "profileIsRunning": "이 프로필을 인계하기 전에 브라우저를 닫으세요.",
+    "profileAlreadyLocal": "이 프로필은 이미 이 컴퓨터의 것입니다.",
+    "marineProfileLeasedElsewhere": "다른 기기가 이 프로필을 사용 중입니다. 여기서도 실행하면 같은 콘텐츠에 중복으로 게시됩니다."
   },
   "rail": {
     "profiles": "프로필",

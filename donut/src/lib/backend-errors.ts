@@ -50,6 +50,9 @@ export type BackendErrorCode =
   | "MARINE_DISCOVERY_PROFILE_CROSS_OS"
   | "COOKIE_DECRYPT_FAILED"
   | "PROFILE_NEVER_LAUNCHED"
+  | "PROFILE_IS_RUNNING"
+  | "PROFILE_ALREADY_LOCAL"
+  | "MARINE_PROFILE_LEASED_ELSEWHERE"
   | "INTERNAL_ERROR";
 
 export interface BackendError {
@@ -196,6 +199,12 @@ export function translateBackendError(t: TFunction, err: unknown): string {
       });
     case "PROFILE_NEVER_LAUNCHED":
       return t("backendErrors.profileNeverLaunched");
+    case "PROFILE_IS_RUNNING":
+      return t("backendErrors.profileIsRunning");
+    case "PROFILE_ALREADY_LOCAL":
+      return t("backendErrors.profileAlreadyLocal");
+    case "MARINE_PROFILE_LEASED_ELSEWHERE":
+      return t("backendErrors.marineProfileLeasedElsewhere");
     case "MARINE_DISCOVERY_PROFILE_CROSS_OS":
       return t("backendErrors.marineDiscoveryProfileCrossOs", {
         name: parsed.params?.message ?? "",

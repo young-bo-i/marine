@@ -257,7 +257,10 @@
       "launchHook": "URL Hook khởi chạy",
       "setPassword": "Đặt mật khẩu",
       "changePassword": "Đổi mật khẩu",
-      "removePassword": "Xóa mật khẩu"
+      "removePassword": "Xóa mật khẩu",
+      "adoptHere": "Tiếp nhận trên máy này",
+      "adoptedWithBackup": "Đã sao lưu cookie vào {{path}} trước khi tiếp nhận.",
+      "adoptedNoCookies": "Chưa có kho cookie nào để sao lưu."
     },
     "synchronizer": {
       "launchWithSync": "Khởi chạy với trình đồng bộ",
@@ -1841,7 +1844,10 @@
     "marineDiscoveryProfileNotFound": "Một trong các hồ sơ đã chọn không còn tồn tại.",
     "marineDiscoveryProfileCrossOs": "Hồ sơ \"{{name}}\" được tạo trên một hệ điều hành khác nên không thể chạy ở đây. Hãy tạo hồ sơ mới trên máy này và đăng nhập lại.",
     "cookieDecryptFailed": "Không giải mã được {{count}} cookie — khóa mã hóa không khớp với kho cookie này. Xuất ra sẽ chỉ có tên cookie mà không có phiên đăng nhập, nên thao tác đã dừng.",
-    "profileNeverLaunched": "Hồ sơ này chưa từng được khởi chạy nên chưa có kho cookie. Hãy mở trình duyệt một lần rồi đóng lại, sau đó thử lại."
+    "profileNeverLaunched": "Hồ sơ này chưa từng được khởi chạy nên chưa có kho cookie. Hãy mở trình duyệt một lần rồi đóng lại, sau đó thử lại.",
+    "profileIsRunning": "Hãy đóng trình duyệt trước khi tiếp nhận hồ sơ này.",
+    "profileAlreadyLocal": "Hồ sơ này đã thuộc về máy này rồi.",
+    "marineProfileLeasedElsewhere": "Một thiết bị khác đang chạy hồ sơ này. Chạy ở đây nữa sẽ khiến cả hai đăng dưới cùng một nội dung."
   },
   "rail": {
     "profiles": "Profile",

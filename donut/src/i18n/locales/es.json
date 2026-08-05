@@ -257,7 +257,10 @@
       "launchHook": "URL del hook de inicio",
       "setPassword": "Establecer Contraseña",
       "changePassword": "Cambiar Contraseña",
-      "removePassword": "Quitar Contraseña"
+      "removePassword": "Quitar Contraseña",
+      "adoptHere": "Adoptar en este equipo",
+      "adoptedWithBackup": "Cookies respaldadas en {{path}} antes de adoptar.",
+      "adoptedNoCookies": "Aún no hay almacén de cookies que respaldar."
     },
     "synchronizer": {
       "launchWithSync": "Lanzar con Sincronizador",
@@ -1841,7 +1844,10 @@
     "marineDiscoveryProfileNotFound": "Uno de los perfiles seleccionados ya no existe.",
     "marineDiscoveryProfileCrossOs": "El perfil «{{name}}» se creó en otro sistema operativo y no puede ejecutarse aquí. Crea un perfil nuevo en este equipo y vuelve a iniciar sesión.",
     "cookieDecryptFailed": "No se pudieron descifrar {{count}} cookie(s): la clave de cifrado no corresponde a este almacén. Exportar solo produciría nombres de cookies sin sesión detrás, así que se detuvo la operación.",
-    "profileNeverLaunched": "Este perfil nunca se ha iniciado, así que aún no tiene almacén de cookies. Inicia el navegador una vez y ciérralo, luego inténtalo de nuevo."
+    "profileNeverLaunched": "Este perfil nunca se ha iniciado, así que aún no tiene almacén de cookies. Inicia el navegador una vez y ciérralo, luego inténtalo de nuevo.",
+    "profileIsRunning": "Detén el navegador antes de adoptar este perfil.",
+    "profileAlreadyLocal": "Este perfil ya pertenece a este equipo.",
+    "marineProfileLeasedElsewhere": "Otro dispositivo está usando este perfil. Ejecutarlo aquí también haría que ambos publiquen bajo el mismo contenido."
   },
   "rail": {
     "profiles": "Perfiles",
