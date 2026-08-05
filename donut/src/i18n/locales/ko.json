@@ -257,10 +257,7 @@
       "launchHook": "실행 후크 URL",
       "setPassword": "비밀번호 설정",
       "changePassword": "비밀번호 변경",
-      "removePassword": "비밀번호 제거",
-      "adoptHere": "이 컴퓨터에서 인계",
-      "adoptedWithBackup": "인계 전에 쿠키를 {{path}}에 백업했습니다.",
-      "adoptedNoCookies": "아직 백업할 쿠키 저장소가 없습니다."
+      "removePassword": "비밀번호 제거"
     },
     "synchronizer": {
       "launchWithSync": "동기화 모드로 실행",
@@ -1125,8 +1122,8 @@
     "viewOnly": "이 프로필은 {{os}}에서 생성되었으며 이 시스템에서는 지원되지 않습니다",
     "cannotLaunch": "이 프로필은 {{os}}에서 생성되었으며 이 시스템에서는 지원되지 않습니다",
     "cannotModify": "교차 OS 프로필의 동기화 설정을 수정할 수 없습니다",
-    "adoptHint": "{{os}}에서 만들어졌습니다. 오른쪽 ⓘ 패널에서 ‘이 컴퓨터에서 인계’를 선택하면 여기서 실행할 수 있습니다.",
-    "adoptHintUnknownOs": "다른 운영 체제에서 만들어졌습니다. 오른쪽 ⓘ 패널에서 ‘이 컴퓨터에서 인계’를 선택하면 여기서 실행할 수 있습니다."
+    "adoptHint": "{{os}}에서 만들어졌습니다. 실행하면 이 컴퓨터로 인계됩니다 — 쿠키를 먼저 백업하고 이 OS용 새 지문을 생성합니다.",
+    "adoptHintUnknownOs": "다른 운영 체제에서 만들어졌습니다. 실행하면 이 컴퓨터로 인계됩니다 — 쿠키를 먼저 백업하고 새 지문을 생성합니다."
   },
   "profileInfo": {
     "title": "프로필 세부 정보",

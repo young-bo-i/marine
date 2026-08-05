@@ -257,10 +257,7 @@
       "launchHook": "启动钩子 URL",
       "setPassword": "设置密码",
       "changePassword": "更改密码",
-      "removePassword": "移除密码",
-      "adoptHere": "在本机接管",
-      "adoptedWithBackup": "接管前已把 cookie 备份到 {{path}}。",
-      "adoptedNoCookies": "还没有 cookie 库，无需备份。"
+      "removePassword": "移除密码"
     },
     "synchronizer": {
       "launchWithSync": "使用同步器启动",
@@ -1125,8 +1122,8 @@
     "viewOnly": "此配置文件在 {{os}} 上创建，不受此系统支持",
     "cannotLaunch": "此配置文件在 {{os}} 上创建，不受此系统支持",
     "cannotModify": "无法修改跨操作系统配置文件的同步设置",
-    "adoptHint": "在 {{os}} 上创建。点右侧 ⓘ 打开信息面板，选「在本机接管」即可在这里运行。",
-    "adoptHintUnknownOs": "在其他操作系统上创建。点右侧 ⓘ 打开信息面板，选「在本机接管」即可在这里运行。"
+    "adoptHint": "在 {{os}} 上创建。启动时会自动接管到本机——先备份 cookie，并为本系统生成新的指纹。",
+    "adoptHintUnknownOs": "在其他操作系统上创建。启动时会自动接管到本机——先备份 cookie，并生成新的指纹。"
   },
   "profileInfo": {
     "title": "配置文件详情",

@@ -257,10 +257,7 @@
       "launchHook": "URL du hook de lancement",
       "setPassword": "Définir un mot de passe",
       "changePassword": "Changer le mot de passe",
-      "removePassword": "Supprimer le mot de passe",
-      "adoptHere": "Adopter sur cette machine",
-      "adoptedWithBackup": "Cookies sauvegardés dans {{path}} avant l'adoption.",
-      "adoptedNoCookies": "Aucun magasin de cookies à sauvegarder pour l'instant."
+      "removePassword": "Supprimer le mot de passe"
     },
     "synchronizer": {
       "launchWithSync": "Lancer avec le synchroniseur",
@@ -1125,8 +1122,8 @@
     "viewOnly": "Ce profil a été créé sur {{os}} et n'est pas pris en charge sur ce système",
     "cannotLaunch": "Ce profil a été créé sur {{os}} et n'est pas pris en charge sur ce système",
     "cannotModify": "Impossible de modifier les paramètres de synchronisation d'un profil d'un autre système d'exploitation",
-    "adoptHint": "Créé sur {{os}}. Ouvrez le panneau ⓘ et choisissez « Adopter sur cette machine » pour l'exécuter ici.",
-    "adoptHintUnknownOs": "Créé sur un autre système. Ouvrez le panneau ⓘ et choisissez « Adopter sur cette machine » pour l'exécuter ici."
+    "adoptHint": "Créé sur {{os}}. Le lancement l'adopte sur cette machine : les cookies sont d'abord sauvegardés et une nouvelle empreinte est générée pour ce système.",
+    "adoptHintUnknownOs": "Créé sur un autre système. Le lancement l'adopte sur cette machine : les cookies sont d'abord sauvegardés et une nouvelle empreinte est générée."
   },
   "profileInfo": {
     "title": "Détails du Profil",

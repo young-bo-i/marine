@@ -257,10 +257,7 @@
       "launchHook": "URL del hook de inicio",
       "setPassword": "Establecer Contraseña",
       "changePassword": "Cambiar Contraseña",
-      "removePassword": "Quitar Contraseña",
-      "adoptHere": "Adoptar en este equipo",
-      "adoptedWithBackup": "Cookies respaldadas en {{path}} antes de adoptar.",
-      "adoptedNoCookies": "Aún no hay almacén de cookies que respaldar."
+      "removePassword": "Quitar Contraseña"
     },
     "synchronizer": {
       "launchWithSync": "Lanzar con Sincronizador",
@@ -1125,8 +1122,8 @@
     "viewOnly": "Este perfil fue creado en {{os}} y no es compatible con este sistema",
     "cannotLaunch": "Este perfil fue creado en {{os}} y no es compatible con este sistema",
     "cannotModify": "No se pueden modificar los ajustes de sincronización de un perfil de otro sistema operativo",
-    "adoptHint": "Creado en {{os}}. Abre el panel ⓘ y elige «Adoptar en este equipo» para ejecutarlo aquí.",
-    "adoptHintUnknownOs": "Creado en otro sistema operativo. Abre el panel ⓘ y elige «Adoptar en este equipo» para ejecutarlo aquí."
+    "adoptHint": "Creado en {{os}}. Al iniciarlo se adopta en este equipo: primero se respaldan las cookies y se genera una huella nueva para este sistema.",
+    "adoptHintUnknownOs": "Creado en otro sistema operativo. Al iniciarlo se adopta en este equipo: primero se respaldan las cookies y se genera una huella nueva."
   },
   "profileInfo": {
     "title": "Detalles del Perfil",

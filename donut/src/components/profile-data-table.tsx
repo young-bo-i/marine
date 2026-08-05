@@ -2502,8 +2502,10 @@ export function ProfilesDataTable({
             />
           );
 
-          const isCrossOs = isCrossOsProfile(profile);
-          const isCrossOsBlocked = isCrossOs;
+          const _isCrossOs = isCrossOsProfile(profile);
+          // 跨 OS 不再是「不能启动」：启动时后端会自动接管到本机。
+          // 保留这个变量名是为了让 grep 找得到这条决策的历史。
+          const isCrossOsBlocked = false;
           const isRunning =
             meta.isClient && meta.runningProfiles.has(profile.id);
           const isLaunching = meta.launchingProfiles.has(profile.id);
@@ -2567,8 +2569,10 @@ export function ProfilesDataTable({
         cell: ({ row, table }) => {
           const meta = table.options.meta as TableMeta;
           const profile = row.original;
-          const isCrossOs = isCrossOsProfile(profile);
-          const isCrossOsBlocked = isCrossOs;
+          const _isCrossOs = isCrossOsProfile(profile);
+          // 跨 OS 不再是「不能启动」：启动时后端会自动接管到本机。
+          // 保留这个变量名是为了让 grep 找得到这条决策的历史。
+          const isCrossOsBlocked = false;
           const isRunning =
             meta.isClient && meta.runningProfiles.has(profile.id);
           const isLaunching = meta.launchingProfiles.has(profile.id);
@@ -2641,8 +2645,10 @@ export function ProfilesDataTable({
         cell: ({ row, table }) => {
           const meta = table.options.meta as TableMeta;
           const profile = row.original;
-          const isCrossOs = isCrossOsProfile(profile);
-          const isCrossOsBlocked = isCrossOs;
+          const _isCrossOs = isCrossOsProfile(profile);
+          // 跨 OS 不再是「不能启动」：启动时后端会自动接管到本机。
+          // 保留这个变量名是为了让 grep 找得到这条决策的历史。
+          const isCrossOsBlocked = false;
           const isRunning =
             meta.isClient && meta.runningProfiles.has(profile.id);
           const isLaunching = meta.launchingProfiles.has(profile.id);

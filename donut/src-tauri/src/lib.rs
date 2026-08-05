@@ -1396,97 +1396,6 @@ fn marine_stop_discovery() -> Result<(), String> {
   Ok(())
 }
 
-/// Take over a profile that was created on another OS, so this machine can run it.
-///
-/// Three things have to change together, and each one alone leaves the profile
-/// broken in a different way:
-///
-/// * `host_os` — this is what `is_cross_os()` reads, so flipping it is what
-///   actually opens all fourteen launch/sync gates at once. Nothing else needs
-///   touching: `manifest.rs`'s diff already has a "local empty, remote has
-///   files" guard that downloads everything rather than deleting the remote
-///   copy, so the browser data arrives on the next sync by itself.
-/// * `wayfern_config.os` — `resolved_os()` falls back to it, so leaving it
-///   behind lets the old OS get picked right back up. Worse, a
-///   `randomize_fingerprint_on_launch` run would ask Wayfern to generate a
-///   macOS fingerprint on a Windows host and get refused.
-/// * `fingerprint` — Wayfern's own binary rejects `setFingerprint` when the
-///   fingerprint's OS is not the host's (CDP -32000, it wants a paid
-///   `wayfernToken`), and Donut treats that failure on the primary tab as
-///   fatal: it kills the browser and the launch fails. Clearing it lets Wayfern
-///   mint a self-consistent host-OS fingerprint on first launch.
-///
-/// Dropping the old fingerprint is also the better choice for staying
-/// unremarkable: the long-lived device identifiers platforms actually track
-/// (buvid3 and friends) live in the cookies and local storage that come along,
-/// so what a site sees is a known device on new hardware — an ordinary reinstall.
-/// A profile claiming to be a Mac while its WebGL reports a Windows GPU is the
-/// self-contradiction that automation detectors look for.
-///
-/// The cookie store is backed up first. Chromium **silently deletes** cookies it
-/// cannot decrypt, so if this machine's browser turns out to disagree about the
-/// key derivation, the logins are gone with no warning — the backup is what
-/// makes that recoverable instead of final.
-#[tauri::command]
-async fn marine_adopt_profile_here(
-  app_handle: tauri::AppHandle,
-  profile_id: String,
-) -> Result<String, String> {
-  let manager = crate::profile::manager::ProfileManager::instance();
-  let mut profile = manager
-    .get_profile_by_id(&profile_id)
-    .ok_or_else(|| marine::err("PROFILE_NOT_FOUND"))?;
-
-  if profile.process_id.is_some() {
-    return Err(marine::err("PROFILE_IS_RUNNING"));
-  }
-  let host = crate::profile::types::get_host_os();
-  if !profile.is_cross_os() {
-    return Err(marine::err("PROFILE_ALREADY_LOCAL"));
-  }
-
-  let profiles_dir = manager.get_profiles_dir();
-  let backup = crate::cookie_manager::CookieManager::back_up_cookie_store(&profile, &profiles_dir)
-    .map_err(|e| marine::err_with("INTERNAL_ERROR", e))?;
-
-  profile.host_os = Some(host.clone());
-  if let Some(cfg) = profile.wayfern_config.as_mut() {
-    cfg.os = Some(host.clone());
-    cfg.fingerprint = None;
-    // Regenerating on launch would ask Wayfern for a fresh fingerprint and can
-    // hit the per-machine free quota; letting it mint one implicitly does not.
-    cfg.randomize_fingerprint_on_launch = Some(false);
-  }
-  manager
-    .save_profile(&profile)
-    .map_err(|e| marine::err_with("INTERNAL_ERROR", e.to_string()))?;
-
-  // 界面按 host_os 决定启动键灰不灰，而 save_profile 自己不发事件 ——
-  // 不发的话用户点完接管看不到任何变化，会以为没生效。
-  if let Err(e) = events::emit_empty("profiles-changed") {
-    log::warn!("Adopted profile but could not notify the UI: {e}");
-  }
-
-  log::info!(
-    "Adopted profile {} ({}) onto {host}; cookie backup: {}",
-    profile.name,
-    profile.id,
-    backup.as_deref().unwrap_or("<no cookie store yet>")
-  );
-
-  // Pull the browser files now rather than waiting for the next scheduled pass.
-  if let Ok(engine) = crate::sync::SyncEngine::create_from_settings(&app_handle).await {
-    if let Err(e) = engine.sync_profile(&app_handle, &profile).await {
-      log::warn!(
-        "Adopted profile {} but its first sync failed: {e}",
-        profile.name
-      );
-    }
-  }
-
-  Ok(backup.unwrap_or_default())
-}
-
 /// Write this device's ledger shard out for another machine to consume.
 ///
 /// The cross-device gates in `claim_next` read every JSON file under
@@ -2756,7 +2665,6 @@ pub fn run() {
       marine_discovery_status,
       marine_log_locations,
       marine_export_ledger_shard,
-      marine_adopt_profile_here,
       get_all_traffic_snapshots,
       get_profile_traffic_snapshot,
       clear_all_traffic_stats,

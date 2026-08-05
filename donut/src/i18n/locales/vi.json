@@ -257,10 +257,7 @@
       "launchHook": "URL Hook khởi chạy",
       "setPassword": "Đặt mật khẩu",
       "changePassword": "Đổi mật khẩu",
-      "removePassword": "Xóa mật khẩu",
-      "adoptHere": "Tiếp nhận trên máy này",
-      "adoptedWithBackup": "Đã sao lưu cookie vào {{path}} trước khi tiếp nhận.",
-      "adoptedNoCookies": "Chưa có kho cookie nào để sao lưu."
+      "removePassword": "Xóa mật khẩu"
     },
     "synchronizer": {
       "launchWithSync": "Khởi chạy với trình đồng bộ",
@@ -1125,8 +1122,8 @@
     "viewOnly": "Profile này được tạo trên {{os}} và không được hỗ trợ trên hệ thống này",
     "cannotLaunch": "Profile này được tạo trên {{os}} và không được hỗ trợ trên hệ thống này",
     "cannotModify": "Không thể chỉnh sửa cài đặt đồng bộ cho profile đa hệ điều hành",
-    "adoptHint": "Được tạo trên {{os}}. Mở bảng ⓘ và chọn “Tiếp nhận trên máy này” để chạy tại đây.",
-    "adoptHintUnknownOs": "Được tạo trên hệ điều hành khác. Mở bảng ⓘ và chọn “Tiếp nhận trên máy này” để chạy tại đây."
+    "adoptHint": "Được tạo trên {{os}}. Khi khởi chạy sẽ tiếp nhận về máy này — cookie được sao lưu trước và tạo dấu vân tay mới cho hệ điều hành này.",
+    "adoptHintUnknownOs": "Được tạo trên hệ điều hành khác. Khi khởi chạy sẽ tiếp nhận về máy này — cookie được sao lưu trước và tạo dấu vân tay mới."
   },
   "profileInfo": {
     "title": "Chi tiết profile",

@@ -257,10 +257,7 @@
       "launchHook": "Launch Hook URL",
       "setPassword": "Set Password",
       "changePassword": "Change Password",
-      "removePassword": "Remove Password",
-      "adoptHere": "Adopt on this machine",
-      "adoptedWithBackup": "Cookies backed up to {{path}} before adopting.",
-      "adoptedNoCookies": "No cookie store to back up yet."
+      "removePassword": "Remove Password"
     },
     "synchronizer": {
       "launchWithSync": "Launch with Synchronizer",
@@ -1125,8 +1122,8 @@
     "viewOnly": "This profile was created on {{os}} and is not supported on this system",
     "cannotLaunch": "This profile was created on {{os}} and is not supported on this system",
     "cannotModify": "Cannot modify sync settings for a cross-OS profile",
-    "adoptHint": "Created on {{os}}. Open the ⓘ panel and choose “Adopt on this machine” to run it here.",
-    "adoptHintUnknownOs": "Created on another operating system. Open the ⓘ panel and choose “Adopt on this machine” to run it here."
+    "adoptHint": "Created on {{os}}. Launching adopts it onto this machine — cookies are backed up first and a fresh fingerprint is generated for this OS.",
+    "adoptHintUnknownOs": "Created on another operating system. Launching adopts it onto this machine — cookies are backed up first and a fresh fingerprint is generated."
   },
   "profileInfo": {
     "title": "Profile Details",

@@ -3088,6 +3088,66 @@ pub async fn launch_browser_profile_impl(
   .await
 }
 
+/// Make a profile created elsewhere belong to this machine, then hand it back.
+///
+/// Three fields move together; each one left behind breaks the launch in its own
+/// way:
+///
+/// * `host_os` decides `is_cross_os()`, which fourteen Rust call sites and six
+///   frontend ones consult. Flipping it is what actually opens the door.
+/// * `wayfern_config.os` is the fallback `resolved_os()` reads, so leaving it
+///   means the old OS gets picked straight back up.
+/// * the stored fingerprint has to go. Wayfern's own binary refuses
+///   `setFingerprint` when the fingerprint's OS is not the host's, and Donut
+///   treats that failure on the first tab as fatal — the browser is killed and
+///   the launch fails. Clearing it lets Wayfern generate a self-consistent one.
+///
+/// Losing the old fingerprint is the better outcome anyway. The identifiers
+/// platforms actually follow live in the cookies and local storage that travel
+/// with the profile, so a site sees a familiar account on new hardware — an
+/// ordinary reinstall. A profile insisting it is a Mac while its WebGL reports a
+/// Windows GPU is the kind of contradiction detectors look for.
+///
+/// Cookies are copied aside first: Chromium **deletes** cookies it cannot
+/// decrypt rather than reporting an error, so if this host's browser disagrees
+/// about key derivation the logins would be gone with nothing to restore from.
+async fn adopt_profile_onto_this_host(profile: &BrowserProfile) -> Result<BrowserProfile, String> {
+  let host = crate::profile::types::get_host_os();
+  let manager = ProfileManager::instance();
+  let profiles_dir = manager.get_profiles_dir();
+
+  match crate::cookie_manager::CookieManager::back_up_cookie_store(profile, &profiles_dir) {
+    Ok(Some(path)) => log::info!("Adopting {}: cookies backed up to {path}", profile.name),
+    Ok(None) => log::info!("Adopting {}: no cookie store to back up yet", profile.name),
+    // A failed backup must not block the launch the operator asked for, but it
+    // does change the stakes, so say so loudly.
+    Err(e) => log::warn!("Adopting {} without a cookie backup: {e}", profile.name),
+  }
+
+  let mut adopted = profile.clone();
+  adopted.host_os = Some(host.clone());
+  if let Some(cfg) = adopted.wayfern_config.as_mut() {
+    cfg.os = Some(host.clone());
+    cfg.fingerprint = None;
+    // Asking Wayfern for a fresh fingerprint spends the per-machine free quota
+    // in `~/.wayfern/`; letting it mint one implicitly on launch does not.
+    cfg.randomize_fingerprint_on_launch = Some(false);
+  }
+  manager
+    .save_profile(&adopted)
+    .map_err(|e| format!("could not adopt profile onto {host}: {e}"))?;
+
+  log::info!(
+    "Adopted profile {} ({}) onto {host}; it is now a local profile",
+    adopted.name,
+    adopted.id
+  );
+  if let Err(e) = events::emit_empty("profiles-changed") {
+    log::warn!("Adopted profile but could not notify the UI: {e}");
+  }
+  Ok(adopted)
+}
+
 async fn launch_browser_profile_impl_with_restore(
   app_handle: tauri::AppHandle,
   profile: BrowserProfile,
@@ -3107,13 +3167,19 @@ async fn launch_browser_profile_impl_with_restore(
     profile.id
   );
 
-  if profile.is_cross_os() {
-    return Err(format!(
-      "Cannot launch profile '{}': this profile was created on {} and cannot be launched on a different operating system",
-      profile.name,
-      profile.host_os.as_deref().unwrap_or("another OS"),
-    ));
-  }
+  // A profile from another OS is adopted onto this machine rather than refused.
+  //
+  // Refusing was a conservative assumption, not a technical limit: Wayfern keeps
+  // its cookie key in a plain `os_crypt_key` file inside the profile rather than
+  // in the Keychain or DPAPI, so the profile directory is portable. What is *not*
+  // portable is the fingerprint — Wayfern's binary rejects `setFingerprint` when
+  // the fingerprint's OS differs from the host's, and that failure is fatal to
+  // the launch — so adoption clears it and lets the browser mint a matching one.
+  let profile = if profile.is_cross_os() {
+    adopt_profile_onto_this_host(&profile).await?
+  } else {
+    profile
+  };
 
   let browser_runner = BrowserRunner::instance();
   // Both manual/API and automation launches take this same guard.  The

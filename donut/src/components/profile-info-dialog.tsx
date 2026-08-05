@@ -320,35 +320,6 @@ export function ProfileInfoDialog({
 
   const actions: ActionItem[] = [
     {
-      // 只在跨 OS 时出现。翻转 host_os 会让 is_cross_os() 变 false，
-      // 十四处启动/同步闸门随之全部打开，浏览器文件由下一轮同步自动拉齐
-      // （manifest 的 diff 有「本地空、远端有 → 全量下载」的护栏）。
-      // 指纹必须一起换掉：Wayfern 二进制拒绝跨 OS 指纹，而 Donut 把主页签
-      // setFingerprint 失败当致命错误，结果就是「打不开」。
-      id: "adopt",
-      icon: <LuDownload className="size-4" />,
-      label: t("profiles.actions.adoptHere"),
-      onClick: () => {
-        handleAction(() => {
-          void invoke<string>("marine_adopt_profile_here", {
-            profileId: profile.id,
-          })
-            .then((backup) => {
-              showSuccessToast(
-                backup
-                  ? t("profiles.actions.adoptedWithBackup", { path: backup })
-                  : t("profiles.actions.adoptedNoCookies"),
-              );
-            })
-            .catch((error) => {
-              showErrorToast(translateBackendError(t as never, error));
-            });
-        });
-      },
-      disabled: isRunning,
-      hidden: !isCrossOs,
-    },
-    {
       id: "network",
       icon: <LuGlobe className="size-4" />,
       label: t("profiles.actions.viewNetwork"),

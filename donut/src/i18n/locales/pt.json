@@ -257,10 +257,7 @@
       "launchHook": "URL do hook de inicialização",
       "setPassword": "Definir Senha",
       "changePassword": "Alterar Senha",
-      "removePassword": "Remover Senha",
-      "adoptHere": "Adotar nesta máquina",
-      "adoptedWithBackup": "Cookies salvos em {{path}} antes de adotar.",
-      "adoptedNoCookies": "Ainda não há armazenamento de cookies para salvar."
+      "removePassword": "Remover Senha"
     },
     "synchronizer": {
       "launchWithSync": "Iniciar com Sincronizador",
@@ -1125,8 +1122,8 @@
     "viewOnly": "Este perfil foi criado em {{os}} e não é compatível com este sistema",
     "cannotLaunch": "Este perfil foi criado em {{os}} e não é compatível com este sistema",
     "cannotModify": "Não é possível modificar as configurações de sincronização de um perfil de outro sistema operacional",
-    "adoptHint": "Criado em {{os}}. Abra o painel ⓘ e escolha “Adotar nesta máquina” para executá-lo aqui.",
-    "adoptHintUnknownOs": "Criado em outro sistema operacional. Abra o painel ⓘ e escolha “Adotar nesta máquina” para executá-lo aqui."
+    "adoptHint": "Criado em {{os}}. Iniciar o adota nesta máquina — os cookies são salvos primeiro e uma nova impressão digital é gerada para este sistema.",
+    "adoptHintUnknownOs": "Criado em outro sistema operacional. Iniciar o adota nesta máquina — os cookies são salvos primeiro e uma nova impressão digital é gerada."
   },
   "profileInfo": {
     "title": "Detalhes do Perfil",

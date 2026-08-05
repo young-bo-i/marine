@@ -55,8 +55,6 @@ export function useBrowserState(
     (profile: BrowserProfile): boolean => {
       if (!isClient) return false;
 
-      if (isCrossOsProfile(profile)) return false;
-
       const isRunning = runningProfiles.has(profile.id);
       const isLaunching = launchingProfiles.has(profile.id);
       const isStopping = stoppingProfiles.has(profile.id);
@@ -160,8 +158,9 @@ export function useBrowserState(
       if (!isClient) return "Loading...";
 
       if (isCrossOsProfile(profile)) {
-        // 说清楚下一步在哪儿。以前这里只说「不能启动」，而「在本机接管」藏在
-        // ⓘ 信息面板里，光看这句提示根本不知道它存在。
+        // 不再是「不能启动」——启动时后端会自动把它接管到本机（备份 cookie、
+        // 翻转 host_os、清掉跨 OS 指纹）。提示要说清会发生什么，因为这一步
+        // 会换掉指纹，而那是用户该知情的。
         const profileOs =
           profile.host_os ||
           profile.camoufox_config?.os ||

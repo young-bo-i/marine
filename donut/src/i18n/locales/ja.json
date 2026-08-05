@@ -257,10 +257,7 @@
       "launchHook": "起動フックURL",
       "setPassword": "パスワードを設定",
       "changePassword": "パスワードを変更",
-      "removePassword": "パスワードを削除",
-      "adoptHere": "このマシンで引き継ぐ",
-      "adoptedWithBackup": "引き継ぐ前に Cookie を {{path}} にバックアップしました。",
-      "adoptedNoCookies": "バックアップする Cookie ストアはまだありません。"
+      "removePassword": "パスワードを削除"
     },
     "synchronizer": {
       "launchWithSync": "シンクロナイザーで起動",
@@ -1125,8 +1122,8 @@
     "viewOnly": "このプロファイルは{{os}}で作成されたもので、このシステムではサポートされていません",
     "cannotLaunch": "このプロファイルは{{os}}で作成されたもので、このシステムではサポートされていません",
     "cannotModify": "他のOSのプロファイルの同期設定は変更できません",
-    "adoptHint": "{{os}} で作成されました。右の ⓘ を開き「このマシンで引き継ぐ」を選ぶとここで実行できます。",
-    "adoptHintUnknownOs": "別の OS で作成されました。右の ⓘ を開き「このマシンで引き継ぐ」を選ぶとここで実行できます。"
+    "adoptHint": "{{os}} で作成されました。起動するとこのマシンに引き継がれます — 先に Cookie をバックアップし、この OS 用の新しい指紋を生成します。",
+    "adoptHintUnknownOs": "別の OS で作成されました。起動するとこのマシンに引き継がれます — 先に Cookie をバックアップし、新しい指紋を生成します。"
   },
   "profileInfo": {
     "title": "プロフィール詳細",
