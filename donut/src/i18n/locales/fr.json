@@ -1847,7 +1847,8 @@
     "profileIsRunning": "Fermez le navigateur avant d'adopter ce profil.",
     "profileAlreadyLocal": "Ce profil appartient déjà à cette machine.",
     "marineProfileLeasedElsewhere": "Un autre appareil pilote actuellement ce profil. L'exécuter ici aussi ferait publier les deux sous le même contenu.",
-    "cookieStoreUnreadableHere": "Le navigateur de cette machine ne peut pas déchiffrer les cookies de ce profil. L'ouvrir les supprimerait tous — Chromium efface les cookies qu'il ne peut pas lire au lieu de signaler une erreur. Le profil n'a pas été modifié ; migrez les sessions vers un profil créé sur cette machine."
+    "cookieStoreUnreadableHere": "Le navigateur de cette machine ne peut pas déchiffrer les cookies de ce profil. L'ouvrir les supprimerait tous — Chromium efface les cookies qu'il ne peut pas lire au lieu de signaler une erreur. Le profil n'a pas été modifié ; migrez les sessions vers un profil créé sur cette machine.",
+    "profileAdoptedButNotSynced": "Ce profil appartient désormais à cette machine, mais ses données de navigateur n'ont pas pu être téléchargées ; il n'a donc pas été lancé — le démarrer vide aurait créé un profil sans aucune session. Vérifiez la synchronisation et réessayez. ({{detail}})"
   },
   "rail": {
     "profiles": "Profils",

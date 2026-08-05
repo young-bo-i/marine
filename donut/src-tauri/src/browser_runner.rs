@@ -3111,7 +3111,10 @@ pub async fn launch_browser_profile_impl(
 /// Cookies are copied aside first: Chromium **deletes** cookies it cannot
 /// decrypt rather than reporting an error, so if this host's browser disagrees
 /// about key derivation the logins would be gone with nothing to restore from.
-async fn adopt_profile_onto_this_host(profile: &BrowserProfile) -> Result<BrowserProfile, String> {
+async fn adopt_profile_onto_this_host(
+  app_handle: &tauri::AppHandle,
+  profile: &BrowserProfile,
+) -> Result<BrowserProfile, String> {
   let host = crate::profile::types::get_host_os();
   let manager = ProfileManager::instance();
   let profiles_dir = manager.get_profiles_dir();
@@ -3145,6 +3148,43 @@ async fn adopt_profile_onto_this_host(profile: &BrowserProfile) -> Result<Browse
   if let Err(e) = events::emit_empty("profiles-changed") {
     log::warn!("Adopted profile but could not notify the UI: {e}");
   }
+
+  // Now pull the browser files, and do not launch without them.
+  //
+  // Cross-OS profiles only ever synced their metadata, so at this point the
+  // directory holds `metadata.json` and nothing else. Launching here would hand
+  // Chromium an empty directory: it would create a fresh profile, open cleanly,
+  // and present zero logins — indistinguishable from "the cookies were
+  // destroyed", which is the wrong thing to conclude and the wrong thing to act
+  // on. Flipping `host_os` above is what makes the full-file sync eligible in
+  // the first place; this is where it gets used.
+  //
+  // Failing closed matters as much as syncing: a freshly-created empty profile
+  // is not empty enough to trip the manifest's "local has nothing, download
+  // everything" guard, so once it has files of its own the newer mtimes can win
+  // the conflict and overwrite the good copy on the server.
+  let engine = crate::sync::SyncEngine::create_from_settings(app_handle)
+    .await
+    .map_err(|e| {
+      serde_json::json!({
+        "code": "PROFILE_ADOPTED_BUT_NOT_SYNCED",
+        "params": { "message": e.to_string() }
+      })
+      .to_string()
+    })?;
+  engine
+    .sync_profile(app_handle, &adopted)
+    .await
+    .map_err(|e| {
+      log::error!("Adopted {} but could not pull its files: {e}", adopted.name);
+      serde_json::json!({
+        "code": "PROFILE_ADOPTED_BUT_NOT_SYNCED",
+        "params": { "message": e.to_string() }
+      })
+      .to_string()
+    })?;
+  log::info!("Pulled browser files for adopted profile {}", adopted.name);
+
   Ok(adopted)
 }
 
@@ -3176,7 +3216,7 @@ async fn launch_browser_profile_impl_with_restore(
   // the fingerprint's OS differs from the host's, and that failure is fatal to
   // the launch — so adoption clears it and lets the browser mint a matching one.
   let profile = if profile.is_cross_os() {
-    adopt_profile_onto_this_host(&profile).await?
+    adopt_profile_onto_this_host(&app_handle, &profile).await?
   } else {
     profile
   };

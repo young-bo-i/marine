@@ -1847,7 +1847,8 @@
     "profileIsRunning": "Hãy đóng trình duyệt trước khi tiếp nhận hồ sơ này.",
     "profileAlreadyLocal": "Hồ sơ này đã thuộc về máy này rồi.",
     "marineProfileLeasedElsewhere": "Một thiết bị khác đang chạy hồ sơ này. Chạy ở đây nữa sẽ khiến cả hai đăng dưới cùng một nội dung.",
-    "cookieStoreUnreadableHere": "Trình duyệt trên máy này không giải mã được cookie của hồ sơ này. Mở nó sẽ xóa toàn bộ cookie — Chromium xóa cookie không đọc được thay vì báo lỗi. Hồ sơ chưa bị thay đổi; hãy chuyển phiên đăng nhập sang hồ sơ tạo trên máy này."
+    "cookieStoreUnreadableHere": "Trình duyệt trên máy này không giải mã được cookie của hồ sơ này. Mở nó sẽ xóa toàn bộ cookie — Chromium xóa cookie không đọc được thay vì báo lỗi. Hồ sơ chưa bị thay đổi; hãy chuyển phiên đăng nhập sang hồ sơ tạo trên máy này.",
+    "profileAdoptedButNotSynced": "Hồ sơ này giờ thuộc về máy này, nhưng không tải được dữ liệu trình duyệt nên chưa khởi chạy — mở khi trống sẽ tạo hồ sơ mới không có phiên đăng nhập. Hãy kiểm tra kết nối đồng bộ rồi thử lại. ({{detail}})"
   },
   "rail": {
     "profiles": "Profile",

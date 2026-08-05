@@ -1847,7 +1847,8 @@
     "profileIsRunning": "Stop the browser before adopting this profile.",
     "profileAlreadyLocal": "This profile already belongs to this machine.",
     "marineProfileLeasedElsewhere": "Another device is currently driving this profile. Running it here too would make both post under the same content.",
-    "cookieStoreUnreadableHere": "This machine's browser cannot decrypt this profile's cookies. Opening it would delete every cookie in it — Chromium removes cookies it cannot read instead of reporting an error. The profile was left untouched; migrate the logins to a profile created on this machine instead."
+    "cookieStoreUnreadableHere": "This machine's browser cannot decrypt this profile's cookies. Opening it would delete every cookie in it — Chromium removes cookies it cannot read instead of reporting an error. The profile was left untouched; migrate the logins to a profile created on this machine instead.",
+    "profileAdoptedButNotSynced": "This profile now belongs to this machine, but its browser data could not be downloaded, so it was not launched — starting it empty would have created a blank profile with no logins. Check the sync connection and try again. ({{detail}})"
   },
   "rail": {
     "profiles": "Profiles",
