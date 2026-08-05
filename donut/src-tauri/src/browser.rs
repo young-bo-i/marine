@@ -452,21 +452,19 @@ mod windows {
       }
     }
 
-    // Look for any .exe file that might be the browser
-    if let Ok(entries) = std::fs::read_dir(install_dir) {
-      for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "exe") && is_pe_executable(&path) {
-          let name = path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_lowercase();
-          if name.contains("chromium") || name.contains("chrome") || name.contains("wayfern") {
-            return Ok(path);
-          }
-        }
-      }
+    // Fall back to a search, because the archive nests everything one level down.
+    //
+    // The Windows build ships as `wayfern-<version>_windows_x64.zip` whose only
+    // top-level entry is a directory named after the archive, with `chrome.exe`
+    // inside it. None of the fixed candidates above match that, and the old
+    // fallback only read `install_dir` itself — so the executable was sitting
+    // one directory away and the launch failed with "not found". macOS never hit
+    // this: its `.dmg` unpacks straight to `Wayfern.app`.
+    //
+    // Searching rather than adding `wayfern-<version>_windows_x64` to the list
+    // keeps the next rename from breaking it again.
+    if let Some(found) = find_chromium_exe(install_dir, 3) {
+      return Ok(found);
     }
 
     Err("Chromium/Wayfern executable not found in Windows installation directory".into())
@@ -774,7 +772,59 @@ impl BrowserFactory {
 /// Check if a file is a valid PE executable by reading its magic bytes (MZ).
 /// Returns false for archive files (.zip starts with PK, etc.) that were
 /// incorrectly named with a .exe extension.
-#[cfg(target_os = "windows")]
+/// Depth-limited hunt for the browser executable under an install directory.
+///
+/// `chrome.exe` sits beside a lot of other executables (`chrome_proxy.exe`,
+/// `elevation_service.exe`, `notification_helper.exe`), so the name has to be
+/// matched exactly rather than by "contains chrome" — picking the proxy stub
+/// would launch something that exits immediately and looks like a browser that
+/// refuses to start.
+///
+/// The depth limit keeps this from walking a full Chromium tree: the executable
+/// is at depth 1 in today's archive, and anything past 3 is not a layout worth
+/// guessing at.
+// Only the Windows launch path calls this, but it stays compiled everywhere so
+// the layout it encodes is type-checked and unit-tested here rather than only
+// on the machine that runs it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn find_chromium_exe(dir: &Path, depth: usize) -> Option<PathBuf> {
+  const EXACT: [&str; 3] = ["chrome", "chromium", "wayfern"];
+  let entries = std::fs::read_dir(dir).ok()?;
+  let mut subdirs = Vec::new();
+  for entry in entries.flatten() {
+    let path = entry.path();
+    if path.is_dir() {
+      subdirs.push(path);
+      continue;
+    }
+    if path.extension().is_some_and(|ext| ext == "exe") && is_pe_executable(&path) {
+      let stem = path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+      if EXACT.contains(&stem.as_str()) {
+        return Some(path);
+      }
+    }
+  }
+  if depth == 0 {
+    return None;
+  }
+  // Breadth-first: the real executable lives near the top, and descending into
+  // the first subdirectory found would wander into `locales/` before checking
+  // the sibling that actually holds it.
+  subdirs.sort();
+  subdirs
+    .into_iter()
+    .find_map(|sub| find_chromium_exe(&sub, depth - 1))
+}
+
+// Not gated on the host OS: reading two magic bytes is the same everywhere, and
+// keeping it compiled on every platform means `find_chromium_exe` below is
+// type-checked and unit-tested on the machine this is developed on rather than
+// only on the one that runs it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn is_pe_executable(path: &Path) -> bool {
   use std::io::Read;
   let Ok(mut file) = std::fs::File::open(path) else {
@@ -851,6 +901,64 @@ pub struct GithubAsset {
 
 #[cfg(test)]
 mod tests {
+  /// Windows 的 Wayfern 包解压出来是**一个版本号命名的顶层目录**，
+  /// `chrome.exe` 在它里面：
+  ///
+  ///   wayfern-150.0.7871.100_windows_x64/chrome.exe
+  ///
+  /// 而原来的查找只试固定的七个路径、兜底只扫 install_dir 一层，
+  /// 结果就是「Chromium/Wayfern executable not found」—— 可执行文件明明
+  /// 只隔了一层目录。macOS 上从来没暴露，因为 .dmg 直接装出 Wayfern.app。
+  #[test]
+  fn the_windows_archive_layout_is_found_one_level_down() {
+    let root = std::env::temp_dir().join(format!("marine-exe-{}", std::process::id()));
+    let nested = root.join("wayfern-150.0.7871.100_windows_x64");
+    std::fs::create_dir_all(&nested).unwrap();
+    // 真实包里 chrome.exe 旁边还躺着一堆别的 exe。
+    for name in [
+      "chrome.exe",
+      "chrome_proxy.exe",
+      "elevation_service.exe",
+      "notification_helper.exe",
+    ] {
+      std::fs::write(nested.join(name), b"MZ\x90\x00").unwrap();
+    }
+
+    let found = super::find_chromium_exe(&root, 3).expect("应当在下一层找到");
+    assert_eq!(
+      found.file_name().unwrap(),
+      "chrome.exe",
+      "必须精确匹配 chrome.exe —— chrome_proxy.exe 只是个转发壳，\
+       启动它会立刻退出，看起来就像浏览器起不来"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+  }
+
+  /// 名字对但不是 PE 文件的，不能当成浏览器。
+  #[test]
+  fn a_non_executable_named_chrome_exe_is_rejected() {
+    let root = std::env::temp_dir().join(format!("marine-exe-fake-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("chrome.exe"), b"PK\x03\x04not-an-exe").unwrap();
+    assert!(super::find_chromium_exe(&root, 3).is_none());
+    let _ = std::fs::remove_dir_all(&root);
+  }
+
+  /// 深度有上限，不能顺着 Chromium 的整棵目录树走下去。
+  #[test]
+  fn the_search_does_not_walk_the_whole_tree() {
+    let root = std::env::temp_dir().join(format!("marine-exe-deep-{}", std::process::id()));
+    let deep = root.join("a").join("b").join("c").join("d");
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("chrome.exe"), b"MZ\x90\x00").unwrap();
+    assert!(
+      super::find_chromium_exe(&root, 3).is_none(),
+      "超过深度上限的不该被找到"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+  }
+
   use super::*;
   use std::fs;
   use tempfile::TempDir;
