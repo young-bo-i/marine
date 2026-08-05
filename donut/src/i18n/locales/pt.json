@@ -1846,7 +1846,8 @@
     "profileNeverLaunched": "Este perfil nunca foi iniciado, portanto ainda não tem armazenamento de cookies. Inicie o navegador uma vez e feche-o, depois tente novamente.",
     "profileIsRunning": "Feche o navegador antes de adotar este perfil.",
     "profileAlreadyLocal": "Este perfil já pertence a esta máquina.",
-    "marineProfileLeasedElsewhere": "Outro dispositivo está usando este perfil. Executá-lo aqui também faria ambos publicarem no mesmo conteúdo."
+    "marineProfileLeasedElsewhere": "Outro dispositivo está usando este perfil. Executá-lo aqui também faria ambos publicarem no mesmo conteúdo.",
+    "cookieStoreUnreadableHere": "O navegador desta máquina não consegue descriptografar os cookies deste perfil. Abri-lo apagaria todos eles — o Chromium remove cookies que não consegue ler em vez de relatar erro. O perfil não foi alterado; migre os logins para um perfil criado nesta máquina."
   },
   "rail": {
     "profiles": "Perfis",

@@ -1846,7 +1846,8 @@
     "profileNeverLaunched": "このプロファイルは一度も起動されていないため、Cookie ストアがまだありません。ブラウザを一度起動して閉じてから、もう一度お試しください。",
     "profileIsRunning": "この プロファイルを引き継ぐ前にブラウザを閉じてください。",
     "profileAlreadyLocal": "このプロファイルはすでにこのマシンのものです。",
-    "marineProfileLeasedElsewhere": "別のデバイスがこのプロファイルを使用中です。ここでも実行すると同じ内容に二重投稿されます。"
+    "marineProfileLeasedElsewhere": "別のデバイスがこのプロファイルを使用中です。ここでも実行すると同じ内容に二重投稿されます。",
+    "cookieStoreUnreadableHere": "このマシンのブラウザはこのプロファイルの Cookie を復号できません。開くと中の Cookie がすべて削除されます — Chromium は読めない Cookie をエラーにせず削除します。プロファイルは変更していません。このマシンで作成したプロファイルへログイン状態を移行してください。"
   },
   "rail": {
     "profiles": "プロファイル",

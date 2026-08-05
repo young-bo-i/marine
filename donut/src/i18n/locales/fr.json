@@ -1846,7 +1846,8 @@
     "profileNeverLaunched": "Ce profil n'a jamais été lancé, il n'a donc pas encore de magasin de cookies. Lancez le navigateur une fois puis fermez-le, et réessayez.",
     "profileIsRunning": "Fermez le navigateur avant d'adopter ce profil.",
     "profileAlreadyLocal": "Ce profil appartient déjà à cette machine.",
-    "marineProfileLeasedElsewhere": "Un autre appareil pilote actuellement ce profil. L'exécuter ici aussi ferait publier les deux sous le même contenu."
+    "marineProfileLeasedElsewhere": "Un autre appareil pilote actuellement ce profil. L'exécuter ici aussi ferait publier les deux sous le même contenu.",
+    "cookieStoreUnreadableHere": "Le navigateur de cette machine ne peut pas déchiffrer les cookies de ce profil. L'ouvrir les supprimerait tous — Chromium efface les cookies qu'il ne peut pas lire au lieu de signaler une erreur. Le profil n'a pas été modifié ; migrez les sessions vers un profil créé sur cette machine."
   },
   "rail": {
     "profiles": "Profils",

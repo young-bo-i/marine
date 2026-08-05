@@ -1846,7 +1846,8 @@
     "profileNeverLaunched": "This profile has never been launched, so it has no cookie store yet. Start the browser once and close it, then try again.",
     "profileIsRunning": "Stop the browser before adopting this profile.",
     "profileAlreadyLocal": "This profile already belongs to this machine.",
-    "marineProfileLeasedElsewhere": "Another device is currently driving this profile. Running it here too would make both post under the same content."
+    "marineProfileLeasedElsewhere": "Another device is currently driving this profile. Running it here too would make both post under the same content.",
+    "cookieStoreUnreadableHere": "This machine's browser cannot decrypt this profile's cookies. Opening it would delete every cookie in it — Chromium removes cookies it cannot read instead of reporting an error. The profile was left untouched; migrate the logins to a profile created on this machine instead."
   },
   "rail": {
     "profiles": "Profiles",

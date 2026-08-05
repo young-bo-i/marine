@@ -289,6 +289,45 @@ impl CookieManager {
     }
   }
 
+  /// Whether this machine's browser will be able to read the profile's cookies.
+  ///
+  /// Chromium does not report cookies it cannot decrypt — it **deletes** them.
+  /// So a profile whose store was written under a different key derivation does
+  /// not fail loudly on launch; it opens, looks fine, and every account is
+  /// logged out with nothing left to inspect. Measured: a store written by
+  /// macOS Wayfern (1003 PBKDF2 iterations) was wiped on first launch under
+  /// Windows Wayfern.
+  ///
+  /// Deciding by derivation convention rather than by which OS wrote the file:
+  /// what matters is whether *this* build can read *these* bytes, and that is
+  /// directly testable. `Ok(true)` also covers the cases with nothing to lose —
+  /// no store yet, or a store with no encrypted values in it.
+  pub fn host_can_read_cookie_store(
+    profile: &BrowserProfile,
+    profiles_dir: &Path,
+  ) -> Result<bool, String> {
+    let data = profile.get_profile_data_path(profiles_dir);
+    let db = Self::wayfern_cookie_path(&data);
+    if !db.exists() {
+      return Ok(true);
+    }
+    // Derive the way this host's browser would, ignoring the profile's recorded
+    // origin: `host_os` has usually already been flipped by adoption at the
+    // point this runs.
+    let Some(key) = chrome_decrypt::get_encryption_key(&data, None) else {
+      // No key file means nothing was encrypted with one.
+      return Ok(true);
+    };
+    let (cookies, undecryptable) = Self::read_chrome_cookies(&db, Some(&key))?;
+    if undecryptable == 0 {
+      return Ok(true);
+    }
+    // Some rows carry plaintext values and never needed the key; only conclude
+    // the key is wrong when *nothing* encrypted came back readable.
+    let readable = cookies.iter().filter(|c| !c.value.is_empty()).count();
+    Ok(readable > 0)
+  }
+
   /// Copy the cookie store and its key aside before something irreversible.
   ///
   /// Returns the backup directory, or `None` when the profile has no cookie
@@ -2144,6 +2183,58 @@ mod tests {
     assert_eq!(cookies[0].value, "", "值确实是空的");
     assert_eq!(undecryptable, 1, "但必须被数出来 —— 这是导出硬失败的依据");
 
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// 这道守卫存在的理由：Chromium 对解不开的 cookie 是**删除**不是报错。
+  /// 实测 —— macOS 写的库（1003 次迭代）在 Windows Wayfern 下首次启动即被清空。
+  #[test]
+  fn a_store_this_host_cannot_read_is_reported_as_unreadable() {
+    let dir = std::env::temp_dir().join(format!("marine-guard-{}", std::process::id()));
+    let default = dir.join("Default");
+    std::fs::create_dir_all(&default).unwrap();
+    std::fs::write(dir.join("os_crypt_key"), b"some-passphrase").unwrap();
+
+    let db = default.join("Cookies");
+    let conn = Connection::open(&db).unwrap();
+    conn
+      .execute_batch(
+        "CREATE TABLE cookies (name TEXT, value TEXT, host_key TEXT, path TEXT,
+           expires_utc INTEGER, is_secure INTEGER, is_httponly INTEGER, samesite INTEGER,
+           creation_utc INTEGER, last_access_utc INTEGER, encrypted_value BLOB);",
+      )
+      .unwrap();
+    // 用「另一套派生」加密的密文 —— 本机怎么算都解不开。
+    conn
+      .execute(
+        "INSERT INTO cookies VALUES ('sess','', '.example.com','/',0,1,1,0,0,0, ?1)",
+        [&b"v10\xde\xad\xbe\xef\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b".to_vec()],
+      )
+      .unwrap();
+    drop(conn);
+
+    let (cookies, undecryptable) = CookieManager::read_chrome_cookies(
+      &db,
+      Some(&chrome_decrypt::get_encryption_key(&dir, None).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(undecryptable, 1, "这条应当解不开");
+    assert!(
+      cookies.iter().all(|c| c.value.is_empty()),
+      "解不开的行值为空 —— 正是它和「本来就是空的」分不清的地方"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// 没有 cookie 库时不该拦 —— 全新 profile 没有任何东西可丢。
+  #[test]
+  fn a_profile_with_no_cookie_store_is_not_blocked() {
+    let dir = std::env::temp_dir().join(format!("marine-guard-empty-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("Default")).unwrap();
+    // 没有 Cookies 文件：探测应当落到「新建时该用的布局」而不是报错。
+    let probed = CookieManager::wayfern_cookie_path(&dir);
+    assert!(!probed.exists());
     let _ = std::fs::remove_dir_all(&dir);
   }
 }

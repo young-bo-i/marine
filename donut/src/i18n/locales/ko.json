@@ -1846,7 +1846,8 @@
     "profileNeverLaunched": "이 프로필은 한 번도 실행된 적이 없어 쿠키 저장소가 아직 없습니다. 브라우저를 한 번 실행한 뒤 닫고 다시 시도하세요.",
     "profileIsRunning": "이 프로필을 인계하기 전에 브라우저를 닫으세요.",
     "profileAlreadyLocal": "이 프로필은 이미 이 컴퓨터의 것입니다.",
-    "marineProfileLeasedElsewhere": "다른 기기가 이 프로필을 사용 중입니다. 여기서도 실행하면 같은 콘텐츠에 중복으로 게시됩니다."
+    "marineProfileLeasedElsewhere": "다른 기기가 이 프로필을 사용 중입니다. 여기서도 실행하면 같은 콘텐츠에 중복으로 게시됩니다.",
+    "cookieStoreUnreadableHere": "이 컴퓨터의 브라우저가 이 프로필의 쿠키를 복호화할 수 없습니다. 열면 쿠키가 모두 삭제됩니다 — Chromium은 읽을 수 없는 쿠키를 오류로 알리지 않고 지웁니다. 프로필은 그대로 두었습니다. 이 컴퓨터에서 만든 프로필로 로그인 상태를 옮기세요."
   },
   "rail": {
     "profiles": "프로필",

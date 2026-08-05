@@ -3181,6 +3181,34 @@ async fn launch_browser_profile_impl_with_restore(
     profile
   };
 
+  // Last stop before Chromium sees the profile.
+  //
+  // Cookies this build cannot decrypt are not skipped, they are **deleted** —
+  // so a key-derivation mismatch does not surface as an error, it surfaces as
+  // every account being logged out with the evidence already gone. Measured on
+  // a macOS-written store opened under Windows Wayfern.
+  //
+  // The check runs here rather than at adoption because adoption happens before
+  // the browser files arrive: at that moment there is no cookie store to test.
+  if profile.browser == "wayfern" {
+    let profiles_dir = ProfileManager::instance().get_profiles_dir();
+    match crate::cookie_manager::CookieManager::host_can_read_cookie_store(&profile, &profiles_dir)
+    {
+      Ok(true) => {}
+      Ok(false) => {
+        log::error!(
+          "Refusing to launch {}: this build cannot decrypt the profile's cookie store, and \
+           opening it would make Chromium delete every cookie in it",
+          profile.name
+        );
+        return Err(serde_json::json!({ "code": "COOKIE_STORE_UNREADABLE_HERE" }).to_string());
+      }
+      // A failed check is not a reason to block a launch that would otherwise
+      // work; log it and let the operator through.
+      Err(e) => log::warn!("Could not verify {}'s cookie store: {e}", profile.name),
+    }
+  }
+
   let browser_runner = BrowserRunner::instance();
   // Both manual/API and automation launches take this same guard.  The
   // automation occupancy check and its failure cleanup therefore describe one

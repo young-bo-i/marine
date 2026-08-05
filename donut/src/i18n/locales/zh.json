@@ -1846,7 +1846,8 @@
     "profileNeverLaunched": "这个配置文件从未启动过，还没有 cookie 库。请先启动一次浏览器并关闭，然后重试。",
     "profileIsRunning": "接管前请先关闭浏览器。",
     "profileAlreadyLocal": "这个配置文件已经属于本机了。",
-    "marineProfileLeasedElsewhere": "另一台设备正在驱动这个配置文件。本机同时跑会导致两边在同一条内容下重复发言。"
+    "marineProfileLeasedElsewhere": "另一台设备正在驱动这个配置文件。本机同时跑会导致两边在同一条内容下重复发言。",
+    "cookieStoreUnreadableHere": "本机浏览器解不开这个配置文件的 cookie。直接打开会把里面的 cookie 全部删掉——Chromium 对读不了的 cookie 是删除而不是报错。已阻止启动、配置文件未被改动；请改用在本机创建的配置文件并迁移登录态。"
   },
   "rail": {
     "profiles": "配置文件",

@@ -49,6 +49,7 @@ export type BackendErrorCode =
   | "MARINE_DISCOVERY_PROFILE_NOT_FOUND"
   | "MARINE_DISCOVERY_PROFILE_CROSS_OS"
   | "COOKIE_DECRYPT_FAILED"
+  | "COOKIE_STORE_UNREADABLE_HERE"
   | "PROFILE_NEVER_LAUNCHED"
   | "PROFILE_IS_RUNNING"
   | "PROFILE_ALREADY_LOCAL"
@@ -193,6 +194,8 @@ export function translateBackendError(t: TFunction, err: unknown): string {
       return t("backendErrors.marineDiscoveryEmptyKeyword");
     case "MARINE_DISCOVERY_PROFILE_NOT_FOUND":
       return t("backendErrors.marineDiscoveryProfileNotFound");
+    case "COOKIE_STORE_UNREADABLE_HERE":
+      return t("backendErrors.cookieStoreUnreadableHere");
     case "COOKIE_DECRYPT_FAILED":
       return t("backendErrors.cookieDecryptFailed", {
         count: parsed.params?.count ?? "",
