@@ -907,9 +907,12 @@ export default function Home() {
         console.log("Successfully launched profile:", result.name);
       } catch (err: unknown) {
         console.error("Failed to launch browser:", err);
-        const errorMessage = err instanceof Error ? err.message : String(err);
+        // 走 translateBackendError：后端的错误是 `{"code":…}` JSON，
+        // String(err) 会把那串 JSON 原样贴进文案给用户看。
         showErrorToast(
-          t("errors.launchBrowserFailed", { error: errorMessage }),
+          t("errors.launchBrowserFailed", {
+            error: translateBackendError(t as never, err),
+          }),
         );
         throw err;
       }

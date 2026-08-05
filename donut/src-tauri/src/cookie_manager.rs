@@ -57,7 +57,7 @@ pub mod chrome_decrypt {
   const IV: [u8; 16] = [b' '; 16]; // 16 spaces
   const HOST_HASH_LEN: usize = 32; // SHA-256 output length
 
-  fn derive_key(password: &[u8], iterations: u32) -> [u8; KEY_LEN] {
+  pub(crate) fn derive_key(password: &[u8], iterations: u32) -> [u8; KEY_LEN] {
     let mut key = [0u8; KEY_LEN];
     // Using ring::pbkdf2 instead of the `pbkdf2` crate to avoid digest
     // version conflicts between sha1 0.11 (digest 0.11) and pbkdf2 0.12
@@ -311,21 +311,43 @@ impl CookieManager {
     if !db.exists() {
       return Ok(true);
     }
-    // Derive the way this host's browser would, ignoring the profile's recorded
-    // origin: `host_os` has usually already been flipped by adoption at the
-    // point this runs.
-    let Some(key) = chrome_decrypt::get_encryption_key(&data, None) else {
-      // No key file means nothing was encrypted with one.
+    let Ok(passphrase) = std::fs::read(data.join("os_crypt_key")) else {
+      // No key file means nothing in there was encrypted with one.
       return Ok(true);
     };
-    let (cookies, undecryptable) = Self::read_chrome_cookies(&db, Some(&key))?;
-    if undecryptable == 0 {
-      return Ok(true);
+
+    // Try every derivation we know of, not just the one this host is assumed to
+    // use.
+    //
+    // Blocking on the assumed convention alone was wrong: the mapping
+    // (macOS → 1003, everything else → 1) is Chromium's, and Wayfern replaced
+    // that whole layer with its own file-based scheme. A fork that does that is
+    // quite likely to use one implementation everywhere, in which case refusing
+    // to launch would be refusing something that works. What can be stated
+    // honestly is narrower: if *no* derivation reads the store, the bytes are
+    // not something any build of this browser family will read either.
+    for (label, iterations) in [
+      ("host", chrome_decrypt::iterations_for(None)),
+      ("macos", chrome_decrypt::ITERATIONS_MACOS),
+      ("other", chrome_decrypt::ITERATIONS_OTHER),
+    ] {
+      let key = chrome_decrypt::derive_key(&passphrase, iterations);
+      let (cookies, undecryptable) = Self::read_chrome_cookies(&db, Some(&key))?;
+      let readable = cookies.iter().filter(|c| !c.value.is_empty()).count();
+      if undecryptable == 0 || readable > 0 {
+        log::info!(
+          "Profile {}: cookie store reads with the '{label}' derivation \
+           ({iterations} PBKDF2 iterations), {readable} value(s) recovered",
+          profile.name
+        );
+        return Ok(true);
+      }
     }
-    // Some rows carry plaintext values and never needed the key; only conclude
-    // the key is wrong when *nothing* encrypted came back readable.
-    let readable = cookies.iter().filter(|c| !c.value.is_empty()).count();
-    Ok(readable > 0)
+    log::error!(
+      "Profile {}: no known key derivation reads its cookie store",
+      profile.name
+    );
+    Ok(false)
   }
 
   /// Copy the cookie store and its key aside before something irreversible.
