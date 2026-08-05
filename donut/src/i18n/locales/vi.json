@@ -1124,7 +1124,9 @@
   "crossOs": {
     "viewOnly": "Profile này được tạo trên {{os}} và không được hỗ trợ trên hệ thống này",
     "cannotLaunch": "Profile này được tạo trên {{os}} và không được hỗ trợ trên hệ thống này",
-    "cannotModify": "Không thể chỉnh sửa cài đặt đồng bộ cho profile đa hệ điều hành"
+    "cannotModify": "Không thể chỉnh sửa cài đặt đồng bộ cho profile đa hệ điều hành",
+    "adoptHint": "Được tạo trên {{os}}. Mở bảng ⓘ và chọn “Tiếp nhận trên máy này” để chạy tại đây.",
+    "adoptHintUnknownOs": "Được tạo trên hệ điều hành khác. Mở bảng ⓘ và chọn “Tiếp nhận trên máy này” để chạy tại đây."
   },
   "profileInfo": {
     "title": "Chi tiết profile",

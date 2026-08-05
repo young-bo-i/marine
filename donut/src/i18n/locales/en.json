@@ -1124,7 +1124,9 @@
   "crossOs": {
     "viewOnly": "This profile was created on {{os}} and is not supported on this system",
     "cannotLaunch": "This profile was created on {{os}} and is not supported on this system",
-    "cannotModify": "Cannot modify sync settings for a cross-OS profile"
+    "cannotModify": "Cannot modify sync settings for a cross-OS profile",
+    "adoptHint": "Created on {{os}}. Open the ⓘ panel and choose “Adopt on this machine” to run it here.",
+    "adoptHintUnknownOs": "Created on another operating system. Open the ⓘ panel and choose “Adopt on this machine” to run it here."
   },
   "profileInfo": {
     "title": "Profile Details",

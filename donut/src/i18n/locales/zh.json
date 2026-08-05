@@ -1124,7 +1124,9 @@
   "crossOs": {
     "viewOnly": "此配置文件在 {{os}} 上创建，不受此系统支持",
     "cannotLaunch": "此配置文件在 {{os}} 上创建，不受此系统支持",
-    "cannotModify": "无法修改跨操作系统配置文件的同步设置"
+    "cannotModify": "无法修改跨操作系统配置文件的同步设置",
+    "adoptHint": "在 {{os}} 上创建。点右侧 ⓘ 打开信息面板，选「在本机接管」即可在这里运行。",
+    "adoptHintUnknownOs": "在其他操作系统上创建。点右侧 ⓘ 打开信息面板，选「在本机接管」即可在这里运行。"
   },
   "profileInfo": {
     "title": "配置文件详情",

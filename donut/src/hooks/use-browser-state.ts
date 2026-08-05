@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+
 import {
   getBrowserDisplayName,
   getOSDisplayName,
@@ -16,6 +18,7 @@ export function useBrowserState(
   launchingProfiles: Set<string>,
   stoppingProfiles: Set<string>,
 ) {
+  const { t } = useTranslation();
   const [isClient, setIsClient] = useState(false);
 
   useEffect(() => {
@@ -157,15 +160,15 @@ export function useBrowserState(
       if (!isClient) return "Loading...";
 
       if (isCrossOsProfile(profile)) {
+        // 说清楚下一步在哪儿。以前这里只说「不能启动」，而「在本机接管」藏在
+        // ⓘ 信息面板里，光看这句提示根本不知道它存在。
         const profileOs =
           profile.host_os ||
           profile.camoufox_config?.os ||
           profile.wayfern_config?.os;
-        if (profileOs) {
-          const osName = getOSDisplayName(profileOs);
-          return `This profile was created on ${osName} and cannot be launched on a different operating system.`;
-        }
-        return "This profile was created on a different operating system and cannot be launched here.";
+        return profileOs
+          ? t("crossOs.adoptHint", { os: getOSDisplayName(profileOs) })
+          : t("crossOs.adoptHintUnknownOs");
       }
 
       const isRunning = runningProfiles.has(profile.id);
@@ -199,6 +202,7 @@ export function useBrowserState(
       isSingleInstanceBrowser,
       canLaunchProfile,
       launchingProfiles,
+      t,
       stoppingProfiles,
     ],
   );

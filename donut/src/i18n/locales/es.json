@@ -1124,7 +1124,9 @@
   "crossOs": {
     "viewOnly": "Este perfil fue creado en {{os}} y no es compatible con este sistema",
     "cannotLaunch": "Este perfil fue creado en {{os}} y no es compatible con este sistema",
-    "cannotModify": "No se pueden modificar los ajustes de sincronización de un perfil de otro sistema operativo"
+    "cannotModify": "No se pueden modificar los ajustes de sincronización de un perfil de otro sistema operativo",
+    "adoptHint": "Creado en {{os}}. Abre el panel ⓘ y elige «Adoptar en este equipo» para ejecutarlo aquí.",
+    "adoptHintUnknownOs": "Creado en otro sistema operativo. Abre el panel ⓘ y elige «Adoptar en este equipo» para ejecutarlo aquí."
   },
   "profileInfo": {
     "title": "Detalles del Perfil",

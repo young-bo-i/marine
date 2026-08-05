@@ -1461,6 +1461,12 @@ async fn marine_adopt_profile_here(
     .save_profile(&profile)
     .map_err(|e| marine::err_with("INTERNAL_ERROR", e.to_string()))?;
 
+  // 界面按 host_os 决定启动键灰不灰，而 save_profile 自己不发事件 ——
+  // 不发的话用户点完接管看不到任何变化，会以为没生效。
+  if let Err(e) = events::emit_empty("profiles-changed") {
+    log::warn!("Adopted profile but could not notify the UI: {e}");
+  }
+
   log::info!(
     "Adopted profile {} ({}) onto {host}; cookie backup: {}",
     profile.name,
