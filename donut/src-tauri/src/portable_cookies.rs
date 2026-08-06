@@ -724,7 +724,9 @@ pub fn spawn_snapshot_loop(profile: crate::profile::BrowserProfile, profiles_dir
   tauri::async_runtime::spawn(async move {
     let mut ticker = tokio::time::interval(SNAPSHOT_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    ticker.tick().await; // the restore has only just finished
+    // `interval` yields its first tick immediately; spend it here so the loop
+    // below starts one full period after the restore rather than racing it.
+    ticker.tick().await;
     loop {
       ticker.tick().await;
       // The browser going away ends the loop; the stop path takes the last
@@ -750,10 +752,19 @@ pub fn spawn_snapshot_loop(profile: crate::profile::BrowserProfile, profiles_dir
 
 /// How often a running browser's login state is captured.
 ///
-/// A compromise: short enough that closing a window loses at most this much of a
-/// session, long enough that a browser left open all day is not writing a file
-/// and queueing a sync every few seconds.
-const SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+/// Short, because this poll is the ONLY thing covering the most ordinary way a
+/// session ends: the user closing the browser window themselves. The app-driven
+/// stop takes a final snapshot before shutting CDP down; a manual close has no
+/// such hook — by the time the status checker notices, the process is gone and
+/// all that is left is a store this machine may not be able to read. Measured on
+/// the real pair: a browser holding 49 cookies whose blob still had 45, with the
+/// difference lost for exactly this reason.
+///
+/// Fifteen seconds is affordable because an unchanged capture costs one CDP
+/// round trip and writes nothing — `write_snapshot` bails before touching the
+/// file when the cookie set is identical. The expensive part only happens when
+/// something actually changed, which is precisely when it is wanted.
+const SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Combine a fresh read with the previous blob.
 ///
