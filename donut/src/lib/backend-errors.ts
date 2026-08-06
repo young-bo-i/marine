@@ -48,7 +48,6 @@ export type BackendErrorCode =
   | "MARINE_DISCOVERY_EMPTY_KEYWORD"
   | "MARINE_DISCOVERY_PROFILE_NOT_FOUND"
   | "COOKIE_DECRYPT_FAILED"
-  | "COOKIE_STORE_UNREADABLE_HERE"
   | "PROFILE_ADOPTED_BUT_NOT_SYNCED"
   | "PROFILE_NEVER_LAUNCHED"
   | "PROFILE_IS_RUNNING"
@@ -198,8 +197,6 @@ export function translateBackendError(t: TFunction, err: unknown): string {
       return t("backendErrors.profileAdoptedButNotSynced", {
         detail: parsed.params?.message ?? "",
       });
-    case "COOKIE_STORE_UNREADABLE_HERE":
-      return t("backendErrors.cookieStoreUnreadableHere");
     case "COOKIE_DECRYPT_FAILED":
       return t("backendErrors.cookieDecryptFailed", {
         count: parsed.params?.count ?? "",

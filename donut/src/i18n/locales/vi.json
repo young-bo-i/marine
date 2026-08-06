@@ -1845,7 +1845,6 @@
     "profileIsRunning": "Hãy đóng trình duyệt trước khi tiếp nhận hồ sơ này.",
     "profileAlreadyLocal": "Hồ sơ này đã thuộc về máy này rồi.",
     "marineProfileLeasedElsewhere": "Một thiết bị khác đang chạy hồ sơ này. Chạy ở đây nữa sẽ khiến cả hai đăng dưới cùng một nội dung.",
-    "cookieStoreUnreadableHere": "Trình duyệt trên máy này không giải mã được cookie của hồ sơ này, và cũng không có trạng thái đăng nhập di động nào để khôi phục. Mở nó sẽ xóa sạch cookie bên trong — Chromium xóa những cookie nó không đọc được thay vì báo lỗi. Việc khởi chạy đã bị chặn và hồ sơ không bị thay đổi. Hãy mở rồi đóng hồ sơ này một lần trên máy vẫn còn phiên đăng nhập: thao tác đó ghi ra một bản sao độc lập với hệ điều hành và đồng bộ sang đây.",
     "profileAdoptedButNotSynced": "Hồ sơ này giờ thuộc về máy này, nhưng không tải được dữ liệu trình duyệt nên chưa khởi chạy — mở khi trống sẽ tạo hồ sơ mới không có phiên đăng nhập. Hãy kiểm tra kết nối đồng bộ rồi thử lại. ({{detail}})"
   },
   "rail": {

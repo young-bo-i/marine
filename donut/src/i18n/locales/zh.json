@@ -1845,7 +1845,6 @@
     "profileIsRunning": "接管前请先关闭浏览器。",
     "profileAlreadyLocal": "这个配置文件已经属于本机了。",
     "marineProfileLeasedElsewhere": "另一台设备正在驱动这个配置文件。本机同时跑会导致两边在同一条内容下重复发言。",
-    "cookieStoreUnreadableHere": "本机浏览器解不开这个配置文件的 cookie，也没有可移植的登录态可以恢复。直接打开会把里面的 cookie 全部删掉——Chromium 对读不了的 cookie 是删除而不是报错。已阻止启动、配置文件未被改动。请在还有登录态的那台机器上把这个配置文件开一次再关掉：那会写出一份与系统无关的副本并同步过来。",
     "profileAdoptedButNotSynced": "配置文件已归到本机，但浏览器数据没能下载下来，所以没有启动——空着启动会建出一个没有任何登录态的新配置文件。请检查同步连接后重试。（{{detail}}）"
   },
   "rail": {

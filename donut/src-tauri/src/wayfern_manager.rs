@@ -1707,6 +1707,29 @@ impl WayfernManager {
     )
   }
 
+  /// 把浏览器**当前实际持有**的 cookie 全量读出来。
+  ///
+  /// **为什么导出也必须走 CDP**：cookie 库是用 profile 里 `os_crypt_key` 那份口令
+  /// 加密的，而各平台构建的派生方式不一样。灌入早就交给浏览器自己做了，导出却还是
+  /// 我们自己开 SQLite 解密——这个不对称正是整套设计要消灭的依赖，只是当时留在了
+  /// 出口这一侧。实测后果：macOS 导出的登录态能到 Windows，Windows 上登录的却永远
+  /// 回不来，因为本机代码解不开本机浏览器刚写的库，导出直接判定「一条可读的都没有」
+  /// 而放弃。让浏览器自己交明文，就再也不用知道它今天用的是哪一套。
+  ///
+  /// 顺带还去掉了对「有没有落盘」的依赖：返回的是内存里的活状态，不是上一次 flush
+  /// 的快照。
+  pub async fn get_all_cookies(&self, profile_path: &str) -> Option<Vec<serde_json::Value>> {
+    let ws = self
+      .list_page_targets(profile_path)
+      .await
+      .and_then(|t| t.iter().find_map(|t| t.websocket_debugger_url.clone()))?;
+    let result = self
+      .send_cdp_command(&ws, "Network.getAllCookies", json!({}))
+      .await
+      .ok()?;
+    Some(result.get("cookies")?.as_array()?.clone())
+  }
+
   /// 重新加载所有页签。
   ///
   /// cookie 是在启动之后才灌进去的，而 `--restore-last-session` 恢复的页签和启动

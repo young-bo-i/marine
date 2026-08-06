@@ -1845,7 +1845,6 @@
     "profileIsRunning": "Detén el navegador antes de adoptar este perfil.",
     "profileAlreadyLocal": "Este perfil ya pertenece a este equipo.",
     "marineProfileLeasedElsewhere": "Otro dispositivo está usando este perfil. Ejecutarlo aquí también haría que ambos publiquen bajo el mismo contenido.",
-    "cookieStoreUnreadableHere": "El navegador de este equipo no puede descifrar las cookies de este perfil y no hay un estado de sesión portátil que restaurar. Abrirlo borraría todas sus cookies: Chromium elimina las cookies que no puede leer en lugar de informar de un error. Se bloqueó el inicio y el perfil no se modificó. Abre y cierra este perfil una vez en el equipo que todavía conserva las sesiones: eso genera una copia independiente del sistema operativo que se sincroniza aquí.",
     "profileAdoptedButNotSynced": "Este perfil ya pertenece a este equipo, pero no se pudieron descargar sus datos del navegador, así que no se inició: arrancarlo vacío habría creado un perfil sin sesiones. Revisa la conexión de sincronización e inténtalo de nuevo. ({{detail}})"
   },
   "rail": {

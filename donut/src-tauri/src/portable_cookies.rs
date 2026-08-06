@@ -494,6 +494,267 @@ pub fn export(
   Ok(Some(store.cookies.len()))
 }
 
+/// Snapshot the profile's login state straight out of the running browser.
+///
+/// This is the primary export path, and the reason it exists is that the other
+/// one requires knowing how the browser encrypts its store. Injection has always
+/// let the browser do that work; reading it back did not, and the asymmetry was
+/// the whole bug: a machine whose Wayfern build uses a key derivation this code
+/// does not implement can be given login state perfectly well and can never
+/// hand any back. Measured across a real pair — every blob on the macOS side
+/// originated on macOS, thirteen hours after the Windows machine had logged in
+/// and closed.
+///
+/// A CDP snapshot is also strictly better evidence than the database:
+///
+/// * It is the LIVE state, so it does not depend on Chromium having flushed.
+/// * Because it is live, an absence really is an absence — which makes it
+///   authoritative for deletions in a way a post-exit database read can never
+///   be. Callers get [`ExitKind::Clean`] semantics without having to guess how
+///   the browser stopped.
+///
+/// Returns the number of cookies written, or `None` when the browser could not
+/// be reached (the caller should then fall back to [`export`]).
+pub async fn export_from_browser(
+  profile: &crate::profile::BrowserProfile,
+  profiles_dir: &Path,
+) -> Option<usize> {
+  if profile.browser != "wayfern" || profile.ephemeral {
+    return None;
+  }
+  let profile_path = effective_data_path(profile, profiles_dir)
+    .to_string_lossy()
+    .to_string();
+  // A snapshot says "this is everything, absences are deletions". That is only
+  // safe once this browser is known to hold the blob — otherwise a store that
+  // Chromium wiped at startup, or one whose restore has not run yet, would be
+  // captured as a mass logout and synced out as tombstones.
+  let profile_id = profile.id.to_string();
+  match load(profile, profiles_dir) {
+    Ok(Some(blob)) => {
+      if !already_applied(applied_mark(&profile_id, profiles_dir).as_ref(), &blob) {
+        log::debug!(
+          "Profile {}: not snapshotting — this browser has not been confirmed to hold \
+           {FILE_NAME} revision {}",
+          profile.name,
+          blob.revision
+        );
+        return None;
+      }
+    }
+    // No blob yet: nothing to contradict, so whatever the browser has is the
+    // truth by definition.
+    Ok(None) => {}
+    Err(e) => {
+      log::warn!("Profile {}: not snapshotting — {e}", profile.name);
+      return None;
+    }
+  }
+
+  let raw = crate::wayfern_manager::WayfernManager::instance()
+    .get_all_cookies(&profile_path)
+    .await?;
+
+  let now = now_secs() as f64;
+  let cookies: Vec<PortableCookie> = raw
+    .iter()
+    .filter_map(|c| {
+      // CDP reports a session cookie as `session: true` with `expires: -1`.
+      let expires = c.get("expires").and_then(|v| v.as_f64()).unwrap_or(-1.0);
+      let session = c
+        .get("session")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(expires <= 0.0);
+      if !session && expires <= now {
+        return None;
+      }
+      let secure = c.get("secure").and_then(|v| v.as_bool()).unwrap_or(false);
+      let same_site = c
+        .get("sameSite")
+        .and_then(|v| v.as_str())
+        // Chromium refuses `SameSite=None` on a non-secure cookie, so sending it
+        // back that way would lose the whole entry rather than one attribute.
+        .filter(|s| *s != "None" || secure)
+        .map(str::to_string);
+      Some(PortableCookie {
+        name: c.get("name")?.as_str()?.to_string(),
+        value: c.get("value")?.as_str()?.to_string(),
+        domain: c.get("domain")?.as_str()?.to_string(),
+        path: c.get("path")?.as_str()?.to_string(),
+        expires: (!session).then_some(expires),
+        secure,
+        http_only: c.get("httpOnly").and_then(|v| v.as_bool()).unwrap_or(false),
+        same_site,
+      })
+    })
+    .collect();
+
+  if cookies.is_empty() {
+    log::debug!(
+      "Profile {}: the browser reports no cookies; leaving {FILE_NAME} untouched",
+      profile.name
+    );
+    return None;
+  }
+
+  match write_snapshot(profile, profiles_dir, cookies) {
+    Ok(n) => Some(n),
+    Err(e) => {
+      log::warn!("Profile {}: could not write {FILE_NAME}: {e}", profile.name);
+      None
+    }
+  }
+}
+
+/// Persist an authoritative snapshot: everything the browser holds, nothing else.
+///
+/// Absences are real, so this derives tombstones unconditionally — no
+/// [`ExitKind`] involved. Nothing is carried forward either, which is safe here
+/// and only here: a live read cannot be missing something the browser has.
+fn write_snapshot(
+  profile: &crate::profile::BrowserProfile,
+  profiles_dir: &Path,
+  cookies: Vec<PortableCookie>,
+) -> Result<usize, String> {
+  let profile_id = profile.id.to_string();
+  let previous = load(profile, profiles_dir).ok().flatten();
+  let mark = applied_mark(&profile_id, profiles_dir);
+  let revision = previous
+    .as_ref()
+    .map(|p| p.revision)
+    .unwrap_or(0)
+    .max(mark.as_ref().map(|m| m.revision).unwrap_or(0))
+    + 1;
+
+  let honoured_previous = previous
+    .as_ref()
+    .is_some_and(|p| already_applied(mark.as_ref(), p));
+  let present: std::collections::HashSet<CookieKey> = cookies.iter().map(key_of).collect();
+  let Reconciled {
+    cookies,
+    deleted,
+    carried,
+    ..
+  } = reconcile(
+    cookies,
+    previous.as_ref(),
+    ExitKind::Clean,
+    revision,
+    &present,
+    honoured_previous,
+  );
+  debug_assert_eq!(carried, 0, "a live read never needs carrying");
+
+  // Nothing changed? Do not write.
+  //
+  // The snapshot loop runs every couple of minutes for as long as a browser is
+  // open. Writing an identical blob with a new revision each time would make the
+  // file diff perpetually non-empty and put this profile into a permanent upload
+  // loop — the exact failure the "an unchanged sync must issue zero PUTs" rule
+  // exists to prevent.
+  if let Some(prev) = previous.as_ref() {
+    if !deleted.is_empty() {
+      // fall through: a logout is always worth publishing
+    } else if same_cookie_set(&prev.cookies, &cookies) {
+      log::debug!(
+        "Profile {}: login state unchanged since revision {}, not rewriting {FILE_NAME}",
+        profile.name,
+        prev.revision
+      );
+      return Ok(cookies.len());
+    }
+  }
+
+  let store = PortableCookieStore {
+    version: FORMAT_VERSION,
+    revision,
+    device: crate::team_lock::device_id(),
+    exported_at: now_secs(),
+    source_os: crate::profile::types::get_host_os(),
+    cookies,
+    deleted,
+  };
+  write_store(profile, profiles_dir, &store)?;
+  // The browser is where these came from, so it holds them by definition.
+  set_applied_mark(
+    &profile_id,
+    profiles_dir,
+    &AppliedMark {
+      revision,
+      device: store.device.clone(),
+      unconfirmed: Vec::new(),
+    },
+  );
+  log::info!(
+    "Profile {}: snapshotted revision {revision} from the running browser — {} cookie(s), {} \
+     tombstone(s)",
+    profile.name,
+    store.cookies.len(),
+    store.deleted.len()
+  );
+  Ok(store.cookies.len())
+}
+
+/// Do two cookie sets carry identical state? Compares values too — a refreshed
+/// session token keeps the same key and absolutely must be published.
+fn same_cookie_set(a: &[PortableCookie], b: &[PortableCookie]) -> bool {
+  if a.len() != b.len() {
+    return false;
+  }
+  let index: std::collections::HashMap<CookieKey, &str> =
+    a.iter().map(|c| (key_of(c), c.value.as_str())).collect();
+  b.iter()
+    .all(|c| index.get(&key_of(c)).is_some_and(|v| *v == c.value))
+}
+
+/// Keep snapshotting the profile's login state for as long as its browser runs.
+///
+/// The snapshot has to happen while CDP is alive, and there is no hook for "the
+/// user is about to close this window" — by the time the status checker notices,
+/// the process is gone and the only thing left is a store this machine may not
+/// be able to read. Polling is what covers the case that actually matters to a
+/// human: log in, browse, close the window.
+///
+/// Cheap: one CDP round trip per tick, and `write_snapshot` is skipped entirely
+/// unless the cookie set actually changed.
+pub fn spawn_snapshot_loop(profile: crate::profile::BrowserProfile, profiles_dir: PathBuf) {
+  if profile.browser != "wayfern" || profile.ephemeral {
+    return;
+  }
+  tauri::async_runtime::spawn(async move {
+    let mut ticker = tokio::time::interval(SNAPSHOT_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await; // the restore has only just finished
+    loop {
+      ticker.tick().await;
+      // The browser going away ends the loop; the stop path takes the last
+      // snapshot itself, while CDP is still up.
+      let path = effective_data_path(&profile, &profiles_dir)
+        .to_string_lossy()
+        .to_string();
+      if crate::wayfern_manager::WayfernManager::instance()
+        .get_cdp_port(&path)
+        .await
+        .is_none()
+      {
+        log::debug!(
+          "Profile {}: browser gone, stopping the snapshot loop",
+          profile.name
+        );
+        return;
+      }
+      export_from_browser(&profile, &profiles_dir).await;
+    }
+  });
+}
+
+/// How often a running browser's login state is captured.
+///
+/// A compromise: short enough that closing a window loses at most this much of a
+/// session, long enough that a browser left open all day is not writing a file
+/// and queueing a sync every few seconds.
+const SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Combine a fresh read with the previous blob.
 ///
 /// Returns `(cookies, tombstones, carried_forward_count)`.
@@ -1061,51 +1322,6 @@ fn local_store_written_since_blob(
     return true;
   };
   store > blob
-}
-
-/// Take the profile's os_crypt-encrypted state out of the way so the browser
-/// mints its own on the next start.
-///
-/// Only ever called for a store this host has been measured unable to read, and
-/// only when there is a portable blob to put back afterwards. Both files are
-/// copied to a timestamped directory outside `profiles/` first.
-///
-/// Leaving them in place is not the safe option it looks like. A foreign
-/// `os_crypt_key` is the passphrase the browser will pick up and use, so what
-/// happens next is decided by an implementation detail of a third-party binary
-/// on the other platform — which is exactly the thing this whole mechanism
-/// exists to stop depending on. Removing them makes the outcome the same every
-/// time: fresh key, fresh store, sessions injected over CDP.
-pub fn clear_foreign_cookie_state(
-  profile: &crate::profile::BrowserProfile,
-  profiles_dir: &Path,
-) -> Result<(), String> {
-  let backup = crate::cookie_manager::CookieManager::back_up_cookie_store(profile, profiles_dir)?;
-  if let Some(dir) = &backup {
-    log::info!(
-      "Profile {}: unreadable cookie store backed up to {dir}",
-      profile.name
-    );
-  }
-
-  let data = effective_data_path(profile, profiles_dir);
-  let db = local_cookie_db(profile, profiles_dir);
-  for path in [db.clone(), data.join("os_crypt_key")] {
-    if !path.exists() {
-      continue;
-    }
-    std::fs::remove_file(&path).map_err(|e| format!("failed to clear {}: {e}", path.display()))?;
-  }
-  // `Cookies-journal` / `-wal` describe a database that no longer exists.
-  for suffix in ["-journal", "-wal", "-shm"] {
-    let mut side = db.clone().into_os_string();
-    side.push(suffix);
-    let side = PathBuf::from(side);
-    if side.exists() {
-      let _ = std::fs::remove_file(side);
-    }
-  }
-  Ok(())
 }
 
 /// Decide, **before the browser starts**, whether its sessions need putting
@@ -1721,7 +1937,7 @@ mod tests {
 
   // ── exit classification ───────────────────────────────────────────────────
 
-  fn test_profile() -> crate::profile::types::BrowserProfile {
+  pub fn test_profile() -> crate::profile::types::BrowserProfile {
     crate::profile::types::BrowserProfile {
       id: uuid::Uuid::new_v4(),
       name: "t".to_string(),
@@ -1871,5 +2087,83 @@ mod tests_support {
       cookies,
       deleted: Vec::new(),
     }
+  }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+  use super::tests_support::*;
+  use super::*;
+
+  /// The snapshot loop runs every couple of minutes for as long as a browser is
+  /// open. If an unchanged capture still bumped the revision, the file diff
+  /// would never be empty and the profile would upload forever — the failure the
+  /// "an unchanged sync issues zero PUTs" rule exists to prevent.
+  #[test]
+  fn an_unchanged_snapshot_does_not_rewrite_the_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = dir.path();
+    let profile = super::tests::test_profile();
+    let id = profile.id.to_string();
+    std::fs::create_dir_all(profiles.join(&id)).unwrap();
+
+    let first = vec![ck("SESSDATA", ".bilibili.com"), ck("sid", ".zhihu.com")];
+    assert_eq!(
+      write_snapshot(&profile, profiles, first.clone()).unwrap(),
+      2
+    );
+    let after_first = load(&profile, profiles).unwrap().unwrap();
+    assert_eq!(after_first.revision, 1);
+
+    // Same set again: no write, so the revision must not move.
+    write_snapshot(&profile, profiles, first).unwrap();
+    let again = load(&profile, profiles).unwrap().unwrap();
+    assert_eq!(again.revision, 1, "an identical capture must not bump");
+    assert_eq!(again.exported_at, after_first.exported_at);
+  }
+
+  /// A refreshed session token keeps its (domain, name, path) but is the entire
+  /// point of syncing — comparing keys alone would drop it.
+  #[test]
+  fn a_changed_value_still_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = dir.path();
+    let profile = super::tests::test_profile();
+    std::fs::create_dir_all(profiles.join(profile.id.to_string())).unwrap();
+
+    write_snapshot(&profile, profiles, vec![ck("SESSDATA", ".bilibili.com")]).unwrap();
+    let mut refreshed = ck("SESSDATA", ".bilibili.com");
+    refreshed.value = "rotated".into();
+    write_snapshot(&profile, profiles, vec![refreshed]).unwrap();
+
+    let out = load(&profile, profiles).unwrap().unwrap();
+    assert_eq!(out.revision, 2);
+    assert_eq!(out.cookies[0].value, "rotated");
+  }
+
+  /// A live read is authoritative, so an absence really is a logout — this is
+  /// the one export path that may tombstone without asking how the browser died.
+  #[test]
+  fn a_snapshot_tombstones_what_the_browser_no_longer_has() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = dir.path();
+    let profile = super::tests::test_profile();
+    std::fs::create_dir_all(profiles.join(profile.id.to_string())).unwrap();
+
+    write_snapshot(
+      &profile,
+      profiles,
+      vec![
+        ck("SESSDATA", ".bilibili.com"),
+        ck("web_session", ".xiaohongshu.com"),
+      ],
+    )
+    .unwrap();
+    write_snapshot(&profile, profiles, vec![ck("SESSDATA", ".bilibili.com")]).unwrap();
+
+    let out = load(&profile, profiles).unwrap().unwrap();
+    assert_eq!(out.cookies.len(), 1);
+    assert_eq!(out.deleted.len(), 1);
+    assert_eq!(out.deleted[0].name, "web_session");
   }
 }

@@ -2149,6 +2149,12 @@ impl BrowserRunner {
             wayfern_process.processId
           );
 
+          // Last chance to ask the browser what it holds. After `stop_wayfern`
+          // there is no CDP, and on platforms whose store this code cannot
+          // decrypt there is no other way to read it at all.
+          let profiles_dir = ProfileManager::instance().get_profiles_dir();
+          crate::portable_cookies::export_from_browser(profile, &profiles_dir).await;
+
           match self.wayfern_manager.stop_wayfern(&wayfern_process.id).await {
             Ok(closed_itself) => {
               // Whether Chromium shut itself down decides whether the cookie
@@ -3413,74 +3419,29 @@ async fn launch_browser_profile_impl_with_restore(
     profile
   };
 
-  // Last stop before Chromium sees the profile.
+  // The cookie store is the browser's business, not ours.
   //
-  // Cookies this build cannot decrypt are not skipped, they are **deleted** —
-  // so a key-derivation mismatch does not surface as an error, it surfaces as
-  // every account being logged out with the evidence already gone. Measured on
-  // a macOS-written store opened under Windows Wayfern.
+  // There used to be a guard here that tried to decrypt the store with every key
+  // derivation this code knows, and — when none worked — backed it up, deleted
+  // it along with `os_crypt_key`, and let the browser start fresh. Measured on a
+  // real Windows machine, that was actively destructive: Wayfern there writes a
+  // store this code cannot read (49 of 49 rows failed) but which the BROWSER
+  // reads perfectly well, so every launch threw away a working store and
+  // everything the previous session had added to it.
   //
-  // What that costs depends entirely on whether the sessions exist anywhere
-  // else. With a portable blob on disk they do, so the encrypted store and its
-  // foreign key are simply cleared and the sessions go back in over CDP after
-  // launch (`portable_cookies`). Without one, the store is the only copy and
-  // opening it is destructive, so the launch is refused instead.
+  // The question it was asking — "can *I* decrypt this?" — was never the right
+  // one. What mattered was "did this store come from another machine?", and that
+  // can no longer happen: `os_crypt_key` and the stores encrypted under it are
+  // device-local and never sync (`DEVICE_LOCAL_PATTERNS`). A store on this disk
+  // was written by this machine's browser, which can therefore read it.
   //
-  // The check runs here rather than at adoption because adoption happens before
-  // the browser files arrive: at that moment there is no cookie store to test.
-  //
-  // Whether to re-inject the portable login state is decided HERE too, not after
-  // the launch, even though the injection itself needs a live CDP endpoint. The
-  // decision compares the blob's export time against the local store's mtime,
-  // and Chromium rewrites that store while starting up — asking afterwards
-  // returns "the local copy is newer" every single time, and the sessions would
-  // never go in.
+  // If a legacy profile does still hold mismatched key material, Chromium drops
+  // what it cannot decrypt and the portable blob puts the sessions back — the
+  // same recovery, without destroying a good store in every other case.
   let mut restore_plan: Option<crate::portable_cookies::PortableCookieStore> = None;
   if profile.browser == "wayfern" {
     let profiles_dir = ProfileManager::instance().get_profiles_dir();
-    let host_can_read = match crate::cookie_manager::CookieManager::host_can_read_cookie_store(
-      &profile,
-      &profiles_dir,
-    ) {
-      Ok(true) => true,
-      Ok(false) => {
-        let recoverable = matches!(
-          crate::portable_cookies::load(&profile, &profiles_dir),
-          Ok(Some(ref s)) if !s.cookies.is_empty()
-        );
-        if !recoverable {
-          log::error!(
-            "Refusing to launch {}: this build cannot decrypt the profile's cookie store, there \
-               is no portable login state to restore from, and opening it would make Chromium \
-               delete every cookie in it",
-            profile.name
-          );
-          return Err(serde_json::json!({ "code": "COOKIE_STORE_UNREADABLE_HERE" }).to_string());
-        }
-        log::warn!(
-          "Profile {}: cookie store is unreadable on this machine; clearing it and its foreign \
-             key, sessions will be restored from {} after launch",
-          profile.name,
-          crate::portable_cookies::FILE_NAME
-        );
-        if let Err(e) = crate::portable_cookies::clear_foreign_cookie_state(&profile, &profiles_dir)
-        {
-          // Launching over a foreign key would hand the outcome to a
-          // third-party binary's behaviour on another platform. Refuse rather
-          // than guess.
-          log::error!("Profile {}: {e}", profile.name);
-          return Err(serde_json::json!({ "code": "COOKIE_STORE_UNREADABLE_HERE" }).to_string());
-        }
-        false
-      }
-      // A failed check is not a reason to block a launch that would otherwise
-      // work; log it and let the operator through.
-      Err(e) => {
-        log::warn!("Could not verify {}'s cookie store: {e}", profile.name);
-        true
-      }
-    };
-    restore_plan = crate::portable_cookies::plan_restore(&profile, &profiles_dir, host_can_read);
+    restore_plan = crate::portable_cookies::plan_restore(&profile, &profiles_dir, true);
   }
 
   let browser_runner = BrowserRunner::instance();
@@ -3669,9 +3630,17 @@ async fn launch_browser_profile_impl_with_restore(
   //
   // Awaited rather than spawned: automation navigates as soon as this returns,
   // and a page loaded before its cookies are in place is a logged-out page.
-  if let Some(plan) = restore_plan {
+  if updated_profile.browser == "wayfern" {
     let profiles_dir = ProfileManager::instance().get_profiles_dir();
-    crate::portable_cookies::apply(&updated_profile, &profiles_dir, &plan).await;
+    if let Some(plan) = restore_plan {
+      crate::portable_cookies::apply(&updated_profile, &profiles_dir, &plan).await;
+    }
+    // From here on the browser is the source of truth, and it is reachable over
+    // CDP. Snapshot it periodically so a window the user closes by hand — the
+    // common case for a manual login — does not lose the session it just
+    // created. Started only after any restore, so the first snapshot cannot
+    // capture a pre-restore state.
+    crate::portable_cookies::spawn_snapshot_loop(updated_profile.clone(), profiles_dir);
   }
 
   // Now update the proxy with the correct PID if we have one
