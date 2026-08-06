@@ -1119,9 +1119,8 @@
     }
   },
   "crossOs": {
-    "viewOnly": "Este perfil fue creado en {{os}} y no es compatible con este sistema",
-    "cannotLaunch": "Este perfil fue creado en {{os}} y no es compatible con este sistema",
-    "cannotModify": "No se pueden modificar los ajustes de sincronización de un perfil de otro sistema operativo",
+    "viewOnly": "Creado en {{os}}. Iniciarlo aquí lo adopta en este equipo y restaura sus sesiones.",
+    "cannotModify": "La configuración de sincronización de este perfil se gestiona en el equipo que lo creó",
     "adoptHint": "Creado en {{os}}. Al iniciarlo se adopta en este equipo: primero se respaldan las cookies y se genera una huella nueva para este sistema.",
     "adoptHintUnknownOs": "Creado en otro sistema operativo. Al iniciarlo se adopta en este equipo: primero se respaldan las cookies y se genera una huella nueva."
   },
@@ -1841,13 +1840,12 @@
     "marineDiscoveryEmptyPlan": "Elige al menos un perfil y una plataforma.",
     "marineDiscoveryEmptyKeyword": "Introduce una palabra clave de búsqueda.",
     "marineDiscoveryProfileNotFound": "Uno de los perfiles seleccionados ya no existe.",
-    "marineDiscoveryProfileCrossOs": "El perfil «{{name}}» se creó en otro sistema operativo y no puede ejecutarse aquí. Crea un perfil nuevo en este equipo y vuelve a iniciar sesión.",
     "cookieDecryptFailed": "No se pudieron descifrar {{count}} cookie(s): la clave de cifrado no corresponde a este almacén. Exportar solo produciría nombres de cookies sin sesión detrás, así que se detuvo la operación.",
     "profileNeverLaunched": "Este perfil nunca se ha iniciado, así que aún no tiene almacén de cookies. Inicia el navegador una vez y ciérralo, luego inténtalo de nuevo.",
     "profileIsRunning": "Detén el navegador antes de adoptar este perfil.",
     "profileAlreadyLocal": "Este perfil ya pertenece a este equipo.",
     "marineProfileLeasedElsewhere": "Otro dispositivo está usando este perfil. Ejecutarlo aquí también haría que ambos publiquen bajo el mismo contenido.",
-    "cookieStoreUnreadableHere": "El navegador de este equipo no puede descifrar las cookies de este perfil. Abrirlo eliminaría todas las cookies: Chromium borra las que no puede leer en lugar de informar un error. El perfil quedó intacto; migra las sesiones a un perfil creado en este equipo.",
+    "cookieStoreUnreadableHere": "El navegador de este equipo no puede descifrar las cookies de este perfil y no hay un estado de sesión portátil que restaurar. Abrirlo borraría todas sus cookies: Chromium elimina las cookies que no puede leer en lugar de informar de un error. Se bloqueó el inicio y el perfil no se modificó. Abre y cierra este perfil una vez en el equipo que todavía conserva las sesiones: eso genera una copia independiente del sistema operativo que se sincroniza aquí.",
     "profileAdoptedButNotSynced": "Este perfil ya pertenece a este equipo, pero no se pudieron descargar sus datos del navegador, así que no se inició: arrancarlo vacío habría creado un perfil sin sesiones. Revisa la conexión de sincronización e inténtalo de nuevo. ({{detail}})"
   },
   "rail": {

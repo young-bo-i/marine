@@ -42,6 +42,7 @@ mod human_typing;
 mod ip_utils;
 mod marine;
 mod platform_browser;
+pub mod portable_cookies;
 mod profile;
 mod profile_importer;
 mod proxy_manager;
@@ -2318,6 +2319,34 @@ pub fn run() {
                     );
                   }
 
+                  // Snapshot login state when the browser exits naturally
+                  // (user closing the window) — the explicit kill path in
+                  // browser_runner.rs handles app-driven stops. Same ordering
+                  // requirement as the re-encryption below: before
+                  // `mark_profile_stopped` releases the queued sync.
+                  //
+                  // This branch cannot classify the exit on its own: it fires on
+                  // "the tracked process is gone", which is identical for the
+                  // user closing the window, a renderer crash, an OOM kill, and
+                  // the app's own zero-window reaper. Claiming `Clean` here
+                  // turned each of those into a fleet-wide logout, because a
+                  // clean export reads every not-yet-flushed cookie as a
+                  // deletion. Chromium's own `exit_type` marker is the evidence;
+                  // absent it, unclean.
+                  //
+                  // `_if_unclaimed` because the app-driven kill path fires this
+                  // same transition seconds earlier and has already exported with
+                  // what it actually observed.
+                  if !is_running {
+                    let profiles_dir =
+                      crate::profile::ProfileManager::instance().get_profiles_dir();
+                    let exit =
+                      crate::portable_cookies::observed_exit_kind(&profile, &profiles_dir);
+                    crate::browser_runner::export_portable_login_state_if_unclaimed(
+                      &profile, exit,
+                    );
+                  }
+
                   // Re-encrypt password-protected profiles when the browser
                   // exits naturally (user closing the window) — the explicit
                   // kill path in browser_runner.rs handles app-driven stops.
@@ -2476,6 +2505,22 @@ pub fn run() {
         }
 
         if let Some(work_rx) = work_rx {
+          // Snapshot login state for any profile that does not have a current
+          // one, and finish before the first sync rather than racing it.
+          //
+          // Both used to be detached tasks with a comment claiming this one ran
+          // first. It did not, and losing the race is not free: the profile
+          // uploads a manifest with no `portable-cookies.json` in it, so the
+          // other machine pulls a profile that opens logged out and there is
+          // nothing to distinguish that from "this profile has no sessions".
+          // Awaited on a blocking thread because it decrypts every profile's
+          // cookie store.
+          if let Err(e) =
+            tokio::task::spawn_blocking(crate::portable_cookies::backfill_all).await
+          {
+            log::warn!("Portable login-state backfill did not complete: {e}");
+          }
+
           let scheduler = Arc::new(sync::SyncScheduler::new());
 
           // Set the global scheduler so commands can access it
@@ -2510,6 +2555,40 @@ pub fn run() {
             .start(app_handle_sync.clone(), work_rx)
             .await;
           log::info!("Sync scheduler started");
+
+          // Re-run discovery on a timer.
+          //
+          // It used to happen only at startup, at login, and on a manual sync.
+          // A profile created on another machine while this one is running was
+          // therefore never pulled: its SSE notification names an id this
+          // machine has no local record of, which the scheduler resolves to
+          // nothing and reports as "synced". The only recovery was restarting
+          // the app, which nobody knows to do.
+          let discovery_handle = app_handle_sync.clone();
+          tauri::async_runtime::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await; // the startup pass above just ran
+            loop {
+              interval.tick().await;
+              let Ok(engine) = sync::SyncEngine::create_from_settings(&discovery_handle).await
+              else {
+                continue;
+              };
+              if let Err(e) = engine
+                .check_for_missing_synced_profiles(&discovery_handle)
+                .await
+              {
+                log::debug!("Periodic profile discovery failed: {e}");
+              }
+              if let Err(e) = engine
+                .check_for_missing_synced_entities(&discovery_handle)
+                .await
+              {
+                log::debug!("Periodic entity discovery failed: {e}");
+              }
+            }
+          });
         }
       });
 

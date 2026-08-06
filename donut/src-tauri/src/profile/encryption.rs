@@ -175,6 +175,30 @@ pub fn verify_key_against_dir(key: &[u8; 32], encrypted_dir: &Path) -> PasswordR
   Ok(())
 }
 
+/// Encrypted device-local files live in this subdirectory of the encrypted tree.
+///
+/// A password-protected profile's `Cookies` / `os_crypt_key` are encrypted under
+/// an HMAC'd filename, which the sync exclusion globs cannot see through — so
+/// the device-bound key material of these profiles kept crossing machines, in
+/// the exact form that made a macOS store unreadable after Windows had touched
+/// it. Routing them into a directory whose NAME is stable gives the globs
+/// something to match (`**/device-local/**` in `DEVICE_LOCAL_PATTERNS`) while
+/// they stay encrypted at rest, which is the whole point of the feature.
+///
+/// Costs nothing on the read side: `decrypt_profile_file` recovers the original
+/// relative path from inside the ciphertext, so the on-disk name is only an index.
+pub const DEVICE_LOCAL_SUBDIR: &str = "device-local";
+
+/// Where the encrypted form of `relpath` belongs inside the encrypted tree.
+fn on_disk_path(key: &[u8; 32], encrypted_dir: &Path, relpath: &str) -> PathBuf {
+  let name = hmac_filename(key, relpath);
+  if crate::sync::manifest::device_local_globset().is_match(relpath) {
+    encrypted_dir.join(DEVICE_LOCAL_SUBDIR).join(name)
+  } else {
+    encrypted_dir.join(name)
+  }
+}
+
 /// Encrypt every file under `plaintext_dir` into `encrypted_dir`, replacing
 /// it. Files matching `exclude_patterns` are dropped.
 pub fn encrypt_profile_dir(
@@ -197,7 +221,10 @@ pub fn encrypt_profile_dir(
   for (relpath, abs) in files {
     let bytes = std::fs::read(&abs)?;
     let encrypted = encrypt_profile_file(key, &relpath, &bytes)?;
-    let on_disk = encrypted_dir.join(hmac_filename(key, &relpath));
+    let on_disk = on_disk_path(key, encrypted_dir, &relpath);
+    if let Some(parent) = on_disk.parent() {
+      std::fs::create_dir_all(parent)?;
+    }
     atomic_write(&on_disk, &encrypted)?;
   }
 
@@ -217,9 +244,16 @@ pub fn decrypt_profile_dir(
   std::fs::create_dir_all(plaintext_dir)?;
   let mut mtimes = HashMap::new();
 
-  let entries: Vec<_> = std::fs::read_dir(encrypted_dir)?
+  // Both the top level and the device-local subdirectory. The filename carries
+  // no meaning either way — the plaintext path comes out of the ciphertext — so
+  // this is purely about not skipping a directory.
+  let mut entries: Vec<_> = std::fs::read_dir(encrypted_dir)?
     .filter_map(|r| r.ok())
     .collect();
+  let local_dir = encrypted_dir.join(DEVICE_LOCAL_SUBDIR);
+  if local_dir.exists() {
+    entries.extend(std::fs::read_dir(&local_dir)?.filter_map(|r| r.ok()));
+  }
 
   for entry in entries {
     let path = entry.path();
@@ -235,6 +269,24 @@ pub fn decrypt_profile_dir(
     }
     let bytes = std::fs::read(&path)?;
     let (relpath, content) = decrypt_profile_file(key, &bytes)?;
+
+    // Relocate anything a pre-`DEVICE_LOCAL_SUBDIR` build left in the flat
+    // layout. Without this, an already-enrolled password-protected profile keeps
+    // its os_crypt key and cookie store at the top level of the encrypted tree,
+    // where the sync exclusion cannot see them — so the very files this change
+    // exists to keep at home carry on crossing machines, just unreadably named.
+    // Done here because this is the one place that knows both the on-disk name
+    // and the plaintext path it stands for.
+    let want = on_disk_path(key, encrypted_dir, &relpath);
+    if want != path {
+      if want.exists() {
+        let _ = std::fs::remove_file(&path);
+      } else if let Some(parent) = want.parent() {
+        let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::rename(&path, &want);
+      }
+    }
+
     let dest = plaintext_dir.join(&relpath);
     if let Some(parent) = dest.parent() {
       std::fs::create_dir_all(parent)?;
@@ -274,42 +326,68 @@ pub fn reencrypt_changed_files(
   for (relpath, abs) in current_files {
     current_paths.insert(relpath.clone());
 
+    let on_disk = on_disk_path(key, encrypted_dir, &relpath);
     let cur_mtime = abs.metadata().and_then(|m| m.modified()).ok();
-    let unchanged = match (cur_mtime, before_launch_mtimes.get(&relpath)) {
-      (Some(now), Some(before)) => now == *before,
-      _ => false,
-    };
+    // "Unchanged" also has to mean "already where it belongs". A profile whose
+    // cookie store never changes would otherwise take the fast path forever and
+    // never migrate out of the flat layout.
+    let unchanged = on_disk.exists()
+      && match (cur_mtime, before_launch_mtimes.get(&relpath)) {
+        (Some(now), Some(before)) => now == *before,
+        _ => false,
+      };
     if unchanged {
       continue;
     }
 
     let bytes = std::fs::read(&abs)?;
     let encrypted = encrypt_profile_file(key, &relpath, &bytes)?;
-    let on_disk = encrypted_dir.join(hmac_filename(key, &relpath));
+    if let Some(parent) = on_disk.parent() {
+      std::fs::create_dir_all(parent)?;
+    }
     atomic_write(&on_disk, &encrypted)?;
     rewrote += 1;
   }
 
-  // Delete on-disk files for plaintext paths that no longer exist
-  let valid_names: HashSet<String> = current_paths
-    .iter()
-    .map(|p| hmac_filename(key, p))
-    .collect();
+  // Delete on-disk files for plaintext paths that no longer exist — or that
+  // exist but belong in the other directory.
+  //
+  // A name-only check cannot tell those apart: the legacy top-level copy of
+  // `Default/Cookies` has exactly the same HMAC name as its new home under
+  // `device-local/`, so it counted as valid and survived — still syncing.
+  let mut valid_top: HashSet<String> = HashSet::new();
+  let mut valid_local: HashSet<String> = HashSet::new();
+  for relpath in &current_paths {
+    let name = hmac_filename(key, relpath);
+    if crate::sync::manifest::device_local_globset().is_match(relpath) {
+      valid_local.insert(name);
+    } else {
+      valid_top.insert(name);
+    }
+  }
 
-  for entry in std::fs::read_dir(encrypted_dir)?.flatten() {
-    let path = entry.path();
-    if !path.is_file() {
-      continue;
-    }
-    let name = match path.file_name().and_then(|n| n.to_str()) {
-      Some(n) => n.to_string(),
-      None => continue,
-    };
-    if name == VERIFY_FILE_NAME {
-      continue;
-    }
-    if !valid_names.contains(&name) {
-      let _ = std::fs::remove_file(&path);
+  for (dir, valid) in [
+    (encrypted_dir.to_path_buf(), &valid_top),
+    (encrypted_dir.join(DEVICE_LOCAL_SUBDIR), &valid_local),
+  ]
+  .iter()
+  .filter(|(d, _)| d.exists())
+  {
+    for entry in std::fs::read_dir(dir)?.flatten() {
+      let path = entry.path();
+      if !path.is_file() {
+        continue;
+      }
+      let name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n.to_string(),
+        None => continue,
+      };
+      if name == VERIFY_FILE_NAME {
+        continue;
+      }
+      if !valid.contains(&name) {
+        let _ = std::fs::remove_file(&path);
+      }
     }
   }
 
@@ -324,9 +402,17 @@ pub fn rekey_profile_dir(
   new_key: &[u8; 32],
   encrypted_dir: &Path,
 ) -> PasswordResult<()> {
-  let entries: Vec<_> = std::fs::read_dir(encrypted_dir)?
+  // Both levels of the tree. Missing the device-local subdirectory here would
+  // leave its files encrypted under the OLD key while the verifier says the new
+  // one — so the profile becomes permanently unopenable, reported as "invalid
+  // password".
+  let mut entries: Vec<_> = std::fs::read_dir(encrypted_dir)?
     .filter_map(|r| r.ok())
     .collect();
+  let local_dir = encrypted_dir.join(DEVICE_LOCAL_SUBDIR);
+  if local_dir.exists() {
+    entries.extend(std::fs::read_dir(&local_dir)?.filter_map(|r| r.ok()));
+  }
 
   let mut decrypted: Vec<(String, Vec<u8>)> = Vec::new();
   for entry in &entries {
@@ -356,7 +442,10 @@ pub fn rekey_profile_dir(
 
   for (relpath, content) in decrypted {
     let encrypted = encrypt_profile_file(new_key, &relpath, &content)?;
-    let on_disk = encrypted_dir.join(hmac_filename(new_key, &relpath));
+    let on_disk = on_disk_path(new_key, encrypted_dir, &relpath);
+    if let Some(parent) = on_disk.parent() {
+      std::fs::create_dir_all(parent)?;
+    }
     atomic_write(&on_disk, &encrypted)?;
   }
 

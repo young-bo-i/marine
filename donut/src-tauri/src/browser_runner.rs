@@ -4,11 +4,13 @@ use crate::cloud_auth::CLOUD_AUTH;
 use crate::downloaded_browsers_registry::DownloadedBrowsersRegistry;
 use crate::events;
 use crate::platform_browser;
+use crate::portable_cookies::ExitKind;
 use crate::profile::{BrowserProfile, ProfileManager};
 use crate::proxy_manager::PROXY_MANAGER;
 use crate::wayfern_manager::{WayfernConfig, WayfernManager};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::System;
 
@@ -632,6 +634,17 @@ impl BrowserRunner {
         );
       }
 
+      // A new browser session starts here, on every launch path — including the
+      // URL-open cold start, which reaches this function without going through
+      // `launch_browser_profile_impl_with_restore`. Clearing the stop-export
+      // latch there only meant a profile opened by URL never exported again.
+      // AFTER the launch, deliberately: clearing it before would reopen the
+      // double-export race the latch exists to close.
+      crate::portable_cookies::note_launch(
+        &updated_profile.id.to_string(),
+        &ProfileManager::instance().get_profiles_dir(),
+      );
+      clear_stop_export_latch(&updated_profile.id.to_string());
       return Ok(updated_profile);
     }
 
@@ -1051,6 +1064,17 @@ impl BrowserRunner {
         );
       }
 
+      // A new browser session starts here, on every launch path — including the
+      // URL-open cold start, which reaches this function without going through
+      // `launch_browser_profile_impl_with_restore`. Clearing the stop-export
+      // latch there only meant a profile opened by URL never exported again.
+      // AFTER the launch, deliberately: clearing it before would reopen the
+      // double-export race the latch exists to close.
+      crate::portable_cookies::note_launch(
+        &updated_profile.id.to_string(),
+        &ProfileManager::instance().get_profiles_dir(),
+      );
+      clear_stop_export_latch(&updated_profile.id.to_string());
       return Ok(updated_profile);
     }
 
@@ -2104,6 +2128,15 @@ impl BrowserRunner {
       }
 
       let mut process_actually_stopped = false;
+      // Assume the worst until the stop path says otherwise. An export that
+      // wrongly believes the browser closed cleanly reads every not-yet-flushed
+      // cookie as a deletion and propagates that logout to every machine.
+      let mut wayfern_exit = ExitKind::Unclean;
+      // Did this path actually watch the browser stop? When the process was
+      // already gone, `wayfern_exit` is a placeholder, not an observation —
+      // latching on it would suppress the status sweep's evidence-based export
+      // and replace it with a fabricated "unclean".
+      let mut observed_exit = false;
       match self
         .wayfern_manager
         .find_wayfern_by_profile(&profile_path_str)
@@ -2117,7 +2150,15 @@ impl BrowserRunner {
           );
 
           match self.wayfern_manager.stop_wayfern(&wayfern_process.id).await {
-            Ok(_) => {
+            Ok(closed_itself) => {
+              // Whether Chromium shut itself down decides whether the cookie
+              // store on disk is complete. See `export_portable_login_state`.
+              wayfern_exit = if closed_itself {
+                ExitKind::Clean
+              } else {
+                ExitKind::Unclean
+              };
+              observed_exit = true;
               if let Some(pid) = wayfern_process.processId {
                 // Verify the process actually died by checking after a short delay
                 use tokio::time::{sleep, Duration};
@@ -2389,6 +2430,27 @@ impl BrowserRunner {
           "Successfully emitted profile-running-changed event for Wayfern {}: running={}",
           updated_profile.name,
           payload.is_running
+        );
+      }
+
+      // Capture login state before anything else touches the directory, and
+      // before `mark_profile_stopped` (in the caller) releases the queued sync —
+      // an upload that runs first would carry the previous export. It also has to
+      // precede `complete_after_quit_and_wait` below: for a password-protected
+      // profile the readable cookie store only exists in the ephemeral directory,
+      // and re-encryption tears that down.
+      if observed_exit {
+        export_portable_login_state(profile, wayfern_exit);
+        if let Ok(mut set) = STOP_ALREADY_EXPORTED.lock() {
+          set.insert(profile.id.to_string());
+        }
+      } else {
+        // The process was already gone when we looked. We know nothing about how
+        // it ended, so leave it to the status sweep, which reads Chromium's own
+        // marker.
+        log::debug!(
+          "Profile {}: no live browser to stop; leaving the export to the status checker",
+          profile.name
         );
       }
 
@@ -2832,17 +2894,42 @@ impl BrowserRunner {
       .find(|p| p.id.to_string() == profile_id)
       .ok_or_else(|| format!("Profile '{profile_id}' not found"))?;
 
-    if profile.is_cross_os() {
-      return Err(format!(
-        "Cannot open URL with profile '{}': this profile was created on {} and cannot be used on a different operating system",
-        profile.name,
-        profile.host_os.as_deref().unwrap_or("another OS"),
-      ));
-    }
-
     log::info!("Opening URL '{url}' with profile '{profile_id}'");
 
-    // Use launch_or_open_url which handles both launching new instances and opening in existing ones
+    // A cold start here goes through the SAME path as pressing launch.
+    //
+    // This used to call `launch_or_open_url` directly, which skips everything
+    // `launch_browser_profile_impl_with_restore` does first: adopting a
+    // profile from another OS, refusing to open a cookie store this machine
+    // would destroy, and — the one that always bit — injecting the portable
+    // login state. So a profile opened by URL came up logged out, and because
+    // the browser then wrote a store of its own, the state looked normal
+    // afterwards. The cross-OS refusal that used to live here is gone with the
+    // same change: adoption handles it.
+    //
+    // When the browser is already running the cookies went in at its launch,
+    // so opening another tab needs none of that.
+    let already_running = self
+      .check_browser_status(app_handle.clone(), &profile)
+      .await
+      .unwrap_or(false);
+    if !already_running {
+      return launch_browser_profile_impl(
+        app_handle,
+        profile.clone(),
+        Some(url.clone()),
+        None,
+        false,
+        false,
+      )
+      .await
+      .map(|_| ())
+      .map_err(|e| {
+        log::error!("Failed to open URL '{url}' with profile '{profile_id}': {e}");
+        e
+      });
+    }
+
     self
       .launch_or_open_url(app_handle, &profile, Some(url.clone()), None)
       .await
@@ -3090,11 +3177,16 @@ pub async fn launch_browser_profile_impl(
 
 /// Make a profile created elsewhere belong to this machine, then hand it back.
 ///
+/// Only the fingerprint identity moves here. The browser FILES are not this
+/// function's job any more — ordinary sync carries them for cross-OS profiles
+/// like any other (see `SyncEngine::sync_profile`), so by the time a launch
+/// reaches this point the directory is already populated.
+///
 /// Three fields move together; each one left behind breaks the launch in its own
 /// way:
 ///
-/// * `host_os` decides `is_cross_os()`, which fourteen Rust call sites and six
-///   frontend ones consult. Flipping it is what actually opens the door.
+/// * `host_os` decides `is_cross_os()`. Flipping it is what actually opens the
+///   door.
 /// * `wayfern_config.os` is the fallback `resolved_os()` reads, so leaving it
 ///   means the old OS gets picked straight back up.
 /// * the stored fingerprint has to go. Wayfern's own binary refuses
@@ -3108,9 +3200,19 @@ pub async fn launch_browser_profile_impl(
 /// ordinary reinstall. A profile insisting it is a Mac while its WebGL reports a
 /// Windows GPU is the kind of contradiction detectors look for.
 ///
-/// Cookies are copied aside first: Chromium **deletes** cookies it cannot
-/// decrypt rather than reporting an error, so if this host's browser disagrees
-/// about key derivation the logins would be gone with nothing to restore from.
+/// # Ordering
+///
+/// The pull runs BEFORE `host_os` is written, and that order is the whole point.
+/// Writing it first made adoption a one-shot: `is_cross_os()` went false the
+/// instant the field hit disk, so a failed pull meant the next launch skipped
+/// adoption entirely and handed Chromium a near-empty directory — while the
+/// error told the user to check their connection and try again, down a path that
+/// no longer did anything. Leaving `host_os` alone until the files are verifiably
+/// here keeps every retry a real retry.
+///
+/// `updated_at` is bumped so the adoption survives `merge_profile_metadata_lww`;
+/// without it a newer remote copy puts the origin machine's `wayfern_config`
+/// straight back and nothing is left to clear it again.
 async fn adopt_profile_onto_this_host(
   app_handle: &tauri::AppHandle,
   profile: &BrowserProfile,
@@ -3119,9 +3221,76 @@ async fn adopt_profile_onto_this_host(
   let manager = ProfileManager::instance();
   let profiles_dir = manager.get_profiles_dir();
 
+  // Make sure this machine actually has something to open before claiming the
+  // profile.
+  //
+  // "Has something" is deliberately either the browser files OR the portable
+  // login blob — a profile whose directory is empty but whose sessions are in
+  // the blob comes up fully logged in, because Chromium creates a fresh store
+  // and the restore fills it. Demanding files there would refuse a launch that
+  // works perfectly.
+  if !profile_has_browser_files(profile, &profiles_dir)
+    || transfer_unfinished(profile, &profiles_dir)
+  {
+    // Nothing here yet, so pull. Normally the periodic sync already did this
+    // and we never reach the pull at all; it stays because "sync has run at
+    // least once for this profile" is not something a launch can assume — the
+    // profile may have appeared seconds ago.
+    let engine = crate::sync::SyncEngine::create_from_settings(app_handle)
+      .await
+      .map_err(|e| {
+        serde_json::json!({
+          "code": "PROFILE_ADOPTED_BUT_NOT_SYNCED",
+          "params": { "message": e.to_string() }
+        })
+        .to_string()
+      })?;
+    engine
+      .sync_profile(app_handle, profile)
+      .await
+      .map_err(|e| {
+        log::error!(
+          "Could not pull files for {} before adopting: {e}",
+          profile.name
+        );
+        serde_json::json!({
+          "code": "PROFILE_ADOPTED_BUT_NOT_SYNCED",
+          "params": { "message": e.to_string() }
+        })
+        .to_string()
+      })?;
+
+    // `Ok(())` is not proof anything moved. `sync_profile` returns success while
+    // transferring nothing in at least two ordinary situations: the profile is
+    // held by another device's team lock, and the remote has no manifest yet.
+    // Adopting on top of that produces the exact failure this path exists to
+    // prevent — a browser that opens on an empty directory and presents zero
+    // logins, indistinguishable from "the cookies were destroyed". Check the
+    // directory, not the return value.
+    if !profile_has_restorable_state(profile, &profiles_dir) {
+      log::error!(
+        "Refusing to adopt {}: sync reported success but nothing arrived",
+        profile.name
+      );
+      return Err(
+        serde_json::json!({
+          "code": "PROFILE_ADOPTED_BUT_NOT_SYNCED",
+          "params": { "message": "no browser files or login state arrived" }
+        })
+        .to_string(),
+      );
+    }
+  }
+
+  // Only now does the profile become ours. Cookies are copied aside first:
+  // Chromium **deletes** cookies it cannot decrypt rather than reporting an
+  // error. In the common cross-OS case there is nothing here to back up (the
+  // encrypted store is device-local and never synced); it fires in the ping-pong
+  // case, where this host launched the profile before and another machine has
+  // since flipped `host_os` back.
   match crate::cookie_manager::CookieManager::back_up_cookie_store(profile, &profiles_dir) {
     Ok(Some(path)) => log::info!("Adopting {}: cookies backed up to {path}", profile.name),
-    Ok(None) => log::info!("Adopting {}: no cookie store to back up yet", profile.name),
+    Ok(None) => log::info!("Adopting {}: no cookie store to back up", profile.name),
     // A failed backup must not block the launch the operator asked for, but it
     // does change the stakes, so say so loudly.
     Err(e) => log::warn!("Adopting {} without a cookie backup: {e}", profile.name),
@@ -3136,6 +3305,9 @@ async fn adopt_profile_onto_this_host(
     // in `~/.wayfern/`; letting it mint one implicitly on launch does not.
     cfg.randomize_fingerprint_on_launch = Some(false);
   }
+  // Adoption is a real edit, not bookkeeping: it has to win the next LWW merge
+  // against the origin machine's copy, or the foreign `wayfern_config` returns.
+  adopted.updated_at = Some(crate::proxy_manager::now_secs());
   manager
     .save_profile(&adopted)
     .map_err(|e| format!("could not adopt profile onto {host}: {e}"))?;
@@ -3149,43 +3321,63 @@ async fn adopt_profile_onto_this_host(
     log::warn!("Adopted profile but could not notify the UI: {e}");
   }
 
-  // Now pull the browser files, and do not launch without them.
-  //
-  // Cross-OS profiles only ever synced their metadata, so at this point the
-  // directory holds `metadata.json` and nothing else. Launching here would hand
-  // Chromium an empty directory: it would create a fresh profile, open cleanly,
-  // and present zero logins — indistinguishable from "the cookies were
-  // destroyed", which is the wrong thing to conclude and the wrong thing to act
-  // on. Flipping `host_os` above is what makes the full-file sync eligible in
-  // the first place; this is where it gets used.
-  //
-  // Failing closed matters as much as syncing: a freshly-created empty profile
-  // is not empty enough to trip the manifest's "local has nothing, download
-  // everything" guard, so once it has files of its own the newer mtimes can win
-  // the conflict and overwrite the good copy on the server.
-  let engine = crate::sync::SyncEngine::create_from_settings(app_handle)
-    .await
-    .map_err(|e| {
-      serde_json::json!({
-        "code": "PROFILE_ADOPTED_BUT_NOT_SYNCED",
-        "params": { "message": e.to_string() }
-      })
-      .to_string()
-    })?;
-  engine
-    .sync_profile(app_handle, &adopted)
-    .await
-    .map_err(|e| {
-      log::error!("Adopted {} but could not pull its files: {e}", adopted.name);
-      serde_json::json!({
-        "code": "PROFILE_ADOPTED_BUT_NOT_SYNCED",
-        "params": { "message": e.to_string() }
-      })
-      .to_string()
-    })?;
-  log::info!("Pulled browser files for adopted profile {}", adopted.name);
-
   Ok(adopted)
+}
+
+/// Are the browser's own files on disk here?
+///
+/// This is the only thing that lets a launch SKIP the pull. The portable blob
+/// deliberately does not count: a profile whose directory is empty would launch
+/// on a brand-new Chromium tree, and those freshly written files then carry
+/// newer mtimes than the good remote copy and win the next conflict — the
+/// profile's real history overwritten by a blank one. When the files are absent
+/// we pull, and only then does the blob get a say (see
+/// `profile_has_restorable_state`).
+///
+/// Also refuses a tree the transfer never finished. `.donut-sync/resume-state.json`
+/// exists only while a transfer has work outstanding and is removed on a clean
+/// run, so its presence means the directory is a partial download that would
+/// otherwise look populated enough to skip the pull.
+fn profile_has_browser_files(profile: &BrowserProfile, profiles_dir: &Path) -> bool {
+  let data = profile.get_profile_data_path(profiles_dir);
+  let Ok(entries) = std::fs::read_dir(&data) else {
+    return false;
+  };
+  entries.flatten().any(|e| {
+    e.file_name()
+      .to_str()
+      .is_some_and(|n| !n.starts_with('.') && n != "metadata.json")
+  })
+}
+
+/// Did a transfer for this profile leave work outstanding?
+///
+/// `.donut-sync/resume-state.json` exists only while files are still to move, so
+/// its presence means the tree is a partial download that would otherwise look
+/// populated enough to skip the pull.
+///
+/// Deliberately consulted ONLY when deciding whether to skip the pull, never
+/// when deciding whether the pull delivered anything. Folding it into the latter
+/// made a stray marker — one left by an older build, or by a crash between the
+/// last file and the cleanup — refuse every future launch of the profile
+/// permanently, with an error telling the user to check their sync connection.
+fn transfer_unfinished(profile: &BrowserProfile, profiles_dir: &Path) -> bool {
+  profiles_dir
+    .join(profile.id.to_string())
+    .join(".donut-sync")
+    .join("resume-state.json")
+    .exists()
+}
+
+/// Does this machine hold anything that makes launching this profile meaningful?
+///
+/// Checked only AFTER a pull, to decide whether the pull actually delivered
+/// anything. Either is enough: the browser files, or the portable blob on its
+/// own — Chromium will accept the sessions into a store it creates from scratch,
+/// so a blob-only profile comes up fully logged in.
+fn profile_has_restorable_state(profile: &BrowserProfile, profiles_dir: &Path) -> bool {
+  crate::portable_cookies::path_for(&profile.id.to_string(), profiles_dir).exists()
+    || profile_has_browser_files(profile, profiles_dir)
 }
 
 async fn launch_browser_profile_impl_with_restore(
@@ -3228,25 +3420,67 @@ async fn launch_browser_profile_impl_with_restore(
   // every account being logged out with the evidence already gone. Measured on
   // a macOS-written store opened under Windows Wayfern.
   //
+  // What that costs depends entirely on whether the sessions exist anywhere
+  // else. With a portable blob on disk they do, so the encrypted store and its
+  // foreign key are simply cleared and the sessions go back in over CDP after
+  // launch (`portable_cookies`). Without one, the store is the only copy and
+  // opening it is destructive, so the launch is refused instead.
+  //
   // The check runs here rather than at adoption because adoption happens before
   // the browser files arrive: at that moment there is no cookie store to test.
+  //
+  // Whether to re-inject the portable login state is decided HERE too, not after
+  // the launch, even though the injection itself needs a live CDP endpoint. The
+  // decision compares the blob's export time against the local store's mtime,
+  // and Chromium rewrites that store while starting up — asking afterwards
+  // returns "the local copy is newer" every single time, and the sessions would
+  // never go in.
+  let mut restore_plan: Option<crate::portable_cookies::PortableCookieStore> = None;
   if profile.browser == "wayfern" {
     let profiles_dir = ProfileManager::instance().get_profiles_dir();
-    match crate::cookie_manager::CookieManager::host_can_read_cookie_store(&profile, &profiles_dir)
-    {
-      Ok(true) => {}
+    let host_can_read = match crate::cookie_manager::CookieManager::host_can_read_cookie_store(
+      &profile,
+      &profiles_dir,
+    ) {
+      Ok(true) => true,
       Ok(false) => {
-        log::error!(
-          "Refusing to launch {}: this build cannot decrypt the profile's cookie store, and \
-           opening it would make Chromium delete every cookie in it",
-          profile.name
+        let recoverable = matches!(
+          crate::portable_cookies::load(&profile, &profiles_dir),
+          Ok(Some(ref s)) if !s.cookies.is_empty()
         );
-        return Err(serde_json::json!({ "code": "COOKIE_STORE_UNREADABLE_HERE" }).to_string());
+        if !recoverable {
+          log::error!(
+            "Refusing to launch {}: this build cannot decrypt the profile's cookie store, there \
+               is no portable login state to restore from, and opening it would make Chromium \
+               delete every cookie in it",
+            profile.name
+          );
+          return Err(serde_json::json!({ "code": "COOKIE_STORE_UNREADABLE_HERE" }).to_string());
+        }
+        log::warn!(
+          "Profile {}: cookie store is unreadable on this machine; clearing it and its foreign \
+             key, sessions will be restored from {} after launch",
+          profile.name,
+          crate::portable_cookies::FILE_NAME
+        );
+        if let Err(e) = crate::portable_cookies::clear_foreign_cookie_state(&profile, &profiles_dir)
+        {
+          // Launching over a foreign key would hand the outcome to a
+          // third-party binary's behaviour on another platform. Refuse rather
+          // than guess.
+          log::error!("Profile {}: {e}", profile.name);
+          return Err(serde_json::json!({ "code": "COOKIE_STORE_UNREADABLE_HERE" }).to_string());
+        }
+        false
       }
       // A failed check is not a reason to block a launch that would otherwise
       // work; log it and let the operator through.
-      Err(e) => log::warn!("Could not verify {}'s cookie store: {e}", profile.name),
-    }
+      Err(e) => {
+        log::warn!("Could not verify {}'s cookie store: {e}", profile.name);
+        true
+      }
+    };
+    restore_plan = crate::portable_cookies::plan_restore(&profile, &profiles_dir, host_can_read);
   }
 
   let browser_runner = BrowserRunner::instance();
@@ -3425,6 +3659,21 @@ async fn launch_browser_profile_impl_with_restore(
     updated_profile.id
   );
 
+  // Hand the browser its sessions back.
+  //
+  // The decision was made before the launch (see `restore_plan` above); only the
+  // injection has to wait, because it goes in over CDP and CDP only exists once
+  // the browser is up. That is the whole point: the receiving browser encrypts
+  // every value under its own key, so no ciphertext and no key derivation ever
+  // has to cross machines. See `portable_cookies`.
+  //
+  // Awaited rather than spawned: automation navigates as soon as this returns,
+  // and a page loaded before its cookies are in place is a logged-out page.
+  if let Some(plan) = restore_plan {
+    let profiles_dir = ProfileManager::instance().get_profiles_dir();
+    crate::portable_cookies::apply(&updated_profile, &profiles_dir, &plan).await;
+  }
+
   // Now update the proxy with the correct PID if we have one
   if let Some(actual_pid) = updated_profile.process_id {
     // Update the proxy manager with the correct PID (we always started with temp pid 1 for non-Camoufox)
@@ -3432,6 +3681,73 @@ async fn launch_browser_profile_impl_with_restore(
   }
 
   Ok(updated_profile)
+}
+
+/// Snapshot the profile's login state in OS-neutral form.
+///
+/// Called from both stop paths — the explicit kill and the status checker's
+/// natural-exit branch — and always before the queued sync is released, so what
+/// gets uploaded is this session's cookies rather than the previous export's.
+/// Best-effort by design: a profile whose export failed still stopped
+/// correctly, and the next stop tries again.
+///
+/// `exit` decides whether a cookie missing from the store counts as a logout or
+/// as an unflushed write, so passing `Clean` for a force-kill would log the user
+/// out of every site on every crash. Only pass it when the browser was observed
+/// to shut down normally.
+/// Profiles whose stop was already exported by the app-driven kill path.
+///
+/// The status sweep runs every few seconds and fires on the same transition the
+/// kill path just handled — `last_running_states` is task-local and nothing in
+/// the kill path clears it, so the sweep sees running -> stopped for a process
+/// the app itself stopped. Without this latch that second export re-reads the
+/// SAME unchanged database and, believing the exit was clean, tombstones every
+/// cookie the first export had carried forward. No crash required; it is
+/// deterministic on any force-kill.
+static STOP_ALREADY_EXPORTED: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+  std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// Called by the launch path so a fresh session can be exported again.
+pub(crate) fn clear_stop_export_latch(profile_id: &str) {
+  if let Ok(mut set) = STOP_ALREADY_EXPORTED.lock() {
+    set.remove(profile_id);
+  }
+}
+
+/// Export unless the app-driven stop already did it for this session.
+///
+/// Returns whether anything was attempted, so the caller can log honestly.
+pub(crate) fn export_portable_login_state_if_unclaimed(
+  profile: &BrowserProfile,
+  exit: ExitKind,
+) -> bool {
+  let id = profile.id.to_string();
+  if STOP_ALREADY_EXPORTED
+    .lock()
+    .map(|s| s.contains(&id))
+    .unwrap_or(false)
+  {
+    log::debug!(
+      "Profile {}: stop already exported by the kill path, not exporting again",
+      profile.name
+    );
+    return false;
+  }
+  export_portable_login_state(profile, exit);
+  true
+}
+
+pub(crate) fn export_portable_login_state(profile: &BrowserProfile, exit: ExitKind) {
+  if profile.browser != "wayfern" {
+    return;
+  }
+  let profiles_dir = ProfileManager::instance().get_profiles_dir();
+  if let Err(e) = crate::portable_cookies::export(profile, &profiles_dir, exit) {
+    log::warn!(
+      "Profile {}: could not export portable login state: {e}",
+      profile.name
+    );
+  }
 }
 
 #[tauri::command]

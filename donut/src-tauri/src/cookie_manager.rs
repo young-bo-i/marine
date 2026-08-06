@@ -261,6 +261,43 @@ impl CookieManager {
     network
   }
 
+  /// Same, for callers that already resolved which directory the profile is
+  /// actually running from. An ephemeral or password-protected profile does not
+  /// keep its live store under `profiles/<id>/profile`.
+  pub fn chromium_cookie_db_path_at(profile_data_path: &Path) -> PathBuf {
+    Self::wayfern_cookie_path(profile_data_path)
+  }
+
+  /// [`Self::read_all_cookies`] against an explicit data directory.
+  ///
+  /// Exists for the same reason as `chromium_cookie_db_path_at`: for a
+  /// password-protected profile the on-disk `profiles/<id>/profile` tree is flat
+  /// HMAC-named ciphertext with no `Default/Cookies` in it, and the only readable
+  /// copy is in the ephemeral directory the browser runs from.
+  pub fn read_all_cookies_at(
+    profile: &BrowserProfile,
+    profile_data_path: &Path,
+  ) -> Result<(Vec<UnifiedCookie>, usize), String> {
+    match profile.browser.as_str() {
+      "camoufox" => {
+        let db = profile_data_path.join("cookies.sqlite");
+        if !db.exists() {
+          return Err(format!("Cookie database not found at: {}", db.display()));
+        }
+        Ok((Self::read_firefox_cookies(&db)?, 0))
+      }
+      "wayfern" => {
+        let db = Self::wayfern_cookie_path(profile_data_path);
+        if !db.exists() {
+          return Err(format!("Cookie database not found at: {}", db.display()));
+        }
+        let key = chrome_decrypt::get_encryption_key(profile_data_path, profile.resolved_os());
+        Self::read_chrome_cookies(&db, key.as_ref())
+      }
+      _ => Err(format!("Unsupported browser type: {}", profile.browser)),
+    }
+  }
+
   /// Get the cookie database path for a profile (read-side: errors if missing).
   fn get_cookie_db_path(profile: &BrowserProfile, profiles_dir: &Path) -> Result<PathBuf, String> {
     let profile_data_path = profile.get_profile_data_path(profiles_dir);

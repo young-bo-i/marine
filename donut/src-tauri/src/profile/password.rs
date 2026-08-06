@@ -954,7 +954,16 @@ mod tests {
     // The on-disk encrypted dir was still updated
     let key = get_cached_key(&profile.id).unwrap();
     let cookies_name = crate::profile::encryption::hmac_filename(&key, "Default/Cookies");
-    let cipher = std::fs::read(plain_dir.join(&cookies_name)).unwrap();
+    // `Default/Cookies` is device-local, so its ciphertext lives in the
+    // subdirectory sync is told to skip — see `DEVICE_LOCAL_SUBDIR`. It is still
+    // encrypted with the same key under the same HMAC'd name; only the directory
+    // moved.
+    let cipher = std::fs::read(
+      plain_dir
+        .join(crate::profile::encryption::DEVICE_LOCAL_SUBDIR)
+        .join(&cookies_name),
+    )
+    .unwrap();
     let (path, content) = crate::profile::encryption::decrypt_profile_file(&key, &cipher).unwrap();
     assert_eq!(path, "Default/Cookies");
     assert_eq!(content, b"new-bytes");

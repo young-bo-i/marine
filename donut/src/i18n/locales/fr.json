@@ -1119,9 +1119,8 @@
     }
   },
   "crossOs": {
-    "viewOnly": "Ce profil a été créé sur {{os}} et n'est pas pris en charge sur ce système",
-    "cannotLaunch": "Ce profil a été créé sur {{os}} et n'est pas pris en charge sur ce système",
-    "cannotModify": "Impossible de modifier les paramètres de synchronisation d'un profil d'un autre système d'exploitation",
+    "viewOnly": "Créé sur {{os}}. Le lancer ici l'adopte sur cette machine et restaure ses connexions.",
+    "cannotModify": "Les paramètres de synchronisation de ce profil sont gérés sur la machine qui l'a créé",
     "adoptHint": "Créé sur {{os}}. Le lancement l'adopte sur cette machine : les cookies sont d'abord sauvegardés et une nouvelle empreinte est générée pour ce système.",
     "adoptHintUnknownOs": "Créé sur un autre système. Le lancement l'adopte sur cette machine : les cookies sont d'abord sauvegardés et une nouvelle empreinte est générée."
   },
@@ -1841,13 +1840,12 @@
     "marineDiscoveryEmptyPlan": "Choisissez au moins un profil et une plateforme.",
     "marineDiscoveryEmptyKeyword": "Saisissez un mot-clé de recherche.",
     "marineDiscoveryProfileNotFound": "L'un des profils sélectionnés n'existe plus.",
-    "marineDiscoveryProfileCrossOs": "Le profil « {{name}} » a été créé sur un autre système d'exploitation et ne peut pas s'exécuter ici. Créez un nouveau profil sur cette machine et reconnectez-vous.",
     "cookieDecryptFailed": "Impossible de déchiffrer {{count}} cookie(s) : la clé de chiffrement ne correspond pas à ce magasin. L'export ne produirait que des noms de cookies sans session, l'opération a donc été interrompue.",
     "profileNeverLaunched": "Ce profil n'a jamais été lancé, il n'a donc pas encore de magasin de cookies. Lancez le navigateur une fois puis fermez-le, et réessayez.",
     "profileIsRunning": "Fermez le navigateur avant d'adopter ce profil.",
     "profileAlreadyLocal": "Ce profil appartient déjà à cette machine.",
     "marineProfileLeasedElsewhere": "Un autre appareil pilote actuellement ce profil. L'exécuter ici aussi ferait publier les deux sous le même contenu.",
-    "cookieStoreUnreadableHere": "Le navigateur de cette machine ne peut pas déchiffrer les cookies de ce profil. L'ouvrir les supprimerait tous — Chromium efface les cookies qu'il ne peut pas lire au lieu de signaler une erreur. Le profil n'a pas été modifié ; migrez les sessions vers un profil créé sur cette machine.",
+    "cookieStoreUnreadableHere": "Le navigateur de cette machine ne peut pas déchiffrer les cookies de ce profil, et aucun état de connexion portable n'est disponible pour le restaurer. L'ouvrir supprimerait tous ses cookies : Chromium efface les cookies qu'il ne peut pas lire au lieu de signaler une erreur. Le lancement a été bloqué et le profil est intact. Ouvrez puis fermez ce profil une fois sur la machine qui possède encore ses sessions : cela écrit une copie indépendante du système, qui se synchronise ici.",
     "profileAdoptedButNotSynced": "Ce profil appartient désormais à cette machine, mais ses données de navigateur n'ont pas pu être téléchargées ; il n'a donc pas été lancé — le démarrer vide aurait créé un profil sans aucune session. Vérifiez la synchronisation et réessayez. ({{detail}})"
   },
   "rail": {

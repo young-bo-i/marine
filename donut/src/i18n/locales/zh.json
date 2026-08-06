@@ -1119,9 +1119,8 @@
     }
   },
   "crossOs": {
-    "viewOnly": "此配置文件在 {{os}} 上创建，不受此系统支持",
-    "cannotLaunch": "此配置文件在 {{os}} 上创建，不受此系统支持",
-    "cannotModify": "无法修改跨操作系统配置文件的同步设置",
+    "viewOnly": "在 {{os}} 上创建。在本机启动会自动接管到这台机器，并恢复它的登录态。",
+    "cannotModify": "这个配置文件的同步设置由创建它的那台机器管理",
     "adoptHint": "在 {{os}} 上创建。启动时会自动接管到本机——先备份 cookie，并为本系统生成新的指纹。",
     "adoptHintUnknownOs": "在其他操作系统上创建。启动时会自动接管到本机——先备份 cookie，并生成新的指纹。"
   },
@@ -1841,13 +1840,12 @@
     "marineDiscoveryEmptyPlan": "请至少选择一个配置文件和一个平台。",
     "marineDiscoveryEmptyKeyword": "请填写搜索关键词。",
     "marineDiscoveryProfileNotFound": "所选配置文件中有一个已不存在。",
-    "marineDiscoveryProfileCrossOs": "配置文件「{{name}}」是在其他操作系统上创建的，无法在这里运行。请在本机新建一个配置文件并重新登录。",
     "cookieDecryptFailed": "有 {{count}} 条 cookie 解密失败——加密密钥和这个 cookie 库对不上。继续导出只会得到一堆有名字没有登录态的 cookie，所以已中止。",
     "profileNeverLaunched": "这个配置文件从未启动过，还没有 cookie 库。请先启动一次浏览器并关闭，然后重试。",
     "profileIsRunning": "接管前请先关闭浏览器。",
     "profileAlreadyLocal": "这个配置文件已经属于本机了。",
     "marineProfileLeasedElsewhere": "另一台设备正在驱动这个配置文件。本机同时跑会导致两边在同一条内容下重复发言。",
-    "cookieStoreUnreadableHere": "本机浏览器解不开这个配置文件的 cookie。直接打开会把里面的 cookie 全部删掉——Chromium 对读不了的 cookie 是删除而不是报错。已阻止启动、配置文件未被改动；请改用在本机创建的配置文件并迁移登录态。",
+    "cookieStoreUnreadableHere": "本机浏览器解不开这个配置文件的 cookie，也没有可移植的登录态可以恢复。直接打开会把里面的 cookie 全部删掉——Chromium 对读不了的 cookie 是删除而不是报错。已阻止启动、配置文件未被改动。请在还有登录态的那台机器上把这个配置文件开一次再关掉：那会写出一份与系统无关的副本并同步过来。",
     "profileAdoptedButNotSynced": "配置文件已归到本机，但浏览器数据没能下载下来，所以没有启动——空着启动会建出一个没有任何登录态的新配置文件。请检查同步连接后重试。（{{detail}}）"
   },
   "rail": {

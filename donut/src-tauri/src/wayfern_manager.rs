@@ -1291,11 +1291,17 @@ impl WayfernManager {
     })
   }
 
+  /// 关掉一个实例，并**说清楚它是怎么没的**。
+  ///
+  /// 返回 `true` 表示浏览器自己优雅退出了。调用方需要这个区分：优雅退出时磁盘上
+  /// 的 cookie 库是完整的，「库里没有」就等于「被删了」；强杀之后「库里没有」只
+  /// 说明没来得及落盘。把这两件事搞混，代价是每崩一次就把所有站点登出一遍。
   pub async fn stop_wayfern(
     &self,
     id: &str,
-  ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+  ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut inner = self.inner.lock().await;
+    let mut exited_cleanly = false;
 
     if let Some(instance) = inner.instances.remove(id) {
       log::info!("Cleaning up Wayfern instance {}", instance.id);
@@ -1312,6 +1318,7 @@ impl WayfernManager {
         Some(port) => self.close_browser_via_cdp(port, instance.process_id).await,
         None => false,
       };
+      exited_cleanly = closed_itself;
 
       if let Some(pid) = instance.process_id {
         if closed_itself {
@@ -1342,7 +1349,7 @@ impl WayfernManager {
       }
     }
 
-    Ok(())
+    Ok(exited_cleanly)
   }
 
   /// Ask the browser to close itself, and wait for the process to actually go.
@@ -1350,6 +1357,23 @@ impl WayfernManager {
   /// Returns whether it exited on its own. `Browser.close` is sent on the
   /// browser-level WebSocket from `/json/version` — the per-page endpoints only
   /// close tabs.
+  /// The browser-level WebSocket from `/json/version`.
+  ///
+  /// Distinct from the per-page endpoints in `/json`: the `Browser.*` and
+  /// `Storage.*` domains only exist here.
+  async fn browser_ws_url(&self, port: u16) -> Option<String> {
+    let url = format!("http://127.0.0.1:{port}/json/version");
+    let resp = tokio::time::timeout(Duration::from_secs(2), self.http_client.get(&url).send())
+      .await
+      .ok()?
+      .ok()?;
+    let body = resp.json::<serde_json::Value>().await.ok()?;
+    body
+      .get("webSocketDebuggerUrl")
+      .and_then(|v| v.as_str())
+      .map(str::to_string)
+  }
+
   async fn close_browser_via_cdp(&self, port: u16, pid: Option<u32>) -> bool {
     /// Long enough for Chromium to flush its profile, short enough that the
     /// between-leg pause absorbs it. Measured shutdowns land near 2 s.
@@ -1359,25 +1383,13 @@ impl WayfernManager {
     const FIRST_POLL: Duration = Duration::from_millis(100);
     const MAX_POLL: Duration = Duration::from_secs(1);
 
-    let version_url = format!("http://127.0.0.1:{port}/json/version");
-    let Ok(Ok(resp)) = tokio::time::timeout(
-      Duration::from_secs(2),
-      self.http_client.get(&version_url).send(),
-    )
-    .await
-    else {
-      return false;
-    };
-    let Ok(body) = resp.json::<serde_json::Value>().await else {
-      return false;
-    };
-    let Some(ws) = body.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) else {
+    let Some(ws) = self.browser_ws_url(port).await else {
       return false;
     };
 
     // The socket dies with the browser, so an error here is as likely to mean
     // "it worked" as "it failed" — the process check below is what decides.
-    let _ = self.send_cdp_command(ws, "Browser.close", json!({})).await;
+    let _ = self.send_cdp_command(&ws, "Browser.close", json!({})).await;
 
     let Some(pid) = pid else {
       // 没有 PID 就无从确认，只能按「没关成」处理，让调用方去强杀。
@@ -1537,6 +1549,181 @@ impl WayfernManager {
       .send_cdp_command(ws, "Page.navigate", json!({ "url": url }))
       .await?;
     Ok(target.id.clone())
+  }
+
+  /// 把可移植登录态灌进正在运行的浏览器。
+  ///
+  /// **为什么必须走 CDP 而不是直接写库**：cookie 库是用 profile 里 `os_crypt_key`
+  /// 那份口令加密的，而各平台构建的派生方式不一样（macOS 24 字节 / 1003 轮 PBKDF2，
+  /// Windows 32 字节且方案未知）。自己写库就等于要先猜对方案，猜错的代价是
+  /// Chromium 把解不开的 cookie **静默删掉**。交给浏览器自己写，就永远不用知道
+  /// 它今天用的是哪一套。
+  ///
+  /// 先试 `Network.setCookies`（页面 target），失败再退到 `Storage.setCookies`
+  /// （browser target）。两个方法接受同一份 `CookieParam`，作用域都是整个
+  /// browser context，所以挂在哪个页签上无所谓。
+  ///
+  /// **为什么要两条路**：Wayfern 二进制自带的付费闸门会拒掉一部分 CDP 方法。
+  /// 实测被拦的是 `Runtime.evaluate` 那一类，`Network.*` 通——但 `Storage.*` 从没
+  /// 验过，反过来也没验过闸门会不会哪天扩到 `Network.*`。这条链路一旦被拦，症状
+  /// 是浏览器起来了、账号全是登出的，跟「本来就没登录」长得一模一样。留一条备用
+  /// 路径比事后从日志里认出这件事便宜得多。
+  ///
+  /// 分批发送：一次几百条 cookie 会把单条 WebSocket 消息撑到几百 KB，而
+  /// `send_cdp_command` 每次都新开连接、整条命令要么全成功要么全失败——一批失败
+  /// 只丢那一批，不会连带丢掉已经灌进去的。
+  pub async fn set_cookies(
+    &self,
+    profile_path: &str,
+    cookies: &[serde_json::Value],
+  ) -> Result<usize, String> {
+    const BATCH: usize = 100;
+
+    let page_ws = self
+      .list_page_targets(profile_path)
+      .await
+      .and_then(|t| t.iter().find_map(|t| t.websocket_debugger_url.clone()));
+    let browser_ws = match self.get_cdp_port(profile_path).await {
+      Some(port) => self.browser_ws_url(port).await,
+      None => None,
+    };
+
+    let mut routes: Vec<(&str, String)> = Vec::new();
+    if let Some(ws) = page_ws {
+      routes.push(("Network.setCookies", ws));
+    }
+    if let Some(ws) = browser_ws {
+      routes.push(("Storage.setCookies", ws));
+    }
+    if routes.is_empty() {
+      return Err("CDP unreachable while restoring cookies".to_string());
+    }
+
+    // Cumulative across routes, never reset.
+    //
+    // Zeroing it per route meant a primary route that placed most of a large set
+    // and then hit one bad batch reported whatever the LAST route managed —
+    // usually 0 — so the caller concluded total failure, skipped the read-back
+    // and skipped the reload, for an injection that had largely succeeded.
+    let mut best = 0usize;
+    let mut first_error: Option<String> = None;
+    for (i, (method, ws)) in routes.iter().enumerate() {
+      let mut applied = 0usize;
+      let mut failed = false;
+      for chunk in cookies.chunks(BATCH) {
+        match self
+          .send_cdp_command(ws, method, json!({ "cookies": chunk }))
+          .await
+        {
+          Ok(_) => applied += chunk.len(),
+          Err(e) => {
+            log::warn!("{method} rejected a batch of {}: {e}", chunk.len());
+            first_error.get_or_insert_with(|| e.to_string());
+            failed = true;
+            // A gated or unsupported method fails identically on every batch;
+            // don't spend a WebSocket round trip per chunk proving it.
+            break;
+          }
+        }
+      }
+      best = best.max(applied);
+      if !failed {
+        if i > 0 {
+          log::info!("Restored cookies via {method} after the primary route failed");
+        }
+        break;
+      }
+    }
+    let applied = best;
+
+    if applied == 0 {
+      return Err(first_error.unwrap_or_else(|| "no cookies were applied".to_string()));
+    }
+    Ok(applied)
+  }
+
+  /// 删掉指定的 cookie（登出传播）。
+  ///
+  /// 没有它的话，可移植登录态就是个只增不减的并集：在一台机器上登出，下次启动会
+  /// 被自己的 blob 原样灌回来，而且不需要第二台机器参与——单机就会复活。
+  pub async fn delete_cookies(
+    &self,
+    profile_path: &str,
+    cookies: &[serde_json::Value],
+  ) -> Result<usize, String> {
+    let Some(ws) = self
+      .list_page_targets(profile_path)
+      .await
+      .and_then(|t| t.iter().find_map(|t| t.websocket_debugger_url.clone()))
+    else {
+      return Err("CDP unreachable while deleting cookies".to_string());
+    };
+    let mut deleted = 0usize;
+    for c in cookies {
+      // `Network.deleteCookies` 一次只吃一条，没有批量形式。
+      match self
+        .send_cdp_command(&ws, "Network.deleteCookies", c.clone())
+        .await
+      {
+        Ok(_) => deleted += 1,
+        Err(e) => log::warn!("Network.deleteCookies failed: {e}"),
+      }
+    }
+    Ok(deleted)
+  }
+
+  /// 浏览器**现在实际持有**的全部 cookie 键（domain, name, path）。
+  ///
+  /// 返回集合而不是计数：调用方要知道的是「哪几条没进去」，不是「进去了几条」。
+  /// 命令返回成功不等于 cookie 被接受 —— `setCookies` 返回的是「消息收到了」，
+  /// 单条被拒（域名不合法、`SameSite=None` 配非 secure、超长等）不会让整条命令
+  /// 失败。而没进去的那几条如果被当成「已应用」，下一次优雅退出就会把它们当成
+  /// 用户主动登出，做成 tombstone 同步出去，在别的机器上把好好的会话删掉。
+  pub async fn live_cookie_keys(
+    &self,
+    profile_path: &str,
+  ) -> Option<std::collections::HashSet<(String, String, String)>> {
+    let ws = self
+      .list_page_targets(profile_path)
+      .await
+      .and_then(|t| t.iter().find_map(|t| t.websocket_debugger_url.clone()))?;
+    let result = self
+      .send_cdp_command(&ws, "Network.getAllCookies", json!({}))
+      .await
+      .ok()?;
+    Some(
+      result
+        .get("cookies")?
+        .as_array()?
+        .iter()
+        .filter_map(|c| {
+          Some((
+            c.get("domain")?.as_str()?.to_string(),
+            c.get("name")?.as_str()?.to_string(),
+            c.get("path")?.as_str()?.to_string(),
+          ))
+        })
+        .collect(),
+    )
+  }
+
+  /// 重新加载所有页签。
+  ///
+  /// cookie 是在启动之后才灌进去的，而 `--restore-last-session` 恢复的页签和启动
+  /// URL 都在那之前就发出请求了——那些页面是以登出状态取回来的。与其去保证「灌完
+  /// 之前什么都别导航」（做不到，页签恢复发生在进程启动瞬间），不如灌完重载一次。
+  pub async fn reload_all_pages(&self, profile_path: &str) {
+    let Some(targets) = self.list_page_targets(profile_path).await else {
+      return;
+    };
+    for t in targets {
+      let Some(ws) = t.websocket_debugger_url.as_deref() else {
+        continue;
+      };
+      if let Err(e) = self.send_cdp_command(ws, "Page.reload", json!({})).await {
+        log::debug!("Page.reload on {} failed: {e}", t.id);
+      }
+    }
   }
 
   /// 把标签页带到前台（操作系统层面）。

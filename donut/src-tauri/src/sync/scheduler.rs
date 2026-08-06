@@ -430,6 +430,34 @@ impl SyncScheduler {
           // event leaves the row spinning forever — which is exactly what
           // happens after sync is turned off for a profile: the delete echoes
           // back, queues one last sync, and finds nothing to do here.
+          //
+          // Two very different situations reach this point and only one of them
+          // is "nothing to do": the profile may be sync-disabled locally, or it
+          // may not exist here at all because another machine just created it.
+          // The second is a profile that needs DOWNLOADING, and reporting it as
+          // synced is how it stayed invisible until someone restarted the app.
+          // Discovery is what pulls it, so nudge that instead of claiming
+          // success.
+          if ProfileManager::instance()
+            .get_profile_by_id(&profile_id)
+            .is_none()
+          {
+            log::info!(
+              "Sync event names profile {profile_id}, which does not exist here — running \
+               discovery to pull it"
+            );
+            let discover_app = app.clone();
+            tauri::async_runtime::spawn(async move {
+              if let Ok(engine) = SyncEngine::create_from_settings(&discover_app).await {
+                if let Err(e) = engine
+                  .check_for_missing_synced_profiles(&discover_app)
+                  .await
+                {
+                  log::warn!("Discovery triggered by a sync event failed: {e}");
+                }
+              }
+            });
+          }
           let _ = events::emit(
             "profile-sync-status",
             serde_json::json!({

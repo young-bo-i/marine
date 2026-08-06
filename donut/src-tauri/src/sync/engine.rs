@@ -60,6 +60,34 @@ pub async fn cancel_profile_sync(profile_id: String) -> Result<bool, String> {
   Ok(request_sync_cancel(&profile_id))
 }
 
+/// Serializes whole discovery sweeps.
+static DISCOVERY_SWEEP: std::sync::LazyLock<TokioMutex<()>> =
+  std::sync::LazyLock::new(|| TokioMutex::new(()));
+
+/// Profiles currently being downloaded by `download_profile_if_missing`.
+static DOWNLOADS_IN_FLIGHT: std::sync::LazyLock<StdMutex<std::collections::HashSet<String>>> =
+  std::sync::LazyLock::new(|| StdMutex::new(std::collections::HashSet::new()));
+
+/// Holds a per-profile download claim and releases it on drop, including on the
+/// early returns and `?` exits scattered through `download_profile_if_missing`.
+struct DownloadClaim(String);
+
+impl DownloadClaim {
+  fn try_acquire(profile_id: &str) -> Option<Self> {
+    let mut set = DOWNLOADS_IN_FLIGHT.lock().unwrap();
+    if !set.insert(profile_id.to_string()) {
+      return None;
+    }
+    Some(Self(profile_id.to_string()))
+  }
+}
+
+impl Drop for DownloadClaim {
+  fn drop(&mut self) {
+    DOWNLOADS_IN_FLIGHT.lock().unwrap().remove(&self.0);
+  }
+}
+
 /// Upload/download concurrency limit
 const SYNC_CONCURRENCY: usize = 32;
 
@@ -68,20 +96,17 @@ const MAX_FILE_RETRIES: u32 = 3;
 
 /// Critical file patterns — if any of these fail to upload/download, the sync is aborted.
 const CRITICAL_FILE_PATTERNS: &[&str] = &[
-  // Wayfern's portable cookie-encryption key. Cookies are useless without it
-  // (Chromium silently WIPES undecryptable cookies, i.e. all logins), so a key
-  // that can't transfer must fail the sync loudly rather than leave a profile
-  // whose Cookies and key don't match.
-  "os_crypt_key",
-  "Cookies",
-  "Login Data",
+  // The OS-neutral login state (`portable_cookies`). This is what carries every
+  // session between machines now that the os_crypt-encrypted stores and their
+  // key stay device-local (see `DEVICE_LOCAL_PATTERNS` in `manifest.rs`), so
+  // a profile that syncs "successfully" without it arrives logged out of
+  // everything. Fail the sync loudly instead.
+  "portable-cookies.json",
   "Local Storage",
   "Local State",
   "Preferences",
-  "Secure Preferences",
-  "Web Data",
-  "Extension Cookies",
-  // Firefox/Camoufox equivalents
+  // Firefox/Camoufox equivalents — Firefox keeps cookie values in the clear, so
+  // its stores really are portable and stay in the manifest.
   "cookies.sqlite",
   "key4.db",
   "logins.json",
@@ -156,6 +181,31 @@ fn merge_profile_metadata_lww(local: &BrowserProfile, remote: &BrowserProfile) -
   merged.host_os = local.host_os.clone(); // which OS this copy lives on
   merged.ephemeral = local.ephemeral; // per-device runtime flag
   merged.default_bookmarks_seeded = local.default_bookmarks_seeded; // per-device disk bookkeeping
+
+  // The fingerprint's OS must agree with the OS this copy lives on.
+  //
+  // `host_os` is restored above as a per-device field, but the fingerprint that
+  // has to match it was being taken from remote wholesale — so a profile adopted
+  // onto this machine got the ORIGIN machine's `wayfern_config` back on the next
+  // newer remote edit: foreign `os`, foreign `fingerprint`, and `randomize_...`
+  // flipped back on. Nothing cleaned that up afterwards either, because
+  // `is_cross_os()` reads `host_os`, which is local and therefore already
+  // correct — adoption never ran again. The visible result is a macOS profile
+  // minting Windows fingerprints (`wayfern_manager` regenerates from
+  // `config.os`), which is precisely the contradiction adoption exists to avoid.
+  //
+  // Everything else in `wayfern_config` IS shared, user-editable config the other
+  // device may legitimately change, so only the three OS-bound fields are pinned.
+  if let (Some(merged_cfg), Some(local_cfg)) = (
+    merged.wayfern_config.as_mut(),
+    local.wayfern_config.as_ref(),
+  ) {
+    if merged_cfg.os != local_cfg.os {
+      merged_cfg.os = local_cfg.os.clone();
+      merged_cfg.fingerprint = local_cfg.fingerprint.clone();
+      merged_cfg.randomize_fingerprint_on_launch = local_cfg.randomize_fingerprint_on_launch;
+    }
+  }
   merged
 }
 
@@ -557,14 +607,21 @@ impl SyncEngine {
     app_handle: &tauri::AppHandle,
     profile: &BrowserProfile,
   ) -> SyncResult<()> {
-    if profile.is_cross_os() {
-      log::info!(
-        "Cross-OS profile: {} ({}) — syncing metadata only",
-        profile.name,
-        profile.id
-      );
-      return self.sync_cross_os_metadata(app_handle, profile).await;
-    }
+    // A profile created on another OS syncs its files like any other.
+    //
+    // This used to divert to a metadata-only path, which made sense while the
+    // manifest still carried `os_crypt_key` and the stores encrypted under it:
+    // moving those between platforms is destructive, so not moving anything was
+    // the safer of two bad options. It is no longer the trade-off. Every file in
+    // the manifest is now OS-neutral by construction — the device-bound ones are
+    // stripped from BOTH directions by `DEVICE_LOCAL_PATTERNS` (manifest.rs) —
+    // and login state travels as `portable-cookies.json`.
+    //
+    // Keeping the gate had become the thing that broke the feature it was meant
+    // to protect: `portable-cookies.json` exists precisely to cross machines,
+    // and the gate refused to move it for exactly the profiles it was built for.
+    // A cross-OS profile's directory stayed empty until someone clicked launch,
+    // so every "the other machine opens it logged out" report traced back here.
 
     // Skip if profile is currently running locally
     if profile.process_id.is_some() {
@@ -1023,6 +1080,17 @@ impl SyncEngine {
       }),
     );
 
+    // Say what happened to the login state, on every sync rather than only on the
+    // recovery path. It is the one file whose absence is invisible until someone
+    // opens the profile on another machine and finds it logged out, and until now
+    // a routine sync said nothing about it at all.
+    match crate::portable_cookies::describe(&profile_dir.join(crate::portable_cookies::FILE_NAME)) {
+      Some(summary) => log::info!("Profile {profile_id}: {summary}"),
+      None => log::warn!(
+        "Profile {profile_id} synced with no {} — it will open logged out anywhere else",
+        crate::portable_cookies::FILE_NAME
+      ),
+    }
     log::info!("Profile {} synced successfully", profile_id);
     Ok(())
   }
@@ -1120,59 +1188,6 @@ impl SyncEngine {
       .map_err(|e| SyncError::SerializationError(format!("Failed to parse metadata: {e}")))?;
 
     Ok(profile)
-  }
-
-  /// Sync only metadata for cross-OS profiles (tags, notes, proxies, groups).
-  /// No browser files are synced.
-  async fn sync_cross_os_metadata(
-    &self,
-    app_handle: &tauri::AppHandle,
-    profile: &BrowserProfile,
-  ) -> SyncResult<()> {
-    let profile_id = profile.id.to_string();
-    let key_prefix = Self::get_team_key_prefix(profile).await;
-    let profile_manager = ProfileManager::instance();
-
-    // Upload our metadata (skipped when unchanged vs remote).
-    self
-      .upload_profile_metadata(&profile_id, profile, &key_prefix)
-      .await?;
-
-    // Download remote metadata and merge with last-write-wins (same rule as
-    // sync_profile): remote config fields win only when strictly newer, so a
-    // stale remote never clobbers a local rename.
-    let remote_metadata_key = format!("{}profiles/{}/metadata.json", key_prefix, profile_id);
-    if let Ok(remote_meta) = self.download_profile_metadata(&remote_metadata_key).await {
-      let mut updated = merge_profile_metadata_lww(profile, &remote_meta);
-      updated.last_sync = Some(
-        std::time::SystemTime::now()
-          .duration_since(std::time::UNIX_EPOCH)
-          .unwrap()
-          .as_secs(),
-      );
-      let _ = profile_manager.save_profile(&updated);
-    }
-
-    // Sync associated entities
-    if let Some(proxy_id) = &profile.proxy_id {
-      let _ = self.sync_proxy(proxy_id, Some(app_handle)).await;
-    }
-    if let Some(group_id) = &profile.group_id {
-      let _ = self.sync_group(group_id, Some(app_handle)).await;
-    }
-
-    let _ = events::emit("profiles-changed", ());
-    let _ = events::emit(
-      "profile-sync-status",
-      serde_json::json!({
-        "profile_id": profile_id,
-        "profile_name": profile.name,
-        "status": "synced"
-      }),
-    );
-
-    log::info!("Cross-OS profile {} metadata synced", profile_id);
-    Ok(())
   }
 
   /// Reconcile the profile's config `metadata.json`, `updated_at` last-write-wins,
@@ -1511,10 +1526,20 @@ impl SyncEngine {
       }
     }
 
-    // Final resume state save
+    // Keep the resume state only while work is outstanding.
+    //
+    // Saving it unconditionally meant a transfer that completed cleanly still
+    // left `resume-state.json` on disk, where it reads as "this tree is a
+    // partial download" to anything that checks. The recovery path never runs
+    // the clean-run delete in `sync_profile`, so for a profile pulled by
+    // discovery the marker was permanent.
     {
       let state = resume_state.lock().await;
-      let _ = state.save(&profile_dir);
+      if outcome.failed.is_empty() {
+        SyncResumeState::delete(&profile_dir);
+      } else {
+        let _ = state.save(&profile_dir);
+      }
     }
 
     tracker.emit_final();
@@ -1553,6 +1578,15 @@ impl SyncEngine {
     // split) may still list it; downloading `files/metadata.json` then 404s.
     // Drop it here so a normal pull skips the expected-missing legacy entry at
     // debug instead of retrying 3x and warning.
+    //
+    // The exclude list is enforced here too, and this is the chokepoint that
+    // makes it a real guarantee: `compute_diff_3way` is not the only way into
+    // this function — profile recovery hands it the remote manifest wholesale.
+    // Every remote manifest written before `os_crypt_key` and the
+    // os_crypt-encrypted stores became device-local still lists them, and
+    // downloading one of those is not a wasted request, it is another machine's
+    // key landing next to a database it cannot open.
+    let exclude = crate::sync::manifest::default_exclude_globset().ok();
     let files: Vec<ManifestFileEntry> = files
       .iter()
       .filter(|f| {
@@ -1561,10 +1595,16 @@ impl SyncEngine {
             "Skipping legacy profile-root metadata.json file entry for profile {} (config synced separately)",
             profile_id
           );
-          false
-        } else {
-          true
+          return false;
         }
+        if exclude.as_ref().is_some_and(|g| g.is_match(&f.path)) {
+          log::info!(
+            "Not downloading {} for profile {profile_id}: this build never syncs it",
+            f.path
+          );
+          return false;
+        }
+        true
       })
       .cloned()
       .collect();
@@ -1818,10 +1858,20 @@ impl SyncEngine {
       }
     }
 
-    // Final resume state save
+    // Keep the resume state only while work is outstanding.
+    //
+    // Saving it unconditionally meant a transfer that completed cleanly still
+    // left `resume-state.json` on disk, where it reads as "this tree is a
+    // partial download" to anything that checks. The recovery path never runs
+    // the clean-run delete in `sync_profile`, so for a profile pulled by
+    // discovery the marker was permanent.
     {
       let state = resume_state.lock().await;
-      let _ = state.save(&profile_dir);
+      if outcome.failed.is_empty() {
+        SyncResumeState::delete(&profile_dir);
+      } else {
+        let _ = state.save(&profile_dir);
+      }
     }
 
     tracker.emit_final();
@@ -2681,6 +2731,31 @@ impl SyncEngine {
       return Ok(false);
     }
 
+    // One downloader per profile.
+    //
+    // Discovery has four triggers now — startup, the 5-minute timer, a sync
+    // event naming a profile this machine has never seen, and the manual sync
+    // button — and nothing stops two of them overlapping. Two concurrent
+    // downloads into the same directory interleave writes to the same files and
+    // the same `.donut-sync/` bookkeeping; a torn `portable-cookies.json` is the
+    // worst outcome, because it reads as "this profile has no sessions" and the
+    // launch that follows starts logged out.
+    let _claim = match DownloadClaim::try_acquire(profile_id) {
+      Some(c) => c,
+      None => {
+        log::debug!("Profile {profile_id} is already being downloaded; skipping this attempt");
+        return Ok(false);
+      }
+    };
+    // Re-check under the claim: the run that held it may have just finished.
+    if profile_manager
+      .list_profiles()
+      .map(|ps| ps.iter().any(|p| p.id == profile_uuid))
+      .unwrap_or(false)
+    {
+      return Ok(false);
+    }
+
     // Check if profile exists remotely
     let manifest_key = format!("{}profiles/{}/manifest.json", key_prefix, profile_id);
     let stat = self.client.stat(&manifest_key).await?;
@@ -2723,51 +2798,9 @@ impl SyncEngine {
     let mut profile: BrowserProfile = serde_json::from_slice(&metadata_data)
       .map_err(|e| SyncError::SerializationError(format!("Failed to parse metadata: {e}")))?;
 
-    // Cross-OS profile: save metadata only, skip manifest + file downloads
-    if profile.is_cross_os() {
-      log::info!(
-        "Profile {} is cross-OS (host_os={:?}), downloading metadata only",
-        profile_id,
-        profile.host_os
-      );
-
-      fs::create_dir_all(&profile_dir).map_err(|e| {
-        SyncError::IoError(format!(
-          "Failed to create profile directory {}: {e}",
-          profile_dir.display()
-        ))
-      })?;
-
-      if profile.sync_mode == SyncMode::Disabled {
-        profile.sync_mode = SyncMode::Regular;
-      }
-      profile.last_sync = Some(
-        std::time::SystemTime::now()
-          .duration_since(std::time::UNIX_EPOCH)
-          .unwrap()
-          .as_secs(),
-      );
-
-      profile_manager
-        .save_profile(&profile)
-        .map_err(|e| SyncError::IoError(format!("Failed to save cross-OS profile: {e}")))?;
-
-      let _ = events::emit("profiles-changed", ());
-      let _ = events::emit(
-        "profile-sync-status",
-        serde_json::json!({
-          "profile_id": profile_id,
-          "profile_name": profile.name,
-          "status": "synced"
-        }),
-      );
-
-      log::info!(
-        "Cross-OS profile {} metadata downloaded successfully",
-        profile_id
-      );
-      return Ok(true);
-    }
+    // No cross-OS branch here either — see `sync_profile`. A profile arriving
+    // on a machine that has never seen it needs its FILES more than any other
+    // case does: metadata alone gives a row in the table that opens logged out.
 
     // Derive encryption key before downloading manifest if profile uses encrypted sync.
     // The manifest itself may be encrypted (new behavior) or plaintext (backwards compat).
@@ -2852,51 +2885,21 @@ impl SyncEngine {
       }
     }
 
-    // Verify critical files after download
-    let os_crypt_key_path = profile_dir.join("profile").join("os_crypt_key");
-    let cookies_path = {
-      let network = profile_dir
-        .join("profile")
-        .join("Default")
-        .join("Network")
-        .join("Cookies");
-      if network.exists() {
-        network
-      } else {
-        profile_dir.join("profile").join("Default").join("Cookies")
-      }
-    };
-    if os_crypt_key_path.exists() {
-      let key_data = fs::read(&os_crypt_key_path).unwrap_or_default();
-      log::info!(
-        "Profile {} sync: os_crypt_key present ({} bytes, sha256: {:x})",
-        profile_id,
-        key_data.len(),
-        {
-          use std::hash::{Hash, Hasher};
-          let mut h = std::collections::hash_map::DefaultHasher::new();
-          key_data.hash(&mut h);
-          h.finish()
-        }
-      );
-    } else {
-      log::warn!(
-        "Profile {} sync: os_crypt_key NOT FOUND after download",
-        profile_id
-      );
-    }
-    if cookies_path.exists() {
-      let cookies_meta = fs::metadata(&cookies_path).unwrap_or_else(|_| fs::metadata(".").unwrap());
-      log::info!(
-        "Profile {} sync: Cookies present ({} bytes)",
-        profile_id,
-        cookies_meta.len()
-      );
-    } else {
-      log::warn!(
-        "Profile {} sync: Cookies NOT FOUND after download",
-        profile_id
-      );
+    // Verify login state arrived.
+    //
+    // Checking `os_crypt_key` / `Cookies` here would now always warn and always
+    // be wrong to warn about: both are device-local and deliberately never
+    // transferred. The file that actually decides whether this profile comes up
+    // logged in is the OS-neutral blob, which is re-injected over CDP on the
+    // next launch.
+    let portable = profile_dir.join(crate::portable_cookies::FILE_NAME);
+    match crate::portable_cookies::describe(&portable) {
+      Some(summary) => log::info!("Profile {profile_id} sync: {summary}"),
+      None => log::warn!(
+        "Profile {profile_id} sync: no {} after download — this profile will start logged out \
+         until a machine that still has its sessions exports one",
+        crate::portable_cookies::FILE_NAME
+      ),
     }
 
     // Set sync mode and save profile
@@ -2937,6 +2940,14 @@ impl SyncEngine {
     &self,
     app_handle: &tauri::AppHandle,
   ) -> SyncResult<Vec<String>> {
+    // Single-flight. A sweep lists the entire bucket and then downloads whatever
+    // is missing; overlapping sweeps duplicate every request and race each other
+    // into the same profile directories. `try_lock` rather than `lock` because a
+    // queued second sweep would find nothing left to do anyway.
+    let Ok(_sweep) = DISCOVERY_SWEEP.try_lock() else {
+      log::debug!("Profile discovery already running; skipping this pass");
+      return Ok(Vec::new());
+    };
     log::info!("Checking for missing synced profiles...");
 
     // List all personal profiles from S3 (paginated)
@@ -3123,89 +3134,12 @@ impl SyncEngine {
       }
     }
 
-    // Refresh metadata for local cross-OS profiles (propagate renames, tags, notes from originating device)
-    let profile_manager = ProfileManager::instance();
-    // Collect cross-OS profiles before async operations to avoid holding non-Send Result across await
-    let cross_os_profiles: Vec<(BrowserProfile, SyncMode, Option<String>)> = profile_manager
-      .list_profiles()
-      .unwrap_or_default()
-      .into_iter()
-      .filter(|p| p.is_cross_os() && p.is_sync_enabled())
-      .map(|p| {
-        let sync_mode = p.sync_mode;
-        let created_by_id = p.created_by_id.clone();
-        (p, sync_mode, created_by_id)
-      })
-      .collect();
-
-    if !cross_os_profiles.is_empty() {
-      let team_prefix = if let Some(auth) = crate::cloud_auth::CLOUD_AUTH.get_user().await {
-        auth.user.team_id.map(|tid| format!("teams/{}/", tid))
-      } else {
-        None
-      };
-
-      for (local_profile, sync_mode, created_by_id) in &cross_os_profiles {
-        let pid = local_profile.id.to_string();
-        let kp = if created_by_id.is_some() {
-          team_prefix.as_deref().unwrap_or("")
-        } else {
-          ""
-        };
-        let metadata_key = format!("{}profiles/{}/metadata.json", kp, pid);
-        match self.client.stat(&metadata_key).await {
-          Ok(stat) if stat.exists => {
-            // Same `updated_at` last-write-wins rule as every other config
-            // entity. This used to overwrite the local profile unconditionally,
-            // so a rename/tag edit made on THIS machine was rolled back by a
-            // staler remote copy on the next sync.
-            //
-            // Only the HEAD-metadata timestamp may short-circuit here. On legacy
-            // objects that carry no metadata, resolving `updated_at` would cost a
-            // full body GET of its own, so fetch the body once and compare after
-            // parsing rather than downloading the same object twice.
-            let local_updated = local_profile.updated_at.unwrap_or(0);
-            if let Some(remote_updated) = Self::remote_updated_at_from_stat(&stat) {
-              if remote_updated <= local_updated {
-                log::debug!(
-                  "Cross-OS profile {pid} metadata is current (remote {remote_updated} <= local {local_updated})"
-                );
-                continue;
-              }
-            }
-            // `fetch_profile_metadata` unseals first — the raw body is an
-            // encrypted envelope whenever an E2E password is set, which the old
-            // inline `from_slice` silently failed to parse (and then skipped).
-            match self.fetch_profile_metadata(&metadata_key).await {
-              Ok(remote_meta) => {
-                if remote_meta.updated_at.unwrap_or(0) <= local_updated {
-                  log::debug!("Cross-OS profile {pid} metadata is current (body timestamp)");
-                  continue;
-                }
-                let mut merged = merge_profile_metadata_lww(local_profile, &remote_meta);
-                merged.sync_mode = *sync_mode;
-                merged.last_sync = Some(
-                  std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                );
-                if let Err(e) = profile_manager.save_profile(&merged) {
-                  log::warn!("Failed to refresh cross-OS profile {pid} metadata: {e}");
-                } else {
-                  log::debug!("Refreshed cross-OS profile {pid} metadata");
-                }
-              }
-              Err(e) => {
-                log::warn!("Failed to download cross-OS profile {pid} metadata: {e}");
-              }
-            }
-          }
-          _ => {}
-        }
-      }
-      let _ = events::emit("profiles-changed", ());
-    }
+    // The cross-OS metadata refresh that used to live here is gone with the
+    // gate it existed for. It was a second, cross-OS-only reconcile bolted onto
+    // discovery precisely because those profiles never reached `sync_profile`.
+    // They do now, and it applies the same `updated_at` last-write-wins merge to
+    // every profile, so keeping this would just be a duplicate writer racing the
+    // scheduler over the same `metadata.json`.
 
     Ok(downloaded)
   }
@@ -3506,10 +3440,6 @@ pub async fn set_profile_sync_mode(
     .into_iter()
     .find(|p| p.id == profile_uuid)
     .ok_or_else(|| format!("Profile with ID '{profile_id}' not found"))?;
-
-  if profile.is_cross_os() {
-    return Err("Cannot modify sync settings for a cross-OS profile".to_string());
-  }
 
   let enabling_now = new_mode != SyncMode::Disabled;
   if enabling_now && profile.process_id.is_some() {

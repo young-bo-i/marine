@@ -559,21 +559,13 @@ fn resolve_from(
         );
         return Err(super::err("MARINE_DISCOVERY_PROFILE_NOT_FOUND"));
       }
-      // A profile synced from another OS cannot launch here — `launch_browser`
-      // refuses it. Caught up front because the run would otherwise accept the
-      // plan and fail every single leg: `run_profile_session` reports a failed
-      // leg as `Ok`, so the consecutive-failure cap never trips and a cycling
-      // run spins all night producing nothing but burnt candidates.
-      if profile.is_cross_os() {
-        log::error!(
-          "Discovery plan names profile {}, created on another OS; it cannot launch here",
-          profile.name
-        );
-        return Err(super::err_with(
-          "MARINE_DISCOVERY_PROFILE_CROSS_OS",
-          profile.name.clone(),
-        ));
-      }
+      // No cross-OS pre-check any more. It existed because `launch_browser` used
+      // to refuse a profile created elsewhere, which would have failed every leg
+      // of the run — and since `run_profile_session` reports a failed leg as
+      // `Ok`, the consecutive-failure cap never tripped and a cycling run spun
+      // all night burning candidates. Launching now adopts such a profile onto
+      // this machine instead of refusing it, so rejecting the plan here would be
+      // refusing work that succeeds.
       let account_index = universe.iter().position(|u| u == id).ok_or_else(|| {
         log::error!("Discovery plan names a profile that is not indexable: {id}");
         super::err("MARINE_DISCOVERY_PROFILE_NOT_FOUND")
@@ -2374,37 +2366,22 @@ mod tests {
       .unwrap_or_else(|| format!("<not a coded error: {err}>"))
   }
 
-  /// 从别的操作系统同步过来的 profile 在本机起不来，必须在**接受计划之前**挡下。
+  /// 跨 OS 的 profile 现在是**可以**进计划的 —— 启动时会接管到本机。
   ///
-  /// 放进去的后果不是「这条腿失败」而是无限空转：`run_profile_session` 把失败
-  /// 的腿当 `Ok` 返回，`run_cycles` 的连续失败计数只认 `Err`，所以永远不会触顶。
+  /// 这条以前是硬拒。留着这个测试是为了守住反向：谁要是把那道闸门加回来，
+  /// 等于把一批能正常跑的账号永久挡在自动化外面，而且报的还是「不支持」。
   #[test]
-  fn a_profile_from_another_os_is_rejected_before_the_run_starts() {
+  fn a_profile_from_another_os_is_accepted_and_adopted_at_launch() {
     let foreign = wayfern_profile("from-elsewhere", Some(a_foreign_os()));
     let native = wayfern_profile("local", None);
     let all = vec![foreign.clone(), native.clone()];
 
-    let err =
-      resolve_from(&all, &[foreign.id.to_string()]).expect_err("跨 OS 的 profile 必须被拒绝");
-    assert_eq!(code_of(&err), "MARINE_DISCOVERY_PROFILE_CROSS_OS");
-    // 错误里要带上是哪个 profile，否则勾了一堆时无从下手。
-    assert!(err.contains("from-elsewhere"));
-
-    // 本机 profile 不受影响。
-    let ok = resolve_from(&all, &[native.id.to_string()]).expect("本机 profile 应当通过");
+    let ok = resolve_from(&all, &[foreign.id.to_string()]).expect("跨 OS 的 profile 应当通过");
     assert_eq!(ok.len(), 1);
-  }
 
-  /// 同一批里只要有一个跨 OS，整个计划就得拒 —— 半个计划跑起来更难排查。
-  #[test]
-  fn one_foreign_profile_rejects_the_whole_plan() {
-    let foreign = wayfern_profile("from-elsewhere", Some(a_foreign_os()));
-    let native = wayfern_profile("local", None);
-    let all = vec![foreign.clone(), native.clone()];
-
-    let err = resolve_from(&all, &[native.id.to_string(), foreign.id.to_string()])
-      .expect_err("混着跨 OS 的计划也要拒");
-    assert_eq!(code_of(&err), "MARINE_DISCOVERY_PROFILE_CROSS_OS");
+    let mixed = resolve_from(&all, &[native.id.to_string(), foreign.id.to_string()])
+      .expect("混着跨 OS 的计划也应当通过");
+    assert_eq!(mixed.len(), 2);
   }
 
   /// 错误必须是结构化错误码 —— 裸英文会原样漏到界面上。

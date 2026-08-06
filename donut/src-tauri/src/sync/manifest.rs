@@ -38,12 +38,6 @@ pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
   "**/datareporting/**",
   "**/saved-telemetry-pings/**",
   "**/sessionstore-backups/**",
-  // Chromium's `Sessions/` dir (Session_*/Tabs_*) holds open-tab state. Syncing
-  // it across devices is DEFERRED pending the sync-frequency fix: those files
-  // rewrite constantly and inflated sync churn. Local tab restore still works
-  // via the `--restore-last-session` launch flag; only cross-device tab sync is
-  // on hold here.
-  "**/sessions/**",
   "**/serviceworker.txt",
   "**/AlternateServices.bin",
   "**/SiteSecurityServiceState.bin",
@@ -87,6 +81,89 @@ pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
   // and restore a stale one onto other machines. Never sync this directory.
   "**/marine-ext/**",
 ];
+
+/// Files that must never leave the machine that wrote them.
+///
+/// Kept separate from [`DEFAULT_EXCLUDE_PATTERNS`] on purpose. That list means
+/// "not worth persisting", and it has a second consumer with nothing to do with
+/// sync: `profile::password` uses it to choose what to encrypt at rest, so
+/// dropping the cookie store from *that* list would leave a password-protected
+/// profile's sessions sitting in the clear. This list means something narrower —
+/// "belongs to this machine and no other".
+///
+/// `os_crypt_key` is the passphrase Wayfern encrypts `Cookies` / `Login Data` /
+/// `Web Data` with. Its derivation is NOT the same on every platform: the macOS
+/// build writes 24 bytes read back with 1003 PBKDF2 iterations, the Windows
+/// build writes 32 bytes under a scheme this code does not implement. Syncing
+/// the key looked safe because it travelled together with the ciphertext it
+/// belongs to — right up until a second machine wrote *its* key over the first
+/// machine's. Measured here on 2026-08-05: one profile's 24-byte macOS key was
+/// replaced by a 32-byte one, after which the macOS host could no longer read a
+/// store it had written itself. Chromium never reports an undecryptable cookie;
+/// it silently DELETES it, so the failure mode is every account logged out with
+/// nothing left to inspect.
+///
+/// Login state travels as `portable-cookies.json` instead: plaintext values,
+/// re-injected over CDP after launch so the receiving browser encrypts them
+/// under its own freshly minted key. That is OS-neutral by construction — no
+/// ciphertext ever crosses a machine boundary, so no derivation has to be
+/// guessed. Ciphertext and key both stay on the machine that produced them.
+///
+/// `Local Storage` deliberately stays synced: it is plaintext LevelDB, not
+/// os_crypt-encrypted, and several sites keep their session there.
+pub const DEVICE_LOCAL_PATTERNS: &[&str] = &[
+  "**/os_crypt_key",
+  "**/Cookies",
+  "**/Login Data",
+  "**/Login Data For Account",
+  // `Web Data` and `Account Web Data` are siblings holding the same
+  // os_crypt-encrypted autofill/payment tables. The glob matches a whole path
+  // COMPONENT, so `**/Web Data` does not cover `Account Web Data` — it was still
+  // crossing machines on its own, in the same encrypted-with-a-device-key form
+  // that started all of this.
+  "**/Web Data",
+  "**/Account Web Data",
+  "**/Extension Cookies",
+  // Chromium's `Sessions/` dir (Session_*/Tabs_*) holds THIS machine's open tabs.
+  //
+  // Listed here rather than in `DEFAULT_EXCLUDE_PATTERNS`, where a `**/sessions/**`
+  // entry sat for a long time doing nothing: globset is case-sensitive and
+  // Chromium's directory is capital-S, so the tab files were being synced the
+  // whole time the comment said they were deferred. Fixing the case in that list
+  // would also have stopped `profile::password` encrypting them at rest — it is
+  // the list's other consumer — and open-tab URLs are exactly the kind of thing a
+  // password-protected profile is protecting. Here it means "not synced" only.
+  "**/Sessions/**",
+  // Where `profile::encryption` puts the encrypted form of everything above for
+  // a password-protected profile. Inside that tree filenames are HMAC'd, so no
+  // glob can recognize a cookie store by name — this stable directory name is
+  // the handle. Without it a password-protected profile still shipped its
+  // os_crypt key and stores to every other machine, just unreadably named.
+  "**/device-local/**",
+];
+
+/// GlobSet of [`DEVICE_LOCAL_PATTERNS`] alone, for deciding whether a given file
+/// belongs to this machine — as opposed to whether sync should skip it (which is
+/// the broader `default_exclude_globset`, volatile files included).
+pub fn device_local_globset() -> &'static GlobSet {
+  static SET: std::sync::OnceLock<GlobSet> = std::sync::OnceLock::new();
+  SET.get_or_init(|| {
+    let patterns: Vec<String> = DEVICE_LOCAL_PATTERNS
+      .iter()
+      .map(|s| (*s).to_string())
+      .collect();
+    build_exclude_globset(&patterns).expect("DEVICE_LOCAL_PATTERNS must compile")
+  })
+}
+
+/// Everything sync skips: the volatile files plus the device-local ones.
+pub fn sync_exclude_patterns() -> Vec<String> {
+  DEFAULT_EXCLUDE_PATTERNS
+    .iter()
+    .chain(DEVICE_LOCAL_PATTERNS)
+    .map(|s| (*s).to_string())
+    .collect()
+}
 
 /// A single file entry in the manifest
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -232,14 +309,39 @@ fn build_exclude_globset(patterns: &[String]) -> SyncResult<GlobSet> {
     .map_err(|e| SyncError::InvalidData(format!("Failed to build exclude globset: {e}")))
 }
 
-/// GlobSet of [`DEFAULT_EXCLUDE_PATTERNS`], for callers that walk a profile
+/// GlobSet of [`sync_exclude_patterns`], for callers that walk a profile
 /// directory and must skip exactly what the manifest skips.
 pub fn default_exclude_globset() -> SyncResult<GlobSet> {
-  let patterns: Vec<String> = DEFAULT_EXCLUDE_PATTERNS
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
-  build_exclude_globset(&patterns)
+  build_exclude_globset(&sync_exclude_patterns())
+}
+
+/// Cached [`default_exclude_globset`] for the reconcile path, which runs per
+/// sync and cannot return an error. The patterns are compile-time constants and
+/// are validated on every `generate_manifest`, so a build in which this fails
+/// cannot produce a manifest at all.
+fn cached_exclude_globset() -> &'static GlobSet {
+  static SET: std::sync::OnceLock<GlobSet> = std::sync::OnceLock::new();
+  SET.get_or_init(|| default_exclude_globset().expect("the sync exclude patterns must compile"))
+}
+
+/// Drop every entry the exclude list covers.
+///
+/// Applied to the remote and baseline manifests before reconciling, so a path
+/// that this build refuses to sync cannot be reintroduced by an older manifest
+/// that still lists it. See the comment in [`compute_diff_3way`].
+fn filter_excluded(manifest: &SyncManifest) -> SyncManifest {
+  let globset = cached_exclude_globset();
+  let mut out = manifest.clone();
+  let before = out.files.len();
+  out.files.retain(|f| !globset.is_match(&f.path));
+  if out.files.len() != before {
+    log::info!(
+      "Ignoring {} excluded file(s) listed in a manifest for profile {}",
+      before - out.files.len(),
+      manifest.profile_id
+    );
+  }
+  out
 }
 
 /// Compute blake3 hash of a file
@@ -305,10 +407,7 @@ pub fn generate_manifest(
   profile_dir: &Path,
   cache: &mut HashCache,
 ) -> SyncResult<SyncManifest> {
-  let exclude_patterns: Vec<String> = DEFAULT_EXCLUDE_PATTERNS
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+  let exclude_patterns = sync_exclude_patterns();
   let globset = build_exclude_globset(&exclude_patterns)?;
 
   let mut manifest = SyncManifest::new(profile_id.to_string(), exclude_patterns);
@@ -530,6 +629,33 @@ pub fn compute_diff_3way(
   baseline: Option<&SyncManifest>,
 ) -> ManifestDiff {
   let mut diff = ManifestDiff::default();
+
+  // Anything the exclude list covers is dropped from the remote and baseline
+  // sides before reconciling.
+  //
+  // The exclude list only ever filtered the LOCAL scan, which is enough while
+  // the list never grows. It grew: `os_crypt_key` and the os_crypt-encrypted
+  // stores became device-local (see `DEVICE_LOCAL_PATTERNS`), and every
+  // remote manifest written before that still lists them. Reconciling against
+  // an unfiltered remote hands each of those paths to the L=None branch — which
+  // reads "the user deleted it" only when a baseline agrees, and otherwise reads
+  // "remote has a file we don't" and DOWNLOADS it. That is precisely the foreign
+  // key material coming straight back, on the machine least able to survive it:
+  // one syncing a profile for the first time, where there is no baseline.
+  //
+  // Filtering both sides makes the outcome the same either way: never downloaded,
+  // and never deleted either. Objects an older build already uploaded stay in the
+  // bucket, orphaned — they drop out of the manifest on this machine's next
+  // upload, so no client ever fetches them again, but nothing goes back to remove
+  // the bytes. Deleting them would be the tidier end state; it is deliberately
+  // not done here, because a peer still running the old build reads a missing
+  // remote file plus a baseline that has it as "the other side deleted this" and
+  // deletes its own local copy — which for `os_crypt_key` means destroying the
+  // one machine-local key that still opens its cookie store.
+  let remote = remote.map(filter_excluded);
+  let baseline = baseline.map(filter_excluded);
+  let remote = remote.as_ref();
+  let baseline = baseline.as_ref();
 
   let Some(remote) = remote else {
     // Nothing on the server yet — upload everything we have.
@@ -819,7 +945,7 @@ mod tests {
     // Simulate real Chromium structure: profile/Default/Cache/...
     let default_dir = profile_dir.join("profile/Default");
     fs::create_dir_all(&default_dir).unwrap();
-    fs::write(default_dir.join("Cookies"), "keep").unwrap();
+    fs::write(default_dir.join("Cookies"), "device-local").unwrap();
     fs::create_dir_all(default_dir.join("Cache")).unwrap();
     fs::write(default_dir.join("Cache/data_0"), "exclude").unwrap();
     fs::create_dir_all(default_dir.join("Code Cache/js")).unwrap();
@@ -854,8 +980,8 @@ mod tests {
       "profile-root metadata.json is the config blob and must be excluded from the file manifest"
     );
     assert!(
-      paths.contains(&"profile/Default/Cookies"),
-      "Cookies should be synced"
+      !paths.contains(&"profile/Default/Cookies"),
+      "the os_crypt-encrypted cookie store is device-local and must not be synced"
     );
     assert!(
       paths.contains(&"profile/Default/Local Storage/leveldb/000001.ldb"),
@@ -873,6 +999,136 @@ mod tests {
       !paths.iter().any(|p| p.contains("Crashpad")),
       "Crashpad should be excluded: {paths:?}"
     );
+  }
+
+  fn manifest_of(paths: &[(&str, &str)]) -> SyncManifest {
+    SyncManifest {
+      version: 1,
+      profile_id: "test".to_string(),
+      generated_at: Utc::now().to_rfc3339(),
+      updated_at: Utc::now().to_rfc3339(),
+      exclude_globs: vec![],
+      files: paths
+        .iter()
+        .map(|(path, hash)| ManifestFileEntry {
+          path: (*path).to_string(),
+          size: 10,
+          mtime: 1000,
+          hash: (*hash).to_string(),
+        })
+        .collect(),
+      encrypted: false,
+    }
+  }
+
+  /// The paths the manifest actually carries are relative to `profiles/<id>/`,
+  /// so the `**/` prefixed globs have to match several depths — including zero
+  /// directories, which is how `portable-cookies.json` sits next to `profile/`.
+  #[test]
+  fn device_local_key_material_is_excluded_at_every_depth() {
+    let g = default_exclude_globset().unwrap();
+    for path in [
+      "profile/os_crypt_key",
+      "profile/Default/Cookies",
+      "profile/Default/Network/Cookies",
+      "profile/Default/Login Data",
+      "profile/Default/Login Data For Account",
+      "profile/Default/Web Data",
+      // Sibling of `Web Data`, same os_crypt-encrypted tables. `**/Web Data`
+      // matches a whole path component and does NOT cover this.
+      "profile/Default/Account Web Data",
+      "profile/Default/Extension Cookies",
+      // Capital S. A `**/sessions/**` entry matched nothing Chromium writes for
+      // as long as it existed, so these were being synced while the comment
+      // above them said they were deferred.
+      "profile/Default/Sessions/Session_13400000000000000",
+      "profile/Default/Sessions/Tabs_13400000000000000",
+    ] {
+      assert!(g.is_match(path), "{path} must never be synced");
+    }
+    for path in [
+      "portable-cookies.json",
+      "profile/Default/Local Storage/leveldb/000003.log",
+      "profile/Local State",
+      "profile/Default/Preferences",
+      "profile/Default/cookies.sqlite",
+    ] {
+      assert!(
+        !g.is_match(path),
+        "{path} carries portable state and must keep syncing"
+      );
+    }
+  }
+
+  /// The case that actually bites: a machine syncing a profile for the FIRST
+  /// time, so there is no baseline, against a remote manifest written before
+  /// these files became device-local. Without filtering the remote side, the
+  /// `L == B` branch reads this as "only remote changed" and downloads another
+  /// machine's os_crypt key — which is exactly how a cookie store ends up
+  /// paired with a key that cannot open it, and Chromium deletes cookies it
+  /// cannot decrypt rather than reporting them.
+  #[test]
+  fn legacy_remote_manifest_never_reintroduces_key_material() {
+    let local = manifest_of(&[("profile/Local State", "l1")]);
+    let remote = manifest_of(&[
+      ("profile/Local State", "l1"),
+      ("profile/os_crypt_key", "k1"),
+      ("profile/Default/Cookies", "c1"),
+    ]);
+
+    let diff = compute_diff_3way(&local, Some(&remote), None);
+    assert!(
+      diff.files_to_download.is_empty(),
+      "downloaded {:?}",
+      diff
+        .files_to_download
+        .iter()
+        .map(|f| &f.path)
+        .collect::<Vec<_>>()
+    );
+    assert!(diff.files_to_delete_local.is_empty());
+  }
+
+  /// Same manifest, but reached through the empty-local recovery guard, which
+  /// short-circuits before the per-path reconcile and downloads the remote
+  /// wholesale.
+  #[test]
+  fn empty_local_recovery_does_not_pull_key_material() {
+    let local = manifest_of(&[]);
+    let remote = manifest_of(&[
+      ("profile/Local State", "l1"),
+      ("profile/os_crypt_key", "k1"),
+      ("profile/Default/Network/Cookies", "c1"),
+    ]);
+
+    let diff = compute_diff_3way(&local, Some(&remote), None);
+    let pulled: Vec<&String> = diff.files_to_download.iter().map(|f| &f.path).collect();
+    assert_eq!(pulled, vec!["profile/Local State"]);
+  }
+
+  /// A profile whose baseline still lists the now-excluded files must not have
+  /// them deleted off its own disk. They are the machine's own working state;
+  /// sync simply stopped having an opinion about them.
+  #[test]
+  fn dropping_files_from_sync_does_not_delete_them_locally() {
+    let local = manifest_of(&[("profile/Local State", "l2")]);
+    let remote = manifest_of(&[
+      ("profile/Local State", "l1"),
+      ("profile/os_crypt_key", "k1"),
+    ]);
+    let baseline = manifest_of(&[
+      ("profile/Local State", "l1"),
+      ("profile/os_crypt_key", "k1"),
+    ]);
+
+    let diff = compute_diff_3way(&local, Some(&remote), Some(&baseline));
+    assert!(
+      diff.files_to_delete_local.is_empty(),
+      "would have deleted {:?}",
+      diff.files_to_delete_local
+    );
+    assert_eq!(diff.files_to_upload.len(), 1);
+    assert_eq!(diff.files_to_upload[0].path, "profile/Local State");
   }
 
   #[test]
@@ -1028,7 +1284,7 @@ mod tests {
       exclude_globs: vec![],
       files: vec![
         ManifestFileEntry {
-          path: "Cookies".to_string(),
+          path: "portable-cookies.json".to_string(),
           size: 100,
           mtime: 1000,
           hash: "abc".to_string(),
@@ -1093,8 +1349,8 @@ mod tests {
       "top-level metadata.json must be excluded: {paths:?}"
     );
     assert!(
-      paths.contains(&"profile/Default/Cookies"),
-      "Cookies should be synced: {paths:?}"
+      !paths.contains(&"profile/Default/Cookies"),
+      "the os_crypt-encrypted cookie store is device-local and must not be synced: {paths:?}"
     );
     assert!(
       paths.contains(&"profile/Default/metadata.json"),
@@ -1194,29 +1450,33 @@ mod tests {
   #[test]
   fn test_3way_conflict_newer_local_wins() {
     // The login-loss scenario: both machines used the profile, but the LOCAL
-    // copy (e.g. Cookies written by the just-closed browser with a fresh login)
-    // is newer → local must win and be uploaded, with the remote loser flagged
-    // for backup. "Always remote wins" would have eaten the login.
-    let base = mk_mt(&[("Cookies", "v1", 100)]);
-    let local = mk_mt(&[("Cookies", "vLoginFresh", 300)]); // newer
-    let remote = mk_mt(&[("Cookies", "vStale", 200)]);
+    // copy (the portable login state written by the just-closed browser, with a
+    // fresh login in it) is newer → local must win and be uploaded, with the
+    // remote loser flagged for backup. "Always remote wins" would have eaten
+    // the login.
+    let base = mk_mt(&[("portable-cookies.json", "v1", 100)]);
+    let local = mk_mt(&[("portable-cookies.json", "vLoginFresh", 300)]); // newer
+    let remote = mk_mt(&[("portable-cookies.json", "vStale", 200)]);
     let diff = compute_diff_3way(&local, Some(&remote), Some(&base));
     assert_eq!(diff.files_to_upload.len(), 1);
     assert_eq!(diff.files_to_upload[0].hash, "vLoginFresh");
-    assert_eq!(diff.conflict_uploads, vec!["Cookies".to_string()]);
+    assert_eq!(
+      diff.conflict_uploads,
+      vec!["portable-cookies.json".to_string()]
+    );
     assert!(diff.files_to_download.is_empty());
     assert!(diff.conflicts.is_empty());
   }
 
   #[test]
   fn test_3way_conflict_newer_remote_wins() {
-    let base = mk_mt(&[("Cookies", "v1", 100)]);
-    let local = mk_mt(&[("Cookies", "vOld", 200)]);
-    let remote = mk_mt(&[("Cookies", "vNewer", 300)]); // newer
+    let base = mk_mt(&[("portable-cookies.json", "v1", 100)]);
+    let local = mk_mt(&[("portable-cookies.json", "vOld", 200)]);
+    let remote = mk_mt(&[("portable-cookies.json", "vNewer", 300)]); // newer
     let diff = compute_diff_3way(&local, Some(&remote), Some(&base));
     assert_eq!(diff.files_to_download.len(), 1);
     assert_eq!(diff.files_to_download[0].hash, "vNewer");
-    assert_eq!(diff.conflicts, vec!["Cookies".to_string()]);
+    assert_eq!(diff.conflicts, vec!["portable-cookies.json".to_string()]);
     assert!(diff.files_to_upload.is_empty());
     assert!(diff.conflict_uploads.is_empty());
   }
@@ -1300,11 +1560,7 @@ mod tests {
   /// regenerated on every launch, so nothing in it is worth syncing.
   #[test]
   fn marine_extension_dir_is_never_synced() {
-    let patterns: Vec<String> = DEFAULT_EXCLUDE_PATTERNS
-      .iter()
-      .map(|p| (*p).to_string())
-      .collect();
-    let globset = build_exclude_globset(&patterns).unwrap();
+    let globset = build_exclude_globset(&sync_exclude_patterns()).unwrap();
     for path in [
       "profile/marine-ext/marine-runtime-config.json",
       "profile/marine-ext/manifest.json",
@@ -1314,7 +1570,10 @@ mod tests {
       assert!(globset.is_match(path), "{path} must be excluded from sync");
     }
     // Guard against an over-broad pattern swallowing real profile data.
-    assert!(!globset.is_match("profile/Default/Cookies"));
+    // (`Default/Cookies` is deliberately excluded now — see
+    // `device_local_key_material_is_excluded_at_every_depth` — so the canary
+    // here has to be something that still syncs.)
+    assert!(!globset.is_match("profile/Default/Local Storage/leveldb/000001.ldb"));
     assert!(!globset.is_match("profile/Default/Extensions/abc/1.0/manifest.json"));
   }
 }

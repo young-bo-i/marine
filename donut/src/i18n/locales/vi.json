@@ -1119,9 +1119,8 @@
     }
   },
   "crossOs": {
-    "viewOnly": "Profile này được tạo trên {{os}} và không được hỗ trợ trên hệ thống này",
-    "cannotLaunch": "Profile này được tạo trên {{os}} và không được hỗ trợ trên hệ thống này",
-    "cannotModify": "Không thể chỉnh sửa cài đặt đồng bộ cho profile đa hệ điều hành",
+    "viewOnly": "Được tạo trên {{os}}. Khởi chạy tại đây sẽ tiếp quản nó về máy này và khôi phục các phiên đăng nhập.",
+    "cannotModify": "Cài đặt đồng bộ của hồ sơ này được quản lý trên máy đã tạo ra nó",
     "adoptHint": "Được tạo trên {{os}}. Khi khởi chạy sẽ tiếp nhận về máy này — cookie được sao lưu trước và tạo dấu vân tay mới cho hệ điều hành này.",
     "adoptHintUnknownOs": "Được tạo trên hệ điều hành khác. Khi khởi chạy sẽ tiếp nhận về máy này — cookie được sao lưu trước và tạo dấu vân tay mới."
   },
@@ -1841,13 +1840,12 @@
     "marineDiscoveryEmptyPlan": "Hãy chọn ít nhất một hồ sơ và một nền tảng.",
     "marineDiscoveryEmptyKeyword": "Hãy nhập từ khóa tìm kiếm.",
     "marineDiscoveryProfileNotFound": "Một trong các hồ sơ đã chọn không còn tồn tại.",
-    "marineDiscoveryProfileCrossOs": "Hồ sơ \"{{name}}\" được tạo trên một hệ điều hành khác nên không thể chạy ở đây. Hãy tạo hồ sơ mới trên máy này và đăng nhập lại.",
     "cookieDecryptFailed": "Không giải mã được {{count}} cookie — khóa mã hóa không khớp với kho cookie này. Xuất ra sẽ chỉ có tên cookie mà không có phiên đăng nhập, nên thao tác đã dừng.",
     "profileNeverLaunched": "Hồ sơ này chưa từng được khởi chạy nên chưa có kho cookie. Hãy mở trình duyệt một lần rồi đóng lại, sau đó thử lại.",
     "profileIsRunning": "Hãy đóng trình duyệt trước khi tiếp nhận hồ sơ này.",
     "profileAlreadyLocal": "Hồ sơ này đã thuộc về máy này rồi.",
     "marineProfileLeasedElsewhere": "Một thiết bị khác đang chạy hồ sơ này. Chạy ở đây nữa sẽ khiến cả hai đăng dưới cùng một nội dung.",
-    "cookieStoreUnreadableHere": "Trình duyệt trên máy này không giải mã được cookie của hồ sơ này. Mở nó sẽ xóa toàn bộ cookie — Chromium xóa cookie không đọc được thay vì báo lỗi. Hồ sơ chưa bị thay đổi; hãy chuyển phiên đăng nhập sang hồ sơ tạo trên máy này.",
+    "cookieStoreUnreadableHere": "Trình duyệt trên máy này không giải mã được cookie của hồ sơ này, và cũng không có trạng thái đăng nhập di động nào để khôi phục. Mở nó sẽ xóa sạch cookie bên trong — Chromium xóa những cookie nó không đọc được thay vì báo lỗi. Việc khởi chạy đã bị chặn và hồ sơ không bị thay đổi. Hãy mở rồi đóng hồ sơ này một lần trên máy vẫn còn phiên đăng nhập: thao tác đó ghi ra một bản sao độc lập với hệ điều hành và đồng bộ sang đây.",
     "profileAdoptedButNotSynced": "Hồ sơ này giờ thuộc về máy này, nhưng không tải được dữ liệu trình duyệt nên chưa khởi chạy — mở khi trống sẽ tạo hồ sơ mới không có phiên đăng nhập. Hãy kiểm tra kết nối đồng bộ rồi thử lại. ({{detail}})"
   },
   "rail": {
