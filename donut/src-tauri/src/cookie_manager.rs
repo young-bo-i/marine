@@ -13,6 +13,8 @@ use tauri::AppHandle;
 /// `encrypted_value` is empty, regardless of what other cookies store.
 pub mod chrome_decrypt {
   use aes::cipher::{block_padding::Pkcs7, BlockModeDecrypt, KeyIvInit};
+  use aes_gcm::aead::{Aead, KeyInit};
+  use aes_gcm::{Aes256Gcm, Nonce};
   use ring::pbkdf2;
   use sha2::{Digest, Sha256};
   use std::num::NonZeroU32;
@@ -22,46 +24,88 @@ pub mod chrome_decrypt {
 
   /// PBKDF2 iteration count for deriving the AES key from the password stored
   /// in `os_crypt_key`. Must match Chromium's `OSCryptImpl` on each platform:
-  /// macOS uses 1003 iterations, Linux uses 1. Getting this wrong produces a
-  /// different AES key → silent decryption failure → empty cookie values.
+  /// macOS uses 1003 iterations, Linux uses 1.
   /// See `components/os_crypt/sync/os_crypt_{mac.mm,linux.cc}` in Chromium.
-  /// macOS Chromium derives with 1003 iterations, Linux with 1.
   pub(crate) const ITERATIONS_MACOS: u32 = 1003;
   pub(crate) const ITERATIONS_OTHER: u32 = 1;
 
-  /// Iteration count for a store that was written on `source_os`.
+  const SALT: &[u8] = b"saltysalt";
+  const CBC_IV: [u8; 16] = [b' '; 16]; // 16 spaces
+  const HOST_HASH_LEN: usize = 32; // SHA-256 output length
+  const GCM_NONCE_LEN: usize = 12;
+
+  /// How a particular build of the browser encrypts cookie values.
   ///
-  /// The count belongs to **whoever encrypted the cookies**, not to whoever is
-  /// reading them. As a `#[cfg]` constant it silently meant "the machine running
-  /// this build", which is the same thing right up until a profile moves between
-  /// machines — and then a Windows host would derive with 1 iteration against a
-  /// store macOS wrote with 1003, get a wrong key, and decrypt nothing. Passing
-  /// `None` falls back to the host's own convention, which is correct for a
-  /// profile with no recorded origin.
-  pub(crate) fn iterations_for(source_os: Option<&str>) -> u32 {
-    match source_os {
-      Some("macos") => ITERATIONS_MACOS,
-      Some(_) => ITERATIONS_OTHER,
-      None => {
-        if cfg!(target_os = "macos") {
-          ITERATIONS_MACOS
-        } else {
-          ITERATIONS_OTHER
-        }
-      }
-    }
+  /// There is more than one, and which one is in play is a property of the
+  /// binary that wrote the store — not of anything we can look up. Modelling it
+  /// as a value we try, rather than a constant we assume, is the difference
+  /// between reading a store and silently reporting it as empty.
+  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+  pub enum Scheme {
+    /// `PBKDF2-HMAC-SHA1(key_file, "saltysalt", iterations)` → AES-128-CBC with
+    /// an all-spaces IV. Chromium's macOS and Linux convention; the macOS
+    /// Wayfern build measured at 1003 iterations with a 24-byte key file.
+    Pbkdf2Cbc { iterations: u32 },
+    /// The 32 bytes of the key file used directly as an AES-256-GCM key, with
+    /// `nonce(12) || ciphertext || tag(16)` after the version prefix. This is
+    /// Chromium's Windows shape, and it is what a 32-byte `os_crypt_key`
+    /// implies.
+    ///
+    /// Added because the Windows build writes a store this code could not read:
+    /// 49 of 49 rows failed, so the export gave up every time and login state
+    /// created on Windows could never leave it.
+    RawGcm,
   }
 
-  const KEY_LEN: usize = 16; // AES-128
-  const SALT: &[u8] = b"saltysalt";
-  const IV: [u8; 16] = [b' '; 16]; // 16 spaces
-  const HOST_HASH_LEN: usize = 32; // SHA-256 output length
+  /// Every scheme worth trying, cheapest and most likely first.
+  ///
+  /// `source_os` orders the list; it never restricts it. Ordering by the
+  /// recorded origin is a good guess — the count belongs to whoever encrypted
+  /// the cookies — but a *guess* is all it is, and the previous version treated
+  /// it as fact. A profile whose `host_os` says macOS can be sitting on a store
+  /// a Windows browser rewrote ten minutes ago.
+  pub(crate) fn candidates(source_os: Option<&str>, key_len: usize) -> Vec<Scheme> {
+    let mut out = Vec::new();
+    let mac_first =
+      matches!(source_os, Some("macos")) || (source_os.is_none() && cfg!(target_os = "macos"));
+    // A 32-byte key file is the strongest single signal there is: no PBKDF2
+    // derivation produces one, so it was meant to be used raw.
+    if key_len == 32 && !mac_first {
+      out.push(Scheme::RawGcm);
+    }
+    if mac_first {
+      out.push(Scheme::Pbkdf2Cbc {
+        iterations: ITERATIONS_MACOS,
+      });
+      out.push(Scheme::Pbkdf2Cbc {
+        iterations: ITERATIONS_OTHER,
+      });
+    } else {
+      out.push(Scheme::Pbkdf2Cbc {
+        iterations: ITERATIONS_OTHER,
+      });
+      out.push(Scheme::Pbkdf2Cbc {
+        iterations: ITERATIONS_MACOS,
+      });
+    }
+    if key_len == 32 && mac_first {
+      out.push(Scheme::RawGcm);
+    }
+    out
+  }
 
-  pub(crate) fn derive_key(password: &[u8], iterations: u32) -> [u8; KEY_LEN] {
-    let mut key = [0u8; KEY_LEN];
-    // Using ring::pbkdf2 instead of the `pbkdf2` crate to avoid digest
-    // version conflicts between sha1 0.11 (digest 0.11) and pbkdf2 0.12
-    // (digest 0.10). ring's implementation is self-contained.
+  /// The material a scheme needs: either a derived 16-byte key or the raw file.
+  #[derive(Clone)]
+  pub struct Decryptor {
+    scheme: Scheme,
+    cbc_key: [u8; 16],
+    raw: Vec<u8>,
+  }
+
+  pub(crate) fn derive_key(password: &[u8], iterations: u32) -> [u8; 16] {
+    let mut key = [0u8; 16];
+    // ring::pbkdf2 rather than the `pbkdf2` crate, to avoid a digest version
+    // conflict between sha1 0.11 (digest 0.11) and pbkdf2 0.12 (digest 0.10).
     pbkdf2::derive(
       pbkdf2::PBKDF2_HMAC_SHA1,
       NonZeroU32::new(iterations).expect("iterations must be non-zero"),
@@ -72,60 +116,73 @@ pub mod chrome_decrypt {
     key
   }
 
-  /// `source_os` is the profile's recorded `host_os` — the OS whose Chromium
-  /// wrote this cookie store. See [`iterations_for`].
-  pub fn get_encryption_key(
-    profile_data_path: &Path,
-    source_os: Option<&str>,
-  ) -> Option<[u8; KEY_LEN]> {
-    let key_file = profile_data_path.join("os_crypt_key");
-    // Read as raw bytes and do NOT trim — Chromium's `ReadFileToString`
-    // passes the exact file contents to `Pbkdf2(file_contents)`. Any
-    // normalisation we do here would produce a different derived key.
-    let contents = std::fs::read(&key_file).ok()?;
-    if contents.is_empty() {
-      return None;
-    }
-    Some(derive_key(&contents, iterations_for(source_os)))
-  }
-
-  /// Decrypt a Chrome encrypted cookie value.
-  ///
-  /// Chromium prefixes encrypted values with "v10" / "v11" and, since ~M100,
-  /// prepends `SHA-256(host_key)` to the plaintext before encryption as an
-  /// integrity check. After decryption we verify and strip those 32 bytes
-  /// when present. Passing `host_key` is required to do that verification —
-  /// without it we'd return 32 bytes of hash noise plus the actual value,
-  /// which is not valid UTF-8 and gets thrown away.
-  pub fn decrypt(encrypted: &[u8], host_key: &str, key: &[u8; KEY_LEN]) -> Option<String> {
-    if encrypted.len() < 3 {
-      return None;
-    }
-    let prefix = &encrypted[..3];
-    if prefix != b"v10" && prefix != b"v11" {
-      return None;
-    }
-    let ciphertext = &encrypted[3..];
-    if ciphertext.is_empty() {
-      return Some(String::new());
-    }
-
-    let mut buf = ciphertext.to_vec();
-    let decrypted = Aes128CbcDec::new(key.into(), &IV.into())
-      .decrypt_padded::<Pkcs7>(&mut buf)
-      .ok()?;
-
-    // Strip the SHA-256(host_key) integrity prefix if present. Older cookies
-    // (pre-M100) didn't have this prefix, so we fall back to the raw bytes
-    // when the first 32 bytes don't match the expected hash.
-    if decrypted.len() >= HOST_HASH_LEN {
-      let expected: [u8; HOST_HASH_LEN] = Sha256::digest(host_key.as_bytes()).into();
-      if decrypted[..HOST_HASH_LEN] == expected {
-        return String::from_utf8(decrypted[HOST_HASH_LEN..].to_vec()).ok();
+  impl Decryptor {
+    pub fn new(key_file_contents: &[u8], scheme: Scheme) -> Self {
+      let cbc_key = match scheme {
+        Scheme::Pbkdf2Cbc { iterations } => derive_key(key_file_contents, iterations),
+        Scheme::RawGcm => [0u8; 16],
+      };
+      Self {
+        scheme,
+        cbc_key,
+        raw: key_file_contents.to_vec(),
       }
     }
 
-    String::from_utf8(decrypted.to_vec()).ok()
+    /// Decrypt one stored cookie value.
+    ///
+    /// Chromium prefixes encrypted values with `v10`/`v11` and, since ~M100,
+    /// prepends `SHA-256(host_key)` to the plaintext as an integrity check.
+    /// That prefix is verified and stripped when present.
+    pub fn decrypt(&self, encrypted: &[u8], host_key: &str) -> Option<String> {
+      if encrypted.len() < 3 {
+        return None;
+      }
+      let prefix = &encrypted[..3];
+      if prefix != b"v10" && prefix != b"v11" {
+        return None;
+      }
+      let body = &encrypted[3..];
+      if body.is_empty() {
+        return Some(String::new());
+      }
+
+      let decrypted: Vec<u8> = match self.scheme {
+        Scheme::Pbkdf2Cbc { .. } => {
+          let mut buf = body.to_vec();
+          Aes128CbcDec::new(&self.cbc_key.into(), &CBC_IV.into())
+            .decrypt_padded::<Pkcs7>(&mut buf)
+            .ok()?
+            .to_vec()
+        }
+        Scheme::RawGcm => {
+          if self.raw.len() != 32 || body.len() <= GCM_NONCE_LEN {
+            return None;
+          }
+          let cipher = Aes256Gcm::new_from_slice(&self.raw).ok()?;
+          let (nonce, ct) = body.split_at(GCM_NONCE_LEN);
+          cipher.decrypt(Nonce::from_slice(nonce), ct).ok()?
+        }
+      };
+
+      // Older cookies (pre-M100) have no integrity prefix, so fall back to the
+      // raw bytes when the first 32 do not match.
+      if decrypted.len() >= HOST_HASH_LEN {
+        let expected: [u8; HOST_HASH_LEN] = Sha256::digest(host_key.as_bytes()).into();
+        if decrypted[..HOST_HASH_LEN] == expected {
+          return String::from_utf8(decrypted[HOST_HASH_LEN..].to_vec()).ok();
+        }
+      }
+      String::from_utf8(decrypted.to_vec()).ok()
+    }
+  }
+
+  /// Read `os_crypt_key`, or `None` when the profile has none.
+  pub fn read_key_file(profile_data_path: &Path) -> Option<Vec<u8>> {
+    // Raw bytes, never trimmed — Chromium's `ReadFileToString` passes the exact
+    // file contents to the derivation, so any normalisation here changes the key.
+    let contents = std::fs::read(profile_data_path.join("os_crypt_key")).ok()?;
+    (!contents.is_empty()).then_some(contents)
   }
 }
 
@@ -227,10 +284,46 @@ impl CookieManager {
   /// Windows epoch offset: seconds between 1601-01-01 and 1970-01-01
   const WINDOWS_EPOCH_DIFF: i64 = 11644473600;
 
-  fn get_chrome_encryption_key(profile: &BrowserProfile, profiles_dir: &Path) -> Option<[u8; 16]> {
-    let profile_data_path = profile.get_profile_data_path(profiles_dir);
-    // Derive with the convention of the OS that wrote the store, not this one.
-    chrome_decrypt::get_encryption_key(&profile_data_path, profile.resolved_os())
+  /// Pick the decryption scheme that actually opens THIS store.
+  ///
+  /// Tries each candidate against the real rows and keeps the first that reads
+  /// something. Choosing by the profile's recorded `host_os` alone is what left
+  /// Windows unable to read a store its own browser had just written — the
+  /// recorded origin is a hint about who encrypted the cookies, and a profile
+  /// that has moved between machines invalidates it.
+  fn chrome_decryptor(
+    profile: &BrowserProfile,
+    profile_data_path: &Path,
+    db: &Path,
+  ) -> Option<chrome_decrypt::Decryptor> {
+    let key = chrome_decrypt::read_key_file(profile_data_path)?;
+    let mut first: Option<chrome_decrypt::Decryptor> = None;
+    for scheme in chrome_decrypt::candidates(profile.resolved_os(), key.len()) {
+      let candidate = chrome_decrypt::Decryptor::new(&key, scheme);
+      match Self::read_chrome_cookies(db, Some(&candidate)) {
+        Ok((cookies, undecryptable)) => {
+          let readable = cookies.iter().filter(|c| !c.value.is_empty()).count();
+          if undecryptable == 0 || readable > 0 {
+            if first.is_some() {
+              log::info!(
+                "Profile {}: cookie store opens with {scheme:?}, not the scheme its \
+                 host_os implies",
+                profile.name
+              );
+            }
+            return Some(candidate);
+          }
+        }
+        Err(_) => return None,
+      }
+      first.get_or_insert(candidate);
+    }
+    log::warn!(
+      "Profile {}: no known scheme opens its cookie store ({} byte key)",
+      profile.name,
+      key.len()
+    );
+    first
   }
 
   /// Where this profile actually keeps its cookie database.
@@ -291,8 +384,8 @@ impl CookieManager {
         if !db.exists() {
           return Err(format!("Cookie database not found at: {}", db.display()));
         }
-        let key = chrome_decrypt::get_encryption_key(profile_data_path, profile.resolved_os());
-        Self::read_chrome_cookies(&db, key.as_ref())
+        let dec = Self::chrome_decryptor(profile, profile_data_path, &db);
+        Self::read_chrome_cookies(&db, dec.as_ref())
       }
       _ => Err(format!("Unsupported browser type: {}", profile.browser)),
     }
@@ -504,7 +597,7 @@ impl CookieManager {
   /// surfaces as every request 401-ing on whatever machine imported the file.
   fn read_chrome_cookies(
     db_path: &Path,
-    encryption_key: Option<&[u8; 16]>,
+    encryption_key: Option<&chrome_decrypt::Decryptor>,
   ) -> Result<(Vec<UnifiedCookie>, usize), String> {
     let conn = Connection::open(db_path).map_err(|e| format!("Failed to open database: {e}"))?;
     let undecryptable = std::cell::Cell::new(0usize);
@@ -537,9 +630,7 @@ impl CookieManager {
         let value = if !plaintext_value.is_empty() {
           plaintext_value
         } else if !encrypted_value.is_empty() {
-          match encryption_key
-            .and_then(|key| chrome_decrypt::decrypt(&encrypted_value, &domain, key))
-          {
+          match encryption_key.and_then(|d| d.decrypt(&encrypted_value, &domain)) {
             Some(v) => v,
             None => {
               // Still yields an empty string so one bad row cannot fail the whole
@@ -785,8 +876,9 @@ impl CookieManager {
       // Firefox keeps cookie values in the clear, so nothing can fail to decrypt.
       "camoufox" => (Self::read_firefox_cookies(&db_path)?, 0),
       "wayfern" => {
-        let key = Self::get_chrome_encryption_key(profile, &profiles_dir);
-        Self::read_chrome_cookies(&db_path, key.as_ref())?
+        let data = profile.get_profile_data_path(&profiles_dir);
+        let dec = Self::chrome_decryptor(profile, &data, &db_path);
+        Self::read_chrome_cookies(&db_path, dec.as_ref())?
       }
       _ => return Err(format!("Unsupported browser type: {}", profile.browser)),
     };
@@ -978,8 +1070,9 @@ impl CookieManager {
     let (all_cookies, undecryptable_count) = match source.browser.as_str() {
       "camoufox" => (Self::read_firefox_cookies(&source_db_path)?, 0),
       "wayfern" => {
-        let key = Self::get_chrome_encryption_key(source, &profiles_dir);
-        Self::read_chrome_cookies(&source_db_path, key.as_ref())?
+        let data = source.get_profile_data_path(&profiles_dir);
+        let dec = Self::chrome_decryptor(source, &data, &source_db_path);
+        Self::read_chrome_cookies(&source_db_path, dec.as_ref())?
       }
       _ => return Err(format!("Unsupported browser type: {}", source.browser)),
     };
@@ -1987,6 +2080,17 @@ mod tests {
   /// this test fails and we instantly know why all copied cookies end up
   /// with empty values — which is exactly the bug that shipped and made
   /// issue-265-style silent failures reappear.
+  /// The macOS scheme, which the real vectors below were produced under.
+  fn mac_decryptor(profile_dir: &Path) -> chrome_decrypt::Decryptor {
+    let key = chrome_decrypt::read_key_file(profile_dir).expect("os_crypt_key");
+    chrome_decrypt::Decryptor::new(
+      &key,
+      chrome_decrypt::Scheme::Pbkdf2Cbc {
+        iterations: chrome_decrypt::ITERATIONS_MACOS,
+      },
+    )
+  }
+
   #[test]
   #[cfg(target_os = "macos")]
   fn test_decrypt_v10_cookie_with_real_vector() {
@@ -1999,8 +2103,7 @@ mod tests {
     )
     .unwrap();
 
-    let key = chrome_decrypt::get_encryption_key(&profile_dir, None)
-      .expect("should derive key from os_crypt_key file");
+    let dec = mac_decryptor(&profile_dir);
 
     let encrypted_hex = "76313077ad5b27e78f685a6ccc7b92a8a242e279e54b8d2ba8e55b433ca7e2421bec52369e29a57b593c02c839f50962245da3ed8617dce142fff67778950a271d2c07";
     let encrypted: Vec<u8> = (0..encrypted_hex.len())
@@ -2008,7 +2111,8 @@ mod tests {
       .map(|i| u8::from_str_radix(&encrypted_hex[i..i + 2], 16).unwrap())
       .collect();
 
-    let decrypted = chrome_decrypt::decrypt(&encrypted, ".github.com", &key)
+    let decrypted = dec
+      .decrypt(&encrypted, ".github.com")
       .expect("decryption must succeed with correct key and host");
     assert_eq!(decrypted, "GH1.1.2077424036.1774792325");
 
@@ -2031,7 +2135,7 @@ mod tests {
     )
     .unwrap();
 
-    let key = chrome_decrypt::get_encryption_key(&profile_dir, None).unwrap();
+    let dec = mac_decryptor(&profile_dir);
     let encrypted_hex = "76313077ad5b27e78f685a6ccc7b92a8a242e279e54b8d2ba8e55b433ca7e2421bec52369e29a57b593c02c839f50962245da3ed8617dce142fff67778950a271d2c07";
     let encrypted: Vec<u8> = (0..encrypted_hex.len())
       .step_by(2)
@@ -2042,7 +2146,7 @@ mod tests {
     // `String::from_utf8(full_decrypted)` which fails on the binary hash
     // bytes and returns `None`. Either way, we must NOT return the real
     // value "GH1.1.2077424036.1774792325".
-    let result = chrome_decrypt::decrypt(&encrypted, ".facebook.com", &key);
+    let result = dec.decrypt(&encrypted, ".facebook.com");
     assert!(
       result.as_deref() != Some("GH1.1.2077424036.1774792325"),
       "decrypt must not return the real cookie value when host_key is wrong"
@@ -2093,21 +2197,30 @@ mod tests {
   /// 以前它是 `#[cfg]` 编译期常量，profile 一跨机就必然算出错误的密钥。
   #[test]
   fn key_derivation_follows_the_store_not_the_host() {
-    use chrome_decrypt::*;
     // macOS 写的库永远按 1003 解，哪怕在 Windows 上读。
-    assert_eq!(iterations_for(Some("macos")), ITERATIONS_MACOS);
-    // 其余平台按 1。
-    assert_eq!(iterations_for(Some("windows")), ITERATIONS_OTHER);
-    assert_eq!(iterations_for(Some("linux")), ITERATIONS_OTHER);
-    // 来源未记录时才回落到本机惯例。
-    let host = if cfg!(target_os = "macos") {
-      ITERATIONS_MACOS
-    } else {
-      ITERATIONS_OTHER
+    use chrome_decrypt::{candidates, Scheme, ITERATIONS_MACOS, ITERATIONS_OTHER};
+    let mac = Scheme::Pbkdf2Cbc {
+      iterations: ITERATIONS_MACOS,
     };
-    assert_eq!(iterations_for(None), host);
-    // 两个常量必须不同，否则这条修复没有意义。
-    assert_ne!(ITERATIONS_MACOS, ITERATIONS_OTHER);
+    let other = Scheme::Pbkdf2Cbc {
+      iterations: ITERATIONS_OTHER,
+    };
+
+    // Ordering follows the recorded origin...
+    assert_eq!(candidates(Some("macos"), 24)[0], mac);
+    assert_eq!(candidates(Some("windows"), 24)[0], other);
+
+    // ...but never restricts: a profile stamped macOS sitting on a store some
+    // other build rewrote must still be readable, which is exactly the case
+    // that left Windows unable to export.
+    assert!(candidates(Some("macos"), 24).contains(&other));
+    assert!(candidates(Some("windows"), 24).contains(&mac));
+
+    // A 32-byte key file cannot have come from PBKDF2, so the raw-GCM scheme is
+    // always offered for one — and tried first when nothing says otherwise.
+    assert!(candidates(Some("windows"), 32).contains(&Scheme::RawGcm));
+    assert_eq!(candidates(Some("windows"), 32)[0], Scheme::RawGcm);
+    assert!(!candidates(Some("windows"), 24).contains(&Scheme::RawGcm));
   }
 
   /// 同一份密码 + 不同迭代数 = 不同密钥。这是上一条为什么要紧的原因。
@@ -2117,8 +2230,9 @@ mod tests {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("os_crypt_key"), b"pretend-passphrase").unwrap();
 
-    let mac = chrome_decrypt::get_encryption_key(&dir, Some("macos")).unwrap();
-    let win = chrome_decrypt::get_encryption_key(&dir, Some("windows")).unwrap();
+    let key = chrome_decrypt::read_key_file(&dir).unwrap();
+    let mac = chrome_decrypt::derive_key(&key, chrome_decrypt::ITERATIONS_MACOS);
+    let win = chrome_decrypt::derive_key(&key, chrome_decrypt::ITERATIONS_OTHER);
     assert_ne!(mac, win, "迭代数不同就必须得到不同的密钥");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -2175,8 +2289,11 @@ mod tests {
       .unwrap();
     drop(conn);
 
-    let key = [0u8; 16];
-    let (cookies, undecryptable) = CookieManager::read_chrome_cookies(&db, Some(&key)).unwrap();
+    let dec = chrome_decrypt::Decryptor::new(
+      b"wrong-key",
+      chrome_decrypt::Scheme::Pbkdf2Cbc { iterations: 1 },
+    );
+    let (cookies, undecryptable) = CookieManager::read_chrome_cookies(&db, Some(&dec)).unwrap();
     assert_eq!(cookies.len(), 1, "行本身还在，不因为解不开就丢掉");
     assert_eq!(cookies[0].value, "", "值确实是空的");
     assert_eq!(undecryptable, 1, "但必须被数出来 —— 这是导出硬失败的依据");
@@ -2211,11 +2328,8 @@ mod tests {
       .unwrap();
     drop(conn);
 
-    let (cookies, undecryptable) = CookieManager::read_chrome_cookies(
-      &db,
-      Some(&chrome_decrypt::get_encryption_key(&dir, None).unwrap()),
-    )
-    .unwrap();
+    let (cookies, undecryptable) =
+      CookieManager::read_chrome_cookies(&db, Some(&mac_decryptor(&dir))).unwrap();
     assert_eq!(undecryptable, 1, "这条应当解不开");
     assert!(
       cookies.iter().all(|c| c.value.is_empty()),
@@ -2234,5 +2348,72 @@ mod tests {
     let probed = CookieManager::wayfern_cookie_path(&dir);
     assert!(!probed.exists());
     let _ = std::fs::remove_dir_all(&dir);
+  }
+}
+
+#[cfg(test)]
+mod gcm_scheme_tests {
+  use super::chrome_decrypt::{Decryptor, Scheme};
+  use aes_gcm::aead::{Aead, KeyInit};
+  use aes_gcm::{Aes256Gcm, Nonce};
+  use sha2::{Digest, Sha256};
+
+  /// A round trip in Chromium's Windows shape: 32 raw key bytes, AES-256-GCM,
+  /// `v10 || nonce(12) || ct || tag(16)`, with the SHA-256(host) integrity
+  /// prefix in front of the plaintext.
+  ///
+  /// This scheme exists because the Windows build writes a store the old
+  /// PBKDF2/CBC-only code could not read — 49 of 49 rows failed — so every
+  /// export from that machine gave up and login state created there could never
+  /// leave it.
+  #[test]
+  fn raw_gcm_round_trips_a_chromium_shaped_value() {
+    let key = [7u8; 32];
+    let host = ".xiaohongshu.com";
+    let value = b"web_session=abc123";
+
+    let mut plaintext = Sha256::digest(host.as_bytes()).to_vec();
+    plaintext.extend_from_slice(value);
+
+    let nonce = [3u8; 12];
+    let ct = Aes256Gcm::new_from_slice(&key)
+      .unwrap()
+      .encrypt(Nonce::from_slice(&nonce), plaintext.as_slice())
+      .unwrap();
+
+    let mut stored = b"v10".to_vec();
+    stored.extend_from_slice(&nonce);
+    stored.extend_from_slice(&ct);
+
+    let dec = Decryptor::new(&key, Scheme::RawGcm);
+    assert_eq!(
+      dec.decrypt(&stored, host).as_deref(),
+      Some("web_session=abc123")
+    );
+
+    // Wrong host: the integrity prefix will not match, so the real value must
+    // not come back.
+    assert_ne!(
+      dec.decrypt(&stored, ".zhihu.com").as_deref(),
+      Some("web_session=abc123")
+    );
+  }
+
+  /// A GCM value must not be mistaken for a CBC one, and vice versa — the
+  /// probe relies on a wrong scheme failing rather than returning garbage.
+  #[test]
+  fn the_wrong_scheme_fails_instead_of_returning_garbage() {
+    let key = [7u8; 32];
+    let nonce = [3u8; 12];
+    let ct = Aes256Gcm::new_from_slice(&key)
+      .unwrap()
+      .encrypt(Nonce::from_slice(&nonce), b"hello".as_slice())
+      .unwrap();
+    let mut stored = b"v10".to_vec();
+    stored.extend_from_slice(&nonce);
+    stored.extend_from_slice(&ct);
+
+    let cbc = Decryptor::new(&key, Scheme::Pbkdf2Cbc { iterations: 1003 });
+    assert_eq!(cbc.decrypt(&stored, ".example.com"), None);
   }
 }

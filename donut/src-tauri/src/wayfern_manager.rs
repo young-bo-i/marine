@@ -771,10 +771,11 @@ impl WayfernManager {
           );
 
           // Try decrypting one cookie using the cookie_manager
-          if let Some(encryption_key) = crate::cookie_manager::chrome_decrypt::get_encryption_key(
-            &profile_path_buf,
-            profile.resolved_os(),
-          ) {
+          // Diagnostic only: report which scheme (if any) opens this store, so a
+          // "logged out on launch" report says whether we could read it.
+          if let Some(key_file) =
+            crate::cookie_manager::chrome_decrypt::read_key_file(&profile_path_buf)
+          {
             if let Ok(mut stmt) = conn.prepare(
               "SELECT name, host_key, encrypted_value FROM cookies WHERE length(encrypted_value) > 0 LIMIT 1",
             ) {
@@ -783,19 +784,26 @@ impl WayfernManager {
                   let name: String = row.get(0).unwrap_or_default();
                   let host: String = row.get(1).unwrap_or_default();
                   let encrypted: Vec<u8> = row.get(2).unwrap_or_default();
-                  let decrypted = crate::cookie_manager::chrome_decrypt::decrypt(
-                    &encrypted,
-                    &host,
-                    &encryption_key,
-                  );
-                  match decrypted {
-                    Some(val) => log::info!(
-                      "Pre-launch: Cookie decryption SUCCEEDED for '{}' (host: {}, decrypted {} bytes)",
-                      name, host, val.len()
+                  let opened = crate::cookie_manager::chrome_decrypt::candidates(
+                    profile.resolved_os(),
+                    key_file.len(),
+                  )
+                  .into_iter()
+                  .find_map(|scheme| {
+                    crate::cookie_manager::chrome_decrypt::Decryptor::new(&key_file, scheme)
+                      .decrypt(&encrypted, &host)
+                      .map(|val| (scheme, val.len()))
+                  });
+                  match opened {
+                    Some((scheme, len)) => log::info!(
+                      "Pre-launch: cookie decryption SUCCEEDED for '{}' (host: {}, {} bytes) using {:?}",
+                      name, host, len, scheme
                     ),
-                    None => log::error!(
-                      "Pre-launch: Cookie decryption FAILED for '{}' (host: {}, encrypted {} bytes)",
-                      name, host, encrypted.len()
+                    None => log::warn!(
+                      "Pre-launch: no known scheme decrypts '{}' (host: {}, {} byte value, {} byte key). \
+                       The browser reads its own store regardless; this only limits what we can export \
+                       from disk, and the CDP snapshot covers that.",
+                      name, host, encrypted.len(), key_file.len()
                     ),
                   }
                 }
