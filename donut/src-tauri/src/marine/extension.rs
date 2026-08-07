@@ -320,7 +320,7 @@ mod tests {
       serde_json::from_str(include_str!("../../../marine-extension/manifest.json")).unwrap();
     let version = manifest["version"].as_str().unwrap();
     let worker = manifest["background"]["service_worker"].as_str().unwrap();
-    assert_eq!(version, "0.1.33");
+    assert_eq!(version, "0.1.34");
     assert_eq!(worker, format!("src/sw-entry-{version}.js"));
     let entry = fs::read_to_string(
       Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -331,44 +331,65 @@ mod tests {
     assert!(entry.contains(&format!("sw.js?v={version}")));
   }
 
-  /// Editing `sw.js` without renaming the entry ships a silent no-op.
+  /// Editing ANY script the worker imports, without moving its URL, ships a
+  /// silent no-op.
   ///
-  /// Chromium replaces a cached unpacked-extension worker only when the
-  /// TOP-LEVEL service-worker script URL changes. Our manifest registers
-  /// `src/sw-entry-<v>.js`, whose whole body is `importScripts('sw.js?v=<v>')`,
-  /// so every real change lives in a file whose URL never moves. Measured
-  /// against Wayfern 150.0.7871.102 with a persistent profile and a full browser
+  /// Chromium caches worker scripts by URL, and each `importScripts` target is
+  /// its own cache entry. The manifest registers `src/sw-entry-<v>.js`, whose
+  /// body is `importScripts('sw.js?v=<v>')`, and `sw.js` in turn imports
+  /// `scholay-skill.js?v=<v>`. Every one of those URLs has to move together.
+  ///
+  /// Measured against Wayfern 150.0.7871.102, persistent profile, full browser
   /// restart between runs:
   ///
-  /// | changed                                   | worker |
-  /// |-------------------------------------------|--------|
-  /// | `sw.js` only                              | stale  |
-  /// | `sw.js` + manifest `version`              | stale  |
-  /// | entry filename                            | fresh  |
+  /// | changed                       | worker |
+  /// |-------------------------------|--------|
+  /// | an imported script only       | stale  |
+  /// | that + manifest `version`     | stale  |
+  /// | the entry filename            | fresh  |
   ///
-  /// So a manifest bump is NOT enough, and "restart the browser" does not help
-  /// either — three consecutive fixes shipped as no-ops before that was noticed,
-  /// and each one cost a round trip with the person testing it.
+  /// This has now bitten twice. First: three consecutive `sw.js` fixes shipped
+  /// as no-ops. Then, one release after the guard was added for `sw.js` alone,
+  /// `scholay-skill.js` was edited — the browser kept the old copy, which
+  /// expected a six-paragraph mother draft while the bundle now shipped nine,
+  /// so the skill build threw, the Rime context PUT never went out, and
+  /// automation could not even reach the generate step. Hence: every imported
+  /// script, not just the entry's.
   ///
-  /// This test fails whenever `sw.js` changes, which is the point: the fix is to
-  /// rename the entry, update the manifest, and paste the new digest here — all
-  /// in the same commit as the `sw.js` edit.
+  /// Failing here means: rename the entry, bump every `?v=` alongside it, and
+  /// paste the new digests — all in the same commit as the edit.
   #[test]
-  fn editing_the_worker_requires_bumping_its_registration_url() {
+  fn editing_any_worker_script_requires_bumping_its_url() {
     use sha2::{Digest, Sha256};
-    const SW_SHA256: &str = "8e0e18fb93e988f328ddd3e36268d12d628a8e81866ac0df1619a8b3ced1de11";
-    let actual: String = Sha256::digest(include_bytes!("../../../marine-extension/src/sw.js"))
-      .iter()
-      .map(|b| format!("{b:02x}"))
-      .collect();
-    assert_eq!(
-      actual, SW_SHA256,
-      "\n\nsw.js changed. Chromium will keep running the OLD worker unless the \
-       registration URL moves. In the SAME commit:\n\
-       \n  1. git mv marine-extension/src/sw-entry-<old>.js marine-extension/src/sw-entry-<new>.js\
-       \n  2. update its importScripts('sw.js?v=<new>')\
-       \n  3. manifest.json: version + background.service_worker\
-       \n  4. the two version asserts above, and SW_SHA256 = {actual}\n"
-    );
+    let hex = |bytes: &[u8]| -> String {
+      Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+    };
+    for (name, actual, expected) in [
+      (
+        "sw.js",
+        hex(include_bytes!("../../../marine-extension/src/sw.js")),
+        "3d5dad44d04418f52b2099e68a2025dcf20e7e86b0a995c9e8750085a5e63241",
+      ),
+      (
+        "scholay-skill.js",
+        hex(include_bytes!(
+          "../../../marine-extension/src/scholay-skill.js"
+        )),
+        "adc4cd1cd42acd0997e772549723a2443d21dc8242569d3cf5e171c572be8b91",
+      ),
+    ] {
+      assert_eq!(
+        actual, expected,
+        "\n\n{name} changed. Chromium will keep running the OLD copy — it caches \
+         each imported script by URL — unless that URL moves. In the SAME commit:\n\
+         \n  1. git mv src/sw-entry-<old>.js src/sw-entry-<new>.js\
+         \n  2. bump every `?v=` (the entry's importScripts AND sw.js's)\
+         \n  3. manifest.json: version + background.service_worker\
+         \n  4. the version asserts above, and this digest = {actual}\n"
+      );
+    }
   }
 }

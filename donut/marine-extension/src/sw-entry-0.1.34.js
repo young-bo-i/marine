@@ -8,4 +8,4 @@
 // replaces it. Three consecutive sw.js-only fixes shipped as silent no-ops
 // before that was noticed — `bundled_manifest_versions_worker_registration_url`
 // now hashes sw.js so the next one cannot.
-importScripts('sw.js?v=0.1.33');
+importScripts('sw.js?v=0.1.34');

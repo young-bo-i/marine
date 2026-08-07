@@ -1,5 +1,10 @@
 // sw.js — 侧边栏与 Marine 本地 API 桥接
-importScripts('scholay-skill.js');
+// 版本查询不是装饰：没有它，这个 URL 永远命中 worker 的脚本缓存，
+// 而它和 sw.js 是两个独立的缓存条目 —— v0.1.45 改了这里的段数常量却没换 URL，
+// 于是浏览器拿旧的 scholay-skill.js（认 6 段）去解析新的 9 段母稿，
+// 技能构建抛异常、Rime 上下文的 PUT 发不出去、自动化连生成都点不到。
+// 改这个文件时必须和 sw-entry 的版本一起动，测试会拦。
+importScripts('scholay-skill.js?v=0.1.34');
 chrome.runtime.onInstalled.addListener(() => {
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
   void marineRetryPublishedOutbox('installed');
