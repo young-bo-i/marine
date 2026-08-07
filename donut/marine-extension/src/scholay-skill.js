@@ -1,7 +1,7 @@
 // scholay-skill.js — deterministic, context-aware Scholay mother-draft routing.
 // Kept dependency-free so popup, MV3 service worker, and smoke tests share one path.
 
-const MARINE_SCHOLAY_MOTHER_PARAGRAPHS = 6;
+const MARINE_SCHOLAY_MOTHER_PARAGRAPHS = 9;
 const MARINE_SCHOLAY_MAX_EXAMPLES = 2;
 
 function marineScholayText(value) {
@@ -30,7 +30,8 @@ function marineScholayValidatedAssets(assets) {
   const value = assets || {};
   const paragraphs = marineScholayParseMotherDraft(value.mother);
   if (paragraphs.length !== MARINE_SCHOLAY_MOTHER_PARAGRAPHS) {
-    throw new Error('Scholay 母稿必须保持为 6 段，当前为 ' + paragraphs.length + ' 段');
+    throw new Error('Scholay 母稿必须保持为 ' + MARINE_SCHOLAY_MOTHER_PARAGRAPHS
+      + ' 段，当前为 ' + paragraphs.length + ' 段');
   }
 
   const index = marineScholayParseIndex(value.index);

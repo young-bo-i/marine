@@ -17,11 +17,30 @@ const sandbox = { assets };
 vm.createContext(sandbox);
 vm.runInContext(helper, sandbox, { filename: "marine-extension/src/scholay-skill.js" });
 
-const digest = crypto.createHash("sha256").update(mother).digest("hex");
+// 守住用户亲手写的那六段，而不是整个文件。
+//
+// 原来这里比的是整份 `母稿.md` 的哈希，意图是对的（那六段是真人写的，一个错别字都
+// 不许「顺手修正」），但它把**追加**也一并禁掉了 —— 而新能力恰恰只能靠追加段落来
+// 获得语感来源，否则模型没有真人话可搬，只能退回产品腔。
+//
+// 所以改成只钉前六段。追加的段落照样受 `执行口径.md` 约束，但不再需要动这个常量；
+// 谁要是改了原版的一个字，这里依然会红。
+const ORIGINAL_PARAGRAPHS = 6;
+const originalDigest = crypto
+  .createHash("sha256")
+  .update(
+    mother
+      .split(/\n\s*\n+/)
+      .map((p) => p.trim())
+      .filter(Boolean)
+      .slice(0, ORIGINAL_PARAGRAPHS)
+      .join("\n\n"),
+  )
+  .digest("hex");
 assert.equal(
-  digest,
-  "7707219d9f301ab1294c4decc92747795dbf65ff898562aac150d35753ac9913",
-  "用户原版母稿必须逐字保持不变",
+  originalDigest,
+  "ff23387e2e319d656181b04353abe0d47fdb50dd23f5e87124d137508b639752",
+  "用户原版母稿的前六段必须逐字保持不变",
 );
 
 const result = vm.runInContext(`(() => {
@@ -93,7 +112,7 @@ const result = vm.runInContext(`(() => {
   };
 })()`, sandbox);
 
-assert.equal(result.paragraphs.length, 6);
+assert.equal(result.paragraphs.length, 9);
 assert.equal(result.subtitleSource, "subtitle");
 assert.deepEqual(Array.from(result.subtitleIds), ["research-matrix"]);
 assert.equal(result.reviewIds[0], "submission-review");
@@ -106,7 +125,7 @@ assert.match(result.skill, /其实开题这个东西，中国的大学根本就�
 assert.doesNotMatch(result.skill, /期刊审稿是很不客气的/);
 assert.doesNotMatch(result.skill, /不得编造/);
 assert.match(result.skill, /用户主动导入的补充范文（次级参照）/);
-assert.match(result.corruptError, /必须保持为 6 段/);
+assert.match(result.corruptError, /必须保持为 9 段/);
 
 const popupHtml = fs.readFileSync(new URL("../popup.html", import.meta.url), "utf8");
 const popupSource = fs.readFileSync(new URL("../popup.js", import.meta.url), "utf8");
