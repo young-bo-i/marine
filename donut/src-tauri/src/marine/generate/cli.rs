@@ -34,6 +34,17 @@ const MAX_PROVIDER_STDERR_BYTES: usize = 64 * 1024;
 const MAX_PROVIDER_PROTOCOL_EVENTS: usize = 8192;
 const PROCESS_CLEANUP_TIMEOUT_SECS: u64 = 2;
 
+/// How long a provider gets to answer its FIRST JSON-RPC message.
+///
+/// Separate from `GENERATION_TIMEOUT_SECS` (240 s), which budgets the whole
+/// generation and is the right size for a model that is actually thinking. A
+/// provider that never completes the handshake is not thinking — it is stuck,
+/// usually on something it wants to tell you about — and making the user watch
+/// a spinner for four minutes to find that out is the wrong trade. Observed on
+/// Windows: codex launched and produced nothing at all; the person testing gave
+/// up after 55 s, so the deadline never even fired and the log stayed empty.
+const HANDSHAKE_TIMEOUT_SECS: u64 = 25;
+
 const CODEX_DISABLED_FEATURES: &[&str] = &[
   "apps",
   "browser_use",
@@ -756,7 +767,7 @@ async fn run_claude_stream(
   let mut stdin = child.stdin.take().ok_or("Claude has no stdin handle")?;
   let stdout = child.stdout.take().ok_or("Claude has no stdout handle")?;
   let stderr = child.stderr.take().ok_or("Claude has no stderr handle")?;
-  let mut stderr_task = tokio::spawn(read_bounded(stderr, MAX_PROVIDER_STDERR_BYTES));
+  let mut stderr_task = tokio::spawn(read_bounded(stderr, MAX_PROVIDER_STDERR_BYTES, "Claude"));
   let prompt = prompt.to_owned();
   let mut writer = tokio::spawn(async move {
     stdin.write_all(prompt.as_bytes()).await?;
@@ -928,8 +939,11 @@ async fn run_codex_app_server_stream(
     .stderr
     .take()
     .ok_or("Codex app-server has no stderr handle")?;
-  let mut stderr_task = tokio::spawn(read_bounded(stderr, MAX_PROVIDER_STDERR_BYTES));
+  let mut stderr_task = tokio::spawn(read_bounded(stderr, MAX_PROVIDER_STDERR_BYTES, "Codex"));
   let deadline = tokio::time::Instant::now() + Duration::from_secs(GENERATION_TIMEOUT_SECS);
+  // The first reply gets a much shorter leash — see `HANDSHAKE_TIMEOUT_SECS`.
+  let handshake_deadline =
+    deadline.min(tokio::time::Instant::now() + Duration::from_secs(HANDSHAKE_TIMEOUT_SECS));
   let mut reader = BufReader::new(stdout);
   let mut queued = Vec::new();
   let mut budget = ProviderProtocolBudget::default();
@@ -949,15 +963,26 @@ async fn run_codex_app_server_stream(
       deadline,
     )
     .await?;
+    // The `initialize` reply is the handshake — short leash.
     let _ = read_until_response(
       &mut reader,
       &cancellation,
-      deadline,
+      handshake_deadline,
       1,
       &mut queued,
       &mut budget,
     )
-    .await?;
+    .await
+    .map_err(|error| {
+      if error == "MARINE_GENERATE_TIMEOUT" {
+        format!(
+          "Codex did not answer its first JSON-RPC message within {HANDSHAKE_TIMEOUT_SECS}s — \
+           it launched but never handshook"
+        )
+      } else {
+        error
+      }
+    })?;
     write_json_line(
       &mut stdin,
       &serde_json::json!({"jsonrpc": "2.0", "method": "initialized"}),
@@ -1557,19 +1582,52 @@ fn claude_final_text(value: &Value) -> Result<Option<String>, String> {
     .ok_or_else(|| "Claude result event omitted its output".to_string())
 }
 
-async fn read_bounded<R: AsyncRead + Unpin>(mut reader: R, maximum: usize) -> String {
+/// Collect a child's stderr, **and log each line as it arrives**.
+///
+/// The buffered return value is only surfaced by `with_stderr` on failure, which
+/// means a provider that HANGS produces no diagnostics at all — the request sits
+/// there until the 240 s deadline while whatever the agent is complaining about
+/// stays in a buffer nobody reads. That is what a stuck "生成中…" looked like
+/// from the outside for several rounds, and codex may well have been saying why
+/// the whole time.
+///
+/// `provider` names the source so two concurrent agents stay distinguishable.
+async fn read_bounded<R: AsyncRead + Unpin>(
+  mut reader: R,
+  maximum: usize,
+  provider: &'static str,
+) -> String {
   let mut output = Vec::new();
   let mut buffer = [0u8; 4096];
+  let mut pending = String::new();
   loop {
     let read = match reader.read(&mut buffer).await {
       Ok(0) | Err(_) => break,
       Ok(read) => read,
     };
+
+    // Live view, line by line. Bounded by the same budget as the buffer, so a
+    // chatty or looping provider cannot flood the log either.
+    if output.len() < maximum {
+      pending.push_str(&String::from_utf8_lossy(&buffer[..read]));
+      while let Some(newline) = pending.find('\n') {
+        let line: String = pending.drain(..=newline).collect();
+        let line = line.trim_end();
+        if !line.is_empty() {
+          log::info!("Marine {provider} stderr: {line}");
+        }
+      }
+    }
+
     let remaining = maximum.saturating_sub(output.len());
     if remaining == 0 {
       continue;
     }
     output.extend_from_slice(&buffer[..read.min(remaining)]);
+  }
+  let tail = pending.trim_end();
+  if !tail.is_empty() {
+    log::info!("Marine {provider} stderr: {tail}");
   }
   String::from_utf8_lossy(&output).into_owned()
 }
