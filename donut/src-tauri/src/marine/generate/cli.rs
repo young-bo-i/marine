@@ -15,6 +15,8 @@ use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::Value;
 use std::io::Read as StdRead;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -197,7 +199,53 @@ struct CodexLaunch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CodexExecutableKind {
   Direct,
-  NodeLauncher(Option<PathBuf>),
+  NodeLauncher {
+    /// An explicit interpreter named by a `#!` line, if there was one.
+    interpreter: Option<PathBuf>,
+    /// What to hand the interpreter. Normally the resolved file itself; a
+    /// Windows `.cmd` shim is not runnable by Node, so it names the `.js` it
+    /// would have launched instead.
+    script: Option<PathBuf>,
+  },
+}
+
+/// Pull the script out of an npm-generated Windows `.cmd` shim.
+///
+/// npm installs three shims side by side — an extensionless sh script, a
+/// `.cmd`, and a `.ps1` — and `PATHEXT` resolution lands on the `.cmd`. Running
+/// that means running `cmd.exe`, which brings two problems this avoids
+/// entirely: a console window flashes up on every generation, and every
+/// argument is re-parsed by the shell on the way through. The Codex invocation
+/// passes `-c web_search="disabled"` and a JSON schema, so shell re-parsing is
+/// not a theoretical risk.
+///
+/// The shim's last line has a fixed shape:
+///
+/// ```text
+/// endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_modules\@openai\codex\bin\codex.js" %*
+/// ```
+///
+/// so the `.js` it names, with `%dp0%` resolved against the shim's own
+/// directory, is the thing to give Node.
+fn script_from_windows_shim(shim: &Path, contents: &str) -> Option<PathBuf> {
+  let dir = shim.parent()?;
+  contents
+    .split('"')
+    .find(|token| {
+      let lower = token.to_ascii_lowercase();
+      (lower.ends_with(".js") || lower.ends_with(".mjs") || lower.ends_with(".cjs"))
+        && !token.contains("%*")
+    })
+    .map(|token| {
+      // `%dp0%` already carries a trailing separator in npm's shims, so strip
+      // any leading separator left behind to avoid an absolute-path join.
+      let rest = token
+        .replace("%dp0%", "")
+        .replace("%~dp0", "")
+        .trim_start_matches(['\\', '/'])
+        .to_string();
+      dir.join(rest.replace('\\', "/"))
+    })
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -238,6 +286,26 @@ fn codex_executable_kind(path: &Path) -> Result<CodexExecutableKind, String> {
     .split(|byte| *byte == b'\n')
     .next()
     .unwrap_or_default();
+  // A Windows `.cmd`/`.bat` shim has no shebang; what it has is the `.js` it
+  // would hand to Node. Read it out and skip the shell entirely.
+  let extension = path
+    .extension()
+    .and_then(|e| e.to_str())
+    .map(str::to_ascii_lowercase);
+  if matches!(extension.as_deref(), Some("cmd") | Some("bat")) {
+    let text = String::from_utf8_lossy(&header[..count]);
+    let mut whole = text.into_owned();
+    // The `.js` reference lives on the shim's LAST line, well past the 512
+    // bytes read for a shebang.
+    if let Ok(full) = std::fs::read_to_string(path) {
+      whole = full;
+    }
+    return Ok(CodexExecutableKind::NodeLauncher {
+      interpreter: None,
+      script: script_from_windows_shim(path, &whole),
+    });
+  }
+
   let Ok(first_line) = std::str::from_utf8(first_line) else {
     return Ok(CodexExecutableKind::Direct);
   };
@@ -251,9 +319,10 @@ fn codex_executable_kind(path: &Path) -> Result<CodexExecutableKind, String> {
   let interpreter_path = Path::new(interpreter);
   let interpreter_name = interpreter_path.file_name().and_then(|name| name.to_str());
   if interpreter_name == Some("node") || interpreter_name == Some("node.exe") {
-    return Ok(CodexExecutableKind::NodeLauncher(Some(
-      interpreter_path.to_path_buf(),
-    )));
+    return Ok(CodexExecutableKind::NodeLauncher {
+      interpreter: Some(interpreter_path.to_path_buf()),
+      script: None,
+    });
   }
   if interpreter_name != Some("env") {
     return Ok(CodexExecutableKind::Direct);
@@ -264,7 +333,10 @@ fn codex_executable_kind(path: &Path) -> Result<CodexExecutableKind, String> {
     }
     let name = Path::new(part).file_name().and_then(|name| name.to_str());
     return if name == Some("node") || name == Some("node.exe") {
-      Ok(CodexExecutableKind::NodeLauncher(None))
+      Ok(CodexExecutableKind::NodeLauncher {
+        interpreter: None,
+        script: None,
+      })
     } else {
       Ok(CodexExecutableKind::Direct)
     };
@@ -369,8 +441,11 @@ fn resolve_codex_launch_with_nodes(
       program: codex,
       prefix_args: Vec::new(),
     }),
-    CodexExecutableKind::NodeLauncher(explicit) => {
-      let node = explicit
+    CodexExecutableKind::NodeLauncher {
+      interpreter,
+      script,
+    } => {
+      let node = interpreter
         .into_iter()
         .chain(candidates.iter().cloned())
         .find(|path| is_executable_file(path))
@@ -381,9 +456,10 @@ fn resolve_codex_launch_with_nodes(
           )
         })?;
       let node = std::fs::canonicalize(&node).unwrap_or(node);
+      let script = script.unwrap_or(codex);
       Ok(CodexLaunch {
         program: node,
-        prefix_args: vec![codex],
+        prefix_args: vec![script],
       })
     }
   }
@@ -516,6 +592,24 @@ fn isolated_codex_command(
     let mut command = tokio::process::Command::new(&launch.program);
     command.args(&launch.prefix_args);
     Ok(command)
+  }
+}
+
+/// Keep child processes from flashing a console window on Windows.
+///
+/// Every provider launch is a headless, piped subprocess — nothing about it is
+/// meant to be visible. Without this flag each generation pops a console for as
+/// long as the process lives, which on the extension's "generate" button looks
+/// exactly like a crash. `0x08000000` is `CREATE_NO_WINDOW`; the same constant
+/// the browser-teardown code already passes to `taskkill`.
+fn hide_console(command: &mut tokio::process::Command) {
+  #[cfg(windows)]
+  {
+    command.creation_flags(0x0800_0000);
+  }
+  #[cfg(not(windows))]
+  {
+    let _ = command;
   }
 }
 
@@ -653,6 +747,7 @@ async fn run_claude_stream(
   }
   #[cfg(unix)]
   command.process_group(0);
+  hide_console(&mut command);
   let mut child = command
     .spawn()
     .map_err(|error| format!("spawn Claude failed: {error}"))?;
@@ -795,6 +890,7 @@ async fn run_codex_app_server_stream(
   }
   #[cfg(unix)]
   command.process_group(0);
+  hide_console(&mut command);
   let mut child = command
     .spawn()
     .map_err(|error| format!("spawn Codex app-server failed: {error}"))?;
@@ -1500,6 +1596,60 @@ mod stream_tests {
       use std::os::unix::fs::PermissionsExt;
       std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+  }
+
+  /// An npm `.cmd` shim must be unwrapped to the `.js` it names, so Node is
+  /// invoked directly.
+  ///
+  /// Running the shim instead means running `cmd.exe`, which flashes a console
+  /// on every generation and re-parses every argument on the way through — and
+  /// the Codex invocation passes `-c web_search="disabled"` plus a JSON schema,
+  /// so shell re-parsing is not hypothetical.
+  #[test]
+  fn a_windows_npm_cmd_shim_resolves_to_the_js_it_wraps() {
+    let dir = tempfile::tempdir().unwrap();
+    let shim = dir.path().join("codex.cmd");
+    std::fs::write(
+      &shim,
+      concat!(
+        "@ECHO off\r\n",
+        "GOTO start\r\n",
+        ":find_dp0\r\n",
+        "SET dp0=%~dp0\r\n",
+        "EXIT /b\r\n",
+        ":start\r\n",
+        "SETLOCAL\r\n",
+        "CALL :find_dp0\r\n",
+        "IF EXIST \"%dp0%\\node.exe\" (\r\n",
+        "  SET \"_prog=%dp0%\\node.exe\"\r\n",
+        ") ELSE (\r\n",
+        "  SET \"_prog=node\"\r\n",
+        ")\r\n",
+        "endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & ",
+        "\"%_prog%\"  \"%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js\" %*\r\n",
+      ),
+    )
+    .unwrap();
+
+    let script = script_from_windows_shim(&shim, &std::fs::read_to_string(&shim).unwrap())
+      .expect("the shim names a .js");
+    assert_eq!(
+      script,
+      dir.path().join("node_modules/@openai/codex/bin/codex.js")
+    );
+  }
+
+  /// `%*` is not a script, and neither is `node.exe`. Picking either would send
+  /// Node something it cannot run.
+  #[test]
+  fn shim_parsing_ignores_non_script_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let shim = dir.path().join("x.cmd");
+    assert_eq!(
+      script_from_windows_shim(&shim, "@ECHO off\r\n\"%dp0%\\node.exe\" %*\r\n"),
+      None,
+      "no .js in this shim, so there is nothing to hand Node"
+    );
   }
 
   #[test]
