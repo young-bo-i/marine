@@ -379,6 +379,52 @@ fn node_candidates(codex: &Path) -> Vec<PathBuf> {
   candidates
 }
 
+/// `canonicalize`, minus the `\\?\` prefix Windows insists on adding.
+///
+/// `std::fs::canonicalize` on Windows always returns an extended-length path.
+/// `CreateProcessW` accepts those, so a native `.exe` is fine — but an npm
+/// `.cmd` shim is a batch file, which Rust can only run through `cmd.exe`, and
+/// **`cmd.exe` does not understand `\\?\`**. It misreads the path, the shim's
+/// `%~dp0` comes out wrong, and the `node` it launches receives `C:` as its
+/// main module:
+///
+/// ```text
+/// Error: EISDIR: illegal operation on a directory, lstat 'C:'
+///     at resolveMainPath (node:internal/modules/run_main:35:21)
+/// ```
+///
+/// Measured from a real launch line:
+/// `"\\?\C:\Users\...\npm-global\codex.cmd" "app-server" "--stdio" ...`
+///
+/// Canonicalising is still worth doing — it resolves symlinks and `..`, and the
+/// sandbox profile on macOS needs a real path — so this strips the prefix rather
+/// than dropping the call. A genuine UNC path (`\\?\UNC\server\share`) is folded
+/// back to `\\server\share` rather than mangled.
+fn canonicalize_for_exec(path: &Path) -> PathBuf {
+  let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+  strip_extended_length_prefix(&canonical)
+}
+
+fn strip_extended_length_prefix(path: &Path) -> PathBuf {
+  let text = path.to_string_lossy();
+  if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+    return PathBuf::from(format!(r"\\{rest}"));
+  }
+  if let Some(rest) = text.strip_prefix(r"\\?\") {
+    // Only a drive-qualified path is safe to unwrap; anything else keeps the
+    // prefix, since it may be a device path that has no ordinary spelling.
+    let looks_like_drive = rest
+      .as_bytes()
+      .first()
+      .is_some_and(|c| c.is_ascii_alphabetic())
+      && rest.as_bytes().get(1) == Some(&b':');
+    if looks_like_drive {
+      return PathBuf::from(rest);
+    }
+  }
+  path.to_path_buf()
+}
+
 fn resolve_codex_launch_with_nodes(
   codex: &Path,
   candidates: &[PathBuf],
@@ -389,7 +435,7 @@ fn resolve_codex_launch_with_nodes(
       codex.display()
     ));
   }
-  let codex = std::fs::canonicalize(codex).unwrap_or_else(|_| codex.to_path_buf());
+  let codex = canonicalize_for_exec(codex);
   match codex_executable_kind(&codex)? {
     CodexExecutableKind::Direct => Ok(CodexLaunch {
       program: codex,
@@ -409,7 +455,7 @@ fn resolve_codex_launch_with_nodes(
             codex.display()
           )
         })?;
-      let node = std::fs::canonicalize(&node).unwrap_or(node);
+      let node = canonicalize_for_exec(&node);
       let script = script.unwrap_or(codex);
       Ok(CodexLaunch {
         program: node,
@@ -1573,6 +1619,40 @@ mod stream_tests {
     }
   }
 
+  /// `cmd.exe` cannot parse an extended-length path, and an npm `.cmd` shim can
+  /// only be run through `cmd.exe`.
+  ///
+  /// Measured launch line before this: the program was
+  /// `\\?\C:\Users\...\npm-global\codex.cmd`, the shim's `%~dp0` came out wrong,
+  /// and node was handed `C:` as its main module. Pure string logic, so it is
+  /// checked on every platform rather than only where it bites.
+  #[test]
+  fn an_extended_length_prefix_is_stripped_before_exec() {
+    assert_eq!(
+      strip_extended_length_prefix(Path::new(r"\\?\C:\Users\winmini\npm-global\codex.cmd")),
+      PathBuf::from(r"C:\Users\winmini\npm-global\codex.cmd")
+    );
+    // A real UNC share folds back to its ordinary spelling.
+    assert_eq!(
+      strip_extended_length_prefix(Path::new(r"\\?\UNC\server\share\codex.cmd")),
+      PathBuf::from(r"\\server\share\codex.cmd")
+    );
+    // Device paths have no ordinary spelling — leave them alone.
+    assert_eq!(
+      strip_extended_length_prefix(Path::new(r"\\?\Volume{f0000000-0000}\x")),
+      PathBuf::from(r"\\?\Volume{f0000000-0000}\x")
+    );
+    // Anything without the prefix is untouched, on every platform.
+    assert_eq!(
+      strip_extended_length_prefix(Path::new("/usr/local/bin/codex")),
+      PathBuf::from("/usr/local/bin/codex")
+    );
+    assert_eq!(
+      strip_extended_length_prefix(Path::new(r"C:\already\plain.cmd")),
+      PathBuf::from(r"C:\already\plain.cmd")
+    );
+  }
+
   #[test]
   fn codex_node_launcher_uses_an_explicit_runtime_without_shell_path() {
     let directory = tempfile::tempdir().unwrap();
@@ -1585,11 +1665,8 @@ mod stream_tests {
 
     let launch =
       resolve_codex_launch_with_nodes(&codex, &[first_node.clone(), second_node.clone()]).unwrap();
-    assert_eq!(launch.program, std::fs::canonicalize(first_node).unwrap());
-    assert_eq!(
-      launch.prefix_args,
-      vec![std::fs::canonicalize(codex).unwrap()]
-    );
+    assert_eq!(launch.program, canonicalize_for_exec(&first_node));
+    assert_eq!(launch.prefix_args, vec![canonicalize_for_exec(&codex)]);
   }
 
   #[test]
@@ -1599,7 +1676,7 @@ mod stream_tests {
     write_test_executable(&codex, b"\xcf\xfa\xed\xfe native placeholder");
 
     let launch = resolve_codex_launch_with_nodes(&codex, &[]).unwrap();
-    assert_eq!(launch.program, std::fs::canonicalize(codex).unwrap());
+    assert_eq!(launch.program, canonicalize_for_exec(&codex));
     assert!(launch.prefix_args.is_empty());
   }
 
