@@ -720,4 +720,58 @@ assert.equal(
   "没有编排标记的 PUT 在失焦时仍然不准落地 —— 放宽的是编排，不是所有人",
 );
 
+// ---- 焦点缓存烂掉之后必须还能自愈 ----
+//
+// `onFocusChanged(WINDOW_ID_NONE)` 把 `marineFocusedWindowId` 写成 null。清掉它
+// 原来只有一条路：再来一次 `onFocusChanged(某窗口)`。可窗口本来就已经在前台的话
+// 那个事件不会再触发 —— 于是 null 永久卡住，`onActivated` 在开头 return、
+// 焦点确认在开头 false、焦点闸只在 `undefined` 时才肯问 API。实测表现是用户点多少
+// 次输入框都是「目标准备超时」，只有重启浏览器才好。
+//
+// 这里模拟的正是那个状态：浏览器**确实**在前台（`focusedWindowId` 是真的），
+// 但缓存里还留着 blur 事件写下的 null，而且不会再有事件来纠正它。
+focusWindow(chrome.windows.WINDOW_ID_NONE);
+await flushTasks();
+// 窗口回到前台，但没有任何事件送达（这正是「窗口本来就是前台」的情形）。
+focusedWindowId = 10;
+activeTabByWindow.set(10, 31);
+const staleNullId = "recovers-from-stale-null-focus";
+const callsBeforeStaleNull = apiCalls.length;
+const staleNull = await sendContext(
+  31,
+  putMessage(staleNullId, 9, "document-stale-null"),
+  { active: true, windowId: 10 },
+);
+assert.equal(staleNull.ok, true);
+assert.equal(
+  staleNull.deferred,
+  undefined,
+  "缓存说没焦点、API 说有焦点时，必须信 API —— 推迟就再也没人来兑现了",
+);
+assert.equal(
+  apiCalls.slice(callsBeforeStaleNull).some(
+    (call) => call.method === "PUT" && call.contextId === staleNullId,
+  ),
+  true,
+  "焦点缓存过期不能让用户点击的输入框永远拿不到上下文",
+);
+
+// 反面：复核走的是 API，不是「放行一切」。后台标签页仍然过不去。
+activeTabByWindow.set(10, 31);
+const backgroundId = "background-tab-still-refused";
+const callsBeforeBackground = apiCalls.length;
+const background = await sendContext(
+  32,
+  putMessage(backgroundId, 10, "document-background"),
+  { active: true, windowId: 10 },
+);
+assert.equal(background.ok, true);
+assert.equal(
+  apiCalls.slice(callsBeforeBackground).some(
+    (call) => call.method === "PUT" && call.contextId === backgroundId,
+  ),
+  false,
+  "自称 active 但不是该窗口当前活动标签的 sender，复核后仍然必须被拒",
+);
+
 console.log("Marine extension Rime service-worker smoke: OK");

@@ -799,23 +799,41 @@ function marineFocusEpochIsCurrent(epoch, windowId) {
     && (marineFocusedWindowId === undefined || marineFocusedWindowId === windowId);
 }
 
+// 拿 API 复核，而不是信一个可能已经烂掉的缓存。
+//
+// `marineFocusedWindowId === null` 的意思是「没有任何浏览器窗口在前台」。它由
+// `onFocusChanged(WINDOW_ID_NONE)` 写入，而清掉它**只有**再来一次
+// `onFocusChanged(某窗口)` 这一条路 —— 可窗口本来就已经是前台的话，那个事件
+// 根本不会再触发。于是这个 null 会永久卡住：`onActivated` 在开头就 return，
+// 这个函数在开头就 false，焦点闸只在 `undefined` 时才肯问 API。用户表现是点多少
+// 次输入框都是「目标准备超时」，而且重启浏览器才好。
+//
+// 所以 null 不再当结论用，只当「需要复核」的信号：直接问
+// `chrome.windows.get` 和 `chrome.tabs.query`。这比事件流更强而不是更弱 ——
+// 后台标签页仍然过不了（下面三个条件缺一不可：sender 自称 active、窗口
+// `focused === true`、该窗口当前活动标签就是它）。
 async function marineConfirmSenderFocus(sender) {
   const tab = sender.tab;
   const tabId = tab && tab.id;
   const windowId = tab && tab.windowId;
   if (tabId == null || tab.active !== true || !Number.isInteger(windowId)) return false;
-  if (marineFocusedWindowId === null) return false;
   if (Number.isInteger(marineFocusedWindowId) && marineFocusedWindowId !== windowId) return false;
 
   const epoch = marineNextFocusEpoch();
-  if (marineFocusedWindowId === undefined) {
+  if (!Number.isInteger(marineFocusedWindowId)) {
     let window;
     try {
       window = await chrome.windows.get(windowId);
     } catch (e) {
       return false;
     }
-    if (!window || window.focused !== true || !marineFocusEpochIsCurrent(epoch, windowId)) return false;
+    // 这里只比 epoch，不用 `marineFocusEpochIsCurrent` —— 那个谓词把 null 当成
+    // 「没有窗口在前台」的结论，而我们正是来推翻这个结论的。epoch 没动就足以
+    // 说明这段 await 期间没有真的失焦事件插进来。
+    if (!window || window.focused !== true || epoch !== marineFocusEpoch) return false;
+    // API 说了它在前台，就把烂掉的缓存改回来。必须在下面那些检查之前 ——
+    // 它们都会经过 `marineFocusEpochIsCurrent`，而那个谓词看到 null 就一票否决。
+    marineFocusedWindowId = windowId;
   }
 
   let tabs;
@@ -873,8 +891,19 @@ async function marineApplyContextMessage(msg, sender, expectedEpoch, expectedSou
     let suspendedRenewalConfirmed = options.allowSuspendedRetainedRenewal === true &&
       marineExactSuspendedRetainedRenewal(msg, sender, expectedSource);
     let senderFocusConfirmed = true;
+    // `null` 和 `undefined` 一样要去问 API。
+    //
+    // 这两者的区别只在于「从没初始化」还是「被 blur 事件写死」，而**都没有事件
+    // 能把它们清掉**：窗口已经是前台时 `onFocusChanged` 不会再触发。原来只复核
+    // `undefined`，等于把一个无解的 null 当成了结论，用户点多少次输入框都是
+    // 「目标准备超时」。
+    //
+    // 范围只放到这里为止：`marineFocusedWindowId` 是个整数、只是活动标签还没
+    // 解析出来时，仍然按原样快速失败。那是一个正在进行中的答案，不是一个卡死的
+    // 状态，去等它会把「失焦即拒」变成「无限等待」。
     if (!suspendedRenewalConfirmed &&
-        (marineActiveTabId === undefined || marineFocusedWindowId === undefined)) {
+        (marineActiveTabId === undefined || marineFocusedWindowId === undefined ||
+         marineFocusedWindowId === null)) {
       senderFocusConfirmed = await marineConfirmSenderFocus(sender);
     }
     suspendedRenewalConfirmed = options.allowSuspendedRetainedRenewal === true &&
@@ -1741,7 +1770,8 @@ async function marineSetActiveTab(tabId, shouldApply = () => true, options = {})
 
 chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
   if (!Number.isInteger(tabId) || !Number.isInteger(windowId)) return;
-  if (marineFocusedWindowId === null) return;
+  // `null` 走下面那条「问 `chrome.windows.get`」的路，和 `undefined` 一样。
+  // 原来在这里直接 return，是这个状态没有出路的第二个原因。
   if (Number.isInteger(marineFocusedWindowId)) {
     if (marineFocusedWindowId !== windowId) return;
     const epoch = marineNextFocusEpoch();
