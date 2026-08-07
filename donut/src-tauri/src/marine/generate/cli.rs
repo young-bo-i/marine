@@ -300,10 +300,26 @@ fn codex_executable_kind(path: &Path) -> Result<CodexExecutableKind, String> {
     if let Ok(full) = std::fs::read_to_string(path) {
       whole = full;
     }
-    return Ok(CodexExecutableKind::NodeLauncher {
-      interpreter: None,
-      script: script_from_windows_shim(path, &whole),
-    });
+    // Only take this route when the parse produced a file that is actually
+    // there. Guessing wrong is worse than not trying: the shim DOES work
+    // through `cmd.exe`, so a bad parse turns a working path into node being
+    // handed something it cannot run — measured once already, as
+    // `EISDIR: illegal operation on a directory, lstat 'C:'`.
+    match script_from_windows_shim(path, &whole).filter(|js| js.is_file()) {
+      Some(script) => {
+        return Ok(CodexExecutableKind::NodeLauncher {
+          interpreter: None,
+          script: Some(script),
+        })
+      }
+      None => {
+        log::debug!(
+          "Could not read a script out of {}; running the shim itself",
+          path.display()
+        );
+        return Ok(CodexExecutableKind::Direct);
+      }
+    }
   }
 
   let Ok(first_line) = std::str::from_utf8(first_line) else {
@@ -866,8 +882,21 @@ async fn run_codex_app_server_stream(
   cancellation: CancellationToken,
 ) -> Result<String, String> {
   let workspace = tempfile::tempdir().map_err(|error| format!("temp dir: {error}"))?;
-  let isolated_codex_home =
-    tempfile::tempdir().map_err(|error| format!("Codex auth temp dir: {error}"))?;
+  // NOT under the system temp dir.
+  //
+  // Codex refuses to create its PATH-alias helper binaries when `CODEX_HOME`
+  // points inside `%TEMP%`, and says so on every run:
+  //
+  //   Refusing to create helper binaries under temporary dir "C:\...\Temp\"
+  //
+  // It proceeds, but in a degraded mode. Putting the isolated home under the
+  // app's own data directory keeps the isolation (a fresh directory per run,
+  // holding only a copy of the auth token) without tripping that refusal.
+  let isolation_root = crate::app_dirs::data_dir().join("codex-isolation");
+  std::fs::create_dir_all(&isolation_root)
+    .map_err(|error| format!("Codex isolation root: {error}"))?;
+  let isolated_codex_home = tempfile::tempdir_in(&isolation_root)
+    .map_err(|error| format!("Codex auth temp dir: {error}"))?;
   copy_codex_auth(isolated_codex_home.path())?;
   let mut command = isolated_codex_command(codex, isolated_codex_home.path())?;
   command
