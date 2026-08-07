@@ -209,45 +209,6 @@ enum CodexExecutableKind {
   },
 }
 
-/// Pull the script out of an npm-generated Windows `.cmd` shim.
-///
-/// npm installs three shims side by side — an extensionless sh script, a
-/// `.cmd`, and a `.ps1` — and `PATHEXT` resolution lands on the `.cmd`. Running
-/// that means running `cmd.exe`, which brings two problems this avoids
-/// entirely: a console window flashes up on every generation, and every
-/// argument is re-parsed by the shell on the way through. The Codex invocation
-/// passes `-c web_search="disabled"` and a JSON schema, so shell re-parsing is
-/// not a theoretical risk.
-///
-/// The shim's last line has a fixed shape:
-///
-/// ```text
-/// endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_modules\@openai\codex\bin\codex.js" %*
-/// ```
-///
-/// so the `.js` it names, with `%dp0%` resolved against the shim's own
-/// directory, is the thing to give Node.
-fn script_from_windows_shim(shim: &Path, contents: &str) -> Option<PathBuf> {
-  let dir = shim.parent()?;
-  contents
-    .split('"')
-    .find(|token| {
-      let lower = token.to_ascii_lowercase();
-      (lower.ends_with(".js") || lower.ends_with(".mjs") || lower.ends_with(".cjs"))
-        && !token.contains("%*")
-    })
-    .map(|token| {
-      // `%dp0%` already carries a trailing separator in npm's shims, so strip
-      // any leading separator left behind to avoid an absolute-path join.
-      let rest = token
-        .replace("%dp0%", "")
-        .replace("%~dp0", "")
-        .trim_start_matches(['\\', '/'])
-        .to_string();
-      dir.join(rest.replace('\\', "/"))
-    })
-}
-
 fn is_executable_file(path: &Path) -> bool {
   let Ok(metadata) = std::fs::metadata(path) else {
     return false;
@@ -286,41 +247,18 @@ fn codex_executable_kind(path: &Path) -> Result<CodexExecutableKind, String> {
     .split(|byte| *byte == b'\n')
     .next()
     .unwrap_or_default();
-  // A Windows `.cmd`/`.bat` shim has no shebang; what it has is the `.js` it
-  // would hand to Node. Read it out and skip the shell entirely.
-  let extension = path
-    .extension()
-    .and_then(|e| e.to_str())
-    .map(str::to_ascii_lowercase);
-  if matches!(extension.as_deref(), Some("cmd") | Some("bat")) {
-    let text = String::from_utf8_lossy(&header[..count]);
-    let mut whole = text.into_owned();
-    // The `.js` reference lives on the shim's LAST line, well past the 512
-    // bytes read for a shebang.
-    if let Ok(full) = std::fs::read_to_string(path) {
-      whole = full;
-    }
-    // Only take this route when the parse produced a file that is actually
-    // there. Guessing wrong is worse than not trying: the shim DOES work
-    // through `cmd.exe`, so a bad parse turns a working path into node being
-    // handed something it cannot run — measured once already, as
-    // `EISDIR: illegal operation on a directory, lstat 'C:'`.
-    match script_from_windows_shim(path, &whole).filter(|js| js.is_file()) {
-      Some(script) => {
-        return Ok(CodexExecutableKind::NodeLauncher {
-          interpreter: None,
-          script: Some(script),
-        })
-      }
-      None => {
-        log::debug!(
-          "Could not read a script out of {}; running the shim itself",
-          path.display()
-        );
-        return Ok(CodexExecutableKind::Direct);
-      }
-    }
-  }
+  // A Windows `.cmd`/`.bat` shim is run as-is, through the shell.
+  //
+  // There WAS code here that read the `.js` out of an npm shim so Node could be
+  // invoked directly, avoiding `cmd.exe` and its argument re-parsing. It is gone
+  // because the evidence went the wrong way: the shim route was observed
+  // starting codex successfully, while the parse produced a main-module path of
+  // `C:` twice — once before a `.is_file()` guard was added and once after —
+  // each time turning a working launch into
+  // `EISDIR: illegal operation on a directory, lstat 'C:'`.
+  //
+  // `CREATE_NO_WINDOW` already deals with the console the shell would otherwise
+  // pop, which was the visible half of what the parse was meant to fix.
 
   let Ok(first_line) = std::str::from_utf8(first_line) else {
     return Ok(CodexExecutableKind::Direct);
@@ -764,6 +702,7 @@ async fn run_claude_stream(
   #[cfg(unix)]
   command.process_group(0);
   hide_console(&mut command);
+  log::info!("Marine Claude launch: {:?}", command.as_std());
   let mut child = command
     .spawn()
     .map_err(|error| format!("spawn Claude failed: {error}"))?;
@@ -920,6 +859,13 @@ async fn run_codex_app_server_stream(
   #[cfg(unix)]
   command.process_group(0);
   hide_console(&mut command);
+  // Say what is actually being executed.
+  //
+  // Two separate Windows failures were diagnosed by guessing at this and both
+  // guesses were wrong; the log said "provider closed" and nothing about the
+  // command line, so each round trip cost a release and a retest. `Command`'s
+  // Debug prints the program and every argument as the OS will receive them.
+  log::info!("Marine Codex launch: {:?}", command.as_std());
   let mut child = command
     .spawn()
     .map_err(|error| format!("spawn Codex app-server failed: {error}"))?;
@@ -1625,60 +1571,6 @@ mod stream_tests {
       use std::os::unix::fs::PermissionsExt;
       std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-  }
-
-  /// An npm `.cmd` shim must be unwrapped to the `.js` it names, so Node is
-  /// invoked directly.
-  ///
-  /// Running the shim instead means running `cmd.exe`, which flashes a console
-  /// on every generation and re-parses every argument on the way through — and
-  /// the Codex invocation passes `-c web_search="disabled"` plus a JSON schema,
-  /// so shell re-parsing is not hypothetical.
-  #[test]
-  fn a_windows_npm_cmd_shim_resolves_to_the_js_it_wraps() {
-    let dir = tempfile::tempdir().unwrap();
-    let shim = dir.path().join("codex.cmd");
-    std::fs::write(
-      &shim,
-      concat!(
-        "@ECHO off\r\n",
-        "GOTO start\r\n",
-        ":find_dp0\r\n",
-        "SET dp0=%~dp0\r\n",
-        "EXIT /b\r\n",
-        ":start\r\n",
-        "SETLOCAL\r\n",
-        "CALL :find_dp0\r\n",
-        "IF EXIST \"%dp0%\\node.exe\" (\r\n",
-        "  SET \"_prog=%dp0%\\node.exe\"\r\n",
-        ") ELSE (\r\n",
-        "  SET \"_prog=node\"\r\n",
-        ")\r\n",
-        "endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & ",
-        "\"%_prog%\"  \"%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js\" %*\r\n",
-      ),
-    )
-    .unwrap();
-
-    let script = script_from_windows_shim(&shim, &std::fs::read_to_string(&shim).unwrap())
-      .expect("the shim names a .js");
-    assert_eq!(
-      script,
-      dir.path().join("node_modules/@openai/codex/bin/codex.js")
-    );
-  }
-
-  /// `%*` is not a script, and neither is `node.exe`. Picking either would send
-  /// Node something it cannot run.
-  #[test]
-  fn shim_parsing_ignores_non_script_tokens() {
-    let dir = tempfile::tempdir().unwrap();
-    let shim = dir.path().join("x.cmd");
-    assert_eq!(
-      script_from_windows_shim(&shim, "@ECHO off\r\n\"%dp0%\\node.exe\" %*\r\n"),
-      None,
-      "no .js in this shim, so there is nothing to hand Node"
-    );
   }
 
   #[test]
