@@ -713,7 +713,11 @@
             }
             return { ok: true, applied: false, skipped: true, response };
           }
-          lastError = new Error('Marine Rime context deferred');
+          // 带上 SW 那边的判据取值，否则每种拒绝理由在日志里都是同一句话。
+          lastError = new Error(
+            'Marine Rime context deferred'
+            + (response && response.diag ? ' [' + response.diag + ']' : '')
+          );
         } else {
           lastError = new Error(response && response.error || 'Marine Rime 未收到有效 ACK');
         }

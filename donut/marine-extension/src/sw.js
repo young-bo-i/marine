@@ -923,7 +923,20 @@ async function marineApplyContextMessage(msg, sender, expectedEpoch, expectedSou
         (!senderFocusConfirmed || marineActiveTabId !== tabId) && !suspendedRenewalConfirmed) {
       const deferred = options.allowDefer !== false
         && marineDeferPut(msg, sender, expectedEpoch, expectedSource);
-      return { ok: true, skipped: true, deferred, reason: 'focus-gate' };
+      // 把判据的**实际取值**带回去。
+      //
+      // 这道闸有好几条互斥的进入方式（缓存从没初始化 / 被 blur 写死 / 指向别的
+      // 标签页 / API 复核失败），而它们在页面日志里长得一模一样，都只是一句
+      // 「context deferred」。查这个问题时因此连着改错了两版 —— 每一版都在补一
+      // 个我猜的分支，而没有任何东西能告诉我走的是哪一个。全是整数或 null，
+      // 不涉及任何页面数据。
+      const diag = 'active=' + String(marineActiveTabId)
+        + ' tab=' + String(tabId)
+        + ' win=' + String(marineFocusedWindowId)
+        + ' senderWin=' + String(sender && sender.tab && sender.tab.windowId)
+        + ' senderActive=' + String(sender && sender.tab && sender.tab.active)
+        + ' confirmed=' + String(senderFocusConfirmed);
+      return { ok: true, skipped: true, deferred, reason: 'focus-gate', diag };
     }
     // 编排同样要跳过**写闸**，不只是上面那道推迟闸。
     //
