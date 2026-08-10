@@ -1345,24 +1345,49 @@ const manifest = JSON.parse(read("../manifest.json"));
   );
 }
 
-// ------------------------------------------------- 抖音走 CDP 键盘代打
+// ------------------------------------------------- 三个平台走 CDP 代打
 {
-  // 抖音的编辑器对页内合成输入有反制：execCommand 写一两个字就把整个评论组件
-  // 拆掉（实测 comment-list 消失且点图标 6 次都恢复不了），**手动点生成也一样**。
-  // CDP Input.dispatchKeyEvent 是浏览器层面的可信事件，实测连打 8 个字无损。
+  // 页内 `execCommand` 写入在这三个平台上各自坏在不同地方，实测（新开页面、
+  // 评论框已聚焦、中文）：
+  //
+  //   抖音：写一两个字就把整个评论组件拆掉（comment-list 消失且点图标 6 次都
+  //         恢复不了），**手动点生成也一样**。
+  //   知乎：Draft.js 不拦 execCommand，浏览器原生插入和 Draft.js 的重渲染各写
+  //         一遍，DOM 里是 `<span>正文<span data-text="true">正文</span></span>`，
+  //         两种读法都是双份 —— 发送前的草稿核对必然不一致，条条卡在拒绝发送。
+  //   B 站：字写得进去但工具栏不展开，内层 `<button>发布</button>` 不挂载，
+  //         只剩 597×50 的壳，被面积兜底挡掉，报「未找到发送按钮」。
   assert.ok(
     iso.includes("marineProspectTypeViaCdp"),
-    "抖音的写入要委托给 Rust 侧的 CDP 键盘事件",
+    "写入要委托给 Rust 侧的 CDP 可信输入",
   );
   assert.ok(
-    /detectPlatform\(\) === 'douyin' && !g\.douyinDelegated/.test(iso),
-    "只对抖音走这条路，且只委托一次",
+    /CDP_TYPING_MODES\s*=\s*\{[^}]*douyin:\s*'keys'/.test(iso),
+    "抖音必须留在 keys —— 那是它唯一验证过的路径，不该为统一而改",
   );
-  // 另外三个平台的页内写入是真实验证过的，不能被这条改动波及
+  for (const platform of ["zhihu", "bilibili"]) {
+    assert.ok(
+      new RegExp(`CDP_TYPING_MODES\\s*=\\s*\\{[^}]*${platform}:\\s*'insert'`).test(iso),
+      `${platform} 必须用 insert —— 三种按键拼法实测中文一个字都写不进知乎的 Draft.js`,
+    );
+  }
+  assert.ok(
+    /if \(cdpMode && !g\.cdpDelegated\)/.test(iso),
+    "只委托一次",
+  );
+  assert.ok(
+    /marineProspectTypeViaCdp\(g\.wanted, cdpMode\)/.test(iso),
+    "写入模式要按平台传下去，不能让 Rust 侧猜",
+  );
+  // 小红书的页内写入是真实验证过的，不该被这条改动波及
+  assert.ok(
+    !/CDP_TYPING_MODES\s*=\s*\{[^}]*xiaohongshu/.test(iso),
+    "小红书的页内写入已验证过，不要顺手拉进来",
+  );
   const wu = iso.slice(iso.indexOf("function marineRimeGenWriteUnit"));
   assert.ok(
-    !/douyin/i.test(wu.slice(0, 900)),
-    "写入函数本身不该出现平台分支 —— 三平台的路径保持原样",
+    !/douyin|zhihu|bilibili/i.test(wu.slice(0, 900)),
+    "写入函数本身不该出现平台分支 —— 分支只在委托那一处",
   );
 
   // 这条路由比 prospects/* 危险，约束必须都在

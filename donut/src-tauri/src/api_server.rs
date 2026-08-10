@@ -1563,6 +1563,13 @@ struct MarineTypeTextRequest {
   /// 攻击面不变；debug 构建里调试环境能跑完整链路。
   #[serde(default)]
   debug_cdp_port: Option<u16>,
+  /// `keys`（默认）走 `Input.dispatchKeyEvent`；`insert` 走 `Input.insertText`。
+  ///
+  /// 由调用方按平台选，因为「哪种写得进去」是**编辑器**的属性：知乎的 Draft.js
+  /// 从 `beforeinput` 建内容，合成按键在中文下压根不产生它 —— 三种按键拼法实测
+  /// 都是一个字都写不进去。见 `automation::InputMode` 上的实测表。
+  #[serde(default)]
+  input_mode: Option<String>,
 }
 
 /// 单次代打的字数上限。一条评论远用不了这么多，超过说明调用方状态不对。
@@ -1593,6 +1600,9 @@ async fn marine_type_text(
     ));
   }
 
+  let mode = crate::marine::automation::InputMode::parse(req.input_mode.as_deref())
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
   let debug_port = if cfg!(debug_assertions) {
     req.debug_cdp_port
   } else {
@@ -1612,7 +1622,7 @@ async fn marine_type_text(
     .await
     .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
-  crate::marine::automation::send_human_keystrokes(&ws, &text, req.wpm)
+  crate::marine::automation::send_human_input(&ws, &text, req.wpm, mode)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
   Ok(StatusCode::OK)

@@ -2139,20 +2139,45 @@
     g.typeTimer = 0;
     if (g.state !== 'typing' && g.state !== 'streaming') return;
 
-    // 抖音：整段交给 Rust 侧用 CDP 真实键盘事件敲，不走页内写入。
+    // 整段交给 Rust 侧用 CDP 敲，不走页内 `execCommand` 写入。
     //
-    // 它的编辑器对 `execCommand('insertText')` 有反制 —— 写一两个字就把整个评论
-    // 组件拆掉，而且点评论图标都恢复不了，手动点「生成」一样。CDP
-    // `Input.dispatchKeyEvent` 产生的是浏览器层面的可信事件，实测同一个编辑器
-    // 连打 8 个字毫发无损。
+    // 页内写入在这三个平台上各自坏在不同地方，实测（每次都是新开页面、评论框
+    // 已聚焦、中文）：
     //
-    // 只对抖音这么做：另外三个平台的页内写入已经真实验证过，不该为它承担风险。
-    if (detectPlatform() === 'douyin' && !g.douyinDelegated) {
+    //   抖音：`execCommand('insertText')` 写一两个字就把整个评论组件拆掉，
+    //         点评论图标都恢复不了，手动点「生成」一样。
+    //   知乎：Draft.js 不拦 `execCommand`，于是**浏览器原生插入和 Draft.js
+    //         自己的重渲染各写一遍** —— DOM 里是
+    //         `<span>正文<span data-text="true">正文</span></span>`，
+    //         `innerText` 和 `textContent` 读回来都是双份。发送前的草稿核对
+    //         必然不一致，于是每一条都停在「拒绝发送」。
+    //   B 站：文字写得进去，但工具栏不展开 —— 内层那个真正的 `<button>发布</button>`
+    //         根本不挂载，只剩一个 597×50 的壳带着「发布」二字，被发送按钮的
+    //         面积兜底挡掉，报「未找到发送按钮」。
+    //
+    // 三者都被 CDP 的可信输入解决。写入方式按平台选，因为「哪种写得进去」是
+    // 编辑器的属性，不是我们的偏好：知乎必须用 `insert`（三种按键拼法实测一个
+    // 字都写不进去，Draft.js 要的 `beforeinput` 合成按键在中文下不产生），
+    // 抖音留在 `keys`（那是它唯一验证过的，不该为统一而动）。
+    const CDP_TYPING_MODES = { douyin: 'keys', zhihu: 'insert', bilibili: 'insert' };
+    const cdpMode = CDP_TYPING_MODES[detectPlatform()];
+    if (cdpMode && !g.cdpDelegated) {
       // 等整段产出完再委托：`wanted` 在流式过程中只是「目前收到的部分」，
       // 提前交出去会只敲半截。CDP 是一次性把整段打完，没有续打的语义。
       if (!g.streamDone) { g.typeTimer = setTimeout(marineRimeGenPump, 300); return; }
-      g.douyinDelegated = true;
-      void marineProspectTypeViaCdp(g.wanted).then(function (ok) {
+      // CDP 敲的是「当前聚焦元素」，所以焦点必须先在目标输入框里 —— 这一步
+      // 是页内的，只把焦点还给本轮自己的 editor，不会写到别人的框里。
+      try {
+        if (g.editor && g.editor.isConnected && !marineRimeGenEditorFocused(g.editor)) {
+          g.editor.focus();
+        }
+      } catch (e) {}
+      if (g.editor && g.editor.isConnected && !marineRimeGenEditorFocused(g.editor)) {
+        marineRimeGenAbort('focus-lost');
+        return;
+      }
+      g.cdpDelegated = true;
+      void marineProspectTypeViaCdp(g.wanted, cdpMode).then(function (ok) {
         // 无论成败都把 typed 推到终点：成了就是真敲完了，败了让上层的
         // 「发送前核对输入框内容」那道闸去拦，不在这里静默继续敲。
         g.typed = ok ? g.wanted : g.typed;
@@ -4215,7 +4240,7 @@
   }
   let marineProspectDebugPortCache;
 
-  function marineProspectTypeViaCdp(text) {
+  function marineProspectTypeViaCdp(text, inputMode) {
     return marineProspectSend(
       { __marineProspectProfileId: true },
       MARINE_PROSPECT_CONTROL_TIMEOUT_MS,
@@ -4232,6 +4257,7 @@
           body: {
             profile_id: profileId,
             text: String(text || ''),
+            input_mode: inputMode || 'keys',
             // 调试浏览器不是 app 启动的，app 认不出它 —— 带上端口让 debug 构建
             // 能跑完整链路。release 构建会忽略这个字段（编译期就不存在）。
             debug_cdp_port: marineProspectDebugCdpPort(),
@@ -4316,9 +4342,15 @@
 
       // 找按钮之前先把输入框重新聚上焦。
       //
-      // B站（很可能不止它）在输入框失焦时会把工具栏收起来，内层的发送 BUTTON
-      // 直接从 DOM 里消失。编排打完字到点发送之间隔着一次读取核对，焦点很容易
-      // 已经不在输入框上 —— 于是要么找不到按钮，要么只找到外层的壳。
+      // 注意这**不是** B 站工具栏展开的机制。这段原先的注释说 `focus()` 能让
+      // 收起的工具栏重新展开，实测是错的：在真实视频页上调 `editor.focus()`，
+      // 编辑器确实成了深层 activeElement，但内层的发送 BUTTON 始终不挂载，
+      // 等 2.5 秒也一样；页内合成的 pointerdown/mousedown/click（带正确坐标）
+      // 同样无效。只有浏览器层面的可信输入能撑开它 —— 也就是上面那条 CDP
+      // 写入路径，而且一旦框里有内容，之后再失焦也不会收回去。
+      //
+      // 留着它是因为把焦点还给本轮目标本身是对的（多平台通用），但别再指望
+      // 它能救回一个收起的工具栏：那条路已经由 CDP 写入负责。
       // 这里聚的是**输入框的 DOM 焦点**，和操作系统的窗口焦点无关，
       // 不会把浏览器抢到前台。
       let refocusDelay = 0;
