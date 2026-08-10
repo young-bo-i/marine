@@ -69,6 +69,11 @@ const CODEX_DISABLED_FEATURES: &[&str] = &[
 ];
 
 const CODEX_ISOLATION_CONFIG: &[&str] = &[
+  // Covers a Codex home that declares no servers. It does NOT clear ones that
+  // are declared — an empty table merges — so the real defence is the
+  // per-server `enabled=false` overrides built by
+  // [`disable_mcp_server_override`]. Kept because it costs nothing and states
+  // the intent for a config that has nothing to merge with.
   "mcp_servers={}",
   "orchestrator.skills.enabled=false",
   "skills.bundled.enabled=false",
@@ -533,77 +538,71 @@ fn find_claude() -> String {
   resolve_binary(&claude_candidates(), "claude").unwrap_or_else(|| "claude".to_string())
 }
 
-fn copy_codex_auth(destination_dir: &Path) -> Result<(), String> {
-  let source = dirs::home_dir()
-    .ok_or("could not resolve home directory for Codex authentication")?
-    .join(".codex/auth.json");
-  if !source.is_file() {
-    return Err("Codex authentication is unavailable".to_string());
+/// Where this machine keeps its Codex configuration and credentials.
+///
+/// Mirrors Codex's own precedence: an explicit `CODEX_HOME` wins, otherwise
+/// `~/.codex`. Marine deliberately does **not** pass `CODEX_HOME` down to the
+/// child — the child resolves it exactly the way the user's own terminal does,
+/// so there is only ever one answer. This exists to check preconditions and to
+/// name the directory in an error message.
+fn codex_home() -> Option<PathBuf> {
+  if let Some(explicit) = std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
+    return Some(PathBuf::from(explicit));
   }
-  let destination = destination_dir.join("auth.json");
-  std::fs::copy(&source, &destination)
-    .map_err(|error| format!("copy isolated Codex authentication: {error}"))?;
-  #[cfg(unix)]
-  {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
-      .map_err(|error| format!("secure isolated Codex authentication: {error}"))?;
-  }
-  Ok(())
+  dirs::home_dir().map(|home| home.join(".codex"))
 }
 
-fn isolated_codex_command(
-  codex: &str,
-  isolated_codex_home: &Path,
-) -> Result<tokio::process::Command, String> {
+fn codex_auth_file() -> Option<PathBuf> {
+  codex_home().map(|home| home.join("auth.json"))
+}
+
+/// Every MCP server the machine's `config.toml` declares, by name.
+///
+/// Running against the real Codex home means the user's MCP servers are in
+/// scope, and the prompt carries scraped page text that must never reach a
+/// tool. `-c mcp_servers={}` does not help: an empty table *merges* into the
+/// configured one and clears nothing — verified against 0.144.4, where all
+/// three configured servers still started. Naming each one and switching it off
+/// is a scalar override, which does replace. So the names have to be read here.
+///
+/// An unreadable or malformed `config.toml` yields no names; the caller treats
+/// that as "nothing to disable", which is correct — Codex will not start
+/// servers it could not parse either.
+fn configured_mcp_server_names(codex_home: &Path) -> Vec<String> {
+  let Ok(text) = std::fs::read_to_string(codex_home.join("config.toml")) else {
+    return Vec::new();
+  };
+  let Ok(config) = text.parse::<toml::Table>() else {
+    return Vec::new();
+  };
+  config
+    .get("mcp_servers")
+    .and_then(toml::Value::as_table)
+    .map(|servers| servers.keys().cloned().collect())
+    .unwrap_or_default()
+}
+
+/// A `-c` override switching one MCP server off, quoting the name when TOML's
+/// bare-key grammar does not cover it (a dot in the name would otherwise be
+/// read as another level of nesting).
+fn disable_mcp_server_override(name: &str) -> String {
+  let is_bare_key = !name.is_empty()
+    && name
+      .chars()
+      .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+  if is_bare_key {
+    format!("mcp_servers.{name}.enabled=false")
+  } else {
+    let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("mcp_servers.\"{escaped}\".enabled=false")
+  }
+}
+
+fn codex_command(codex: &str) -> Result<tokio::process::Command, String> {
   let launch = resolve_codex_launch(Path::new(codex))?;
-  #[cfg(target_os = "macos")]
-  {
-    let home_path = dirs::home_dir().ok_or("could not resolve home directory for Codex sandbox")?;
-    let quote = |path: &Path| {
-      path
-        .to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-    };
-    let home = quote(&home_path);
-    let isolated_home = quote(isolated_codex_home);
-    let mut profile = format!(
-      "(version 1) (allow default) \
-       (deny file-read* (subpath \"{home}\")) \
-       (deny file-write* (subpath \"{home}\")) \
-       (allow file-read* (subpath \"{isolated_home}\")) \
-       (allow file-write* (subpath \"{isolated_home}\"))"
-    );
-    for path in std::iter::once(&launch.program).chain(launch.prefix_args.iter()) {
-      let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-      if !path.starts_with(&home_path) {
-        continue;
-      }
-      let parent = path.parent().unwrap_or(path.as_path());
-      let runtime_root = if parent.file_name().and_then(|name| name.to_str()) == Some("bin") {
-        parent.parent().unwrap_or(parent)
-      } else {
-        parent
-      };
-      let runtime_root = quote(runtime_root);
-      let rule = format!(" (allow file-read* (subpath \"{runtime_root}\"))");
-      if !profile.contains(&rule) {
-        profile.push_str(&rule);
-      }
-    }
-    let mut command = tokio::process::Command::new("/usr/bin/sandbox-exec");
-    command.args(["-p", &profile]).arg(&launch.program);
-    command.args(&launch.prefix_args);
-    Ok(command)
-  }
-  #[cfg(not(target_os = "macos"))]
-  {
-    let _ = isolated_codex_home;
-    let mut command = tokio::process::Command::new(&launch.program);
-    command.args(&launch.prefix_args);
-    Ok(command)
-  }
+  let mut command = tokio::process::Command::new(&launch.program);
+  command.args(&launch.prefix_args);
+  Ok(command)
 }
 
 /// Keep child processes from flashing a console window on Windows.
@@ -657,7 +656,7 @@ pub fn detect_agents() -> Vec<AgentStatus> {
       id: "codex".to_string(),
       name: "OpenAI GPT Codex".to_string(),
       detected: codex.is_some(),
-      authed: home.join(".codex/auth.json").exists(),
+      authed: codex_auth_file().is_some_and(|path| path.is_file()),
       path: codex.unwrap_or_default(),
     },
     AgentStatus {
@@ -878,29 +877,37 @@ async fn run_codex_app_server_stream(
   cancellation: CancellationToken,
 ) -> Result<String, String> {
   let workspace = tempfile::tempdir().map_err(|error| format!("temp dir: {error}"))?;
-  // NOT under the system temp dir.
+  // Run against the machine's real Codex home — the same one `codex` uses in a
+  // terminal — rather than a per-run copy holding only `auth.json`.
   //
-  // Codex refuses to create its PATH-alias helper binaries when `CODEX_HOME`
-  // points inside `%TEMP%`, and says so on every run:
+  // The copy was meant as isolation, but it silently discarded `config.toml`,
+  // so every setting the user had made was invisible to Marine while their
+  // terminal honoured it. That asymmetry is unexplainable to whoever is
+  // debugging: `codex` works by hand and fails here, with no visible cause.
+  // (The case that forced this: forcing the HTTP transport instead of the
+  // websocket one, which is a `config.toml` setting.) The isolation posture is
+  // carried by the flags below — every privileged tool disabled, a read-only
+  // ephemeral thread with no network, and a throwaway `cwd`. Those are scalar
+  // `-c` overrides, which replace what the config file says; the one thing a
+  // config file *can* still introduce is MCP servers, so they are named and
+  // switched off individually below.
   //
-  //   Refusing to create helper binaries under temporary dir "C:\...\Temp\"
-  //
-  // It proceeds, but in a degraded mode. Putting the isolated home under the
-  // app's own data directory keeps the isolation (a fresh directory per run,
-  // holding only a copy of the auth token) without tripping that refusal.
-  let isolation_root = crate::app_dirs::data_dir().join("codex-isolation");
-  std::fs::create_dir_all(&isolation_root)
-    .map_err(|error| format!("Codex isolation root: {error}"))?;
-  let isolated_codex_home = tempfile::tempdir_in(&isolation_root)
-    .map_err(|error| format!("Codex auth temp dir: {error}"))?;
-  copy_codex_auth(isolated_codex_home.path())?;
-  let mut command = isolated_codex_command(codex, isolated_codex_home.path())?;
+  // `CODEX_HOME` is intentionally not set: the child resolves it exactly as the
+  // user's shell does, so there is only ever one Codex home in play. `HOME` is
+  // left alone for the same reason.
+  let codex_home = codex_home().ok_or("could not resolve the Codex home directory")?;
+  if !codex_home.join("auth.json").is_file() {
+    return Err("Codex authentication is unavailable".to_string());
+  }
+  // `--strict-config` is deliberately absent. It was a no-op against the empty
+  // isolated home, but against a real `config.toml` it turns any key this Codex
+  // build does not recognise — a leftover from an older or newer CLI — into a
+  // refusal to start, i.e. comment generation dies wholesale over a stale line
+  // in a config file that the user's terminal tolerates.
+  let mut command = codex_command(codex)?;
   command
     .args(["app-server", "--stdio"])
-    .arg("--strict-config")
     .current_dir(workspace.path())
-    .env("HOME", isolated_codex_home.path())
-    .env("CODEX_HOME", isolated_codex_home.path())
     .env_remove("OPENAI_API_KEY")
     .env("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "codex_sdk_ts")
     .stdin(Stdio::piped())
@@ -912,6 +919,9 @@ async fn run_codex_app_server_stream(
   }
   for config in CODEX_ISOLATION_CONFIG {
     command.args(["-c", config]);
+  }
+  for name in configured_mcp_server_names(&codex_home) {
+    command.args(["-c", &disable_mcp_server_override(&name)]);
   }
   #[cfg(unix)]
   command.process_group(0);
@@ -1153,6 +1163,22 @@ struct CodexStreamState {
   turn_completed: bool,
 }
 
+impl CodexStreamState {
+  /// Forget the attempt Codex just abandoned, keeping the turn open.
+  ///
+  /// A retry re-runs the whole answer under a fresh item id, so the previous
+  /// attempt's id and partial text are not merely stale — left in place they
+  /// fail the very invariants that make this parser trustworthy ("changed
+  /// agent-message itemId mid-stream", "completed agent message did not match
+  /// its streamed deltas"). Only the live preview keeps the abandoned prefix;
+  /// the returned answer is always the authoritative completed item.
+  fn reset_for_retry(&mut self) {
+    self.item_id = None;
+    self.streamed.clear();
+    self.completed_item = None;
+  }
+}
+
 fn require_codex_item_identity(
   params: &Value,
   thread_id: &str,
@@ -1370,16 +1396,67 @@ fn process_codex_message(
         if stream.turn_completed {
           return Err("Codex emitted an error after turn/completed".to_string());
         }
-        let detail = params
-          .get("message")
-          .and_then(Value::as_str)
-          .unwrap_or("Codex app-server error");
-        return Err(detail.chars().take(500).collect());
+        // `willRetry` marks progress, not failure. Codex reports every
+        // reconnect attempt through this same notification — "Reconnecting…
+        // 2/5" — and recovers on its own; it is also how it walks off the
+        // websocket transport onto HTTP after five attempts. Treating the first
+        // one as terminal killed the run before the transport it would have
+        // succeeded on was ever tried, which is why one flaky network turned
+        // into 26 consecutive failures.
+        if params
+          .get("willRetry")
+          .and_then(Value::as_bool)
+          .unwrap_or(false)
+        {
+          log::info!("Marine Codex is retrying: {}", codex_error_detail(params));
+          stream.reset_for_retry();
+          return Ok(None);
+        }
+        return Err(codex_error_detail(params).chars().take(500).collect());
       }
     }
     _ => {}
   }
   Ok(None)
+}
+
+/// The readable half of a Codex `error` notification.
+///
+/// The message lives at `params.error.message`. An earlier reading of the
+/// protocol looked for `params.message`, which does not exist at any Codex
+/// version — so the lookup always missed and every real reason was replaced by
+/// a fixed fallback string. Twenty-six consecutive failures logged the same
+/// uninformative line and no cause at all.
+///
+/// `codexErrorInfo` is folded in because it is what separates "not logged in"
+/// from "out of quota" from "the stream dropped"; it is either a bare tag or a
+/// single-key object naming the variant. `params.message` is still read as a
+/// fallback so an older or newer app-server that does flatten it stays legible.
+fn codex_error_detail(params: &Value) -> String {
+  let error = params.get("error").unwrap_or(&Value::Null);
+  let message = error
+    .get("message")
+    .or_else(|| params.get("message"))
+    .and_then(Value::as_str)
+    .unwrap_or("Codex app-server error");
+  let mut detail = match error.get("codexErrorInfo") {
+    Some(Value::String(tag)) => format!("{message} [{tag}]"),
+    Some(Value::Object(variant)) => match variant.keys().next() {
+      Some(tag) => format!("{message} [{tag}]"),
+      None => message.to_string(),
+    },
+    _ => message.to_string(),
+  };
+  if let Some(extra) = error
+    .get("additionalDetails")
+    .and_then(Value::as_str)
+    .map(str::trim)
+    .filter(|extra| !extra.is_empty() && *extra != message)
+  {
+    detail.push_str(" — ");
+    detail.push_str(extra);
+  }
+  detail
 }
 
 async fn read_until_response<R: AsyncRead + Unpin>(
@@ -1817,6 +1894,133 @@ mod stream_tests {
 
     let mut wrong_turn_stream = CodexStreamState::default();
     assert!(process_codex_message(&message, "thread-2", "turn-1", &mut wrong_turn_stream).is_err());
+  }
+
+  /// A reconnect is progress, and the attempt after it must parse cleanly.
+  ///
+  /// Codex reports every retry through the same `error` notification it uses
+  /// for real failures, separated only by `willRetry`. Failing the turn on the
+  /// first one is what turned a flaky network into 26 straight failures — it
+  /// also meant the websocket→HTTP fallback, which only happens after five
+  /// reconnects, was never reached.
+  #[test]
+  fn codex_retry_notifications_continue_the_turn_under_a_fresh_item() {
+    let mut stream = CodexStreamState::default();
+    let first_attempt = serde_json::json!({
+      "method": "item/agentMessage/delta",
+      "params": {"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1", "delta": "半句"}
+    });
+    process_codex_message(&first_attempt, "thread-1", "turn-1", &mut stream).unwrap();
+
+    let retry = serde_json::json!({
+      "method": "error",
+      "params": {
+        "threadId": "thread-1", "turnId": "turn-1", "willRetry": true,
+        "error": {
+          "message": "Reconnecting... 2/5",
+          "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": null}},
+          "additionalDetails": "stream disconnected before completion"
+        }
+      }
+    });
+    assert_eq!(
+      process_codex_message(&retry, "thread-1", "turn-1", &mut stream).unwrap(),
+      None
+    );
+
+    // The retry runs under a new item id; the abandoned prefix must be gone or
+    // both the id check and the streamed/final comparison reject the answer.
+    let completed = serde_json::json!({
+      "method": "item/completed",
+      "params": {
+        "threadId": "thread-1", "turnId": "turn-1",
+        "item": {"type": "agentMessage", "id": "item-2", "text": "完整答案"}
+      }
+    });
+    process_codex_message(&completed, "thread-1", "turn-1", &mut stream).unwrap();
+    assert_eq!(
+      stream
+        .completed_item
+        .as_ref()
+        .map(|item| item.text.as_str()),
+      Some("完整答案")
+    );
+  }
+
+  /// Running against the real Codex home puts the user's MCP servers in scope,
+  /// and the prompt carries scraped page text. Every declared server has to be
+  /// named and switched off — `mcp_servers={}` merges and clears nothing.
+  #[test]
+  fn every_configured_mcp_server_is_named_and_disabled() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+      home.path().join("config.toml"),
+      r#"
+model = "gpt-5.6-sol"
+
+[mcp_servers.node_repl]
+command = "node_repl"
+
+[mcp_servers.computer-use]
+command = "cua"
+
+[mcp_servers."odd.name"]
+command = "odd"
+"#,
+    )
+    .unwrap();
+
+    let mut names = configured_mcp_server_names(home.path());
+    names.sort();
+    assert_eq!(names, ["computer-use", "node_repl", "odd.name"]);
+
+    assert_eq!(
+      disable_mcp_server_override("node_repl"),
+      "mcp_servers.node_repl.enabled=false"
+    );
+    assert_eq!(
+      disable_mcp_server_override("computer-use"),
+      "mcp_servers.computer-use.enabled=false"
+    );
+    // A dot in the name is another nesting level unless it is quoted, which
+    // would silently disable nothing at all.
+    assert_eq!(
+      disable_mcp_server_override("odd.name"),
+      "mcp_servers.\"odd.name\".enabled=false"
+    );
+  }
+
+  #[test]
+  fn a_codex_home_without_servers_or_config_yields_no_overrides() {
+    let home = tempfile::tempdir().unwrap();
+    assert!(configured_mcp_server_names(home.path()).is_empty());
+
+    std::fs::write(home.path().join("config.toml"), "model = \"x\"\n").unwrap();
+    assert!(configured_mcp_server_names(home.path()).is_empty());
+
+    std::fs::write(home.path().join("config.toml"), "this is not = = toml\n").unwrap();
+    assert!(configured_mcp_server_names(home.path()).is_empty());
+  }
+
+  /// The terminal error has to name its cause; the fallback string is a bug.
+  #[test]
+  fn codex_terminal_error_surfaces_the_real_message_and_kind() {
+    let mut stream = CodexStreamState::default();
+    let failure = serde_json::json!({
+      "method": "error",
+      "params": {
+        "threadId": "thread-1", "turnId": "turn-1", "willRetry": false,
+        "error": {
+          "message": "You've hit your usage limit.",
+          "codexErrorInfo": "usageLimitExceeded",
+          "additionalDetails": null
+        }
+      }
+    });
+    let error = process_codex_message(&failure, "thread-1", "turn-1", &mut stream).unwrap_err();
+    assert!(error.contains("You've hit your usage limit."));
+    assert!(error.contains("usageLimitExceeded"));
+    assert!(!error.contains("Codex app-server error"));
   }
 
   #[test]
