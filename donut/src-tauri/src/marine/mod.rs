@@ -17,6 +17,7 @@ pub mod debug_log;
 pub mod extension;
 pub mod generate;
 pub mod history;
+pub mod history_export;
 pub mod login;
 pub mod login_status;
 pub mod prospect;

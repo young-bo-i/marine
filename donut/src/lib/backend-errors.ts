@@ -41,6 +41,7 @@ export type BackendErrorCode =
   | "MARINE_OPENAI_KEY_MISSING"
   | "MARINE_GENERATE_FAILED"
   | "MARINE_GENERATE_TIMEOUT"
+  | "MARINE_EXPORT_FAILED"
   | "MARINE_FILL_FAILED"
   | "MARINE_MARK_POSTED_FAILED"
   | "MARINE_DISCOVERY_ALREADY_RUNNING"
@@ -183,6 +184,10 @@ export function translateBackendError(t: TFunction, err: unknown): string {
       });
     case "MARINE_MARK_POSTED_FAILED":
       return t("backendErrors.marineMarkPostedFailed", {
+        detail: parsed.params?.message ?? "",
+      });
+    case "MARINE_EXPORT_FAILED":
+      return t("backendErrors.marineExportFailed", {
         detail: parsed.params?.message ?? "",
       });
     case "MARINE_DISCOVERY_ALREADY_RUNNING":

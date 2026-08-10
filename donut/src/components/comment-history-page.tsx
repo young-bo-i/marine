@@ -2,6 +2,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { save } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -12,6 +13,7 @@ import {
   LuRefreshCw,
   LuRotateCcw,
   LuSearch,
+  LuSheet,
   LuTriangleAlert,
 } from "react-icons/lu";
 
@@ -34,6 +36,8 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { translateBackendError } from "@/lib/backend-errors";
+import { showToast } from "@/lib/toast-utils";
 
 export interface PostingRecord {
   id: string;
@@ -57,6 +61,7 @@ export interface PostingRecord {
   parent_id?: string;
   root_id?: string;
   context_id?: string;
+  generation_source?: string;
   confirmation_source?: string;
   status?: string;
 }
@@ -150,6 +155,40 @@ function isHttpUrl(value: string): boolean {
 
 function platformKey(record: PostingRecord): string {
   return record.platform.trim() || UNKNOWN_PLATFORM;
+}
+
+function pad(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+/**
+ * Local wall-clock, zero-padded and fixed-width.
+ *
+ * Deliberately not the locale-formatted string the table renders: in a
+ * spreadsheet these are text cells, and a fixed-width `YYYY-MM-DD HH:mm:ss` is
+ * the one shape whose alphabetical order is also its chronological order.
+ * "Aug 10, 2026, 4:31 PM" sorts next to April.
+ */
+function exportTimestamp(record: PostingRecord): string {
+  const timestamp = timestampMs(record);
+  if (!timestamp) return "";
+  const at = new Date(timestamp);
+  return (
+    `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}` +
+    ` ${pad(at.getHours())}:${pad(at.getMinutes())}:${pad(at.getSeconds())}`
+  );
+}
+
+/**
+ * ASCII-only, and stamped so a second export never silently overwrites the
+ * first — the save dialog would ask, but the suggested name is what most people
+ * accept.
+ */
+function exportFileName(now = new Date()): string {
+  return (
+    `marine-comments-${now.getFullYear()}${pad(now.getMonth() + 1)}` +
+    `${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}.xlsx`
+  );
 }
 
 function IdentityBlock({
@@ -321,6 +360,7 @@ export function CommentHistoryPage() {
   const [records, setRecords] = useState<PostingRecord[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
   const [loadError, setLoadError] = useState(false);
   const [query, setQuery] = useState("");
   const [identityFilter, setIdentityFilter] = useState(ALL_FILTER);
@@ -545,6 +585,135 @@ export function CommentHistoryPage() {
 
   const unknownIdentityLabel = t("marine.history.unknownIdentity");
 
+  // Exports what is on screen, filters and all — the count beside the filters
+  // is the promise the button has to keep. Clearing the filters is how you ask
+  // for the whole ledger.
+  const handleExport = useCallback(async () => {
+    if (filteredRecords.length === 0) return;
+    setIsExporting(true);
+    try {
+      const filePath = await save({
+        defaultPath: exportFileName(),
+        filters: [
+          {
+            name: t("marine.history.export.fileFilter"),
+            extensions: ["xlsx"],
+          },
+        ],
+      });
+      if (!filePath) return;
+
+      const columns: {
+        header: string;
+        value: (record: PostingRecord) => string | undefined;
+      }[] = [
+        { header: t("marine.history.columns.time"), value: exportTimestamp },
+        {
+          header: t("marine.history.columns.status"),
+          value: (record) =>
+            confirmationStatus(record) === "published"
+              ? t("marine.history.status.automatic")
+              : t("marine.history.status.manual"),
+        },
+        {
+          header: t("marine.history.columns.platform"),
+          value: (record) =>
+            platformKey(record) === UNKNOWN_PLATFORM
+              ? t("marine.history.unknownPlatform")
+              : platformKey(record),
+        },
+        {
+          header: t("marine.history.columns.kind"),
+          value: (record) =>
+            postingKind(record) === "reply"
+              ? t("marine.history.kind.reply")
+              : t("marine.history.kind.direct"),
+        },
+        {
+          header: t("marine.history.columns.identity"),
+          value: (record) => profileIdentity(record) || unknownIdentityLabel,
+        },
+        {
+          header: t("marine.history.export.columns.profileId"),
+          value: (record) => record.profile_id,
+        },
+        {
+          header: t("marine.history.export.columns.siteAccount"),
+          value: (record) => record.site_account_name,
+        },
+        {
+          header: t("marine.history.export.columns.siteAccountId"),
+          value: (record) => record.site_account_id,
+        },
+        {
+          header: t("marine.history.export.columns.pageTitle"),
+          value: (record) => record.page_title,
+        },
+        {
+          header: t("marine.history.export.columns.pageUrl"),
+          value: (record) => record.target_url,
+        },
+        {
+          header: t("marine.history.columns.comment"),
+          value: (record) => record.text_snapshot,
+        },
+        {
+          header: t("marine.history.export.columns.replyTo"),
+          value: (record) => record.target_author,
+        },
+        {
+          header: t("marine.history.export.columns.angle"),
+          value: (record) => record.angle,
+        },
+        {
+          header: t("marine.history.export.columns.brand"),
+          value: (record) => record.brand_id,
+        },
+        {
+          header: t("marine.history.export.columns.generationSource"),
+          value: (record) => record.generation_source,
+        },
+        {
+          header: t("marine.history.export.columns.confirmationSource"),
+          value: (record) => record.confirmation_source,
+        },
+        {
+          header: t("marine.history.export.columns.platformCommentId"),
+          value: (record) => record.platform_comment_id,
+        },
+        {
+          header: t("marine.history.export.columns.recordId"),
+          value: (record) => record.id,
+        },
+      ];
+
+      const count = await invoke<number>("marine_export_posting_history", {
+        path: filePath,
+        export: {
+          sheet_name: t("marine.history.export.sheetName"),
+          headers: columns.map((column) => column.header),
+          rows: filteredRecords.map((record) =>
+            columns.map((column) => column.value(record)?.trim() ?? ""),
+          ),
+        },
+      });
+
+      showToast({
+        type: "success",
+        title: t("marine.history.export.success", { count }),
+      });
+    } catch (error) {
+      console.error("Failed to export the comment ledger:", error);
+      showToast({
+        type: "error",
+        title: t("marine.history.export.failed"),
+        description: translateBackendError(t, error),
+      });
+    } finally {
+      setIsExporting(false);
+    }
+  }, [filteredRecords, t, unknownIdentityLabel]);
+
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-4 pt-4 pb-8 sm:px-6">
       <div className="mx-auto flex w-full max-w-7xl flex-col gap-4">
@@ -557,23 +726,46 @@ export function CommentHistoryPage() {
               {t("marine.history.description")}
             </p>
           </div>
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            aria-label={t("common.buttons.refresh")}
-            disabled={isLoading || isRefreshing}
-            onClick={() => {
-              void loadHistory("refresh");
-            }}
-          >
-            <LuRefreshCw
-              className={isRefreshing ? "animate-spin" : undefined}
-            />
-            <span className="hidden sm:inline">
-              {t("common.buttons.refresh")}
-            </span>
-          </Button>
+          <div className="flex shrink-0 items-center gap-2">
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              aria-label={t("marine.history.export.button")}
+              disabled={
+                isLoading || isExporting || filteredRecords.length === 0
+              }
+              onClick={() => {
+                void handleExport();
+              }}
+            >
+              {isExporting ? (
+                <LuLoaderCircle className="animate-spin" />
+              ) : (
+                <LuSheet />
+              )}
+              <span className="hidden sm:inline">
+                {t("marine.history.export.button")}
+              </span>
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              aria-label={t("common.buttons.refresh")}
+              disabled={isLoading || isRefreshing}
+              onClick={() => {
+                void loadHistory("refresh");
+              }}
+            >
+              <LuRefreshCw
+                className={isRefreshing ? "animate-spin" : undefined}
+              />
+              <span className="hidden sm:inline">
+                {t("common.buttons.refresh")}
+              </span>
+            </Button>
+          </div>
         </header>
 
         <section

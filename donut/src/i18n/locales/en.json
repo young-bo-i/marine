@@ -1834,6 +1834,7 @@
     "marineOpenaiKeyMissing": "Set the DONUT_MARINE_OPENAI_API_KEY environment variable.",
     "marineGenerateFailed": "Generation failed. {{detail}}",
     "marineGenerateTimeout": "Generation timed out.",
+    "marineExportFailed": "Couldn't export the comment ledger. {{detail}}",
     "marineFillFailed": "Couldn't fill the reply box. {{detail}}",
     "marineMarkPostedFailed": "Couldn't mark as posted. {{detail}}",
     "marineDiscoveryAlreadyRunning": "A discovery run is already in progress.",
@@ -2174,6 +2175,27 @@
         "kind": "Type",
         "comment": "Final comment",
         "status": "Confirmation"
+      },
+      "export": {
+        "button": "Export Excel",
+        "sheetName": "Comment ledger",
+        "fileFilter": "Excel workbook",
+        "success": "Exported {{count}} comments",
+        "failed": "Couldn't export the comment ledger",
+        "columns": {
+          "profileId": "Profile ID",
+          "siteAccount": "Site account",
+          "siteAccountId": "Site account ID",
+          "pageTitle": "Page title",
+          "pageUrl": "Page URL",
+          "replyTo": "Replying to",
+          "angle": "Angle",
+          "brand": "Talk track",
+          "generationSource": "Written by",
+          "confirmationSource": "Confirmed by",
+          "platformCommentId": "Platform comment ID",
+          "recordId": "Record ID"
+        }
       },
       "kind": {
         "direct": "Direct",

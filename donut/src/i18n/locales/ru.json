@@ -1834,6 +1834,7 @@
     "marineOpenaiKeyMissing": "Задайте переменную окружения DONUT_MARINE_OPENAI_API_KEY.",
     "marineGenerateFailed": "Не удалось сгенерировать. {{detail}}",
     "marineGenerateTimeout": "Время генерации истекло.",
+    "marineExportFailed": "Не удалось экспортировать журнал комментариев. {{detail}}",
     "marineFillFailed": "Не удалось заполнить поле ответа. {{detail}}",
     "marineMarkPostedFailed": "Не удалось отметить как опубликовано. {{detail}}",
     "marineDiscoveryAlreadyRunning": "Прогон поиска уже выполняется.",
@@ -2174,6 +2175,27 @@
         "kind": "Тип",
         "comment": "Итоговый комментарий",
         "status": "Подтверждение"
+      },
+      "export": {
+        "button": "Экспорт в Excel",
+        "sheetName": "Журнал комментариев",
+        "fileFilter": "Книга Excel",
+        "success": "Экспортировано комментариев: {{count}}",
+        "failed": "Не удалось экспортировать журнал комментариев",
+        "columns": {
+          "profileId": "ID профиля",
+          "siteAccount": "Аккаунт на сайте",
+          "siteAccountId": "ID аккаунта на сайте",
+          "pageTitle": "Заголовок страницы",
+          "pageUrl": "URL страницы",
+          "replyTo": "Ответ пользователю",
+          "angle": "Подход",
+          "brand": "Речевой пакет",
+          "generationSource": "Кем написан",
+          "confirmationSource": "Кем подтверждён",
+          "platformCommentId": "ID комментария на площадке",
+          "recordId": "ID записи"
+        }
       },
       "kind": {
         "direct": "Прямой",

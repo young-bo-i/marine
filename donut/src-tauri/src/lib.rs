@@ -1427,6 +1427,34 @@ async fn marine_export_ledger_shard() -> Result<String, String> {
   })?
 }
 
+/// Write the comment ledger out as a spreadsheet at `path`.
+///
+/// The rows arrive already rendered by the caller rather than being read back
+/// from `HISTORY_MANAGER` here, and that is the point: the export has to be the
+/// ledger the operator is actually looking at, filters and all, with the same
+/// localized column headers and status wording the table shows. Re-deriving it
+/// in Rust would mean a second copy of both the filter logic and the
+/// translation catalogue, free to drift from the one on screen.
+#[tauri::command]
+async fn marine_export_posting_history(
+  path: String,
+  export: marine::history_export::PostingHistoryExport,
+) -> Result<usize, String> {
+  tokio::task::spawn_blocking(move || {
+    let rows = export.rows.len();
+    marine::history_export::write_workbook(&export, std::path::Path::new(&path)).map_err(|e| {
+      log::error!("Failed to export Marine comment ledger: {e}");
+      marine::err_with("MARINE_EXPORT_FAILED", e.to_string())
+    })?;
+    Ok(rows)
+  })
+  .await
+  .map_err(|e| {
+    log::error!("Marine comment ledger export task failed: {e}");
+    marine::err("MARINE_EXPORT_FAILED")
+  })?
+}
+
 /// Where the two logs an automation run writes to actually live.
 ///
 /// Two of them, and the useful one is not the obvious one: the app log has the
@@ -2744,6 +2772,7 @@ pub fn run() {
       marine_discovery_status,
       marine_log_locations,
       marine_export_ledger_shard,
+      marine_export_posting_history,
       get_all_traffic_snapshots,
       get_profile_traffic_snapshot,
       clear_all_traffic_stats,

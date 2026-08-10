@@ -1834,6 +1834,7 @@
     "marineOpenaiKeyMissing": "请设置环境变量 DONUT_MARINE_OPENAI_API_KEY。",
     "marineGenerateFailed": "生成失败。{{detail}}",
     "marineGenerateTimeout": "生成超时。",
+    "marineExportFailed": "导出评论账本失败。{{detail}}",
     "marineFillFailed": "无法填入回复框。{{detail}}",
     "marineMarkPostedFailed": "无法标记为已发布。{{detail}}",
     "marineDiscoveryAlreadyRunning": "已有一轮任务在进行中。",
@@ -2174,6 +2175,27 @@
         "kind": "类型",
         "comment": "最终评论",
         "status": "确认状态"
+      },
+      "export": {
+        "button": "导出 Excel",
+        "sheetName": "评论账本",
+        "fileFilter": "Excel 工作簿",
+        "success": "已导出 {{count}} 条评论",
+        "failed": "导出评论账本失败",
+        "columns": {
+          "profileId": "身份 ID",
+          "siteAccount": "站点账号",
+          "siteAccountId": "站点账号 ID",
+          "pageTitle": "页面标题",
+          "pageUrl": "页面链接",
+          "replyTo": "回复对象",
+          "angle": "切入角度",
+          "brand": "话术包",
+          "generationSource": "生成来源",
+          "confirmationSource": "确认来源",
+          "platformCommentId": "平台评论 ID",
+          "recordId": "记录 ID"
+        }
       },
       "kind": {
         "direct": "直评",

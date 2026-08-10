@@ -1834,6 +1834,7 @@
     "marineOpenaiKeyMissing": "Defina a variável de ambiente DONUT_MARINE_OPENAI_API_KEY.",
     "marineGenerateFailed": "Falha na geração. {{detail}}",
     "marineGenerateTimeout": "A geração expirou.",
+    "marineExportFailed": "Não foi possível exportar o registro de comentários. {{detail}}",
     "marineFillFailed": "Não foi possível preencher a resposta. {{detail}}",
     "marineMarkPostedFailed": "Não foi possível marcar como publicado. {{detail}}",
     "marineDiscoveryAlreadyRunning": "Já há uma execução de descoberta em andamento.",
@@ -2174,6 +2175,27 @@
         "kind": "Tipo",
         "comment": "Comentário final",
         "status": "Confirmação"
+      },
+      "export": {
+        "button": "Exportar para Excel",
+        "sheetName": "Registro de comentários",
+        "fileFilter": "Pasta de trabalho do Excel",
+        "success": "{{count}} comentários exportados",
+        "failed": "Não foi possível exportar o registro de comentários",
+        "columns": {
+          "profileId": "ID do perfil",
+          "siteAccount": "Conta do site",
+          "siteAccountId": "ID da conta do site",
+          "pageTitle": "Título da página",
+          "pageUrl": "URL da página",
+          "replyTo": "Respondendo a",
+          "angle": "Abordagem",
+          "brand": "Roteiro da marca",
+          "generationSource": "Escrito por",
+          "confirmationSource": "Confirmado por",
+          "platformCommentId": "ID do comentário na plataforma",
+          "recordId": "ID do registro"
+        }
       },
       "kind": {
         "direct": "Direto",

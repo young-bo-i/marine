@@ -105,6 +105,9 @@ tempfile = "3"
 maxminddb = "0.28"
 quick-xml = { version = "0.40", features = ["serialize"] }
 
+# Marine comment-ledger export. Default features only: no chrono/polars/wasm.
+rust_xlsxwriter = { version = "0.97", default-features = false }
+
 # VPN support
 boringtun = "0.7"
 smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }

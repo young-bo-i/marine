@@ -1834,6 +1834,7 @@
     "marineOpenaiKeyMissing": "環境変数 DONUT_MARINE_OPENAI_API_KEY を設定してください。",
     "marineGenerateFailed": "生成に失敗しました。{{detail}}",
     "marineGenerateTimeout": "生成がタイムアウトしました。",
+    "marineExportFailed": "コメント台帳を書き出せませんでした。{{detail}}",
     "marineFillFailed": "返信欄に入力できませんでした。{{detail}}",
     "marineMarkPostedFailed": "投稿済みにできませんでした。{{detail}}",
     "marineDiscoveryAlreadyRunning": "すでに発見処理が実行中です。",
@@ -2174,6 +2175,27 @@
         "kind": "種別",
         "comment": "最終コメント",
         "status": "確認"
+      },
+      "export": {
+        "button": "Excel に書き出す",
+        "sheetName": "コメント台帳",
+        "fileFilter": "Excel ブック",
+        "success": "{{count}} 件のコメントを書き出しました",
+        "failed": "コメント台帳を書き出せませんでした",
+        "columns": {
+          "profileId": "プロファイル ID",
+          "siteAccount": "サイトアカウント",
+          "siteAccountId": "サイトアカウント ID",
+          "pageTitle": "ページタイトル",
+          "pageUrl": "ページ URL",
+          "replyTo": "返信先",
+          "angle": "切り口",
+          "brand": "トークスクリプト",
+          "generationSource": "作成元",
+          "confirmationSource": "確認元",
+          "platformCommentId": "プラットフォームのコメント ID",
+          "recordId": "レコード ID"
+        }
       },
       "kind": {
         "direct": "直接コメント",

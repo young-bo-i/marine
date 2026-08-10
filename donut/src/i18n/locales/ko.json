@@ -1834,6 +1834,7 @@
     "marineOpenaiKeyMissing": "DONUT_MARINE_OPENAI_API_KEY 환경 변수를 설정하세요.",
     "marineGenerateFailed": "생성에 실패했습니다. {{detail}}",
     "marineGenerateTimeout": "생성 시간이 초과되었습니다.",
+    "marineExportFailed": "댓글 원장을 내보내지 못했습니다. {{detail}}",
     "marineFillFailed": "답글창에 입력할 수 없습니다. {{detail}}",
     "marineMarkPostedFailed": "게시됨으로 표시할 수 없습니다. {{detail}}",
     "marineDiscoveryAlreadyRunning": "이미 발견 작업이 진행 중입니다.",
@@ -2174,6 +2175,27 @@
         "kind": "유형",
         "comment": "최종 댓글",
         "status": "확인"
+      },
+      "export": {
+        "button": "Excel로 내보내기",
+        "sheetName": "댓글 원장",
+        "fileFilter": "Excel 통합 문서",
+        "success": "댓글 {{count}}건을 내보냈습니다",
+        "failed": "댓글 원장을 내보내지 못했습니다",
+        "columns": {
+          "profileId": "프로필 ID",
+          "siteAccount": "사이트 계정",
+          "siteAccountId": "사이트 계정 ID",
+          "pageTitle": "페이지 제목",
+          "pageUrl": "페이지 URL",
+          "replyTo": "답글 대상",
+          "angle": "접근 방식",
+          "brand": "화법 팩",
+          "generationSource": "작성 주체",
+          "confirmationSource": "확인 주체",
+          "platformCommentId": "플랫폼 댓글 ID",
+          "recordId": "레코드 ID"
+        }
       },
       "kind": {
         "direct": "직접 댓글",

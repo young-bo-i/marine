@@ -1834,6 +1834,7 @@
     "marineOpenaiKeyMissing": "Đặt biến môi trường DONUT_MARINE_OPENAI_API_KEY.",
     "marineGenerateFailed": "Tạo thất bại. {{detail}}",
     "marineGenerateTimeout": "Tạo đã hết thời gian chờ.",
+    "marineExportFailed": "Không thể xuất sổ bình luận. {{detail}}",
     "marineFillFailed": "Không thể điền vào ô trả lời. {{detail}}",
     "marineMarkPostedFailed": "Không thể đánh dấu đã đăng. {{detail}}",
     "marineDiscoveryAlreadyRunning": "Đã có một lượt phát hiện đang chạy.",
@@ -2174,6 +2175,27 @@
         "kind": "Loại",
         "comment": "Bình luận cuối",
         "status": "Xác nhận"
+      },
+      "export": {
+        "button": "Xuất Excel",
+        "sheetName": "Sổ bình luận",
+        "fileFilter": "Bảng tính Excel",
+        "success": "Đã xuất {{count}} bình luận",
+        "failed": "Không thể xuất sổ bình luận",
+        "columns": {
+          "profileId": "ID hồ sơ",
+          "siteAccount": "Tài khoản trên trang",
+          "siteAccountId": "ID tài khoản trên trang",
+          "pageTitle": "Tiêu đề trang",
+          "pageUrl": "URL trang",
+          "replyTo": "Trả lời",
+          "angle": "Góc tiếp cận",
+          "brand": "Bộ kịch bản",
+          "generationSource": "Người viết",
+          "confirmationSource": "Xác nhận bởi",
+          "platformCommentId": "ID bình luận trên nền tảng",
+          "recordId": "ID bản ghi"
+        }
       },
       "kind": {
         "direct": "Bình luận trực tiếp",
