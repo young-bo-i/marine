@@ -33,7 +33,9 @@ export interface BrowserProfile {
   host_os?: string; // OS where profile was created ("macos", "windows", "linux")
   ephemeral?: boolean;
   extension_group_id?: string;
-  /** Marine: bound BrandSkill (persona voice); undefined for non-persona profiles. */
+  /** Platforms this profile participates in during Marine automatic execution. */
+  marine_platforms?: string[];
+  /** Marine: bound Scholay persona (`P01`-`P12`); stable fallback when absent. */
   brand_id?: string;
   proxy_bypass_rules?: string[];
   created_by_id?: string;

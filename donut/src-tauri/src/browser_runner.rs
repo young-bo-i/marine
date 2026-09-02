@@ -914,6 +914,7 @@ impl BrowserRunner {
         &app_handle,
         &profile_data_path,
         &updated_profile.id.to_string(),
+        updated_profile.brand_id.as_deref(),
       )
       .await
       {

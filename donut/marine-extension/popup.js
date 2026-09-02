@@ -269,7 +269,7 @@ $('#cfg-profile').addEventListener('change', async () => {
     : '尚未选择身份，自动发布记录不会写入账本。';
 });
 
-// ---- 内置话术方案：后台会把母稿与补充范文发布为 Marine/Rime context ----
+// ---- 内置话术方案：后台会把运行时人格、同池样例与补充范文发布为 Marine/Rime context ----
 const SKILL_BRAND = 'scholay';
 
 // ---- 导入本地 .md 作为补充范文（存 chrome.storage，生成时并入 skill）----
@@ -339,10 +339,10 @@ async function loadSampleStatus() {
   try { o = await chrome.storage.local.get(['marineCustomSampleName', 'marineCustomSampleMd']); } catch (e) {}
   if (o && o.marineCustomSampleMd) {
     const kb = (o.marineCustomSampleMd.length / 1024).toFixed(1);
-    if (st) st.textContent = '已导入补充范文：' + (o.marineCustomSampleName || 'custom.md') + '（' + kb + 'KB，作为原版母稿之后的次级参照）';
+    if (st) st.textContent = '已导入补充范文：' + (o.marineCustomSampleName || 'custom.md') + '（' + kb + 'KB，作为内置人格与同池样例之后的次级参照）';
     if (clr) clr.classList.remove('hidden');
   } else {
-    if (st) st.textContent = '未导入补充范文（当前只用原版母稿）。';
+    if (st) st.textContent = '未导入补充范文（当前使用内置人格与同池样例）。';
     if (clr) clr.classList.add('hidden');
   }
 }
@@ -363,7 +363,7 @@ if ($('#sample-file')) $('#sample-file').addEventListener('change', async (e) =>
 if ($('#sample-clear')) $('#sample-clear').addEventListener('click', async () => {
   try { await chrome.storage.local.remove(['marineCustomSampleMd', 'marineCustomSampleName']); } catch (e) {}
   await loadSampleStatus();
-  setStatus('已移除补充范文（恢复只用原版母稿）', 'ok');
+  setStatus('已移除补充范文（恢复使用内置人格与同池样例）', 'ok');
 });
 
 // ---- 独立发布记录：Marine 记录事实，不生成候选 ----

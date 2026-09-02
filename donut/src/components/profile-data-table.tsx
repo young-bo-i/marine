@@ -82,6 +82,7 @@ import { useScrollFade } from "@/hooks/use-scroll-fade";
 import { useTableSorting } from "@/hooks/use-table-sorting";
 import { useTeamLocks } from "@/hooks/use-team-locks";
 import { useVpnEvents } from "@/hooks/use-vpn-events";
+import { translateBackendError } from "@/lib/backend-errors";
 import {
   getBrowserDisplayName,
   getOSDisplayName,
@@ -89,6 +90,12 @@ import {
   isCrossOsProfile,
 } from "@/lib/browser-utils";
 import { formatRelativeTime } from "@/lib/flag-utils";
+import {
+  MARINE_PLATFORMS,
+  type MarinePlatform,
+  normalizeMarinePlatforms,
+} from "@/lib/marine-platforms";
+import { showErrorToast } from "@/lib/toast-utils";
 import { cn } from "@/lib/utils";
 import type {
   BandwidthDataPoint,
@@ -434,6 +441,113 @@ function ExtCell({
     </Popover>
   );
 }
+
+const MarinePlatformsCell = React.memo<{
+  profile: BrowserProfile;
+  isDisabled: boolean;
+}>(({ profile, isDisabled }) => {
+  const { t } = useTranslation();
+  const configured = React.useMemo(
+    () => normalizeMarinePlatforms(profile.marine_platforms),
+    [profile.marine_platforms],
+  );
+  const [selected, setSelected] = React.useState<MarinePlatform[]>(configured);
+  const [isSaving, setIsSaving] = React.useState(false);
+
+  React.useEffect(() => {
+    setSelected(configured);
+  }, [configured]);
+
+  // Marine's in-page automation extension only ships with Wayfern. Showing an
+  // editable assignment for another engine would promise work the scheduler
+  // cannot perform.
+  if (profile.browser !== "wayfern") {
+    return <span className="text-xs text-muted-foreground">—</span>;
+  }
+
+  const update = async (platform: MarinePlatform, checked: boolean) => {
+    const previous = selected;
+    const requested = new Set(selected);
+    if (checked) requested.add(platform);
+    else requested.delete(platform);
+    const next = MARINE_PLATFORMS.filter((item) => requested.has(item));
+
+    setSelected(next);
+    setIsSaving(true);
+    try {
+      const saved = await invoke<BrowserProfile>(
+        "update_profile_marine_platforms",
+        {
+          profileId: profile.id,
+          marinePlatforms: next,
+        },
+      );
+      setSelected(normalizeMarinePlatforms(saved.marine_platforms));
+    } catch (error) {
+      setSelected(previous);
+      console.error("Failed to update Marine automation platforms:", error);
+      showErrorToast(t("profiles.table.automationPlatforms"), {
+        description: translateBackendError(t, error),
+      });
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const label =
+    selected.length === 0
+      ? t("profiles.table.noAutomationPlatforms")
+      : selected
+          .map((platform) => t(`marine.prospects.platform.${platform}`))
+          .join(" · ");
+
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          disabled={isDisabled || isSaving}
+          aria-label={t("profiles.table.automationPlatforms")}
+          title={label}
+          className={cn(
+            "flex h-7 w-full min-w-0 items-center gap-1 rounded px-1.5 text-left text-xs transition-colors duration-100",
+            selected.length === 0 && "text-muted-foreground",
+            "hover:bg-accent/50 disabled:cursor-not-allowed disabled:opacity-60",
+          )}
+        >
+          <span className="min-w-0 flex-1 truncate">{label}</span>
+          <LuChevronDown className="size-3 shrink-0 text-muted-foreground" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent className="w-52 p-2" align="start">
+        <div className="flex flex-col gap-1">
+          {MARINE_PLATFORMS.map((platform) => {
+            const id = `marine-platform-${profile.id}-${platform}`;
+            return (
+              <label
+                key={platform}
+                htmlFor={id}
+                className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-xs hover:bg-accent"
+              >
+                <Checkbox
+                  id={id}
+                  checked={selected.includes(platform)}
+                  disabled={isSaving}
+                  onCheckedChange={(value) => {
+                    void update(platform, value === true);
+                  }}
+                />
+                {t(`marine.prospects.platform.${platform}`)}
+              </label>
+            );
+          })}
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+});
+
+MarinePlatformsCell.displayName = "MarinePlatformsCell";
 
 const TagsCell = React.memo<{
   profile: BrowserProfile;
@@ -2595,6 +2709,31 @@ export function ProfilesDataTable({
         },
       },
       {
+        id: "marinePlatforms",
+        size: 150,
+        header: ({ table }) => {
+          const meta = table.options.meta as TableMeta;
+          return meta.t("profiles.table.automationPlatforms");
+        },
+        cell: ({ row, table }) => {
+          const meta = table.options.meta as TableMeta;
+          const profile = row.original;
+          const isRunning =
+            meta.isClient && meta.runningProfiles.has(profile.id);
+          const isLaunching = meta.launchingProfiles.has(profile.id);
+          const isStopping = meta.stoppingProfiles.has(profile.id);
+          const isDisabled =
+            isRunning ||
+            isLaunching ||
+            isStopping ||
+            meta.isUpdating(profile.browser);
+
+          return (
+            <MarinePlatformsCell profile={profile} isDisabled={isDisabled} />
+          );
+        },
+      },
+      {
         id: "marineLogin",
         size: 130,
         header: ({ table }) => {
@@ -2973,11 +3112,17 @@ export function ProfilesDataTable({
     [t, setProfileForInfoDialog],
   );
 
-  // Low-priority columns leave the table as the container narrows (most
-  // expendable first); their data stays reachable via the profile info
-  // dialog. Visibility (not CSS hiding) so table-fixed reclaims the width.
+  // Keep secondary profile metadata out of the default table layout. Tags,
+  // network assignment, and extensions remain available in profile details;
+  // the automation-platform assignment is the primary inline configuration.
   const [columnVisibility, setColumnVisibility] =
-    React.useState<VisibilityState>({ created_at: false });
+    React.useState<VisibilityState>({
+      created_at: false,
+      tags: false,
+      marinePlatforms: true,
+      proxy: false,
+      ext: false,
+    });
 
   // Content columns grow proportionally with the container but never drop
   // below the compact-layout floor; the name column takes the remainder.
@@ -3039,10 +3184,14 @@ export function ProfilesDataTable({
         const next: VisibilityState = {
           // Always hidden — sort-only column (issue #454).
           created_at: false,
+          // Hidden from the default table layout at every window width.
+          tags: false,
+          proxy: false,
+          ext: false,
+          // This is the primary per-profile automation control.
+          marinePlatforms: true,
           dns: w >= 768,
-          ext: w >= 672,
           note: w >= 576,
-          tags: w >= 512,
         };
         return Object.keys(next).every((k) => prev[k] === next[k])
           ? prev

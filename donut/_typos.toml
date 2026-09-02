@@ -3,6 +3,9 @@ extend-exclude = [
     "src-tauri/src/camoufox/data/*.json",
     "src-tauri/src/camoufox/data/*.xml",
     "src/i18n/locales/*.json",
+    # Deterministically compiled from the frozen Scholay workbook. Opaque
+    # Bilibili case/job ids contain arbitrary letter sequences such as `UE`.
+    "marine-extension/skills/scholay/generated/*.json",
     # Auto-generated from commit subjects by release.yml; typos here originate
     # in commit messages, which are immutable, so don't spell-check it.
     "CHANGELOG.md",

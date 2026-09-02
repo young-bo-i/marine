@@ -155,13 +155,6 @@ pub const PROGRESS_EVENT: &str = "marine-discovery-progress";
 /// One run's plan, as submitted by the UI.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct RunRequest {
-  /// Which profiles to work. This is a *selection*, not an ordering: the
-  /// search-slot `account_index` is derived in [`resolve_profiles`] from a
-  /// stable global position, deliberately not from this list, so that ticking a
-  /// different set of profiles cannot reshuffle an account's search sort.
-  pub profile_ids: Vec<String>,
-  /// Platforms to visit within each profile, in order.
-  pub platforms: Vec<String>,
   pub keyword: String,
   /// Override for [`DEFAULT_LEG_TIMEOUT_SECS`].
   #[serde(default)]
@@ -403,7 +396,7 @@ fn touch_ends_leg(state: super::prospect::ProspectState) -> bool {
 ///
 /// 属于 (profile, platform) 的终态 touch 数。
 ///
-/// **必须按平台过滤**，这是单会话编排引入的要求：一个浏览器连着跑四个平台时，
+/// **必须按平台过滤**，这是单会话编排引入的要求：一个浏览器连着跑多个平台时，
 /// 上一个平台迟到的 settle 会落在下一条腿的观察窗口里。只按 profile 计数的话，
 /// 下一条腿会把别人的成果当成自己的 —— 它会立刻「完成」、根本没去发那个平台的
 /// 评论，而报表上是一条漂亮的 Settled。每条腿开关一次浏览器的年代没有这个问题，
@@ -489,26 +482,37 @@ pub fn engine_supports_discovery(browser: &str) -> bool {
 /// the profiles is one directory read, cheap enough to do on the command's own
 /// thread and get a translated error back out of the `invoke`.
 pub fn validate_plan(request: &RunRequest) -> Result<(), String> {
-  if request.profile_ids.is_empty() || request.platforms.is_empty() {
-    return Err(super::err("MARINE_DISCOVERY_EMPTY_PLAN"));
-  }
   if request.keyword.trim().is_empty() {
     return Err(super::err("MARINE_DISCOVERY_EMPTY_KEYWORD"));
   }
-  resolve_profiles(&request.profile_ids)?;
+  if resolve_profiles()?.is_empty() {
+    return Err(super::err("MARINE_DISCOVERY_EMPTY_PLAN"));
+  }
   Ok(())
 }
 
-/// Resolve the requested ids, and pair each with its **stable** account index.
+/// One profile's independently configured slice of a run.
+#[derive(Debug, Clone)]
+struct ResolvedProfile {
+  account_index: usize,
+  profile: BrowserProfile,
+  platforms: Vec<String>,
+}
+
+/// Resolve enabled profiles and pair each with its **stable** account index.
 ///
-/// The index must not come from the caller's list position. Two things would
+/// A profile participates only when its `marine_platforms` contains at least
+/// one supported platform. Platform values are projected through the canonical
+/// supported-platform list, which simultaneously filters unknown values,
+/// deduplicates repeats, and gives every profile the same deterministic order.
+///
+/// The account index must not come from the enabled subset. Two things would
 /// break if it did, and both were observed:
 ///
 /// * `list_profiles()` returns raw `read_dir` order, which is not sorted and not
 ///   stable across machines or file operations.
-/// * A caller sends only the profiles the operator ticked, so a profile's
-///   position — and therefore its search sort — would change depending on which
-///   *other* profiles happened to be selected that run.
+/// * Enabling or disabling another profile would change a profile's position —
+///   and therefore its search sort — if the index came from the enabled subset.
 ///
 /// Either one defeats the point of slots: `search_slot` assigns a sort by
 /// `account_index` precisely so one account keeps one browsing habit run after
@@ -516,63 +520,53 @@ pub fn validate_plan(request: &RunRequest) -> Result<(), String> {
 /// looks *less* like a person, not more.
 ///
 /// So the index is this profile's position among **all** discovery-capable
-/// profiles sorted by id — independent of selection and of directory order.
-/// Errors are already `{ "code": … }` strings: the caller surfaces them to the
-/// operator verbatim, and "this profile came from another OS" needs a different
-/// remedy (make a new one here and log in again) than "this profile is gone".
-fn resolve_profiles(ids: &[String]) -> Result<Vec<(usize, BrowserProfile)>, String> {
+/// profiles sorted by id — independent of platform configuration and directory
+/// order.
+fn resolve_profiles() -> Result<Vec<ResolvedProfile>, String> {
   let all = ProfileManager::instance().list_profiles().map_err(|e| {
     log::error!("Discovery could not list profiles: {e}");
     super::err("MARINE_DISCOVERY_PROFILE_NOT_FOUND")
   })?;
-  resolve_from(&all, ids)
+  Ok(resolve_from(&all))
 }
 
 /// The part of [`resolve_profiles`] that does not touch the filesystem.
-fn resolve_from(
-  all: &[BrowserProfile],
-  ids: &[String],
-) -> Result<Vec<(usize, BrowserProfile)>, String> {
-  let mut universe: Vec<String> = all
+fn resolve_from(all: &[BrowserProfile]) -> Vec<ResolvedProfile> {
+  let mut universe: Vec<BrowserProfile> = all
     .iter()
     .filter(|p| engine_supports_discovery(&p.browser))
-    .map(|p| p.id.to_string())
+    .cloned()
     .collect();
-  universe.sort();
+  universe.sort_by_key(|profile| profile.id);
 
-  ids
-    .iter()
-    .map(|id| {
-      let profile = all
+  universe
+    .into_iter()
+    .enumerate()
+    .filter_map(|(account_index, profile)| {
+      let platforms: Vec<String> = super::prospect::SUPPORTED_PLATFORMS
         .iter()
-        .find(|p| p.id.to_string() == *id)
-        .cloned()
-        .ok_or_else(|| {
-          log::error!("Discovery plan names a profile that no longer exists: {id}");
-          super::err("MARINE_DISCOVERY_PROFILE_NOT_FOUND")
-        })?;
-      if !engine_supports_discovery(&profile.browser) {
-        log::error!(
-          "Discovery plan names profile {} running {}, which cannot host the extension",
-          profile.name,
-          profile.browser
-        );
-        return Err(super::err("MARINE_DISCOVERY_PROFILE_NOT_FOUND"));
-      }
-      // No cross-OS pre-check any more. It existed because `launch_browser` used
-      // to refuse a profile created elsewhere, which would have failed every leg
-      // of the run — and since `run_profile_session` reports a failed leg as
-      // `Ok`, the consecutive-failure cap never tripped and a cycling run spun
-      // all night burning candidates. Launching now adopts such a profile onto
-      // this machine instead of refusing it, so rejecting the plan here would be
-      // refusing work that succeeds.
-      let account_index = universe.iter().position(|u| u == id).ok_or_else(|| {
-        log::error!("Discovery plan names a profile that is not indexable: {id}");
-        super::err("MARINE_DISCOVERY_PROFILE_NOT_FOUND")
-      })?;
-      Ok((account_index, profile))
+        .filter(|supported| {
+          profile
+            .marine_platforms
+            .iter()
+            .any(|configured| configured == *supported)
+        })
+        .map(|platform| (*platform).to_string())
+        .collect();
+      (!platforms.is_empty()).then_some(ResolvedProfile {
+        account_index,
+        profile,
+        platforms,
+      })
     })
     .collect()
+}
+
+fn total_legs(profiles: &[ResolvedProfile]) -> usize {
+  profiles
+    .iter()
+    .map(|resolved| resolved.platforms.len())
+    .sum()
 }
 
 /// Sleep, but notice a cancel request while doing it.
@@ -714,8 +708,8 @@ async fn run_inner(
   request: RunRequest,
   scheduler: &DiscoveryScheduler,
 ) -> Result<Vec<LegReport>, String> {
-  let profiles = resolve_profiles(&request.profile_ids)?;
-  if profiles.is_empty() || request.platforms.is_empty() {
+  let profiles = resolve_profiles()?;
+  if profiles.is_empty() {
     return Err(super::err("MARINE_DISCOVERY_EMPTY_PLAN"));
   }
   if request.keyword.trim().is_empty() {
@@ -728,32 +722,32 @@ async fn run_inner(
       .filter(|s| *s > 0)
       .unwrap_or(DEFAULT_LEG_TIMEOUT_SECS),
   );
-  let total_legs = profiles.len() * request.platforms.len();
+  let total_legs = total_legs(&profiles);
   let mut finished: Vec<LegReport> = Vec::with_capacity(total_legs);
   let mut leg_index = 0usize;
 
   let last_profile = profiles.len() - 1;
 
-  for (profile_position, (account_index, profile)) in profiles.iter().enumerate() {
+  for (profile_position, resolved) in profiles.iter().enumerate() {
     if scheduler.cancel.load(Ordering::SeqCst) {
       break;
     }
 
-    // 一个 profile = 一个浏览器会话，四个平台跑在里面。
+    // 一个 profile = 一个浏览器会话，只跑这个 profile 自己配置的平台。
     let keep_going = run_profile_session(
       &app_handle,
       scheduler,
-      profile,
-      &request.platforms,
+      &resolved.profile,
+      &resolved.platforms,
       &request.keyword,
-      *account_index,
+      resolved.account_index,
       leg_timeout,
       leg_index,
       total_legs,
       &mut finished,
     )
     .await;
-    leg_index += request.platforms.len();
+    leg_index += resolved.platforms.len();
     if !keep_going {
       break;
     }
@@ -805,7 +799,7 @@ async fn run_inner(
 /// 反方向判错的代价是毁掉操作员的窗口。
 ///
 /// **每个 profile 只跑一次，且只在会话冷启动之前跑。**单会话编排下，第二条腿
-/// 之后浏览器正是我们自己开的，再问一次必然答「已在运行」，四个平台会全部
+/// 之后浏览器正是我们自己开的，再问一次必然答「已在运行」，后续平台会全部
 /// 跳过；而且 `check_browser_status` 并不是只读的 —— 页签数为零时它会**杀掉
 /// 浏览器**（零窗口收割），会话中途调用等于自己给自己埋雷。
 async fn profile_is_occupied(
@@ -879,7 +873,7 @@ async fn run_profile_session(
   // 会话级：只问一次「操作员是不是已经开着这个 profile」。
   if let Some(err) = profile_is_occupied(app_handle, profile).await {
     // 每个平台都要有一条报告，否则前端的 leg_index/total_legs 对不上 ——
-    // total_legs 是按 profiles × platforms 预先算好的。
+    // total_legs 是按每个 profile 各自的平台数之和预先算好的。
     for platform in platforms {
       finished.push(base(platform, LegOutcome::AlreadyOpen, err.clone()));
     }
@@ -972,7 +966,7 @@ async fn run_profile_session(
 
     // 平台之间不停顿（运营决定）。
     //
-    // 曾经停 8~25 秒，理由是「同一账号短时间连发四个平台」是可识别的节奏。
+    // 曾经停 8~25 秒，理由是「同一账号短时间连发多个平台」是可识别的节奏。
     // 但代价是实打实的：腿一结束页面就被导航到 about:blank，停顿期间浏览器就
     // 是一个空白页干等 —— 从外面看和卡死完全一样，实际观察中被误判过。
     // 账号之间的停顿保留（换身份是更显眼的转换，见 PROFILE_PAUSE_SECS）。
@@ -1194,8 +1188,8 @@ async fn wait_for_extension_ready(
 /// settle 明确失败。后几类如果不识别，页面逻辑已经退出，调度器却仍会白等满超时。
 ///
 /// 调度器原本看不见它们：完成信号只认台账里的 touch，而这些状态**不产生
-/// touch**，于是白等满整个腿超时。一个 profile 没登录四个平台，就是 16 分钟纯
-/// 空转 —— 跑 20 个 profile 时这是最大的一块浪费。
+/// touch**，于是白等满整个腿超时。一个 profile 没登录多个平台，就会连续空转；
+/// 跑 20 个 profile 时这是最大的一块浪费。
 ///
 /// 用日志 sink 而不是新开一条通道：它就在同一个进程里，而且这些状态本来就
 /// 已经写进去了。这不违反「完成信号是台账」那条原则 —— 这里判定的不是「干完了」
@@ -1547,7 +1541,7 @@ async fn run_leg(
 
   // 冷启动，还是原地换页？
   //
-  // 一个 profile 的四个平台跑在**同一个浏览器会话**里：第一条腿冷启动，之后
+  // 一个 profile 配置的平台跑在**同一个浏览器会话**里：第一条腿冷启动，之后
   // 只把同一个标签页导航到下一个平台的搜索页。扩展那边不需要任何新通道 ——
   // 它本来就是「落到搜索页就开工」（内容脚本在每次文档加载时启动编排）。
   //
@@ -1963,7 +1957,7 @@ mod tests {
     }
   }
 
-  // 四个平台跑在同一个浏览器会话里之后，上一个平台迟到的 settle 会落进下一条腿
+  // 多个平台跑在同一个浏览器会话里之后，上一个平台迟到的 settle 会落进下一条腿
   // 的观察窗口。不按平台过滤的话，下一条腿会把别人的成果当成自己的：它立刻
   // 「完成」、根本没去发那个平台，而报表上是一条漂亮的 Settled。
   #[test]
@@ -2184,8 +2178,8 @@ mod tests {
   ///
   /// Reproduced here rather than exercised through `resolve_profiles`, which
   /// reads the real profile directory. The property under test is that the
-  /// index depends on neither directory order nor which profiles were selected
-  /// — both of which produced reshuffled search sorts before this was fixed.
+  /// index does not depend on directory order. The enabled-subset property is
+  /// exercised through `resolve_from` below.
   fn stable_index(universe_unsorted: &[&str], id: &str) -> Option<usize> {
     let mut sorted: Vec<&str> = universe_unsorted.to_vec();
     sorted.sort_unstable();
@@ -2206,13 +2200,35 @@ mod tests {
   }
 
   #[test]
-  fn account_index_ignores_which_other_profiles_were_selected() {
-    // The regression this pins: indexing the *selected* subset meant ticking a
-    // different set of profiles silently changed an account's search sort.
-    let universe = ["aaa", "bbb", "ccc"];
-    // "ccc" alone, and "ccc" alongside others, must land on the same slot.
-    assert_eq!(stable_index(&universe, "ccc"), Some(2));
-    let idx = stable_index(&universe, "ccc").unwrap();
+  fn account_index_ignores_which_other_profiles_are_enabled() {
+    // The regression this pins: indexing only the enabled subset would make a
+    // profile change search sort whenever another profile gained or lost its
+    // platform configuration.
+    let mut first = wayfern_profile("first", None);
+    first.id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let mut middle = wayfern_profile("middle", None);
+    middle.id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+    let mut last = with_platforms(wayfern_profile("last", None), &["bilibili"]);
+    last.id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+
+    let alone = resolve_from(&[last.clone(), first.clone(), middle.clone()]);
+    let alone_index = alone
+      .iter()
+      .find(|item| item.profile.id == last.id)
+      .unwrap()
+      .account_index;
+    assert_eq!(alone_index, 2);
+
+    first.marine_platforms = vec!["zhihu".to_string()];
+    let together = resolve_from(&[middle, last.clone(), first]);
+    let together_index = together
+      .iter()
+      .find(|item| item.profile.id == last.id)
+      .unwrap()
+      .account_index;
+    assert_eq!(together_index, 2);
+
+    let idx = together_index;
     let alone = super::super::search_slot::slot_for("bilibili", "科研工具", idx).unwrap();
     let together = super::super::search_slot::slot_for("bilibili", "科研工具", idx).unwrap();
     assert_eq!(alone.url, together.url);
@@ -2278,11 +2294,9 @@ mod tests {
 
   #[test]
   fn run_request_deserialises_without_the_optional_timeout() {
-    let r: RunRequest = serde_json::from_str(
-      r#"{"profile_ids":["a"],"platforms":["bilibili"],"keyword":"科研工具"}"#,
-    )
-    .unwrap();
+    let r: RunRequest = serde_json::from_str(r#"{"keyword":"科研工具"}"#).unwrap();
     assert_eq!(r.leg_timeout_secs, None);
+    assert_eq!(r.cycle_gap_minutes, None);
     assert_eq!(r.keyword, "科研工具");
   }
 
@@ -2338,6 +2352,7 @@ mod tests {
       ephemeral: false,
       extension_group_id: None,
       brand_id: None,
+      marine_platforms: Vec::new(),
       proxy_bypass_rules: Vec::new(),
       created_by_id: None,
       created_by_email: None,
@@ -2347,6 +2362,14 @@ mod tests {
       updated_at: None,
       default_bookmarks_seeded: false,
     }
+  }
+
+  fn with_platforms(mut profile: BrowserProfile, platforms: &[&str]) -> BrowserProfile {
+    profile.marine_platforms = platforms
+      .iter()
+      .map(|platform| (*platform).to_string())
+      .collect();
+    profile
   }
 
   /// 一个必然与当前宿主不同的 OS 名 —— 写死 "macos" 的话，在 macOS 上跑
@@ -2359,38 +2382,65 @@ mod tests {
     }
   }
 
-  fn code_of(err: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(err)
-      .ok()
-      .and_then(|v| v["code"].as_str().map(str::to_string))
-      .unwrap_or_else(|| format!("<not a coded error: {err}>"))
-  }
-
   /// 跨 OS 的 profile 现在是**可以**进计划的 —— 启动时会接管到本机。
   ///
   /// 这条以前是硬拒。留着这个测试是为了守住反向：谁要是把那道闸门加回来，
   /// 等于把一批能正常跑的账号永久挡在自动化外面，而且报的还是「不支持」。
   #[test]
   fn a_profile_from_another_os_is_accepted_and_adopted_at_launch() {
-    let foreign = wayfern_profile("from-elsewhere", Some(a_foreign_os()));
-    let native = wayfern_profile("local", None);
+    let foreign = with_platforms(
+      wayfern_profile("from-elsewhere", Some(a_foreign_os())),
+      &["bilibili"],
+    );
+    let native = with_platforms(wayfern_profile("local", None), &["zhihu"]);
     let all = vec![foreign.clone(), native.clone()];
 
-    let ok = resolve_from(&all, &[foreign.id.to_string()]).expect("跨 OS 的 profile 应当通过");
-    assert_eq!(ok.len(), 1);
-
-    let mixed = resolve_from(&all, &[native.id.to_string(), foreign.id.to_string()])
-      .expect("混着跨 OS 的计划也应当通过");
-    assert_eq!(mixed.len(), 2);
+    let resolved = resolve_from(&all);
+    assert_eq!(resolved.len(), 2);
+    assert!(resolved.iter().any(|item| item.profile.id == foreign.id));
+    assert!(resolved.iter().any(|item| item.profile.id == native.id));
   }
 
-  /// 错误必须是结构化错误码 —— 裸英文会原样漏到界面上。
   #[test]
-  fn a_missing_profile_reports_a_translatable_code() {
-    let all = vec![wayfern_profile("local", None)];
-    let err =
-      resolve_from(&all, &[uuid::Uuid::new_v4().to_string()]).expect_err("不存在的 profile 要报错");
-    assert_eq!(code_of(&err), "MARINE_DISCOVERY_PROFILE_NOT_FOUND");
+  fn profiles_without_supported_platforms_are_not_resolved() {
+    let empty = wayfern_profile("empty", None);
+    let unknown = with_platforms(wayfern_profile("unknown", None), &["weibo"]);
+    let enabled = with_platforms(wayfern_profile("enabled", None), &["douyin"]);
+    let mut wrong_engine = with_platforms(wayfern_profile("firefox", None), &["bilibili"]);
+    wrong_engine.browser = "camoufox".to_string();
+
+    let resolved = resolve_from(&[empty, unknown, enabled.clone(), wrong_engine]);
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].profile.id, enabled.id);
+    assert_eq!(resolved[0].platforms, vec!["douyin"]);
+  }
+
+  #[test]
+  fn each_profile_keeps_its_own_canonical_platform_plan() {
+    let one = with_platforms(wayfern_profile("one", None), &["zhihu"]);
+    let two = with_platforms(
+      wayfern_profile("two", None),
+      &["xiaohongshu", "bilibili", "weibo", "bilibili"],
+    );
+
+    let resolved = resolve_from(&[two.clone(), one.clone()]);
+    assert_eq!(resolved.len(), 2);
+    assert_eq!(total_legs(&resolved), 3);
+
+    let one_plan = resolved
+      .iter()
+      .find(|item| item.profile.id == one.id)
+      .unwrap();
+    assert_eq!(one_plan.platforms, vec!["zhihu"]);
+
+    let two_plan = resolved
+      .iter()
+      .find(|item| item.profile.id == two.id)
+      .unwrap();
+    assert_eq!(
+      two_plan.platforms,
+      vec!["bilibili".to_string(), "xiaohongshu".to_string()]
+    );
   }
 
   /// 「窗口没到前台」只在**没有别的解释**时才说话，否则会盖掉真正的原因。

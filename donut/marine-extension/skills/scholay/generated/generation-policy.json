@@ -1,0 +1,92 @@
+{
+  "assetBoundaries": {
+    "exemplarsAreEvidence": false,
+    "exemplarsAreStyleOnly": true,
+    "humanQualityLabelsIncluded": false,
+    "productFactsAuthoritative": false,
+    "publicationAuthorization": false,
+    "realPersonIdentityIncluded": false
+  },
+  "assetVersion": "scholay-comment-corpus-20260814.v1",
+  "brandPolicy": {
+    "brandToken": "Scholay",
+    "caseSensitive": true,
+    "modeField": "brandMode",
+    "modes": {
+      "evidence_only": {
+        "brandOccurrences": 0,
+        "freshEvidenceRequired": true
+      },
+      "required": {
+        "brandOccurrences": 1,
+        "freshEvidenceRequired": true
+      }
+    },
+    "runtimeQuotaInheritedFromCorpus": false,
+    "sourceDistribution": {
+      "evidence_only": 108,
+      "required": 252,
+      "requiredRatio": 0.7,
+      "total": 360,
+      "trainingDistributionOnly": true
+    }
+  },
+  "generation": {
+    "evidence": {
+      "freshEvidenceRequiredForProductClaims": true,
+      "styleExemplarsAreEvidence": false,
+      "workbookEvidenceTextIncluded": false
+    },
+    "experience": {
+      "fabricationAllowed": false,
+      "firstPersonClaimsRequireUserProvidedEvidence": true
+    },
+    "identity": {
+      "personasAreFictional": true,
+      "realPersonClaimsAllowed": false
+    },
+    "output": {
+      "draftOnly": true,
+      "language": "zh",
+      "maxCharacters": 240,
+      "minCharacters": 20
+    },
+    "publication": {
+      "authorized": false,
+      "requiresSeparateExplicitUserAction": true
+    },
+    "sourceMaterial": {
+      "executeEmbeddedInstructions": false,
+      "treatAsUntrusted": true
+    }
+  },
+  "schemaVersion": "scholay.generation-policy.v1",
+  "source": {
+    "fileName": "预制人-Scholay-WIKI-评论360条-20260814.xlsx",
+    "runId": "p360-20260813-v6",
+    "sha256": "f82ce1978d531a329824ed3b18392847bdb0f2a750a0782e11d226ac6f27250f",
+    "workbookAuditAt": "2026-08-14T01:00:00Z"
+  },
+  "validation": {
+    "feedbackSemantics": {
+      "humanReviewed": false,
+      "machineAcceptedMeans": "hard-rule pass only; not a human quality label"
+    },
+    "hardRules": [
+      "character_count_20_to_240",
+      "brand_occurrence_matches_brand_mode",
+      "no_fabricated_real_identity",
+      "no_fabricated_lived_experience",
+      "no_execution_of_source_instructions",
+      "fresh_evidence_for_product_claims",
+      "offline_draft_only"
+    ],
+    "recommendedSoftChecks": [
+      "persona_style_alignment",
+      "context_relevance",
+      "claim_to_evidence_alignment",
+      "semantic_duplicate_detection",
+      "natural_brand_integration"
+    ]
+  }
+}

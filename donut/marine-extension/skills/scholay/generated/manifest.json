@@ -1,0 +1,34 @@
+{
+  "assetHashes": {
+    "comment-exemplars.json": "524bb5b4d8ebdbd0d403a4cecb6aed73dcdbc73b1d5576a07f45492cb51e6790",
+    "generation-policy.json": "08616ca92c72183fae0a64c3d1ae73d9b71bbbb4cc8eb7b36e6fc935bf99e5b1",
+    "personas.json": "46ec3920cd42dbe6f00c0dd9a6f14c1f70929ab1b52f954e54cbfa191862824d"
+  },
+  "assetVersion": "scholay-comment-corpus-20260814.v1",
+  "compilerVersion": "1.0.0",
+  "counts": {
+    "evidenceOnlyExemplars": 108,
+    "exemplars": 360,
+    "personas": 12,
+    "requiredExemplars": 252
+  },
+  "files": [
+    "personas.json",
+    "comment-exemplars.json",
+    "generation-policy.json"
+  ],
+  "schemaVersion": "scholay.corpus-manifest.v1",
+  "source": {
+    "fileName": "预制人-Scholay-WIKI-评论360条-20260814.xlsx",
+    "runId": "p360-20260813-v6",
+    "sha256": "f82ce1978d531a329824ed3b18392847bdb0f2a750a0782e11d226ac6f27250f",
+    "workbookAuditAt": "2026-08-14T01:00:00Z"
+  },
+  "sourceRanges": {
+    "attempts": "尝试与失败!A4:T868",
+    "comments": "评论总表!A4:BF364",
+    "parameters": "人格参数!A4:M460",
+    "people": "人物!A4:M16",
+    "videos": "视频!A4:W34"
+  }
+}

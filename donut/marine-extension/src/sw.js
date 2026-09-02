@@ -1,10 +1,7 @@
 // sw.js — 侧边栏与 Marine 本地 API 桥接
-// 版本查询不是装饰：没有它，这个 URL 永远命中 worker 的脚本缓存，
-// 而它和 sw.js 是两个独立的缓存条目 —— v0.1.45 改了这里的段数常量却没换 URL，
-// 于是浏览器拿旧的 scholay-skill.js（认 6 段）去解析新的 9 段母稿，
-// 技能构建抛异常、Rime 上下文的 PUT 发不出去、自动化连生成都点不到。
-// 改这个文件时必须和 sw-entry 的版本一起动，测试会拦。
-importScripts('scholay-skill.js?v=0.1.34');
+// 版本查询不是装饰：sw.js 与它导入的路由脚本是两个独立缓存条目。
+// 改任一文件时都必须同步移动 sw-entry 和两个 importScripts URL，测试会拦。
+importScripts('scholay-skill.js?v=0.1.35');
 chrome.runtime.onInstalled.addListener(() => {
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
   void marineRetryPublishedOutbox('installed');
@@ -202,6 +199,45 @@ async function marineReadJson(rel) {
   } catch (e) { return {}; }
 }
 
+async function marineReadGeneratedAsset(rel) {
+  const response = await fetch(chrome.runtime.getURL(rel), { cache: 'no-store' });
+  if (!response.ok) throw new Error('无法读取 Scholay 生成资产：' + rel);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  let text;
+  try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+  catch (error) { throw new Error('Scholay 生成资产不是有效 UTF-8：' + rel); }
+  try { return { bytes, json: JSON.parse(text) }; }
+  catch (error) { throw new Error('Scholay 生成资产不是有效 JSON：' + rel); }
+}
+
+async function marineSha256Hex(bytes) {
+  const subtle = globalThis.crypto && globalThis.crypto.subtle;
+  if (!subtle) throw new Error('当前运行环境缺少 WebCrypto，无法校验 Scholay 生成资产');
+  const digest = new Uint8Array(await subtle.digest('SHA-256', bytes));
+  return Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function marineLoadGeneratedSkillAssets(base) {
+  const manifestAsset = await marineReadGeneratedAsset(base + 'manifest.json');
+  const manifest = manifestAsset.json || {};
+  const names = ['personas.json', 'comment-exemplars.json', 'generation-policy.json'];
+  const loaded = await Promise.all(names.map(name => marineReadGeneratedAsset(base + name)));
+  for (let index = 0; index < names.length; index++) {
+    const name = names[index];
+    const expected = String(manifest.assetHashes && manifest.assetHashes[name] || '').trim();
+    const actual = await marineSha256Hex(loaded[index].bytes);
+    if (!/^[a-f0-9]{64}$/.test(expected) || actual !== expected) {
+      throw new Error('Scholay 生成资产 SHA-256 不匹配：' + name);
+    }
+  }
+  return {
+    manifest,
+    personas: loaded[0].json,
+    exemplars: loaded[1].json,
+    policy: loaded[2].json,
+  };
+}
+
 async function marineResolveConfig() {
   if (marineConfigCache && Date.now() - marineConfigCache.at < 3000) return marineConfigCache.value;
   const runtime = await marineReadJson('marine-runtime-config.json');
@@ -216,6 +252,7 @@ async function marineResolveConfig() {
     apiBase: pick('apiBase').replace(/\/+$/, ''),
     token: pick('token'),
     profileId: pick('profileId'),
+    personaId: pick('personaId'),
     // 只有调试脚手架会往 runtime-config 里写这个。app 打包的正式 profile 没有
     // 它，所以正式路径上恒为 undefined —— Rust 侧照常走 resolve_running_profile。
     debugCdpPort: Number(runtime.debugCdpPort) || undefined,
@@ -224,24 +261,12 @@ async function marineResolveConfig() {
   return value;
 }
 
-async function marineFetchText(rel) {
-  try {
-    const response = await fetch(chrome.runtime.getURL(rel));
-    return response.ok ? await response.text() : '';
-  } catch (e) { return ''; }
-}
-
-async function marineLoadSkill(context) {
+async function marineLoadSkillBundle(context, runtime) {
   if (!marineSkillCache) {
-    const base = 'skills/scholay/';
-    const [brand, execution, style, mother, index] = await Promise.all([
-      marineFetchText(base + '品牌.md'),
-      marineFetchText(base + '执行口径.md'),
-      marineFetchText(base + '风格参数.json'),
-      marineFetchText(base + '母稿.md'),
-      marineFetchText(base + '母稿索引.json'),
-    ]);
-    marineSkillCache = { brand, execution, style, mother, index, customSample: '' };
+    const base = 'skills/scholay/generated/';
+    const generatedAssets = await marineLoadGeneratedSkillAssets(base);
+    marineScholayValidatedAssets(generatedAssets);
+    marineSkillCache = { ...generatedAssets, customSample: '' };
     try {
       const stored = await chrome.storage.local.get(['marineCustomSampleMd', 'marineCustomSampleName']);
       if (stored.marineCustomSampleMd && stored.marineCustomSampleMd.trim()) {
@@ -253,7 +278,19 @@ async function marineLoadSkill(context) {
       }
     } catch (e) {}
   }
-  return marineScholayBuildSkill(marineSkillCache, context, marineSkillCache.customSample);
+  return marineScholayBuildBundle(
+    marineSkillCache,
+    context,
+    marineSkillCache.customSample,
+    {
+      profileId: runtime && runtime.profileId,
+      personaId: runtime && runtime.personaId,
+    },
+  );
+}
+
+async function marineLoadSkill(context, runtime) {
+  return (await marineLoadSkillBundle(context, runtime)).skill;
 }
 
 function marineUtf8Bytes(value) {
@@ -285,10 +322,13 @@ async function marineContextFetch(method, contextId, context, shouldProceed) {
     headers: { Authorization: 'Bearer ' + config.token },
   };
   if (method === 'PUT') {
-    const skill = marineTruncateUtf8(await marineLoadSkill(context), marineRimeMaxSkillBytes);
+    const bundle = await marineLoadSkillBundle(context, config);
+    const skill = marineTruncateUtf8(bundle.skill, marineRimeMaxSkillBytes);
     if (shouldProceed && !shouldProceed()) return false;
     options.headers['Content-Type'] = 'application/json';
-    options.body = JSON.stringify(Object.assign({}, context, { skill }));
+    const enriched = Object.assign({}, context, { skill, qualitySpec: bundle.qualitySpec });
+    if (config.profileId) enriched.profileId = config.profileId;
+    options.body = JSON.stringify(enriched);
     if (marineUtf8Bytes(options.body) > marineRimeMaxRequestBytes) {
       throw new Error('Marine context 超过本地 API 安全传输上限');
     }
@@ -1072,7 +1112,7 @@ function marineReleaseKeepalive() {
 
 // ---- 页面内「生成」按钮：本地智能体流式生成 ----
 // content-iso 建立一条长连接端口 'marine-generate'，sw 调本地 Marine API 的
-// /generate-stream（本机 codex/claude 智能体）拉 NDJSON 帧并原样转发回页面。
+// /generate-stream（本机 codex/claude 智能体）拉取服务端已筛过的 NDJSON 帧并转发回页面。
 // 上下文（评论目标 + 话术）此前已由聚焦流程 PUT 到本地 API，这里只按 contextId 触发
 // 生成，绝不发布/提交——结果只作草稿预览，由用户确认后填入。
 async function marineRunGenerateStream(req, post, setController) {

@@ -16,6 +16,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use utoipa::ToSchema;
 
+use super::generate::quality::{validate_comment_quality_spec, CommentAction, CommentQualitySpec};
+
 pub const DIRECT_ACTION_ID: &str = "marine.generate-direct";
 pub const REPLY_ACTION_ID: &str = "marine.generate-reply";
 pub const RIME_PLUGIN_ID: &str = "marine";
@@ -80,6 +82,16 @@ impl RimeTarget {
 #[serde(rename_all = "camelCase")]
 pub struct RimeContext {
   pub context_id: String,
+  /// Marine browser profile that owns this context. It is never included in
+  /// the model prompt; generation uses it for persona binding and recent-text
+  /// duplicate checks. Legacy/debug publishers may omit it.
+  #[serde(default)]
+  pub profile_id: Option<String>,
+  /// Server-enforced comment policy compiled by the bundled Scholay runtime.
+  /// Keeping it structured prevents style prose from silently overriding hard
+  /// brand, length, identity, and duplicate rules.
+  #[serde(default)]
+  pub quality_spec: Option<CommentQualitySpec>,
   pub mode: RimeContextMode,
   pub action_id: String,
   pub label: String,
@@ -103,6 +115,27 @@ impl RimeContext {
   pub fn validate(&self, now_secs: u64) -> Result<(), RimeContextError> {
     if self.context_id.trim().is_empty() {
       return Err(RimeContextError::Invalid("contextId is required"));
+    }
+    if self
+      .profile_id
+      .as_deref()
+      .is_some_and(|value| uuid::Uuid::parse_str(value).is_err())
+    {
+      return Err(RimeContextError::Invalid("profileId must be a UUID"));
+    }
+    if let Some(spec) = &self.quality_spec {
+      if !validate_comment_quality_spec(spec).is_empty() {
+        return Err(RimeContextError::Invalid("qualitySpec is invalid"));
+      }
+      let expected_action = match self.mode {
+        RimeContextMode::Direct => CommentAction::Direct,
+        RimeContextMode::Reply => CommentAction::Reply,
+      };
+      if spec.action != expected_action {
+        return Err(RimeContextError::Invalid(
+          "qualitySpec action does not match the context mode",
+        ));
+      }
     }
     if self.action_id != self.mode.action_id() {
       return Err(RimeContextError::Invalid(
@@ -807,10 +840,13 @@ fn restore_claimed_runtime_config(claimed_path: &Path, path: &Path) -> Result<()
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::marine::generate::quality::{BrandMode, COMMENT_QUALITY_SCHEMA_VERSION};
 
   fn direct_context(updated_at: u64) -> RimeContext {
     RimeContext {
       context_id: "ctx-direct".into(),
+      profile_id: None,
+      quality_spec: None,
       mode: RimeContextMode::Direct,
       action_id: DIRECT_ACTION_ID.into(),
       label: "Marine · 直评".into(),
@@ -840,6 +876,44 @@ mod tests {
       }),
       ..direct_context(updated_at)
     }
+  }
+
+  fn quality_spec(action: CommentAction) -> CommentQualitySpec {
+    CommentQualitySpec {
+      schema_version: COMMENT_QUALITY_SCHEMA_VERSION,
+      action,
+      persona_id: "P01".into(),
+      brand_mode: BrandMode::Required,
+      brand_term: "Scholay".into(),
+      brand_case_sensitive: true,
+      required_capability_terms: vec!["文献矩阵分析".into()],
+      min_chars: 20,
+      max_chars: 240,
+      forbidden_claims: None,
+      forbidden_phrases: None,
+      recent_texts: None,
+    }
+  }
+
+  #[test]
+  fn context_rejects_invalid_or_cross_action_quality_specs() {
+    let now = 1_000_000;
+    let mut context = direct_context(now);
+    context.quality_spec = Some(quality_spec(CommentAction::Reply));
+    assert!(matches!(
+      context.validate(now),
+      Err(RimeContextError::Invalid(
+        "qualitySpec action does not match the context mode"
+      ))
+    ));
+
+    let mut invalid = quality_spec(CommentAction::Direct);
+    invalid.required_capability_terms.clear();
+    context.quality_spec = Some(invalid);
+    assert!(matches!(
+      context.validate(now),
+      Err(RimeContextError::Invalid("qualitySpec is invalid"))
+    ));
   }
 
   #[test]

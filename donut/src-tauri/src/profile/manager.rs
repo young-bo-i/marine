@@ -46,6 +46,37 @@ fn stored_tags(metadata_file: &Path) -> Option<Vec<String>> {
     .map(|parsed| parsed.tags)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum UpdateMarinePlatformsError {
+  InvalidProfileId,
+  ProfileNotFound,
+  InvalidPlatforms(Vec<String>),
+  Internal(String),
+}
+
+fn normalize_marine_platforms(platforms: Vec<String>) -> Result<Vec<String>, Vec<String>> {
+  let supported = crate::marine::prospect::SUPPORTED_PLATFORMS;
+  let mut invalid = Vec::new();
+  let mut invalid_seen = std::collections::HashSet::new();
+  for platform in &platforms {
+    if !supported.contains(&platform.as_str()) && invalid_seen.insert(platform.clone()) {
+      invalid.push(platform.clone());
+    }
+  }
+  if !invalid.is_empty() {
+    return Err(invalid);
+  }
+
+  let requested: std::collections::HashSet<&str> = platforms.iter().map(String::as_str).collect();
+  Ok(
+    supported
+      .into_iter()
+      .filter(|platform| requested.contains(platform))
+      .map(str::to_string)
+      .collect(),
+  )
+}
+
 pub struct ProfileManager {
   camoufox_manager: &'static crate::camoufox_manager::CamoufoxManager,
   wayfern_manager: &'static crate::wayfern_manager::WayfernManager,
@@ -214,6 +245,7 @@ impl ProfileManager {
           host_os: None,
           ephemeral: false,
           extension_group_id: None,
+          marine_platforms: Vec::new(),
           brand_id: None,
           proxy_bypass_rules: Vec::new(),
           created_by_id: None,
@@ -320,6 +352,7 @@ impl ProfileManager {
           host_os: None,
           ephemeral: false,
           extension_group_id: None,
+          marine_platforms: Vec::new(),
           brand_id: None,
           proxy_bypass_rules: Vec::new(),
           created_by_id: None,
@@ -393,6 +426,7 @@ impl ProfileManager {
       host_os: Some(get_host_os()),
       ephemeral,
       extension_group_id: None,
+      marine_platforms: Vec::new(),
       brand_id: None,
       proxy_bypass_rules: Vec::new(),
       created_by_id: None,
@@ -881,6 +915,42 @@ impl ProfileManager {
     Ok(profile)
   }
 
+  pub fn update_profile_marine_platforms(
+    &self,
+    profile_id: &str,
+    marine_platforms: Vec<String>,
+  ) -> Result<BrowserProfile, UpdateMarinePlatformsError> {
+    uuid::Uuid::parse_str(profile_id).map_err(|_| UpdateMarinePlatformsError::InvalidProfileId)?;
+    let mut profile = self
+      .get_profile_by_id(profile_id)
+      .ok_or(UpdateMarinePlatformsError::ProfileNotFound)?;
+    let normalized = normalize_marine_platforms(marine_platforms)
+      .map_err(UpdateMarinePlatformsError::InvalidPlatforms)?;
+
+    if profile.marine_platforms == normalized {
+      return Ok(profile);
+    }
+
+    profile.marine_platforms = normalized;
+    let now = crate::proxy_manager::now_secs();
+    profile.updated_at = Some(
+      profile
+        .updated_at
+        .map(|previous| now.max(previous.saturating_add(1)))
+        .unwrap_or(now),
+    );
+    self
+      .save_profile(&profile)
+      .map_err(|error| UpdateMarinePlatformsError::Internal(error.to_string()))?;
+
+    crate::sync::queue_profile_sync_if_eligible(&profile);
+    if let Err(error) = events::emit_empty("profiles-changed") {
+      log::warn!("Warning: Failed to emit profiles-changed event: {error}");
+    }
+
+    Ok(profile)
+  }
+
   pub fn update_profile_note(
     &self,
     _app_handle: &tauri::AppHandle,
@@ -1140,6 +1210,9 @@ impl ProfileManager {
       host_os: Some(get_host_os()),
       ephemeral: false,
       extension_group_id: source.extension_group_id,
+      // Cloning must never opt the new identity into an in-flight recurring
+      // automation plan. The operator enables platforms explicitly afterwards.
+      marine_platforms: Vec::new(),
       brand_id: source.brand_id,
       proxy_bypass_rules: source.proxy_bypass_rules,
       created_by_id: None,
@@ -2195,6 +2268,7 @@ mod tests {
       host_os: Some(get_host_os()),
       ephemeral: false,
       extension_group_id: None,
+      marine_platforms: Vec::new(),
       brand_id: None,
       proxy_bypass_rules: Vec::new(),
       created_by_id: None,
@@ -2205,6 +2279,81 @@ mod tests {
       updated_at: Some(0),
       default_bookmarks_seeded: false,
     }
+  }
+
+  #[test]
+  fn marine_platforms_are_deduplicated_in_supported_order_and_unknown_values_fail() {
+    assert_eq!(
+      normalize_marine_platforms(vec![
+        "xiaohongshu".to_string(),
+        "bilibili".to_string(),
+        "xiaohongshu".to_string(),
+        "douyin".to_string(),
+      ]),
+      Ok(vec![
+        "bilibili".to_string(),
+        "douyin".to_string(),
+        "xiaohongshu".to_string(),
+      ])
+    );
+    assert_eq!(normalize_marine_platforms(Vec::new()), Ok(Vec::new()));
+    assert_eq!(
+      normalize_marine_platforms(vec![
+        "weibo".to_string(),
+        "bilibili".to_string(),
+        "weibo".to_string(),
+      ]),
+      Err(vec!["weibo".to_string()])
+    );
+  }
+
+  #[test]
+  fn updating_marine_platforms_persists_only_real_changes() {
+    let (manager, _temp_dir) = create_test_profile_manager();
+    let mut profile = tagged_test_profile("automation", &[]);
+    profile.updated_at = Some(crate::proxy_manager::now_secs());
+    let original_updated_at = profile.updated_at;
+    manager.save_profile(&profile).unwrap();
+    let id = profile.id.to_string();
+
+    let updated = manager
+      .update_profile_marine_platforms(
+        &id,
+        vec![
+          "zhihu".to_string(),
+          "bilibili".to_string(),
+          "zhihu".to_string(),
+        ],
+      )
+      .unwrap();
+    assert_eq!(
+      updated.marine_platforms,
+      vec!["bilibili".to_string(), "zhihu".to_string()]
+    );
+    assert!(updated.updated_at > original_updated_at);
+
+    let unchanged = manager
+      .update_profile_marine_platforms(&id, vec!["zhihu".to_string(), "bilibili".to_string()])
+      .unwrap();
+    assert_eq!(unchanged.updated_at, updated.updated_at);
+
+    assert!(matches!(
+      manager.update_profile_marine_platforms(&id, vec!["weibo".to_string()]),
+      Err(UpdateMarinePlatformsError::InvalidPlatforms(platforms))
+        if platforms == vec!["weibo".to_string()]
+    ));
+    let persisted = manager.get_profile_by_id(&id).unwrap();
+    assert_eq!(persisted.marine_platforms, updated.marine_platforms);
+    assert_eq!(persisted.updated_at, updated.updated_at);
+
+    assert!(matches!(
+      manager.update_profile_marine_platforms("not-a-uuid", Vec::new()),
+      Err(UpdateMarinePlatformsError::InvalidProfileId)
+    ));
+    assert!(matches!(
+      manager.update_profile_marine_platforms(&uuid::Uuid::new_v4().to_string(), Vec::new()),
+      Err(UpdateMarinePlatformsError::ProfileNotFound)
+    ));
   }
 
   /// `save_profile` used to rescan every profile on disk after ANY save, which
@@ -2614,6 +2763,33 @@ pub fn update_profile_tags(
   profile_manager
     .update_profile_tags(&app_handle, &profile_id, tags)
     .map_err(|e| format!("Failed to update profile tags: {e}"))
+}
+
+#[tauri::command]
+pub fn update_profile_marine_platforms(
+  profile_id: String,
+  marine_platforms: Vec<String>,
+) -> Result<BrowserProfile, String> {
+  match ProfileManager::instance().update_profile_marine_platforms(&profile_id, marine_platforms) {
+    Ok(profile) => Ok(profile),
+    Err(UpdateMarinePlatformsError::InvalidProfileId) => {
+      Err(crate::marine::err("INVALID_PROFILE_ID"))
+    }
+    Err(UpdateMarinePlatformsError::ProfileNotFound) => {
+      Err(crate::marine::err("PROFILE_NOT_FOUND"))
+    }
+    Err(UpdateMarinePlatformsError::InvalidPlatforms(platforms)) => {
+      log::warn!(
+        "Rejected unsupported Marine platforms for profile {profile_id}: {}",
+        platforms.join(", ")
+      );
+      Err(crate::marine::err("MARINE_PROFILE_PLATFORMS_INVALID"))
+    }
+    Err(UpdateMarinePlatformsError::Internal(error)) => {
+      log::error!("Failed to update Marine platforms for profile {profile_id}: {error}");
+      Err(crate::marine::err("INTERNAL_ERROR"))
+    }
+  }
 }
 
 #[tauri::command]

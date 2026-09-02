@@ -18,7 +18,6 @@ import {
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -36,6 +35,10 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { translateBackendError } from "@/lib/backend-errors";
+import {
+  MARINE_PLATFORMS,
+  profileHasMarineAutomation,
+} from "@/lib/marine-platforms";
 import { showToast } from "@/lib/toast-utils";
 import type { BrowserProfile } from "@/types";
 
@@ -122,9 +125,6 @@ interface RunProgress {
 const PROGRESS_EVENT = "marine-discovery-progress";
 const ALL_FILTER = "__all__";
 
-/** The four platforms the ledger accepts — `SUPPORTED_PLATFORMS` in prospect.rs. */
-const PLATFORMS = ["bilibili", "zhihu", "douyin", "xiaohongshu"] as const;
-
 /**
  * Wayfern only, and not as a preference: the discovery pipeline *is* the Marine
  * MV3 extension, and that extension is stamped into a profile solely on the
@@ -183,10 +183,6 @@ export function ProspectLedgerPage() {
   const [keyword, setKeyword] = useState("");
   // 空 = 只跑一轮。填了分钟数就变成「跑完歇这么久，再跑下一轮」。
   const [cycleGap, setCycleGap] = useState("");
-  const [selectedPlatforms, setSelectedPlatforms] = useState<string[]>([
-    "bilibili",
-  ]);
-  const [selectedProfiles, setSelectedProfiles] = useState<string[]>([]);
   const [progress, setProgress] = useState<RunProgress>(idleProgress);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [logs, setLogs] = useState<MarineLogLocations | null>(null);
@@ -232,7 +228,8 @@ export function ProspectLedgerPage() {
 
   useEffect(() => {
     let disposed = false;
-    let unlisten: (() => void) | undefined;
+    let unlistenProgress: (() => void) | undefined;
+    let unlistenProfiles: (() => void) | undefined;
 
     const setup = async () => {
       try {
@@ -245,9 +242,19 @@ export function ProspectLedgerPage() {
           void loadRecords(false);
         });
         if (disposed) stop();
-        else unlisten = stop;
+        else unlistenProgress = stop;
       } catch (error) {
         console.error("Failed to listen for discovery progress:", error);
+      }
+
+      try {
+        const stop = await listen("profiles-changed", () => {
+          if (!disposed) void loadProfiles();
+        });
+        if (disposed) stop();
+        else unlistenProfiles = stop;
+      } catch (error) {
+        console.error("Failed to listen for profile changes:", error);
       }
 
       if (disposed) return;
@@ -265,7 +272,8 @@ export function ProspectLedgerPage() {
     return () => {
       disposed = true;
       requestSequenceRef.current += 1;
-      unlisten?.();
+      unlistenProgress?.();
+      unlistenProfiles?.();
     };
   }, [loadRecords, loadProfiles]);
 
@@ -309,7 +317,7 @@ export function ProspectLedgerPage() {
 
   const platformsPresent = useMemo(() => {
     const present = new Set(records.map((r) => r.platform));
-    return PLATFORMS.filter((p) => present.has(p));
+    return MARINE_PLATFORMS.filter((p) => present.has(p));
   }, [records]);
 
   // 表格列出确认发布和回执待确认的公开动作；待确认项必须显式标注，不能混进
@@ -354,43 +362,19 @@ export function ProspectLedgerPage() {
     return map;
   }, [profiles]);
 
-  const togglePlatform = useCallback((platform: string) => {
-    setSelectedPlatforms((current) =>
-      current.includes(platform)
-        ? current.filter((p) => p !== platform)
-        : [...current, platform],
-    );
-  }, []);
-
-  const toggleProfile = useCallback((profileId: string) => {
-    setSelectedProfiles((current) =>
-      current.includes(profileId)
-        ? current.filter((p) => p !== profileId)
-        : [...current, profileId],
-    );
-  }, []);
+  const hasConfiguredProfiles = profiles.some(profileHasMarineAutomation);
 
   const canStart =
     !progress.running &&
     !isSubmitting &&
     keyword.trim().length > 0 &&
-    selectedPlatforms.length > 0 &&
-    selectedProfiles.length > 0;
+    hasConfiguredProfiles;
 
   const handleStart = useCallback(async () => {
     setIsSubmitting(true);
     try {
-      // Selection only — the order sent here is NOT the account index. The
-      // scheduler derives that from the profile's position among all
-      // discovery-capable profiles, precisely so that ticking a different set
-      // of profiles cannot reshuffle which search sort an account gets.
-      const chosen = profiles
-        .filter((p) => selectedProfiles.includes(p.id))
-        .map((p) => p.id);
       await invoke("marine_start_discovery", {
         request: {
-          profile_ids: chosen,
-          platforms: PLATFORMS.filter((p) => selectedPlatforms.includes(p)),
           keyword: keyword.trim(),
           // 留空就是只跑一轮 —— 循环是明确开启的东西，不该有默认值。
           cycle_gap_minutes: Number(cycleGap) > 0 ? Number(cycleGap) : null,
@@ -406,7 +390,7 @@ export function ProspectLedgerPage() {
     } finally {
       setIsSubmitting(false);
     }
-  }, [profiles, selectedProfiles, selectedPlatforms, keyword, t, cycleGap]);
+  }, [keyword, t, cycleGap]);
 
   const handleStop = useCallback(async () => {
     try {
@@ -497,62 +481,6 @@ export function ProspectLedgerPage() {
                 }}
               />
             </div>
-
-            <div className="flex flex-1 flex-col gap-1.5">
-              <span className="text-xs font-medium text-muted-foreground">
-                {t("marine.prospects.run.platforms")}
-              </span>
-              <div className="flex flex-wrap gap-x-4 gap-y-2 pt-1.5">
-                {PLATFORMS.map((platform) => (
-                  <label
-                    key={platform}
-                    htmlFor={`discovery-platform-${platform}`}
-                    className="flex cursor-pointer items-center gap-1.5 text-xs"
-                  >
-                    <Checkbox
-                      id={`discovery-platform-${platform}`}
-                      checked={selectedPlatforms.includes(platform)}
-                      disabled={progress.running}
-                      onCheckedChange={() => {
-                        togglePlatform(platform);
-                      }}
-                    />
-                    {t(`marine.prospects.platform.${platform}`)}
-                  </label>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          <div className="flex flex-col gap-1.5">
-            <span className="text-xs font-medium text-muted-foreground">
-              {t("marine.prospects.run.profiles")}
-            </span>
-            {profiles.length === 0 ? (
-              <p className="text-xs text-muted-foreground">
-                {t("marine.prospects.run.noProfiles")}
-              </p>
-            ) : (
-              <div className="flex flex-wrap gap-x-4 gap-y-2 pt-0.5">
-                {profiles.map((profile) => (
-                  <label
-                    key={profile.id}
-                    htmlFor={`discovery-profile-${profile.id}`}
-                    className="flex cursor-pointer items-center gap-1.5 text-xs"
-                  >
-                    <Checkbox
-                      id={`discovery-profile-${profile.id}`}
-                      checked={selectedProfiles.includes(profile.id)}
-                      disabled={progress.running}
-                      onCheckedChange={() => {
-                        toggleProfile(profile.id);
-                      }}
-                    />
-                    {profile.name}
-                  </label>
-                ))}
-              </div>
-            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
@@ -596,7 +524,9 @@ export function ProspectLedgerPage() {
                         ? `${progress.current_profile_name} · ${t(`marine.prospects.platform.${progress.current_platform}`)}`
                         : "—",
                   })
-                : t("marine.prospects.run.hint")}
+                : hasConfiguredProfiles
+                  ? t("marine.prospects.run.hint")
+                  : t("marine.prospects.run.noProfiles")}
             </p>
           </div>
 
@@ -726,7 +656,7 @@ export function ProspectLedgerPage() {
               {stats.unconfirmed}
             </p>
           </div>
-          {PLATFORMS.map((platform) => (
+          {MARINE_PLATFORMS.map((platform) => (
             <div
               key={platform}
               className="rounded-lg border border-border bg-card px-3 py-2.5"

@@ -61,9 +61,14 @@ pub struct BrowserProfile {
   pub ephemeral: bool,
   #[serde(default)]
   pub extension_group_id: Option<String>,
-  /// Marine: optional id of the 话术/persona bound to this profile. Inert
-  /// placeholder — the extension currently ships a built-in skill; kept for
-  /// forward compatibility, `None` for profiles not used for comment-marketing.
+  /// Marine platforms enabled for this profile's automatic discovery run.
+  /// An empty list means this profile does not participate in automation.
+  #[serde(default)]
+  pub marine_platforms: Vec<String>,
+  /// Marine: optional Scholay persona id bound to this profile (`P01`–`P12`,
+  /// optionally prefixed with `scholay:`). The launch path stamps a normalized
+  /// id into the extension runtime config; `None` falls back to stable profile
+  /// assignment so legacy profiles remain deterministic.
   #[serde(default)]
   pub brand_id: Option<String>,
   #[serde(default)]
@@ -84,7 +89,8 @@ pub struct BrowserProfile {
   #[serde(default)]
   pub created_at: Option<u64>,
   /// Unix seconds of the last meaningful metadata edit (name, tags, note,
-  /// proxy/vpn/group/extension assignment, launch hook, bypass rules, dns).
+  /// proxy/vpn/group/extension/Marine-platform assignment, launch hook, bypass
+  /// rules, dns).
   /// Source of truth for metadata sync conflict resolution (last-write-wins);
   /// NOT bumped by browser-file changes, which sync via the file manifest.
   #[serde(default)]
@@ -147,5 +153,20 @@ impl BrowserProfile {
   /// Returns true if sync uses E2E encryption.
   pub fn is_encrypted_sync(&self) -> bool {
     self.sync_mode == SyncMode::Encrypted
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::BrowserProfile;
+
+  #[test]
+  fn legacy_profile_without_marine_platforms_defaults_to_disabled() {
+    let mut value = serde_json::to_value(BrowserProfile::default()).unwrap();
+    value.as_object_mut().unwrap().remove("marine_platforms");
+
+    let profile: BrowserProfile = serde_json::from_value(value).unwrap();
+
+    assert!(profile.marine_platforms.is_empty());
   }
 }

@@ -17,6 +17,7 @@
 pub mod cli;
 pub mod openai;
 pub mod prompt;
+pub mod quality;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,16 @@ use utoipa::ToSchema;
 
 use super::{err, err_with};
 use crate::settings_manager::{AppSettings, SettingsManager};
+use quality::{
+  build_comment_repair_prompt, validate_comment_quality, validate_comment_quality_spec,
+  CommentQualitySpec,
+};
+
+const MAX_COMMENT_GENERATION_ATTEMPTS: usize = 3;
+/// One wall-clock budget shared by the initial candidate and every repair.
+/// The extension aborts its fetch after 245 seconds, so the server must finish
+/// generation (or begin graceful provider cleanup) before that outer deadline.
+pub const COMMENT_GENERATION_TOTAL_TIMEOUT_SECS: u64 = 230;
 
 /// One `blocks-v1` output block. `text` is the 话术; `title` is optional metadata.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
@@ -181,18 +192,18 @@ fn select_provider(settings: &AppSettings) -> Result<Box<dyn Provider>, String> 
 }
 
 /// Parse a model's raw output into [`BlocksV1`], tolerating prose around the JSON
-/// object (some models wrap it). Requires at least one block so a bare `{}` or a
-/// truncated stream is treated as a failure, not an empty success.
+/// object (some models wrap it). The connector contract is exactly one nonempty
+/// block; extra blocks are not silently ignored by the page.
 fn parse_blocks_v1(raw: &str) -> Result<BlocksV1, String> {
   if let Ok(output) = serde_json::from_str::<BlocksV1>(raw) {
-    if !output.blocks.is_empty() {
+    if valid_blocks_shape(&output) {
       return Ok(output);
     }
   }
   if let (Some(start), Some(end)) = (raw.find('{'), raw.rfind('}')) {
     if end > start {
       if let Ok(output) = serde_json::from_str::<BlocksV1>(&raw[start..=end]) {
-        if !output.blocks.is_empty() {
+        if valid_blocks_shape(&output) {
           return Ok(output);
         }
       }
@@ -205,6 +216,10 @@ fn parse_blocks_v1(raw: &str) -> Result<BlocksV1, String> {
       raw.chars().take(200).collect::<String>()
     ),
   ))
+}
+
+fn valid_blocks_shape(output: &BlocksV1) -> bool {
+  output.blocks.len() == 1 && !output.blocks[0].text.trim().is_empty()
 }
 
 /// Shared core: pick the configured provider, build the `blocks-v1` prompt from
@@ -228,32 +243,163 @@ async fn run_provider(
     .map_err(map_provider_error)
 }
 
+pub(crate) fn validate_generation_quality_spec(spec: &CommentQualitySpec) -> Result<(), String> {
+  let issues = validate_comment_quality_spec(spec);
+  if issues.is_empty() {
+    return Ok(());
+  }
+  let codes = issues
+    .iter()
+    .map(|issue| issue.code_str())
+    .collect::<Vec<_>>()
+    .join(",");
+  Err(err_with(
+    "MARINE_COMMENT_SPEC_INVALID",
+    format!("comment quality specification is invalid: {codes}"),
+  ))
+}
+
+async fn run_provider_before_deadline(
+  skill: &str,
+  payload: &Value,
+  deltas: mpsc::Sender<String>,
+  cancellation: &CancellationToken,
+  deadline: tokio::time::Instant,
+) -> Result<String, String> {
+  if cancellation.is_cancelled() {
+    return Err(err("MARINE_GENERATE_CANCELLED"));
+  }
+  if tokio::time::Instant::now() >= deadline {
+    return Err(err("MARINE_GENERATE_TIMEOUT"));
+  }
+
+  // Do not drop a CLI provider future at the deadline: it owns the process-group
+  // cleanup path. Cancel its child token, then await that bounded cleanup.
+  let attempt_cancellation = cancellation.child_token();
+  let provider = run_provider(skill, payload, deltas, attempt_cancellation.clone());
+  tokio::pin!(provider);
+  tokio::select! {
+    result = &mut provider => result,
+    _ = cancellation.cancelled() => {
+      attempt_cancellation.cancel();
+      let _ = provider.await;
+      Err(err("MARINE_GENERATE_CANCELLED"))
+    }
+    _ = tokio::time::sleep_until(deadline) => {
+      attempt_cancellation.cancel();
+      let _ = provider.await;
+      Err(err("MARINE_GENERATE_TIMEOUT"))
+    }
+  }
+}
+
+async fn run_validated_provider(
+  skill: &str,
+  payload: &Value,
+  quality_spec: &CommentQualitySpec,
+  deltas: mpsc::Sender<String>,
+  cancellation: CancellationToken,
+) -> Result<BlocksV1, String> {
+  // Static policy errors are never repairable by a model. Reject them before
+  // loading provider settings or consuming any connector quota.
+  validate_generation_quality_spec(quality_spec)?;
+  let deadline =
+    tokio::time::Instant::now() + Duration::from_secs(COMMENT_GENERATION_TOTAL_TIMEOUT_SECS);
+  let mut repair_instruction = None::<String>;
+  let mut last_issue_codes = Vec::<String>::new();
+
+  for attempt in 1..=MAX_COMMENT_GENERATION_ATTEMPTS {
+    if cancellation.is_cancelled() {
+      return Err(err("MARINE_GENERATE_CANCELLED"));
+    }
+    let attempt_skill = repair_instruction
+      .as_ref()
+      .map(|repair| format!("{skill}\n\n---\n\n# Marine 质量修复指令（最高优先级）\n\n{repair}"));
+    let effective_skill = attempt_skill.as_deref().unwrap_or(skill);
+    let raw = run_provider_before_deadline(
+      effective_skill,
+      payload,
+      deltas.clone(),
+      &cancellation,
+      deadline,
+    )
+    .await?;
+
+    let parsed = parse_blocks_v1(&raw);
+    let candidate = parsed.unwrap_or_default();
+    let issues = validate_comment_quality(&candidate, quality_spec);
+    if issues.is_empty() {
+      return Ok(candidate);
+    }
+
+    last_issue_codes = issues
+      .iter()
+      .map(|issue| issue.code_str().to_string())
+      .collect();
+    log::warn!(
+      "Marine comment candidate rejected on attempt {attempt}/{MAX_COMMENT_GENERATION_ATTEMPTS}: {}",
+      last_issue_codes.join(",")
+    );
+    if attempt < MAX_COMMENT_GENERATION_ATTEMPTS {
+      let original_text = candidate
+        .blocks
+        .first()
+        .map(|block| block.text.as_str())
+        .unwrap_or(raw.as_str());
+      repair_instruction = Some(build_comment_repair_prompt(
+        original_text,
+        quality_spec,
+        &issues,
+      ));
+    }
+  }
+
+  Err(err_with(
+    "MARINE_COMMENT_QUALITY_FAILED",
+    format!(
+      "candidate failed semantic validation after {MAX_COMMENT_GENERATION_ATTEMPTS} attempts: {}",
+      last_issue_codes.join(",")
+    ),
+  ))
+}
+
 /// One-shot generation. Runs the same hardened provider path as the streaming
-/// entry point, draining real deltas in the background.
-pub async fn generate_blocks(skill: &str, payload: &Value) -> Result<BlocksV1, String> {
+/// entry point, draining real deltas in the background. A validated structured
+/// policy is mandatory for every caller.
+pub async fn generate_blocks_with_quality(
+  skill: &str,
+  payload: &Value,
+  quality_spec: &CommentQualitySpec,
+) -> Result<BlocksV1, String> {
   let (deltas, mut delta_rx) = mpsc::channel(32);
   let drain = tokio::spawn(async move { while delta_rx.recv().await.is_some() {} });
-  let raw_result = run_provider(skill, payload, deltas, CancellationToken::new()).await;
+  let result = run_validated_provider(
+    skill,
+    payload,
+    quality_spec,
+    deltas,
+    CancellationToken::new(),
+  )
+  .await;
   drain.await.map_err(|error| {
     err_with(
       "MARINE_GENERATE_FAILED",
       format!("delta drain failed: {error}"),
     )
   })?;
-  parse_blocks_v1(&raw_result?)
+  result
 }
 
-/// Streaming generation. Raw assistant deltas are forwarded to the caller for
-/// incremental preview while the final result still goes through the exact same
-/// strict `blocks-v1` parser used by the one-shot path.
-pub async fn generate_blocks_stream(
+/// Streaming generation. Provider deltas go to a server-side sink; only the
+/// validated final block is eligible for an editor-facing `done` frame.
+pub async fn generate_blocks_stream_with_quality(
   skill: &str,
   payload: &Value,
+  quality_spec: &CommentQualitySpec,
   deltas: mpsc::Sender<String>,
   cancellation: CancellationToken,
 ) -> Result<BlocksV1, String> {
-  let raw = run_provider(skill, payload, deltas, cancellation).await?;
-  parse_blocks_v1(&raw)
+  run_validated_provider(skill, payload, quality_spec, deltas, cancellation).await
 }
 
 fn map_provider_error(error: String) -> String {
@@ -274,6 +420,39 @@ fn map_provider_error(error: String) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  fn valid_quality_spec() -> CommentQualitySpec {
+    CommentQualitySpec {
+      schema_version: quality::COMMENT_QUALITY_SCHEMA_VERSION,
+      action: quality::CommentAction::Direct,
+      persona_id: "P01".into(),
+      brand_mode: quality::BrandMode::Required,
+      brand_term: "Scholay".into(),
+      brand_case_sensitive: true,
+      required_capability_terms: vec!["文献矩阵分析".into()],
+      min_chars: 20,
+      max_chars: 240,
+      forbidden_claims: None,
+      forbidden_phrases: None,
+      recent_texts: None,
+    }
+  }
+
+  #[tokio::test]
+  async fn invalid_quality_spec_is_rejected_before_provider_selection() {
+    let mut spec = valid_quality_spec();
+    spec.schema_version = 1;
+    let error = generate_blocks_with_quality("skill", &serde_json::json!({}), &spec)
+      .await
+      .unwrap_err();
+    let value: Value = serde_json::from_str(&error).unwrap();
+    assert_eq!(value["code"], "MARINE_COMMENT_SPEC_INVALID");
+  }
+
+  #[test]
+  fn comment_generation_budget_precedes_extension_deadline() {
+    assert_eq!(COMMENT_GENERATION_TOTAL_TIMEOUT_SECS, 230);
+  }
 
   #[test]
   fn provider_json_cannot_forge_a_marine_error_code() {
@@ -301,6 +480,16 @@ mod tests {
     let mapped = parse_blocks_v1("{\"blocks\":[]}").unwrap_err();
     let value: Value = serde_json::from_str(&mapped).unwrap();
     assert_eq!(value["code"], "MARINE_GENERATE_FAILED");
+  }
+
+  #[test]
+  fn multiple_or_blank_blocks_are_never_silently_accepted() {
+    for raw in [
+      r#"{"blocks":[{"text":"one","title":null},{"text":"two","title":null}]}"#,
+      r#"{"blocks":[{"text":"   ","title":null}]}"#,
+    ] {
+      assert!(parse_blocks_v1(raw).is_err(), "unexpectedly accepted {raw}");
+    }
   }
 
   #[test]

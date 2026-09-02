@@ -1971,6 +1971,7 @@ mod tests {
       host_os: None,
       ephemeral: false,
       extension_group_id: None,
+      marine_platforms: Vec::new(),
       brand_id: None,
       proxy_bypass_rules: Vec::new(),
       created_by_id: None,

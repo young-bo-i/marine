@@ -48,6 +48,7 @@ export type BackendErrorCode =
   | "MARINE_DISCOVERY_EMPTY_PLAN"
   | "MARINE_DISCOVERY_EMPTY_KEYWORD"
   | "MARINE_DISCOVERY_PROFILE_NOT_FOUND"
+  | "MARINE_PROFILE_PLATFORMS_INVALID"
   | "COOKIE_DECRYPT_FAILED"
   | "PROFILE_ADOPTED_BUT_NOT_SYNCED"
   | "PROFILE_NEVER_LAUNCHED"
@@ -198,6 +199,8 @@ export function translateBackendError(t: TFunction, err: unknown): string {
       return t("backendErrors.marineDiscoveryEmptyKeyword");
     case "MARINE_DISCOVERY_PROFILE_NOT_FOUND":
       return t("backendErrors.marineDiscoveryProfileNotFound");
+    case "MARINE_PROFILE_PLATFORMS_INVALID":
+      return t("backendErrors.marineProfilePlatformsInvalid");
     case "PROFILE_ADOPTED_BUT_NOT_SYNCED":
       return t("backendErrors.profileAdoptedButNotSynced", {
         detail: parsed.params?.message ?? "",

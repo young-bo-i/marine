@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { webcrypto } from "node:crypto";
 import fs from "node:fs";
 import vm from "node:vm";
 
@@ -26,11 +27,13 @@ const tabUpdated = eventSource();
 const tabRemoved = eventSource();
 const windowFocusChanged = eventSource();
 const apiCalls = [];
+const putBodies = new Map();
 const putGates = new Map();
 const sessionState = {};
 const activeTabByWindow = new Map();
 const activeTabQueryGates = new Map();
 const activeTabQueryFailures = new Set();
+const tamperedGeneratedAssets = new Map();
 let focusedWindowId = 10;
 
 function gatePut(contextId) {
@@ -64,14 +67,27 @@ async function fetchMock(url, options = {}) {
     return {
       ok: true,
       async json() {
-        return { apiBase: "http://127.0.0.1:10108/v1/marine", token: "test-token" };
+        return {
+          apiBase: "http://127.0.0.1:10108/v1/marine",
+          token: "test-token",
+          profileId: "11111111-1111-4111-8111-111111111111",
+          personaId: "P02",
+        };
       },
     };
   }
   if (value.startsWith("chrome-extension://test/skills/")) {
     const relative = value.slice("chrome-extension://test/".length);
-    const contents = fs.readFileSync(new URL("../" + relative, import.meta.url), "utf8");
-    return { ok: true, async text() { return contents; } };
+    const original = fs.readFileSync(new URL("../" + relative, import.meta.url), "utf8");
+    const contents = tamperedGeneratedAssets.has(relative)
+      ? tamperedGeneratedAssets.get(relative)
+      : original;
+    return {
+      ok: true,
+      async json() { return JSON.parse(contents); },
+      async text() { return contents; },
+      async arrayBuffer() { return new TextEncoder().encode(contents).buffer; },
+    };
   }
 
   const method = options.method || "GET";
@@ -81,6 +97,7 @@ async function fetchMock(url, options = {}) {
     || new URL(value).searchParams.get("contextId")
     || "";
   apiCalls.push({ method, contextId });
+  if (method === "PUT") putBodies.set(contextId, body);
   const gate = method === "PUT" ? putGates.get(contextId) : null;
   if (gate) {
     gate.seen();
@@ -144,19 +161,25 @@ const chrome = {
 
 const helperSource = fs.readFileSync(new URL("../src/scholay-skill.js", import.meta.url), "utf8");
 const source = fs.readFileSync(new URL("../src/sw.js", import.meta.url), "utf8");
-vm.runInNewContext(helperSource + "\n" + source, {
+const workerSandbox = {
   AbortController,
   URL,
   chrome,
   clearTimeout,
   console,
+  crypto: webcrypto,
   fetch: fetchMock,
   importScripts() {},
   Map,
   Promise,
   setTimeout,
+  TextDecoder,
   TextEncoder,
-}, { filename: "marine-extension/src/sw.js" });
+};
+vm.createContext(workerSandbox);
+vm.runInContext(helperSource + "\n" + source, workerSandbox, {
+  filename: "marine-extension/src/sw.js",
+});
 
 const onMessage = runtimeMessages.first();
 
@@ -248,6 +271,14 @@ assert.deepEqual(
 );
 
 assert.equal((await sendContext(2, putMessage("tab-two-current", 1))).ok, true);
+const routedBody = putBodies.get("tab-two-current");
+assert.equal(routedBody.profileId, "11111111-1111-4111-8111-111111111111");
+assert.equal(routedBody.qualitySpec.schemaVersion, 2);
+assert.equal(routedBody.qualitySpec.personaId, "P02");
+assert.equal(routedBody.qualitySpec.brandCaseSensitive, true);
+assert.deepEqual(routedBody.qualitySpec.requiredCapabilityTerms, []);
+assert.match(routedBody.skill, /人格 ID：P02/);
+assert.match(routedBody.skill, /品牌模式：evidence_only/);
 const callsBeforeStaleRevision = apiCalls.length;
 assert.equal((await sendContext(2, putMessage("tab-two-stale", 0))).skipped, undefined);
 // Revision zero is reserved for compatibility and is therefore accepted.
@@ -773,5 +804,21 @@ assert.equal(
   false,
   "自称 active 但不是该窗口当前活动标签的 sender，复核后仍然必须被拒",
 );
+
+const generatedManifestPath = "skills/scholay/generated/manifest.json";
+const tamperedManifest = JSON.parse(
+  fs.readFileSync(new URL("../" + generatedManifestPath, import.meta.url), "utf8"),
+);
+tamperedManifest.assetHashes["personas.json"] = "0".repeat(64);
+tamperedGeneratedAssets.set(generatedManifestPath, JSON.stringify(tamperedManifest));
+await assert.rejects(
+  vm.runInContext(`(() => {
+    marineSkillCache = null;
+    return marineLoadSkillBundle({}, {});
+  })()`, workerSandbox),
+  /SHA-256 不匹配：personas\.json/,
+  "a tampered generated-asset manifest must fail closed before entering the prompt",
+);
+tamperedGeneratedAssets.delete(generatedManifestPath);
 
 console.log("Marine extension Rime service-worker smoke: OK");

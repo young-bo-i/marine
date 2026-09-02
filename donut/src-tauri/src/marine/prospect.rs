@@ -359,7 +359,7 @@ pub struct Candidate {
 
 /// Platforms the ledger accepts. Rejecting unknown platforms here keeps a typo
 /// from silently creating a parallel key namespace that dedups against nothing.
-const SUPPORTED_PLATFORMS: [&str; 4] = ["bilibili", "zhihu", "douyin", "xiaohongshu"];
+pub const SUPPORTED_PLATFORMS: [&str; 4] = ["bilibili", "zhihu", "douyin", "xiaohongshu"];
 
 /// `open_url` durability is a property of the platform, not of the caller.
 /// Deriving it here means a caller cannot accidentally mark a Xiaohongshu URL

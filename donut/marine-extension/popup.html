@@ -88,15 +88,15 @@
         <div class="note">生产环境由 Marine 自动写入 <code>marine-runtime-config.json</code>。轻量开发桥可单独调试上下文；需要发布归档时，请连接真实 Marine 并选择一个身份。</div>
       </details>
 
-      <!-- 话术方案：原版母稿按页面内容路由 + 可导入本地 .md 补充范文 -->
+      <!-- 话术方案：运行时人格 + 同池评论样例 + 可导入本地 .md 补充范文 -->
       <div class="field-label cfg-gap">话术方案</div>
-      <div class="note" style="margin-top:0">已内置 <code>Scholay</code> 原版母稿与场景路由，每次按页面背景选择最相关的一至两段。可再导入本地 <code>.md</code> 作为次级参考。</div>
+      <div class="note" style="margin-top:0">已内置 <code>Scholay</code> 虚构人格与评论样例库；每次按当前人格、平台、页面主题、动作和品牌模式选择最多 3 条同池样例，仅作风格参考。可再导入本地 <code>.md</code> 作为次级参考。</div>
       <div class="brand-row" style="margin-top:8px">
         <button id="sample-import" class="cta-2 brand-mini-btn">导入补充范文（.md）</button>
         <button id="sample-clear" class="cta-2 brand-mini-btn danger hidden">移除</button>
         <input id="sample-file" type="file" accept=".md,text/markdown" class="hidden">
       </div>
-      <div id="sample-status" class="note" style="margin-top:6px">未导入补充范文（当前只用原版母稿）。</div>
+      <div id="sample-status" class="note" style="margin-top:6px">未导入补充范文（当前使用内置人格与同池样例）。</div>
 
       <div class="field-label cfg-gap">AI 模型连接器</div>
       <div class="note" style="margin-top:0">选中评论/回复框后，页面会浮出「生成」按钮：用本机已登录的智能体（Codex / Claude）直接生成话术并填入草稿框，<strong>绝不自动发送</strong>。下面选择用哪个连接器（无需安装输入法）。</div>

@@ -8,3 +8,6 @@
 # Build outputs (bundles copied out for distribution)
 *.dmg
 *.app/
+
+# Local Scholay source corpus; commit only the compiled, sanitized assets.
+预制人-Scholay-WIKI-评论360条-20260814.xlsx

@@ -172,6 +172,7 @@ pub async fn ensure_for_profile(
   app_handle: &tauri::AppHandle,
   profile_data_path: &Path,
   profile_id: &str,
+  bound_persona_id: Option<&str>,
 ) -> Option<PathBuf> {
   let src = match source_dir(app_handle) {
     Some(s) => s,
@@ -237,6 +238,7 @@ pub async fn ensure_for_profile(
     "apiBase": format!("http://127.0.0.1:{port}/v1/marine"),
     "token": capability,
     "profileId": profile_id,
+    "personaId": normalized_persona_id(bound_persona_id),
   });
   if let Err(e) = write_runtime_config(&dst.join("marine-runtime-config.json"), &cfg) {
     log::warn!("Marine: failed to stamp runtime config: {e}");
@@ -244,6 +246,17 @@ pub async fn ensure_for_profile(
   }
 
   Some(dst)
+}
+
+fn normalized_persona_id(value: Option<&str>) -> Option<String> {
+  let raw = value?.trim();
+  let candidate = raw
+    .strip_prefix("scholay:")
+    .or_else(|| raw.strip_prefix("SCHOLAY:"))
+    .unwrap_or(raw)
+    .to_ascii_uppercase();
+  let number = candidate.strip_prefix('P')?.parse::<u8>().ok()?;
+  (1..=12).contains(&number).then(|| format!("P{number:02}"))
 }
 
 #[cfg(test)]
@@ -284,6 +297,18 @@ mod tests {
   }
 
   #[test]
+  fn bound_persona_ids_are_normalized_and_bounded() {
+    assert_eq!(normalized_persona_id(Some("P1")), Some("P01".into()));
+    assert_eq!(
+      normalized_persona_id(Some("scholay:p12")),
+      Some("P12".into())
+    );
+    assert_eq!(normalized_persona_id(Some("scholay")), None);
+    assert_eq!(normalized_persona_id(Some("P13")), None);
+    assert_eq!(normalized_persona_id(None), None);
+  }
+
+  #[test]
   fn sync_dir_upgrades_manifest_and_prunes_stale_bundle_files() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("source");
@@ -320,7 +345,7 @@ mod tests {
       serde_json::from_str(include_str!("../../../marine-extension/manifest.json")).unwrap();
     let version = manifest["version"].as_str().unwrap();
     let worker = manifest["background"]["service_worker"].as_str().unwrap();
-    assert_eq!(version, "0.1.34");
+    assert_eq!(version, "0.1.35");
     assert_eq!(worker, format!("src/sw-entry-{version}.js"));
     let entry = fs::read_to_string(
       Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -371,14 +396,14 @@ mod tests {
       (
         "sw.js",
         hex(include_bytes!("../../../marine-extension/src/sw.js")),
-        "3d5dad44d04418f52b2099e68a2025dcf20e7e86b0a995c9e8750085a5e63241",
+        "4ff3a1cb874427b796b0d33ee7da8f90dcfd2bb29f6854f3d78aca4429ecf8e5",
       ),
       (
         "scholay-skill.js",
         hex(include_bytes!(
           "../../../marine-extension/src/scholay-skill.js"
         )),
-        "adc4cd1cd42acd0997e772549723a2443d21dc8242569d3cf5e171c572be8b91",
+        "1778ab1116a958609ff507c811c939daeb031c63ed3d8af9e5c2a47a3fb2f0a3",
       ),
     ] {
       assert_eq!(
@@ -389,6 +414,42 @@ mod tests {
          \n  2. bump every `?v=` (the entry's importScripts AND sw.js's)\
          \n  3. manifest.json: version + background.service_worker\
          \n  4. the version asserts above, and this digest = {actual}\n"
+      );
+    }
+  }
+
+  #[test]
+  fn bundled_scholay_assets_match_their_manifest() {
+    use sha2::{Digest, Sha256};
+    let manifest: serde_json::Value = serde_json::from_str(include_str!(
+      "../../../marine-extension/skills/scholay/generated/manifest.json"
+    ))
+    .unwrap();
+    for (name, bytes) in [
+      (
+        "personas.json",
+        include_bytes!("../../../marine-extension/skills/scholay/generated/personas.json")
+          .as_slice(),
+      ),
+      (
+        "comment-exemplars.json",
+        include_bytes!("../../../marine-extension/skills/scholay/generated/comment-exemplars.json")
+          .as_slice(),
+      ),
+      (
+        "generation-policy.json",
+        include_bytes!("../../../marine-extension/skills/scholay/generated/generation-policy.json")
+          .as_slice(),
+      ),
+    ] {
+      let actual = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+      assert_eq!(
+        manifest["assetHashes"][name].as_str(),
+        Some(actual.as_str()),
+        "generated Scholay asset does not match manifest: {name}",
       );
     }
   }

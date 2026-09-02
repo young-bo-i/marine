@@ -76,8 +76,8 @@ use browser_runner::{
 use profile::manager::{
   check_browser_status, clone_profile, create_browser_profile_new, delete_profile,
   list_browser_profiles, rename_profile, update_camoufox_config, update_profile_dns_blocklist,
-  update_profile_launch_hook, update_profile_note, update_profile_proxy,
-  update_profile_proxy_bypass_rules, update_profile_tags, update_profile_vpn,
+  update_profile_launch_hook, update_profile_marine_platforms, update_profile_note,
+  update_profile_proxy, update_profile_proxy_bypass_rules, update_profile_tags, update_profile_vpn,
   update_wayfern_config,
 };
 
@@ -1167,6 +1167,7 @@ async fn generate_sample_fingerprint(
     host_os: None,
     ephemeral: false,
     extension_group_id: None,
+    marine_platforms: Vec::new(),
     brand_id: None,
     proxy_bypass_rules: Vec::new(),
     created_by_id: None,
@@ -1374,9 +1375,9 @@ async fn marine_start_discovery(
   request: marine::scheduler::RunRequest,
 ) -> Result<(), String> {
   // Reject synchronously so a bad plan surfaces as a failed invoke rather than
-  // as a run that quietly ends one event later. This includes resolving the
-  // profiles: a selection that went stale (deleted elsewhere, or pulled away by
-  // sync) is the one bad plan the operator cannot see coming.
+  // as a run that quietly ends one event later. Validation reads current Profile
+  // metadata and requires at least one discovery-capable profile with an enabled
+  // Marine platform; profiles with an empty platform list remain opted out.
   marine::scheduler::validate_plan(&request)?;
   if marine::scheduler::SCHEDULER.is_running() {
     return Err(marine::err("MARINE_DISCOVERY_ALREADY_RUNNING"));
@@ -2688,6 +2689,7 @@ pub fn run() {
       update_profile_proxy,
       update_profile_vpn,
       update_profile_tags,
+      update_profile_marine_platforms,
       update_profile_note,
       update_profile_launch_hook,
       update_profile_proxy_bypass_rules,

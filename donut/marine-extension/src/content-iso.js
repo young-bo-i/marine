@@ -1759,10 +1759,11 @@
     });
   }
 
-  // ---- 页面内「生成」按钮 + 本地智能体流式直接输入 ----
+  // ---- 页面内「生成」按钮 + 本地智能体校验后输入 ----
   // 选中评论/回复框后浮出「生成」；点击 = 等价输入法上的「生成评论」键：让 sw 调本地
-  // Marine API 的 /generate-stream（本机 codex/claude 智能体）流式产出话术，然后**直接写进
-  // 那个输入框**——没有预览弹窗。红线不变：只写草稿，绝不自动提交页面表单。
+  // Marine API 的 /generate-stream（本机 codex/claude 智能体）生成话术。原始流只用于
+  // 维持连接；必须等服务端给出最终 done 帧后才写进输入框，避免 schema/业务校验失败时
+  // 留下半截或不合规草稿。没有预览弹窗，且只写草稿，绝不在这里提交页面表单。
   //
   // 写入方式刻意不按 delta 分块整段灌入：文本被拆成「一个字 / 一个词」，以随机间隔逐个
   // 敲进去，接近真人打字节奏（见 marineRimeGenPump / NextUnit / NextDelay）。
@@ -1775,8 +1776,8 @@
     state: 'idle', // idle | preparing | streaming | typing | error
     serial: 0,
     contextId: '', mode: 'direct', target: null, editor: null,
-    raw: '',        // 累积的原始 delta（用于增量抽取 blocks-v1 的 text）
-    wanted: '',     // 目前已知的完整目标文本
+    raw: '',        // 累积原始 delta，仅作本轮诊断；绝不在最终校验前写入页面
+    wanted: '',     // done 帧确认过的完整目标文本
     typed: '',      // 已经敲进输入框的部分
     baseline: '',   // 开始生成前输入框里的原有内容（只追加，不动它）
     streamDone: false,
@@ -1805,13 +1806,14 @@
       MARINE_OPENAI_NOT_CONFIGURED: '未配置 OpenAI 兼容端点',
       MARINE_OPENAI_KEY_MISSING: '缺少 OpenAI 兼容端点密钥',
       MARINE_SETTINGS_FAILED: '读取设置失败',
+      MARINE_COMMENT_QUALITY_FAILED: '候选文案未通过质量校验，请重试',
       MARINE_GENERATE_FAILED: '生成失败，请重试',
     };
     return map[code] || (message ? String(message) : '生成失败，请重试');
   }
 
-  // 从（可能未闭合的）blocks-v1 原始 JSON 里尽力抽出 blocks[0].text，供边生成边打字；
-  // 最终仍以 done 帧的 blocks 为准。
+  // 从（可能未闭合的）blocks-v1 原始 JSON 里尽力抽出 blocks[0].text。保留这个解析器
+  // 只用于诊断/兼容测试；页面写入严格以服务端最终 done 帧为准。
   function marineExtractBlockText(raw) {
     if (!raw) return null;
     const anchor = raw.match(/"blocks"\s*:\s*\[\s*\{/);
@@ -2399,14 +2401,10 @@
     const g = marineRimeGen;
     if (frame.type === 'delta') {
       g.raw += String(frame.text || '');
-      const text = marineExtractBlockText(g.raw);
-      if (text != null && text.length > g.wanted.length) g.wanted = text;
-      // 一拿到可写内容就开始逐字敲，边生成边输入。
-      if (g.wanted && g.state === 'streaming') marineRimeGenBeginTyping();
     } else if (frame.type === 'done') {
       marineRimeGenClosePort();
       const blocks = Array.isArray(frame.blocks) ? frame.blocks : [];
-      const finalText = blocks.length ? String(blocks[0].text || '') : String(g.wanted || '');
+      const finalText = blocks.length ? String(blocks[0].text || '') : '';
       if (!finalText.trim()) { marineRimeGenFail('生成结果为空，请重试'); return; }
       g.wanted = finalText;
       g.streamDone = true;

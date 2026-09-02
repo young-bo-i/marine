@@ -24,7 +24,11 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::marine::generate::cli::{detect_agents, AgentStatus};
-use crate::marine::generate::{generate_blocks, generate_blocks_stream, BlocksV1, GeneratedBlock};
+use crate::marine::generate::quality::CommentQualitySpec;
+use crate::marine::generate::{
+  generate_blocks_stream_with_quality, generate_blocks_with_quality,
+  validate_generation_quality_spec, BlocksV1, GeneratedBlock,
+};
 use crate::marine::history::{HistoryError, PostingRecord, HISTORY_MANAGER};
 use crate::marine::rime::{
   now_secs as rime_now_secs, RimeContext, RimeContextError, RimeContextMode, RimeContextStore,
@@ -50,6 +54,7 @@ pub struct ApiProfile {
   pub camoufox_config: Option<serde_json::Value>,
   pub group_id: Option<String>,
   pub tags: Vec<String>,
+  pub marine_platforms: Vec<String>,
   pub is_running: bool,
   pub proxy_bypass_rules: Vec<String>,
   pub vpn_id: Option<String>,
@@ -113,6 +118,7 @@ pub struct UpdateProfileRequest {
   pub camoufox_config: Option<serde_json::Value>,
   pub group_id: Option<String>,
   pub tags: Option<Vec<String>>,
+  pub marine_platforms: Option<Vec<String>>,
   pub extension_group_id: Option<String>,
   pub proxy_bypass_rules: Option<Vec<String>>,
   /// One of "Disabled", "Regular", "Encrypted".
@@ -442,6 +448,15 @@ struct MarineGenerateRequest {
   /// The grab payload the extension produced (article/subtitle/comments).
   #[schema(value_type = Object)]
   payload: serde_json::Value,
+  /// Marine profile whose confirmed publication history is authoritative for
+  /// duplicate detection.
+  #[serde(default, rename = "profileId", alias = "profile_id")]
+  profile_id: Option<String>,
+  /// Structured hard rules. Kept optional at deserialization only so a missing
+  /// field receives Marine's stable 400-level error instead of Axum's generic
+  /// JSON rejection.
+  #[serde(default, rename = "qualitySpec", alias = "quality_spec")]
+  quality_spec: Option<CommentQualitySpec>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -899,12 +914,86 @@ fn marine_generation_status(error: &str) -> StatusCode {
     .unwrap_or_default();
   match code.as_str() {
     "MARINE_RIME_PROMPT_TOO_LARGE" => StatusCode::PAYLOAD_TOO_LARGE,
-    "MARINE_OPENAI_NOT_CONFIGURED" | "MARINE_OPENAI_KEY_MISSING" | "MARINE_PROVIDER_INVALID" => {
-      StatusCode::BAD_REQUEST
-    }
+    "MARINE_OPENAI_NOT_CONFIGURED"
+    | "MARINE_OPENAI_KEY_MISSING"
+    | "MARINE_PROVIDER_INVALID"
+    | "MARINE_COMMENT_SPEC_REQUIRED"
+    | "MARINE_COMMENT_SPEC_INVALID"
+    | "MARINE_COMMENT_PROFILE_REQUIRED"
+    | "MARINE_COMMENT_PROFILE_INVALID" => StatusCode::BAD_REQUEST,
     "MARINE_GENERATE_TIMEOUT" => StatusCode::GATEWAY_TIMEOUT,
     _ => StatusCode::BAD_GATEWAY,
   }
+}
+
+const MAX_RECENT_COMMENT_TEXTS: usize = 24;
+const MAX_RECENT_COMMENT_CHARS: usize = 240;
+
+fn replace_generation_recent_texts(spec: &mut CommentQualitySpec, records: &[PostingRecord]) {
+  let recent = records
+    .iter()
+    .rev()
+    .filter_map(|record| {
+      let text = record.text_snapshot.trim();
+      (!text.is_empty()).then(|| {
+        text
+          .chars()
+          .take(MAX_RECENT_COMMENT_CHARS)
+          .collect::<String>()
+      })
+    })
+    .take(MAX_RECENT_COMMENT_TEXTS)
+    .collect::<Vec<_>>();
+  // Caller-provided recent text is never authoritative, including when the
+  // server history is empty.
+  spec.recent_texts = Some(recent);
+}
+
+async fn marine_generation_quality_spec(
+  profile_id: Option<String>,
+  quality_spec: Option<CommentQualitySpec>,
+) -> Result<CommentQualitySpec, (StatusCode, String)> {
+  let mut spec = quality_spec.ok_or_else(|| {
+    (
+      StatusCode::BAD_REQUEST,
+      crate::marine::err("MARINE_COMMENT_SPEC_REQUIRED"),
+    )
+  })?;
+  validate_generation_quality_spec(&spec)
+    .map_err(|error| (marine_generation_status(&error), error))?;
+
+  let profile_id = profile_id
+    .as_deref()
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .ok_or_else(|| {
+      (
+        StatusCode::BAD_REQUEST,
+        crate::marine::err("MARINE_COMMENT_PROFILE_REQUIRED"),
+      )
+    })?;
+  let profile_id = uuid::Uuid::parse_str(profile_id)
+    .map_err(|_| {
+      (
+        StatusCode::BAD_REQUEST,
+        crate::marine::err("MARINE_COMMENT_PROFILE_INVALID"),
+      )
+    })?
+    .to_string();
+  // A syntactically valid but nonexistent UUID must not manufacture an empty
+  // history namespace and thereby disable duplicate protection.
+  let profile_id = resolve_marine_identity(&profile_id)?.id;
+
+  let records = spawn_history_blocking(move || {
+    HISTORY_MANAGER
+      .lock()
+      .map_err(|_| history_storage_error("history manager lock poisoned"))?
+      .list_for_profile(&profile_id)
+      .map_err(history_manager_error)
+  })
+  .await?;
+  replace_generation_recent_texts(&mut spec, &records);
+  Ok(spec)
 }
 
 fn marine_settings_error(error: impl std::fmt::Display) -> (StatusCode, String) {
@@ -933,7 +1022,9 @@ fn marine_settings_error(error: impl std::fmt::Display) -> (StatusCode, String) 
 async fn marine_generate_api(
   Json(request): Json<MarineGenerateRequest>,
 ) -> Result<Json<BlocksV1>, (StatusCode, String)> {
-  generate_blocks(&request.skill, &request.payload)
+  let quality_spec =
+    marine_generation_quality_spec(request.profile_id, request.quality_spec).await?;
+  generate_blocks_with_quality(&request.skill, &request.payload, &quality_spec)
     .await
     .map(Json)
     .map_err(|error| (marine_generation_status(&error), error))
@@ -942,15 +1033,17 @@ async fn marine_generate_api(
 /// Streaming generation for the in-page button. The extension has already PUT the
 /// focused comment target as a Rime context; this resolves that lease, assembles
 /// the same server-authoritative `blocks-v1` prompt the `prepare` path builds,
-/// runs the local connector, and streams NDJSON frames:
-///   {"type":"delta","text": "<raw model chunk>"}   (incremental preview)
+/// runs the local connector, and streams NDJSON frames. Raw provider deltas are
+/// drained server-side and never exposed to the editor; only a quality-checked
+/// final value may cross the boundary:
+///   {"type":"status","stage":"generating"}          (non-text progress)
 ///   {"type":"done","blocks":[{ "text", "title" }]} (final, authoritative)
 ///   {"type":"error","code":"…"}                    (failure)
 /// The response is only draft text; this endpoint never submits to a website.
 #[utoipa::path(
   post, path = "/v1/marine/generate-stream", request_body = RimeInvokeRequest,
   responses(
-    (status = 200, description = "NDJSON stream of delta/done/error frames", content_type = "application/x-ndjson"),
+    (status = 200, description = "NDJSON stream of status/done/error frames", content_type = "application/x-ndjson"),
     (status = 400, description = "Invalid or stale context"),
     (status = 404, description = "No active comment target"),
     (status = 409, description = "Comment target changed or expired")
@@ -966,12 +1059,16 @@ async fn marine_generate_stream(
     .map_err(rime_context_error)?;
   let payload = context.prompt_payload();
   let skill = context.skill.clone();
+  let quality_spec =
+    marine_generation_quality_spec(context.profile_id.clone(), context.quality_spec.clone())
+      .await?;
 
   let (frames_tx, frames_rx) = mpsc::channel::<String>(32);
   let cancellation = CancellationToken::new();
   tokio::spawn(run_marine_generation_stream(
     payload,
     skill,
+    quality_spec,
     frames_tx,
     cancellation.clone(),
   ));
@@ -1041,14 +1138,33 @@ fn marine_stream_error_frame(error: &str) -> serde_json::Value {
 async fn run_marine_generation_stream(
   payload: serde_json::Value,
   skill: String,
+  quality_spec: CommentQualitySpec,
   frames: mpsc::Sender<String>,
   cancellation: CancellationToken,
 ) {
   let (provider_tx, mut provider_rx) = mpsc::channel::<String>(32);
   let provider_cancellation = cancellation.child_token();
   let generation = tokio::spawn(async move {
-    generate_blocks_stream(&skill, &payload, provider_tx, provider_cancellation).await
+    generate_blocks_stream_with_quality(
+      &skill,
+      &payload,
+      &quality_spec,
+      provider_tx,
+      provider_cancellation,
+    )
+    .await
   });
+
+  if frames
+    .send(marine_stream_frame(
+      serde_json::json!({ "type": "status", "stage": "generating" }),
+    ))
+    .await
+    .is_err()
+  {
+    cancellation.cancel();
+    return;
+  }
 
   loop {
     tokio::select! {
@@ -1061,15 +1177,9 @@ async fn run_marine_generation_stream(
         return;
       }
       delta = provider_rx.recv() => match delta {
-        Some(text) => {
-          let frame = marine_stream_frame(serde_json::json!({ "type": "delta", "text": text }));
-          if frames.send(frame).await.is_err() {
-            // Client hung up: cancel the child token and detach so the provider
-            // reaps its process group instead of being abort()ed mid-await.
-            cancellation.cancel();
-            return;
-          }
-        }
+        // Provider output is deliberately drained without forwarding it. It may
+        // belong to a rejected attempt and is not safe editor text yet.
+        Some(_) => {}
         None => break,
       },
     }
@@ -1834,6 +1944,17 @@ fn prepare_rime_response(
   let context = store
     .context_for_invoke(&request.invoke, rime_now_secs())
     .map_err(rime_context_error)?;
+  if context.quality_spec.is_some() {
+    // A protected context must keep model output inside Marine so the server can
+    // validate and repair it before exposure. Rime owns its connector output and
+    // has no callback for that terminal check, so fail closed instead of silently
+    // downgrading to prompt-only enforcement. Spec-less legacy contexts retain
+    // the existing prepare contract.
+    return Err((
+      StatusCode::CONFLICT,
+      crate::marine::err("MARINE_RIME_VALIDATED_GENERATION_REQUIRED"),
+    ));
+  }
   let payload = context.prompt_payload();
   let prompt = crate::marine::generate::prompt::build_blocks_v1(&payload, &context.skill).map_err(
     |message| {
@@ -2431,6 +2552,7 @@ async fn get_profiles() -> Result<Json<ApiProfilesResponse>, StatusCode> {
           camoufox_config: config_to_api_value(profile.camoufox_config.as_ref()),
           group_id: profile.group_id.clone(),
           tags: profile.tags.clone(),
+          marine_platforms: profile.marine_platforms.clone(),
           is_running: profile.process_id.is_some(), // Simple check based on process_id
           proxy_bypass_rules: profile.proxy_bypass_rules.clone(),
           vpn_id: profile.vpn_id.clone(),
@@ -2485,6 +2607,7 @@ async fn get_profile(
             camoufox_config: config_to_api_value(profile.camoufox_config.as_ref()),
             group_id: profile.group_id.clone(),
             tags: profile.tags.clone(),
+            marine_platforms: profile.marine_platforms.clone(),
             is_running: profile.process_id.is_some(), // Simple check based on process_id
             proxy_bypass_rules: profile.proxy_bypass_rules.clone(),
             vpn_id: profile.vpn_id.clone(),
@@ -2654,6 +2777,7 @@ async fn create_profile(
           camoufox_config: config_to_api_value(profile.camoufox_config.as_ref()),
           group_id: profile.group_id,
           tags: profile.tags,
+          marine_platforms: profile.marine_platforms,
           is_running: false,
           proxy_bypass_rules: profile.proxy_bypass_rules,
           vpn_id: profile.vpn_id,
@@ -2792,6 +2916,15 @@ async fn update_profile(
     }
 
     // No tag rebuild here — `update_profile_tags` -> `save_profile` already did it.
+  }
+
+  if let Some(marine_platforms) = request.marine_platforms {
+    if profile_manager
+      .update_profile_marine_platforms(&id, marine_platforms)
+      .is_err()
+    {
+      return Err(StatusCode::BAD_REQUEST);
+    }
   }
 
   if let Some(extension_group_id) = request.extension_group_id {
@@ -4353,6 +4486,8 @@ mod tests {
   fn rime_test_context(context_id: &str) -> RimeContext {
     RimeContext {
       context_id: context_id.into(),
+      profile_id: None,
+      quality_spec: None,
       mode: RimeContextMode::Direct,
       action_id: crate::marine::rime::DIRECT_ACTION_ID.into(),
       label: "Marine · 直评".into(),
@@ -4365,6 +4500,115 @@ mod tests {
       payload: serde_json::json!({"article": {"markdown": "video"}}),
       updated_at: rime_now_secs(),
     }
+  }
+
+  fn test_comment_quality_spec() -> CommentQualitySpec {
+    CommentQualitySpec {
+      schema_version: crate::marine::generate::quality::COMMENT_QUALITY_SCHEMA_VERSION,
+      action: crate::marine::generate::quality::CommentAction::Direct,
+      persona_id: "P01".into(),
+      brand_mode: crate::marine::generate::quality::BrandMode::Required,
+      brand_term: "Scholay".into(),
+      brand_case_sensitive: true,
+      required_capability_terms: vec!["文献矩阵分析".into()],
+      min_chars: 20,
+      max_chars: 240,
+      forbidden_claims: None,
+      forbidden_phrases: None,
+      recent_texts: None,
+    }
+  }
+
+  fn protected_rime_test_context(context_id: &str) -> RimeContext {
+    let mut context = rime_test_context(context_id);
+    context.profile_id = Some(uuid::Uuid::new_v4().to_string());
+    context.quality_spec = Some(test_comment_quality_spec());
+    context
+  }
+
+  #[test]
+  fn generation_error_codes_have_stable_http_statuses() {
+    for code in [
+      "MARINE_COMMENT_SPEC_REQUIRED",
+      "MARINE_COMMENT_SPEC_INVALID",
+      "MARINE_COMMENT_PROFILE_REQUIRED",
+      "MARINE_COMMENT_PROFILE_INVALID",
+    ] {
+      assert_eq!(
+        marine_generation_status(&crate::marine::err(code)),
+        StatusCode::BAD_REQUEST,
+        "{code}"
+      );
+    }
+    assert_eq!(
+      marine_generation_status(&crate::marine::err("MARINE_GENERATE_TIMEOUT")),
+      StatusCode::GATEWAY_TIMEOUT
+    );
+    assert_eq!(
+      marine_generation_status(&crate::marine::err("MARINE_COMMENT_QUALITY_FAILED")),
+      StatusCode::BAD_GATEWAY
+    );
+  }
+
+  #[tokio::test]
+  async fn generation_policy_requires_spec_and_profile() {
+    let profile_id = uuid::Uuid::new_v4().to_string();
+    let missing_spec = marine_generation_quality_spec(Some(profile_id.clone()), None)
+      .await
+      .unwrap_err();
+    assert_eq!(missing_spec.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+      serde_json::from_str::<serde_json::Value>(&missing_spec.1).unwrap()["code"],
+      "MARINE_COMMENT_SPEC_REQUIRED"
+    );
+
+    let missing_profile = marine_generation_quality_spec(None, Some(test_comment_quality_spec()))
+      .await
+      .unwrap_err();
+    assert_eq!(missing_profile.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+      serde_json::from_str::<serde_json::Value>(&missing_profile.1).unwrap()["code"],
+      "MARINE_COMMENT_PROFILE_REQUIRED"
+    );
+
+    let mut invalid_spec = test_comment_quality_spec();
+    invalid_spec.schema_version = 1;
+    let invalid_spec = marine_generation_quality_spec(None, Some(invalid_spec))
+      .await
+      .unwrap_err();
+    assert_eq!(invalid_spec.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+      serde_json::from_str::<serde_json::Value>(&invalid_spec.1).unwrap()["code"],
+      "MARINE_COMMENT_SPEC_INVALID"
+    );
+
+    let invalid_profile =
+      marine_generation_quality_spec(Some("not-a-uuid".into()), Some(test_comment_quality_spec()))
+        .await
+        .unwrap_err();
+    assert_eq!(invalid_profile.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+      serde_json::from_str::<serde_json::Value>(&invalid_profile.1).unwrap()["code"],
+      "MARINE_COMMENT_PROFILE_INVALID"
+    );
+
+    let nonexistent_profile =
+      marine_generation_quality_spec(Some(profile_id), Some(test_comment_quality_spec()))
+        .await
+        .unwrap_err();
+    assert_eq!(nonexistent_profile.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+      serde_json::from_str::<serde_json::Value>(&nonexistent_profile.1).unwrap()["code"],
+      "MARINE_HISTORY_PROFILE_NOT_FOUND"
+    );
+  }
+
+  #[test]
+  fn server_history_replaces_caller_controlled_recent_texts_even_when_empty() {
+    let mut spec = test_comment_quality_spec();
+    spec.recent_texts = Some(vec!["caller-controlled history".into()]);
+    replace_generation_recent_texts(&mut spec, &[]);
+    assert_eq!(spec.recent_texts, Some(Vec::new()));
   }
 
   fn rime_test_router(store: RimeContextStore) -> Router {
@@ -4391,6 +4635,23 @@ mod tests {
     let parsed: UpdateProfileRequest =
       serde_json::from_str(json).expect("unknown fields must be ignored, not rejected");
     assert_eq!(parsed.name.as_deref(), Some("p"));
+    assert!(parsed.marine_platforms.is_none());
+  }
+
+  #[test]
+  fn update_profile_request_distinguishes_omitted_and_empty_marine_platforms() {
+    let omitted: UpdateProfileRequest = serde_json::from_str(r#"{"name":"p"}"#).unwrap();
+    assert!(omitted.marine_platforms.is_none());
+
+    let clear: UpdateProfileRequest = serde_json::from_str(r#"{"marine_platforms":[]}"#).unwrap();
+    assert_eq!(clear.marine_platforms, Some(Vec::new()));
+
+    let configured: UpdateProfileRequest =
+      serde_json::from_str(r#"{"marine_platforms":["bilibili","zhihu"]}"#).unwrap();
+    assert_eq!(
+      configured.marine_platforms,
+      Some(vec!["bilibili".to_string(), "zhihu".to_string()])
+    );
   }
 
   #[test]
@@ -4551,6 +4812,29 @@ mod tests {
   }
 
   #[test]
+  fn rime_prepare_rejects_protected_context_with_stable_code() {
+    let store = RimeContextStore::default();
+    let context = protected_rime_test_context("ctx-protected-prepare");
+    store
+      .set(context.clone(), rime_now_secs())
+      .expect("protected context should be accepted for in-page generation");
+    let request = RimePrepareRequest {
+      plugin_id: RIME_PLUGIN_ID.into(),
+      runtime_instance_id: "runtime-test".into(),
+      invoke: RimeInvokeRequest {
+        request_id: "request-protected".into(),
+        action_id: context.action_id,
+        context_id: context.context_id,
+      },
+    };
+
+    let error = prepare_rime_response(&store, "runtime-test", request).unwrap_err();
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    let body: serde_json::Value = serde_json::from_str(&error.1).unwrap();
+    assert_eq!(body["code"], "MARINE_RIME_VALIDATED_GENERATION_REQUIRED");
+  }
+
+  #[test]
   fn rime_prepare_rejects_a_mismatched_runtime_before_building() {
     let store = RimeContextStore::default();
     let context = rime_test_context("ctx-wrong-runtime");
@@ -4672,6 +4956,12 @@ mod tests {
     let captured = rime_test_context("ctx-captured");
     let changes: &[ContextMutation] = &[
       ("contextId", |context| context.context_id.push_str("-other")),
+      ("profileId", |context| {
+        context.profile_id = Some(uuid::Uuid::nil().to_string())
+      }),
+      ("qualitySpec", |context| {
+        context.quality_spec = Some(test_comment_quality_spec())
+      }),
       ("mode", |context| context.mode = RimeContextMode::Reply),
       ("actionId", |context| context.action_id.push_str("-other")),
       ("label", |context| context.label.push_str(" other")),

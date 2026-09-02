@@ -4616,13 +4616,19 @@ mod tests {
   fn test_merge_metadata_lww_remote_newer_applied() {
     // Remote edit is strictly newer → remote config fields win and its
     // updated_at is adopted so both sides agree on the next sync.
-    let local = make_profile("local", Some(100));
-    let remote = make_profile("remote", Some(200));
+    let mut local = make_profile("local", Some(100));
+    local.marine_platforms = vec!["bilibili".to_string()];
+    let mut remote = make_profile("remote", Some(200));
+    remote.marine_platforms = vec!["zhihu".to_string(), "douyin".to_string()];
     let merged = merge_profile_metadata_lww(&local, &remote);
     assert_eq!(merged.name, "remote");
     assert_eq!(merged.tags, vec!["remote".to_string()]);
     assert_eq!(merged.note.as_deref(), Some("remote"));
     assert_eq!(merged.proxy_id.as_deref(), Some("remote-proxy"));
+    assert_eq!(
+      merged.marine_platforms,
+      vec!["zhihu".to_string(), "douyin".to_string()]
+    );
     assert_eq!(merged.updated_at, Some(200));
     // Identity preserved (merge is into the local profile).
     assert_eq!(merged.id, local.id);
@@ -4632,13 +4638,16 @@ mod tests {
   fn test_merge_metadata_lww_remote_older_kept() {
     // Stale remote (older updated_at) must never clobber the local edit —
     // this is the data-loss bug the fix prevents (a local rename reverting).
-    let local = make_profile("local", Some(200));
-    let remote = make_profile("remote", Some(100));
+    let mut local = make_profile("local", Some(200));
+    local.marine_platforms = vec!["xiaohongshu".to_string()];
+    let mut remote = make_profile("remote", Some(100));
+    remote.marine_platforms = vec!["zhihu".to_string()];
     let merged = merge_profile_metadata_lww(&local, &remote);
     assert_eq!(merged.name, "local");
     assert_eq!(merged.tags, vec!["local".to_string()]);
     assert_eq!(merged.note.as_deref(), Some("local"));
     assert_eq!(merged.proxy_id.as_deref(), Some("local-proxy"));
+    assert_eq!(merged.marine_platforms, vec!["xiaohongshu".to_string()]);
     assert_eq!(merged.updated_at, Some(200));
   }
 
