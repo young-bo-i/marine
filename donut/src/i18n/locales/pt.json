@@ -2250,6 +2250,7 @@
         "hint": "Digite uma palavra-chave. Os perfis com plataformas de automação configuradas serão executados; os demais serão ignorados.",
         "progress": "{{done}}/{{total}} · {{phase}} · {{target}}",
         "settledCount": "{{n}} registrados",
+        "errorDetail": "Ver motivo (passe o cursor)",
         "startFailed": "Não foi possível iniciar a execução",
         "stopFailed": "Não foi possível parar a execução",
         "cycleGap": "Intervalo (min)",
@@ -2273,7 +2274,9 @@
         "cancelled": "Cancelado"
       },
       "outcome": {
-        "settled": "Registrado",
+        "posted": "Publicado",
+        "unconfirmed": "Enviado — confirmação pendente",
+        "filled": "Rascunho preenchido — não enviado",
         "timed_out": "Nada registrado",
         "no_slot": "Plataforma sem suporte",
         "already_open": "Já aberto — ignorado",

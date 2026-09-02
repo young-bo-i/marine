@@ -17,6 +17,132 @@ const iso = read("../src/content-iso.js");
 const sw = read("../src/sw.js");
 const manifest = JSON.parse(read("../manifest.json"));
 
+// 两个发送/输入定位器都是 DOM 邻接关系算法。用一个很小的 DOM fixture 跑真实
+// 函数体，避免只靠字符串断言漏掉「选择器写了，但仍会越界点到页面别处」这类问题。
+class ProspectDomFixture {
+  constructor(tagName = "div", options = {}) {
+    this.tagName = String(tagName).toUpperCase();
+    this.className = options.className || "";
+    this.textContent = options.textContent || "";
+    this.attrs = { ...(options.attrs || {}) };
+    this.visible = options.visible !== false;
+    this.disabled = options.disabled === true;
+    this.kind = options.kind || "";
+    this.width = options.width ?? 80;
+    this.height = options.height ?? 30;
+    this.left = options.left ?? 0;
+    this.top = options.top ?? 0;
+    this.children = [];
+    this.parentElement = null;
+    this.clicked = 0;
+    this.isConnected = true;
+  }
+
+  append(...children) {
+    for (const child of children) {
+      child.parentElement = this;
+      this.children.push(child);
+    }
+    return this;
+  }
+
+  get previousElementSibling() {
+    if (!this.parentElement) return null;
+    const siblings = this.parentElement.children;
+    return siblings[siblings.indexOf(this) - 1] || null;
+  }
+
+  get nextElementSibling() {
+    if (!this.parentElement) return null;
+    const siblings = this.parentElement.children;
+    return siblings[siblings.indexOf(this) + 1] || null;
+  }
+
+  getAttribute(name) {
+    if (name === "class") return this.className;
+    return Object.hasOwn(this.attrs, name) ? String(this.attrs[name]) : null;
+  }
+
+  matches(selector) {
+    return String(selector).split(",").some((raw) => {
+      const part = raw.trim();
+      if (part === "*") return true;
+      if (/^[a-z][a-z0-9-]*$/i.test(part)) return this.tagName === part.toUpperCase();
+      const exactAttr = part.match(/^\[([\w-]+)="([^"]+)"\]$/);
+      if (exactAttr) return this.getAttribute(exactAttr[1]) === exactAttr[2];
+      const presentAttr = part.match(/^\[([\w-]+)\]$/);
+      if (presentAttr) return this.getAttribute(presentAttr[1]) !== null;
+      if (part === 'textarea[placeholder]') {
+        return this.tagName === "TEXTAREA" && this.getAttribute("placeholder") !== null;
+      }
+      if (part === 'input[placeholder]') {
+        return this.tagName === "INPUT" && this.getAttribute("placeholder") !== null;
+      }
+      const classContains = part.match(/^\[class\*="([^"]+)" i\]$/);
+      if (classContains) {
+        return this.className.toLowerCase().includes(classContains[1].toLowerCase());
+      }
+      const attrContains = part.match(/^\[([\w-]+)\*="([^"]+)" i\]$/);
+      if (attrContains) {
+        return String(this.getAttribute(attrContains[1]) || "").toLowerCase()
+          .includes(attrContains[2].toLowerCase());
+      }
+      if (part === '.public-DraftEditor-content[role="textbox"]') {
+        return this.className.split(/\s+/).includes("public-DraftEditor-content") &&
+          this.getAttribute("role") === "textbox";
+      }
+      if (part.startsWith(".")) {
+        return this.className.split(/\s+/).includes(part.slice(1));
+      }
+      return false;
+    });
+  }
+
+  querySelectorAll(selector) {
+    const out = [];
+    const visit = (node) => {
+      for (const child of node.children) {
+        if (child.matches(selector)) out.push(child);
+        visit(child);
+      }
+    };
+    visit(this);
+    return out;
+  }
+
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] || null;
+  }
+
+  closest(selector) {
+    for (let node = this; node; node = node.parentElement) {
+      if (node.matches(selector)) return node;
+    }
+    return null;
+  }
+
+  contains(other) {
+    for (let node = other; node; node = node.parentElement) {
+      if (node === this) return true;
+    }
+    return false;
+  }
+
+  getBoundingClientRect() {
+    return {
+      width: this.width,
+      height: this.height,
+      left: this.left,
+      top: this.top,
+      right: this.left + this.width,
+      bottom: this.top + this.height,
+    };
+  }
+
+  scrollIntoView() {}
+  click() { this.clicked += 1; }
+}
+
 // ------------------------------------------------- content-iso 的依赖必须接全
 {
   // 少接一个依赖，run() 里就会在调用 undefined 时抛错，而 catch 会把它变成
@@ -1160,30 +1286,410 @@ const manifest = JSON.parse(read("../manifest.json"));
     finder.slice(0, 900).includes("platform !== 'bilibili'"),
     "没实测过的平台一律不返回控件，猜一个选择器的代价是往真实账号发错东西",
   );
+  // 知乎：新弹层可能把动作做成非 button 的 [role=button]，文字也可能是「发布
+  // 评论」。必须从当前 editor 的祖先向上绑定；页面创作入口的「发布」是诱饵。
+  {
+    const start = iso.indexOf("function marineProspectFindZhihuSendButton");
+    const end = iso.indexOf("\n\n  /**\n   * 当前直评输入框", start);
+    assert.ok(start >= 0 && end > start, "知乎发送定位器必须可独立验证");
+    const source = iso.slice(start, end);
+    const compile = new Function(
+      "marineProspectResolveEditor",
+      "marineRimeIsCommentEditor",
+      "marineVisible",
+      `${source}\nreturn marineProspectFindZhihuSendButton;`,
+    );
+    const finderFor = (editor) => compile(
+      () => editor,
+      (candidate) => candidate?.kind === "comment-editor",
+      (candidate) => candidate?.visible === true,
+    );
+
+    const page = new ProspectDomFixture("main");
+    const decoy = new ProspectDomFixture("button", { textContent: "发布" });
+    const modal = new ProspectDomFixture("section", { className: "Modal-content" });
+    const owner = new ProspectDomFixture("div", { className: "CommentEditorV2" });
+    const editor = new ProspectDomFixture("div", {
+      className: "public-DraftEditor-content",
+      attrs: { role: "textbox" },
+      kind: "comment-editor",
+    });
+    const publish = new ProspectDomFixture("div", {
+      attrs: { role: "button", "aria-label": "发布评论" },
+    });
+    page.append(decoy, modal);
+    modal.append(owner);
+    owner.append(editor, publish);
+    assert.equal(finderFor(editor)(), publish,
+      "要支持当前评论 editor 内的非 button [role=button]/发布评论控件");
+    assert.notEqual(finderFor(editor)(), decoy, "不能选页面级「发布」诱饵");
+
+    // 新 DOM 也可能让动作行与 editor 壳成为兄弟：共同弹层只有一个 editor 时
+    // 归属仍唯一，可以选；一旦出现第二个 editor 就必须 fail closed。
+    const siblingModal = new ProspectDomFixture("section", { className: "Modal-content" });
+    const siblingOwner = new ProspectDomFixture("div", { className: "CommentEditorV2" });
+    const siblingEditor = new ProspectDomFixture("div", {
+      className: "public-DraftEditor-content",
+      attrs: { role: "textbox" },
+      kind: "comment-editor",
+    });
+    const siblingActions = new ProspectDomFixture("div");
+    const siblingPublish = new ProspectDomFixture("button", { textContent: "发布" });
+    siblingOwner.append(siblingEditor);
+    siblingActions.append(siblingPublish);
+    siblingModal.append(siblingOwner, siblingActions);
+    assert.equal(finderFor(siblingEditor)(), siblingPublish,
+      "唯一 editor 时可绑定同一弹层里的 sibling 动作行");
+
+    const ambiguousModal = new ProspectDomFixture("section", { className: "Modal-content" });
+    const firstOwner = new ProspectDomFixture("div", { className: "CommentEditorV2" });
+    const firstEditor = new ProspectDomFixture("div", {
+      className: "public-DraftEditor-content",
+      attrs: { role: "textbox" },
+      kind: "comment-editor",
+    });
+    const secondOwner = new ProspectDomFixture("div", { className: "CommentBox" });
+    const secondEditor = new ProspectDomFixture("div", {
+      className: "public-DraftEditor-content",
+      attrs: { role: "textbox" },
+      kind: "comment-editor",
+    });
+    const sharedActions = new ProspectDomFixture("div");
+    const sharedPublish = new ProspectDomFixture("button", { textContent: "发布" });
+    firstOwner.append(firstEditor);
+    secondOwner.append(secondEditor);
+    sharedActions.append(sharedPublish);
+    ambiguousModal.append(firstOwner, secondOwner, sharedActions);
+    assert.equal(finderFor(firstEditor)(), null,
+      "共同容器有多个 editor 时不能猜共享发布按钮归属");
+
+    // 改版若去掉 CommentEditorV2/CommentBox，localOwner 会是 null；这时更不能
+    // 跳过唯一性检查，否则一个 modal 里的直评框和回复框会共用到同一发布按钮。
+    const ownerlessModal = new ProspectDomFixture("section", { className: "Modal-content" });
+    const ownerlessCurrentWrap = new ProspectDomFixture("div");
+    const ownerlessCurrent = new ProspectDomFixture("div", {
+      className: "public-DraftEditor-content",
+      attrs: { role: "textbox" },
+      kind: "comment-editor",
+    });
+    const ownerlessReplyWrap = new ProspectDomFixture("div");
+    const ownerlessReply = new ProspectDomFixture("div", {
+      className: "public-DraftEditor-content",
+      attrs: { role: "textbox" },
+      kind: "comment-editor",
+    });
+    const ownerlessPublish = new ProspectDomFixture("button", { textContent: "发布" });
+    ownerlessCurrentWrap.append(ownerlessCurrent);
+    ownerlessReplyWrap.append(ownerlessReply);
+    ownerlessModal.append(ownerlessCurrentWrap, ownerlessReplyWrap, ownerlessPublish);
+    assert.equal(finderFor(ownerlessCurrent)(), null,
+      "owner 缺失且 modal 有多个 editor 时必须 fail closed");
+
+    const selfBoundaryPage = new ProspectDomFixture("main");
+    const selfBoundaryEditor = new ProspectDomFixture("div", {
+      className: "CommentBox public-DraftEditor-content",
+      attrs: { role: "textbox" },
+      kind: "comment-editor",
+    });
+    const selfBoundaryDecoy = new ProspectDomFixture("button", { textContent: "发布" });
+    selfBoundaryPage.append(selfBoundaryEditor, selfBoundaryDecoy);
+    assert.equal(finderFor(selfBoundaryEditor)(), null,
+      "boundary 就是 editor 时不能错过停止点后爬到页面级发布诱饵");
+  }
   // 小红书：控件必须限定在 .engage-bar-container 内 —— 页面右上角还有「发布
   // 笔记」的入口，全局找必然选错。
   const xhsFinder = iso.slice(iso.indexOf("function marineProspectFindXhsSendButton"));
   assert.ok(
-    xhsFinder.slice(0, 900).includes("engage-bar-container"),
-    "小红书的发送控件要锚在评论条容器内，不能全局搜",
+    xhsFinder.slice(0, 1800).includes("marineProspectResolveEditor") &&
+      xhsFinder.slice(0, 1800).includes("engage-bar-container") &&
+      !xhsFinder.slice(0, 1800).includes("bar || document"),
+    "小红书必须锚在已验证的当前 editor/bar，缺失时不能全局兜底",
   );
+  {
+    const start = iso.indexOf("function marineProspectFindXhsSendButton");
+    const end = iso.indexOf("\n\n  /**\n   * 抖音的发送控件", start);
+    assert.ok(start >= 0 && end > start, "小红书发送定位器必须可独立验证");
+    const compile = new Function(
+      "marineProspectResolveEditor",
+      "marineRimeIsCommentEditor",
+      "marineVisible",
+      `${iso.slice(start, end)}\nreturn marineProspectFindXhsSendButton;`,
+    );
+    const finderFor = (editor) => compile(
+      () => editor,
+      (candidate) => candidate?.kind === "xhs-comment-editor",
+      (candidate) => candidate?.visible === true,
+    );
+
+    const page = new ProspectDomFixture("main");
+    const pagePublishDecoy = new ProspectDomFixture("button", { textContent: "发布" });
+    const bar = new ProspectDomFixture("div", { className: "engage-bar-container" });
+    const editor = new ProspectDomFixture("div", {
+      attrs: { id: "content-textarea" },
+      kind: "xhs-comment-editor",
+    });
+    const localSend = new ProspectDomFixture("button", { textContent: "发送" });
+    page.append(pagePublishDecoy, bar);
+    bar.append(editor, localSend);
+    assert.equal(finderFor(editor)(), localSend, "只选当前 engage bar 内的发送控件");
+    assert.notEqual(finderFor(editor)(), pagePublishDecoy, "不能选页面级发布诱饵");
+    assert.equal(finderFor(null)(), null, "没有当前 editor 时必须 fail closed");
+
+    const orphanEditor = new ProspectDomFixture("div", {
+      attrs: { id: "content-textarea" },
+      kind: "xhs-comment-editor",
+    });
+    page.append(orphanEditor);
+    assert.equal(finderFor(orphanEditor)(), null,
+      "editor 不在 engage-bar-container 时不能退回 document");
+
+    const ambiguousBar = new ProspectDomFixture("div", { className: "engage-bar-container" });
+    const ambiguousEditor = new ProspectDomFixture("div", {
+      attrs: { id: "content-textarea" },
+      kind: "xhs-comment-editor",
+    });
+    ambiguousBar.append(
+      ambiguousEditor,
+      new ProspectDomFixture("button", { textContent: "发送" }),
+      new ProspectDomFixture("div", { className: "btn submit", textContent: "发布" }),
+    );
+    assert.equal(finderFor(ambiguousEditor)(), null,
+      "同一 bar 有两个独立可见发送控件时必须 fail closed");
+  }
   // 抖音：三个 36×36 的图标控件（@ / 表情 / 发送）都没有文字，类名是混淆的
   // （实测 wchsYBpK jfGCpJo0，改版必变）。唯一稳定的区分是**位置最右**。
   const dyFinder = iso.slice(iso.indexOf("function marineProspectFindDouyinSendButton"));
   assert.ok(
-    dyFinder.slice(0, 1400).includes("bestLeft") &&
-      dyFinder.slice(0, 1400).includes("r.left > bestLeft"),
-    "抖音只能按位置取最右那个 —— 类名是混淆的，钉类名下次改版就选错",
+    dyFinder.slice(0, 5200).includes("marineProspectResolveEditor") &&
+      dyFinder.slice(0, 5200).includes("marineRimeIsCommentEditor"),
+    "抖音发送必须从当前已验证的评论 editor 锚定",
   );
   assert.ok(
-    dyFinder.slice(0, 1400).includes("contenteditable") &&
-      dyFinder.slice(0, 1400).includes("parentElement"),
-    "要锚在输入框的祖先容器内搜 —— 播放器那条弹幕栏也有发送控件，全局搜会选错",
+    dyFinder.slice(0, 5200).includes("proven.length !== 1") &&
+      dyFinder.slice(0, 5200).includes("row[row.length - 1].el") &&
+      !dyFinder.slice(0, 5200).includes("document.querySelector('[contenteditable"),
+    "只在最小语义祖先内证明唯一工具栏行，再取该行最右控件",
   );
+  {
+    const start = iso.indexOf("function marineProspectFindDouyinSendButton");
+    const end = iso.indexOf("\n\n  /**\n   * 点发送", start);
+    assert.ok(start >= 0 && end > start, "抖音发送定位器必须可独立验证");
+    const compile = new Function(
+      "marineProspectResolveEditor",
+      "marineRimeIsCommentEditor",
+      "marineVisible",
+      `${iso.slice(start, end)}\nreturn marineProspectFindDouyinSendButton;`,
+    );
+    const finderFor = (editor) => compile(
+      () => editor,
+      (candidate) => candidate?.kind === "douyin-comment-editor",
+      (candidate) => candidate?.visible === true,
+    );
+    const icon = (left, top) => new ProspectDomFixture("span", {
+      width: 36,
+      height: 36,
+      left,
+      top,
+    });
+    const attachToolbar = (owner, top, left) => {
+      const toolbar = new ProspectDomFixture("div");
+      const icons = [icon(left, top), icon(left + 36, top), icon(left + 72, top)];
+      toolbar.append(...icons);
+      owner.append(toolbar);
+      return icons;
+    };
+
+    const page = new ProspectDomFixture("main");
+    const danmakuOwner = new ProspectDomFixture("div", { className: "comment-input-container" });
+    const danmakuEditor = new ProspectDomFixture("div", { kind: "danmaku-editor" });
+    danmakuOwner.append(danmakuEditor);
+    const danmakuIcons = attachToolbar(danmakuOwner, 420, 80);
+
+    const commentOwner = new ProspectDomFixture("div", { className: "comment-input-container" });
+    const editorWrap = new ProspectDomFixture("div");
+    const commentEditor = new ProspectDomFixture("div", {
+      kind: "douyin-comment-editor",
+      left: 600,
+      top: 100,
+      width: 380,
+      height: 80,
+    });
+    editorWrap.append(commentEditor);
+    commentOwner.append(editorWrap);
+    const commentIcons = attachToolbar(commentOwner, 130, 860);
+    page.append(danmakuOwner, commentOwner);
+    assert.equal(finderFor(commentEditor)(), commentIcons[2],
+      "DOM 更靠前的弹幕 editor/36×36 行不能劫持当前评论的发送定位");
+    assert.notEqual(finderFor(commentEditor)(), danmakuIcons[2]);
+    assert.equal(finderFor(null)(), null, "没有当前评论 editor 时必须 fail closed");
+    assert.equal(finderFor(danmakuEditor)(), null, "未通过评论适配器的 editor 必须拒绝");
+
+    // 当前 comment-input 壳没有工具栏时，不能越过语义壳爬到页面级诱饵。
+    const emptyOwner = new ProspectDomFixture("div", { className: "comment-input-container" });
+    const emptyEditor = new ProspectDomFixture("div", {
+      kind: "douyin-comment-editor",
+      left: 600,
+      top: 100,
+      width: 380,
+      height: 80,
+    });
+    emptyOwner.append(emptyEditor);
+    page.append(emptyOwner);
+    assert.equal(finderFor(emptyEditor)(), null,
+      "局部工具栏缺失时不能在更高页面容器中选别人的最右图标");
+
+    // 极端改版：comment-input 语义直接落在 editor 自身。limit===editor 时循环必须
+    // 当场停住，不能因为从 parent 起步错过 sentinel 后继续爬到外层诱饵。
+    const selfAnchorOuter = new ProspectDomFixture("div");
+    const selfAnchoredEditor = new ProspectDomFixture("div", {
+      className: "comment-input-container",
+      kind: "douyin-comment-editor",
+      left: 600,
+      top: 100,
+      width: 380,
+      height: 80,
+    });
+    selfAnchorOuter.append(selfAnchoredEditor);
+    attachToolbar(selfAnchorOuter, 130, 860);
+    page.append(selfAnchorOuter);
+    assert.equal(finderFor(selfAnchoredEditor)(), null,
+      "limit 就是 editor 时不能越过自身命中外层工具栏诱饵");
+
+    const ambiguousOwner = new ProspectDomFixture("div", { className: "comment-input-container" });
+    const ambiguousEditor = new ProspectDomFixture("div", {
+      kind: "douyin-comment-editor",
+      left: 600,
+      top: 100,
+      width: 380,
+      height: 160,
+    });
+    ambiguousOwner.append(ambiguousEditor);
+    attachToolbar(ambiguousOwner, 120, 850);
+    attachToolbar(ambiguousOwner, 190, 850);
+    assert.equal(finderFor(ambiguousEditor)(), null,
+      "同一局部容器出现两行候选工具栏时必须 fail closed");
+  }
 }
 
 // ------------------------------------------------- 自动打开评论区 / 选中输入框
 {
+  // 知乎问题页同时有多条回答。入口必须由 URL answer id 与卡片 data-zop.itemId
+  // 唯一对应，不能继续点击 DOM 第一条「添加评论」。
+  const zhihuStart = iso.indexOf("function marineProspectZhihuRouteTarget");
+  const zhihuEnd = iso.indexOf("\n\n  /**\n   * 抖音：点开评论面板", zhihuStart);
+  assert.ok(zhihuStart >= 0 && zhihuEnd > zhihuStart, "知乎 opener 必须可独立验证");
+  const zhihuSource = iso.slice(zhihuStart, zhihuEnd);
+  assert.ok(
+    zhihuSource.includes("document.querySelectorAll('[data-zop]')") &&
+      zhihuSource.includes("meta.itemId") && zhihuSource.includes("scopes.length === 1") &&
+      zhihuSource.includes("marker.matches('.Post-content')"),
+    "知乎入口必须由 URL id/type 唯一绑定 answer 卡或专栏 Post-content",
+  );
+  assert.ok(
+    !zhihuSource.includes("document.querySelectorAll('button')"),
+    "知乎入口不能再全文档找第一个评论按钮",
+  );
+
+  const compileZhihuOpen = (document, pathname) => new Function(
+    "document",
+    "location",
+    "marineVisible",
+    `${zhihuSource}\nreturn marineProspectOpenCommentPanel;`,
+  )(document, { pathname }, (candidate) => candidate?.visible === true);
+  const zhihuCard = (itemId, label = "添加评论") => {
+    const card = new ProspectDomFixture("article", {
+      className: "ContentItem AnswerItem",
+      attrs: { "data-zop": JSON.stringify({ itemId, type: "answer" }) },
+    });
+    const actions = new ProspectDomFixture("div", { className: "ContentItem-actions" });
+    const button = new ProspectDomFixture("button", { textContent: label });
+    actions.append(button);
+    card.append(actions);
+    return { card, button };
+  };
+
+  const zhihuPage = new ProspectDomFixture("body");
+  const firstAnswer = zhihuCard("111", "12 条评论");
+  const targetAnswer = zhihuCard("222", "\u200b添加评论");
+  zhihuPage.append(firstAnswer.card, targetAnswer.card);
+  assert.equal(
+    compileZhihuOpen(zhihuPage, "/question/9/answer/222")("zhihu"),
+    true,
+    "目标回答不是 DOM 第一条时仍应打开 URL 指定回答的评论区",
+  );
+  assert.equal(firstAnswer.button.clicked, 0, "不能点击 DOM 第一条其他回答的评论入口");
+  assert.equal(targetAnswer.button.clicked, 1, "应只点击 itemId 与 URL 相等的回答入口");
+
+  const ambiguousZhihuPage = new ProspectDomFixture("body");
+  const duplicateA = zhihuCard("333");
+  const duplicateB = zhihuCard("333");
+  ambiguousZhihuPage.append(duplicateA.card, duplicateB.card);
+  assert.equal(
+    compileZhihuOpen(ambiguousZhihuPage, "/question/9/answer/333")("zhihu"),
+    false,
+    "同一 answer id 对应多个独立卡片时必须 fail closed",
+  );
+  assert.equal(duplicateA.button.clicked + duplicateB.button.clicked, 0,
+    "卡片歧义时不能点击任一评论入口");
+
+  const missingZhihuPage = new ProspectDomFixture("body");
+  const unrelatedAnswer = zhihuCard("444");
+  missingZhihuPage.append(unrelatedAnswer.card);
+  assert.equal(
+    compileZhihuOpen(missingZhihuPage, "/question/9/answer/555")("zhihu"),
+    false,
+    "URL 指定回答缺少 data-zop 卡片证据时必须 fail closed",
+  );
+  assert.equal(unrelatedAnswer.button.clicked, 0, "缺失目标卡片时不能退回其他回答");
+
+  const articlePage = new ProspectDomFixture("body");
+  const articleContent = new ProspectDomFixture("div", {
+    className: "Post-content",
+    attrs: {
+      "data-zop": JSON.stringify({ itemId: "9001", type: "article" }),
+    },
+  });
+  const articleActions = new ProspectDomFixture("div", { className: "ContentItem-actions" });
+  const articleCommentButton = new ProspectDomFixture("button", { textContent: "8 条评论" });
+  articleActions.append(articleCommentButton);
+  articleContent.append(articleActions);
+  const articleDecoy = zhihuCard("9001");
+  articlePage.append(articleDecoy.card, articleContent);
+  assert.equal(
+    compileZhihuOpen(articlePage, "/p/9001")("zhihu"),
+    true,
+    "专栏 /p/:id 应由 type=article 的唯一 Post-content 打开自己的评论入口",
+  );
+  assert.equal(articleCommentButton.clicked, 1, "专栏应点击 Post-content 内的评论入口");
+  assert.equal(articleDecoy.button.clicked, 0,
+    "同 id 的 answer 卡类型不符，不能劫持专栏入口");
+
+  const ambiguousArticlePage = new ProspectDomFixture("body");
+  const articleCopyA = new ProspectDomFixture("div", {
+    className: "Post-content",
+    attrs: { "data-zop": JSON.stringify({ itemId: "9002", type: "article" }) },
+  });
+  const articleCopyB = new ProspectDomFixture("div", {
+    className: "Post-content",
+    attrs: { "data-zop": JSON.stringify({ itemId: "9002", type: "article" }) },
+  });
+  const articleCopyActionsA = new ProspectDomFixture("div", { className: "ContentItem-actions" });
+  const articleCopyActionsB = new ProspectDomFixture("div", { className: "ContentItem-actions" });
+  const articleCopyButtonA = new ProspectDomFixture("button", { textContent: "添加评论" });
+  const articleCopyButtonB = new ProspectDomFixture("button", { textContent: "添加评论" });
+  articleCopyActionsA.append(articleCopyButtonA);
+  articleCopyActionsB.append(articleCopyButtonB);
+  articleCopyA.append(articleCopyActionsA);
+  articleCopyB.append(articleCopyActionsB);
+  ambiguousArticlePage.append(articleCopyA, articleCopyB);
+  assert.equal(
+    compileZhihuOpen(ambiguousArticlePage, "/p/9002")("zhihu"),
+    false,
+    "专栏出现两个匹配 Post-content 时必须 fail closed",
+  );
+  assert.equal(articleCopyButtonA.clicked + articleCopyButtonB.clicked, 0,
+    "专栏 scope 歧义时不能点任一入口");
+
   // 抖音有**三种**页面形态，评论区入口各不相同，而且判据不能是「有没有图标」：
   //   · 视频页 /video/…          feed-comment-icon 点了就出评论区
   //   · 图文笔记页 /note/…       没有图标，右栏「相关推荐 | 评论(N)」要点 tab
@@ -1208,8 +1714,9 @@ const manifest = JSON.parse(read("../manifest.json"));
       "而抖音的右侧抽屉正是 fixed，会把真实存在的输入框判成不可见",
   );
   assert.ok(
-    body.includes("|| document.body"),
-    "找输入条要能在没有 comment-list 时退回全文档 —— 精选页一个带 comment 的 data-e2e 都没有",
+    body.includes("marineProspectFindCommentEditor(marineCommentSearchRoot())") &&
+      !body.includes("document.querySelector('[contenteditable=\"true\"], textarea')"),
+    "已有输入框时也必须经平台适配器确认，不能把搜索框/弹幕框当成评论 editor",
   );
 }
 
@@ -1423,7 +1930,11 @@ const manifest = JSON.parse(read("../manifest.json"));
 // ------------------------------------------------- 抖音的评论区要两步打开
 {
   const dy = iso.slice(iso.indexOf("function marineProspectOpenDouyinComments"));
-  const body = dy.slice(0, 4000);
+  const body = dy.slice(0, 5200);
+  const helperStart = iso.indexOf("const MARINE_PROSPECT_DOUYIN_INPUT_HINT_RE");
+  const helperEnd = iso.indexOf("\n\n  function marineProspectOpenDouyinComments", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, "抖音输入邻域定位器必须可独立验证");
+  const helper = iso.slice(helperStart, helperEnd);
   assert.ok(
     body.includes("feed-comment-icon") && body.includes("comment-list"),
     "抖音要先点评论图标展开面板，再点输入条",
@@ -1436,12 +1947,14 @@ const manifest = JSON.parse(read("../manifest.json"));
     "笔记页要能点「评论(N)」这个 tab —— 那种页面没有 feed-comment-icon",
   );
   assert.ok(
-    body.includes("previousElementSibling"),
-    "输入条要靠「comment-list 的前一个兄弟」定位 —— 抖音类名是混淆的且每个视频页都不同",
+    helper.includes("previousElementSibling") && helper.includes("nextElementSibling") &&
+      /depth < 3/.test(helper),
+    "输入条要在 comment-list 的有限 sibling 邻域找，不能继续只认前一个兄弟",
   );
   assert.ok(
-    !/\.comment-input/.test(body),
-    "不能依赖 .comment-input 类名：实测同一份代码在两个视频上类名完全不同",
+    helper.includes('[class*="comment-input" i]') &&
+      helper.includes("裸 role=textbox / textarea 不是评论信号"),
+    "要认 comment-input 语义壳和新旧提示，但裸 textbox 不能成为评论信号",
   );
   // 抖音评论区要两步打开且渲染慢（实测十几秒）。窗口太短会表现成「定位不到
   // 输入框」，而手动同样的步骤是通的 —— 症状会误导人去查选择器。
@@ -1450,8 +1963,223 @@ const manifest = JSON.parse(read("../manifest.json"));
     "打开评论区的窗口要够抖音用（两步 + 慢渲染）",
   );
   assert.ok(
-    body.includes("spots[spots.length - 1]"),
-    "取最内层元素 —— 外层容器同样命中占位文案，点外层不一定触发挂载",
+    helper.includes("candidate.el.contains(other.el)") && helper.includes("leaves.length === 1"),
+    "同一文案的多层包装要取唯一最内层；出现两个独立入口则 fail closed",
+  );
+
+  const compile = new Function(
+    "marineVisible",
+    `${helper}\nreturn {` +
+      "findInput: marineProspectFindDouyinInputEntry," +
+      "findNoListInput: marineProspectFindDouyinNoListInputEntry };",
+  );
+  const helpers = compile((candidate) => candidate?.visible === true);
+  const findInput = helpers.findInput;
+  const findNoListInput = helpers.findNoListInput;
+
+  // /note/ 新形态：list 的前兄弟只是「全部评论」头，真正输入条在包裹 list 的
+  // comment pane 旁边。页面级另放一个 textbox 诱饵，局部算法绝不能看见它。
+  const bodyRoot = new ProspectDomFixture("body");
+  const rightRail = new ProspectDomFixture("aside");
+  const commentPane = new ProspectDomFixture("section");
+  const header = new ProspectDomFixture("div", { textContent: "全部评论" });
+  const list = new ProspectDomFixture("div", { attrs: { "data-e2e": "comment-list" } });
+  const inputEntry = new ProspectDomFixture("div", { className: "comment-input-container" });
+  const sameRailDecoy = new ProspectDomFixture("div", { attrs: { role: "textbox" } });
+  const outsideDecoy = new ProspectDomFixture("div", { attrs: { role: "textbox" } });
+  commentPane.append(header, list);
+  rightRail.append(sameRailDecoy, commentPane, inputEntry);
+  bodyRoot.append(rightRail, outsideDecoy);
+  assert.notEqual(list.previousElementSibling, inputEntry, "fixture 要复现输入条不在前兄弟的 DOM");
+  assert.equal(findInput(list), inputEntry, "要从 list 包装层附近找到新输入条");
+  assert.notEqual(findInput(list), sameRailDecoy, "同一右栏的裸 textbox 也不是评论信号");
+  assert.notEqual(findInput(list), outsideDecoy, "不能越过右栏边界选页面级 textbox");
+
+  // 若局部根本没有入口，body 下的 textbox 诱饵也不能被当作兜底。
+  const closedRail = new ProspectDomFixture("aside");
+  const closedPane = new ProspectDomFixture("section");
+  const closedHeader = new ProspectDomFixture("div", { textContent: "全部评论" });
+  const closedList = new ProspectDomFixture("div", { attrs: { "data-e2e": "comment-list" } });
+  const closedBody = new ProspectDomFixture("body");
+  closedPane.append(closedHeader, closedList);
+  closedRail.append(closedPane);
+  closedBody.append(closedRail,
+    new ProspectDomFixture("div", { className: "comment-input-container" }));
+  assert.equal(findInput(closedList), null,
+    "有界邻域无入口时应失败，连页面级 comment-input 诱饵也不能选");
+
+  // 旧形态仍保留：占位文案的外壳和叶子都会命中，要点最内层叶子。
+  const legacyPane = new ProspectDomFixture("section");
+  const legacyShell = new ProspectDomFixture("div", { textContent: "留下你的精彩评论吧" });
+  const legacyLeaf = new ProspectDomFixture("span", { textContent: "留下你的精彩评论吧" });
+  const legacyList = new ProspectDomFixture("div", { attrs: { "data-e2e": "comment-list" } });
+  legacyShell.append(legacyLeaf);
+  legacyPane.append(legacyShell, legacyList);
+  assert.equal(findInput(legacyList), legacyLeaf, "旧占位条仍要取唯一最内层点击目标");
+
+  // 精选页没有 comment-list：只能借「评论」tab 所属 dialog/drawer 证明范围。
+  const noListDrawer = new ProspectDomFixture("aside", { attrs: { role: "dialog" } });
+  const noListTabs = new ProspectDomFixture("div", { attrs: { role: "tablist" } });
+  const noListCommentTab = new ProspectDomFixture("div", {
+    textContent: "评论",
+    attrs: { role: "tab" },
+  });
+  const noListPanel = new ProspectDomFixture("section", { attrs: { role: "tabpanel" } });
+  const noListInput = new ProspectDomFixture("div", { textContent: "写下你的评论" });
+  const noListOutsideDecoy = new ProspectDomFixture("div", {
+    className: "comment-input-container",
+  });
+  noListTabs.append(noListCommentTab);
+  noListPanel.append(noListInput);
+  noListDrawer.append(noListTabs, noListPanel);
+  const noListBody = new ProspectDomFixture("body");
+  noListBody.append(noListDrawer, noListOutsideDecoy);
+  assert.equal(findNoListInput(noListCommentTab), noListInput,
+    "无 list 时要能在评论 tab 的 dialog 内找到输入入口");
+  assert.notEqual(findNoListInput(noListCommentTab), noListOutsideDecoy,
+    "无 list fallback 不能越过评论 dialog 选页面级诱饵");
+
+  // /note/ 与部分精选 DOM 没有 ARIA role：同组的「相关推荐」tab 是边界证据，
+  // 仍只允许向上三层、且不能上升到 body。
+  const plainBody = new ProspectDomFixture("body");
+  const plainDrawer = new ProspectDomFixture("aside");
+  const plainTabs = new ProspectDomFixture("div");
+  const plainRelatedTab = new ProspectDomFixture("div", { textContent: "相关推荐" });
+  const plainCommentTab = new ProspectDomFixture("div", { textContent: "评论(12)" });
+  const plainPanel = new ProspectDomFixture("section");
+  const plainInput = new ProspectDomFixture("div", { className: "comment-input-inner-container" });
+  plainTabs.append(plainRelatedTab, plainCommentTab);
+  plainPanel.append(plainInput);
+  plainDrawer.append(plainTabs, plainPanel);
+  plainBody.append(plainDrawer,
+    new ProspectDomFixture("div", { className: "comment-input-container" }));
+  assert.equal(findNoListInput(plainCommentTab), plainInput,
+    "无 role 时可由同组稳定 tab 证明局部 drawer，但仍不能全局搜索");
+
+  // 不只测 helper：连续两轮跑真实 opener，第一轮点 tab，第二轮必须能到达并点击
+  // no-list fallback。这样才能锁住本次「每轮都在 tab.click 后 return」的回归。
+  const openStart = iso.indexOf("let marineProspectDouyinIconClicked");
+  const openEnd = iso.indexOf("\n\n  function marineProspectOpenCommentsAndFocus", openStart);
+  assert.ok(openStart >= 0 && openEnd > openStart, "抖音 opener 必须可独立验证");
+  const openSource = iso.slice(openStart, openEnd);
+  const compileOpen = new Function(
+    "document",
+    "marineProspectFindCommentEditor",
+    "marineCommentSearchRoot",
+    "marineVisible",
+    "marineLog",
+    `${openSource}\nreturn marineProspectOpenDouyinComments;`,
+  );
+  const openDouyin = compileOpen(
+    noListBody,
+    () => null,
+    () => noListBody,
+    (candidate) => candidate?.visible === true,
+    () => {},
+  );
+  assert.equal(openDouyin(), false, "无 list 第一轮只切到评论 tab，等待 panel 挂载");
+  assert.equal(noListCommentTab.clicked, 1, "评论 tab 只点一次，不能轮询时反复开合");
+  assert.equal(openDouyin(), true, "无 list 第二轮必须进入局部 fallback 并点输入条");
+  assert.equal(noListInput.clicked, 1, "应点击 dialog 内的输入入口");
+  assert.equal(noListOutsideDecoy.clicked, 0, "页面级诱饵绝不能被点击");
+
+  // 两套可见抽屉同时残留时不能用 DOM 顺序（旧实现 `.pop()`）任选最后一个。
+  // 即使页面还有 feed icon，也不能用它绕过歧义再开合另一套面板。
+  const ambiguousDouyinBody = new ProspectDomFixture("body");
+  const ambiguousIcon = new ProspectDomFixture("button", {
+    attrs: { "data-e2e": "feed-comment-icon" },
+  });
+  const douyinTabIn = (label) => {
+    const dialog = new ProspectDomFixture("aside", { attrs: { role: "dialog" } });
+    const tablist = new ProspectDomFixture("div", { attrs: { role: "tablist" } });
+    const tab = new ProspectDomFixture("div", { textContent: label, attrs: { role: "tab" } });
+    tablist.append(tab);
+    dialog.append(tablist);
+    return { dialog, tab };
+  };
+  const ambiguousTabA = douyinTabIn("评论");
+  const ambiguousTabB = douyinTabIn("评论(8)");
+  ambiguousDouyinBody.append(ambiguousIcon, ambiguousTabA.dialog, ambiguousTabB.dialog);
+  const ambiguousOpenDouyin = compileOpen(
+    ambiguousDouyinBody,
+    () => null,
+    () => ambiguousDouyinBody,
+    (candidate) => candidate?.visible === true,
+    () => {},
+  );
+  assert.equal(ambiguousOpenDouyin(), false,
+    "多个有边界证据的评论 tab 必须 fail closed");
+  assert.equal(ambiguousTabA.tab.clicked + ambiguousTabB.tab.clicked, 0,
+    "评论 tab 歧义时不能任选其一");
+  assert.equal(ambiguousIcon.clicked, 0,
+    "评论 tab 歧义时也不能转而点击 feed icon 绕过保护");
+  assert.ok(
+    openSource.includes("tabCandidates.length > 1") &&
+      !/\.filter\([\s\S]{0,500}\)\s*\.pop\(\)/.test(openSource),
+    "评论 tab 必须显式拒绝多个候选，不能再按 DOM 顺序取最后一个",
+  );
+
+  // feed icon 也不能 querySelector 任取：隐藏的旧节点应忽略；只剩一个可见节点
+  // 才能点击。没有可见节点或同时两个可见节点都必须 fail closed。
+  const iconPage = new ProspectDomFixture("body");
+  const hiddenIcon = new ProspectDomFixture("button", {
+    visible: false,
+    attrs: { "data-e2e": "feed-comment-icon" },
+  });
+  const visibleIcon = new ProspectDomFixture("button", {
+    attrs: { "data-e2e": "feed-comment-icon" },
+  });
+  iconPage.append(hiddenIcon, visibleIcon);
+  const openWithHiddenIcon = compileOpen(
+    iconPage,
+    () => null,
+    () => iconPage,
+    (candidate) => candidate?.visible === true,
+    () => {},
+  );
+  assert.equal(openWithHiddenIcon(), false, "唯一可见 feed icon 点击后等待面板挂载");
+  assert.equal(hiddenIcon.clicked, 0, "隐藏的旧 feed icon 不能被 querySelector 抢先选中");
+  assert.equal(visibleIcon.clicked, 1, "混有隐藏节点时仍应点击唯一可见 feed icon");
+
+  const hiddenOnlyPage = new ProspectDomFixture("body");
+  const hiddenOnlyIcon = new ProspectDomFixture("button", {
+    visible: false,
+    attrs: { "data-e2e": "feed-comment-icon" },
+  });
+  hiddenOnlyPage.append(hiddenOnlyIcon);
+  const openWithNoVisibleIcon = compileOpen(
+    hiddenOnlyPage,
+    () => null,
+    () => hiddenOnlyPage,
+    (candidate) => candidate?.visible === true,
+    () => {},
+  );
+  assert.equal(openWithNoVisibleIcon(), false, "没有可见 feed icon 时必须 fail closed");
+  assert.equal(hiddenOnlyIcon.clicked, 0, "隐藏 feed icon 绝不能被点击");
+
+  const multipleIconPage = new ProspectDomFixture("body");
+  const visibleIconA = new ProspectDomFixture("button", {
+    attrs: { "data-e2e": "feed-comment-icon" },
+  });
+  const visibleIconB = new ProspectDomFixture("button", {
+    attrs: { "data-e2e": "feed-comment-icon" },
+  });
+  multipleIconPage.append(visibleIconA, visibleIconB);
+  const openWithMultipleIcons = compileOpen(
+    multipleIconPage,
+    () => null,
+    () => multipleIconPage,
+    (candidate) => candidate?.visible === true,
+    () => {},
+  );
+  assert.equal(openWithMultipleIcons(), false, "多个可见 feed icon 时必须 fail closed");
+  assert.equal(visibleIconA.clicked + visibleIconB.clicked, 0,
+    "多个可见 feed icon 时不能任取其一");
+  assert.ok(
+    openSource.includes("iconCandidates.length !== 1") &&
+      openSource.includes(".filter(function (candidate) { return marineVisible(candidate); })") &&
+      !openSource.includes("document.querySelector('[data-e2e=\"feed-comment-icon\"]')"),
+    "feed icon 必须由唯一可见候选证明，不能 querySelector 任取",
   );
 }
 

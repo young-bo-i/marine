@@ -2250,6 +2250,7 @@
         "hint": "Saisissez un mot-clé. Les profils ayant des plateformes d’automatisation configurées seront exécutés ; les autres seront ignorés.",
         "progress": "{{done}}/{{total}} · {{phase}} · {{target}}",
         "settledCount": "{{n}} enregistrés",
+        "errorDetail": "Voir la raison (survol)",
         "startFailed": "Impossible de lancer l'exécution",
         "stopFailed": "Impossible d'arrêter l'exécution",
         "cycleGap": "Intervalle (min)",
@@ -2273,7 +2274,9 @@
         "cancelled": "Annulé"
       },
       "outcome": {
-        "settled": "Enregistré",
+        "posted": "Publié",
+        "unconfirmed": "Envoyé — confirmation en attente",
+        "filled": "Brouillon rempli — non envoyé",
         "timed_out": "Rien enregistré",
         "no_slot": "Plateforme non prise en charge",
         "already_open": "Déjà ouvert — ignoré",

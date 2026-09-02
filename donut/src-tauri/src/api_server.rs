@@ -1438,9 +1438,11 @@ struct MarineProspectPrepareSendRequest {
 fn prospect_error(e: crate::marine::prospect::ProspectError) -> (StatusCode, String) {
   use crate::marine::prospect::ProspectError as E;
   match e {
-    E::UnsupportedPlatform(_) | E::MissingItemId => (StatusCode::BAD_REQUEST, e.to_string()),
+    E::UnsupportedPlatform(_) | E::MissingItemId | E::InvalidSettlementState { .. } => {
+      (StatusCode::BAD_REQUEST, e.to_string())
+    }
     E::NotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
-    E::ClaimOwnerMismatch { .. } => (StatusCode::CONFLICT, e.to_string()),
+    E::ClaimOwnerMismatch { .. } | E::AlreadySpent { .. } => (StatusCode::CONFLICT, e.to_string()),
     _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
   }
 }
@@ -1593,9 +1595,9 @@ async fn marine_settle_prospect(
     "filled" => ProspectState::Filled,
     // Recorded, never retried — a failed attempt is data.
     "failed" => ProspectState::Failed,
-    // Commenting is off on this item. Unlike every other state this withholds
-    // it from ALL accounts, which is why it is a property of the content and
-    // not of the caller.
+    // Commenting is off on this item. Every terminal attempt now closes the
+    // exact item globally; this distinct state preserves the content-level
+    // reason for reporting and debugging.
     "blocked" => ProspectState::Blocked,
     // `seen` / `claimed` are rejected: letting a caller push an item back to
     // "not touched yet" would erase the dedup evidence the ledger exists for.

@@ -2250,6 +2250,7 @@
         "hint": "Hãy nhập từ khóa. Hồ sơ có nền tảng tự động chạy đã cấu hình sẽ được chạy; hồ sơ chưa cấu hình sẽ bị bỏ qua.",
         "progress": "{{done}}/{{total}} · {{phase}} · {{target}}",
         "settledCount": "đã ghi {{n}}",
+        "errorDetail": "Xem lý do (di chuột)",
         "startFailed": "Không thể bắt đầu lượt chạy",
         "stopFailed": "Không thể dừng lượt chạy",
         "cycleGap": "Khoảng lặp (phút)",
@@ -2273,7 +2274,9 @@
         "cancelled": "Đã hủy"
       },
       "outcome": {
-        "settled": "Đã ghi",
+        "posted": "Đã đăng",
+        "unconfirmed": "Đã gửi — chưa xác nhận",
+        "filled": "Đã điền bản nháp — chưa gửi",
         "timed_out": "Không ghi được gì",
         "no_slot": "Nền tảng không hỗ trợ",
         "already_open": "Đang mở — đã bỏ qua",

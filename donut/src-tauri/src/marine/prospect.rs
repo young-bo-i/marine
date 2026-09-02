@@ -10,13 +10,15 @@
 //!
 //! # Two dedup scopes, deliberately different
 //!
-//! * **Content level (global)** — `key = platform:item_id`. Stops N accounts
-//!   piling onto one piece of content, which is the pattern a platform notices
-//!   first. Governed by [`ClaimOptions::per_item_account_cap`].
-//! * **Account level (hard gate)** — `(key, profile_id)`. The same account
-//!   commenting twice under one item is the one failure a platform will
-//!   certainly see. This is enforced inside the claim critical section, never
-//!   by a caller-side `if`.
+//! * **Exact item (global)** — `key = platform:item_id`. The first terminal
+//!   touch closes that item to every profile, even when the outcome was
+//!   `Failed`, `Filled`, or `Skipped`. Repeating a broken target across the
+//!   account fleet is still repeated automation and was observed in practice.
+//! * **Account thread (hard gate)** — on Zhihu, one profile that touched any
+//!   answer under a question cannot take another answer in the same question.
+//!   Different answers remain distinct global items, so another profile may
+//!   take an untouched answer. Both gates are enforced inside the claim
+//!   critical section, never by a caller-side `if`.
 //!
 //! # Search filters do not deduplicate
 //!
@@ -88,6 +90,10 @@ pub enum ProspectError {
   NotFound(String),
   #[error("prospect {key} is not currently claimed by profile {profile_id}")]
   ClaimOwnerMismatch { key: String, profile_id: String },
+  #[error("prospect {key} already has terminal evidence and cannot be sent again")]
+  AlreadySpent { key: String },
+  #[error("prospect settlement requires a terminal state, got {state:?}")]
+  InvalidSettlementState { state: ProspectState },
 }
 
 /// The question id out of a Zhihu answer URL, if it carries one.
@@ -137,9 +143,8 @@ pub enum ProspectState {
   /// The publish control was clicked, but no authoritative success/failure
   /// receipt arrived before the observation deadline.
   ///
-  /// This is conservatively charged as one public footprint.  Treating it as a
-  /// normal failure would let another account publish the same comment target
-  /// even though the first click may already have succeeded.
+  /// This is conservatively charged as one public footprint. Like every other
+  /// terminal touch it also closes the exact item globally.
   Unconfirmed,
   /// An account looked at it and deliberately passed.
   Skipped,
@@ -160,18 +165,24 @@ pub enum ProspectState {
   /// Observed on Bilibili as "由于UP主隐私设置，你无法评论" where the composer
   /// should be; the uploader has switched comments off.
   ///
-  /// This is the ONE state that legitimately withholds an item from every
-  /// account, and it earns that by being a property of the *content* rather
-  /// than of us. Every other terminal state answers "what did this account do
-  /// here" and must not gate other accounts — see the match in
-  /// [`ProspectLedger::claim_next`]. Recording it globally is the whole point:
-  /// without it, all five accounts would each spend a full leg discovering the
-  /// same closed video.
+  /// This explicitly records that the content itself cannot be used. Every
+  /// terminal touch now withholds the exact item globally; `Blocked` remains
+  /// distinct because it explains why no profile can use it and may exist in a
+  /// foreign shard even when an older writer omitted its touch.
   ///
   /// Deliberately NOT counted by [`ProspectRecord::public_footprint_accounts`]: no
   /// comment was made, so there is no public footprint to charge against the
   /// per-item cap.
   Blocked,
+}
+
+impl ProspectState {
+  /// `Seen` and `Claimed` are the only outcomes that have not completed an
+  /// attempt. Kept in one place so local and foreign-shard fail-safes cannot
+  /// drift apart when another terminal state is added.
+  fn is_terminal(self) -> bool {
+    !matches!(self, Self::Seen | Self::Claimed)
+  }
 }
 
 /// One account's interaction with one candidate. Append-only.
@@ -237,17 +248,7 @@ impl ProspectRecord {
     self
       .touches
       .iter()
-      .filter(|t| {
-        matches!(
-          t.state,
-          ProspectState::Posted
-            | ProspectState::Unconfirmed
-            | ProspectState::Skipped
-            | ProspectState::Filled
-            | ProspectState::Failed
-            | ProspectState::Blocked
-        )
-      })
+      .filter(|t| t.state.is_terminal())
       .map(|t| t.profile_id.as_str())
   }
 
@@ -255,6 +256,22 @@ impl ProspectRecord {
   /// account-level hard gate.
   pub fn touched_by(&self, profile_id: &str) -> bool {
     self.settled_accounts().any(|p| p == profile_id)
+  }
+
+  /// Whether any profile has completed an actual attempt on this exact item.
+  ///
+  /// Touches are append-only and therefore remain authoritative even when the
+  /// record's mutable `state` later changed under the old multi-account rules.
+  pub fn has_terminal_touch(&self) -> bool {
+    self.settled_accounts().next().is_some()
+  }
+
+  /// Terminal evidence, including a legacy/corrupt mutable state whose writer
+  /// omitted the append-only touch. This fail-safe is intentionally broader
+  /// than [`Self::has_terminal_touch`]: losing history must not make a spent
+  /// target claimable again, locally or after shard sync.
+  fn has_terminal_evidence(&self) -> bool {
+    self.has_terminal_touch() || self.state.is_terminal()
   }
 
   /// The "one place" an operator — and a platform's risk control — perceives.
@@ -289,9 +306,10 @@ impl ProspectRecord {
   /// Number of distinct accounts that may have left a PUBLIC footprint.
   ///
   /// `Posted` and a click with an `Unconfirmed` receipt both count. A `Filled`
-  /// draft or pre-click `Failed` attempt was never sent, so it leaves no
-  /// footprint for a platform to correlate; charging those would starve the
-  /// pool for no safety benefit.
+  /// draft or pre-click `Failed` attempt was never sent, so it leaves no public
+  /// footprint. Those outcomes still close the exact item through the separate
+  /// terminal-evidence rule; this function answers only whether a comment may
+  /// be visible publicly.
   /// The distinct accounts that may have left a PUBLIC footprint.
   ///
   /// Exposed separately so the cap can be summed across devices without
@@ -378,8 +396,9 @@ pub fn make_key(platform: &str, item_id: &str) -> String {
 /// Knobs for [`ProspectLedger::claim_next`].
 #[derive(Debug, Clone)]
 pub struct ClaimOptions {
-  /// How many distinct accounts may post under one item. `1` means never two
-  /// of our accounts under the same content.
+  /// Upper bound for public footprints retained for API compatibility and as a
+  /// defensive `0 = disabled` gate. The exact-item terminal-touch rule is
+  /// stricter: after the first completed attempt, no later profile may claim.
   pub per_item_account_cap: usize,
   /// Abandoned-claim reclaim window.
   pub claim_ttl_secs: u64,
@@ -410,6 +429,21 @@ pub struct IngestReport {
   pub already_known_kept_url: usize,
 }
 
+/// Claims resolved when an operator cancels one scheduler leg.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CancelledClaimsReport {
+  /// Pre-send claims recorded as an intentional skip.
+  pub skipped: usize,
+  /// Claims that crossed the send guard and may already be public.
+  pub unconfirmed: usize,
+}
+
+impl CancelledClaimsReport {
+  pub fn total(self) -> usize {
+    self.skipped + self.unconfirmed
+  }
+}
+
 /// Directory holding other devices' ledger shards, one JSON file per device.
 ///
 /// Populated by the sync layer; this module only ever reads it.
@@ -424,6 +458,8 @@ const REMOTE_DIR: &str = "remote";
 /// prevent. Reading a handful of small JSON files is far cheaper than that.
 #[derive(Debug, Default)]
 pub struct ForeignIndex {
+  /// Exact `platform:item` keys with terminal evidence on another device.
+  spent_items: std::collections::HashSet<String>,
   /// `(platform, profile_id) → thread keys that account has already spent`.
   spent_threads: std::collections::HashSet<(String, String, String)>,
   /// `key → how many distinct accounts left a public footprint elsewhere`.
@@ -443,15 +479,24 @@ impl ForeignIndex {
   /// [`ProspectError::EmptyLedger`].
   pub fn load() -> Result<Self, ProspectError> {
     let dir = crate::app_dirs::prospects_dir().join(REMOTE_DIR);
-    let mut index = Self::default();
     let entries = match fs::read_dir(&dir) {
       Ok(entries) => entries,
-      Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(index),
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
       Err(source) => return Err(ProspectError::Read { path: dir, source }),
     };
+    Self::load_paths(&dir, entries.map(|entry| entry.map(|entry| entry.path())))
+  }
 
-    for entry in entries.flatten() {
-      let path = entry.path();
+  fn load_paths<I>(dir: &Path, paths: I) -> Result<Self, ProspectError>
+  where
+    I: IntoIterator<Item = Result<PathBuf, std::io::Error>>,
+  {
+    let mut index = Self::default();
+    for path in paths {
+      let path = path.map_err(|source| ProspectError::Read {
+        path: dir.to_path_buf(),
+        source,
+      })?;
       if path.extension().and_then(|e| e.to_str()) != Some("json") {
         continue;
       }
@@ -477,6 +522,9 @@ impl ForeignIndex {
       if r.state == ProspectState::Blocked {
         self.blocked.insert(r.key.clone());
       }
+      if r.has_terminal_evidence() {
+        self.spent_items.insert(r.key.clone());
+      }
       let thread = r.thread_key();
       for profile in r.settled_accounts() {
         self
@@ -491,6 +539,10 @@ impl ForeignIndex {
           .insert(profile.to_string());
       }
     }
+  }
+
+  fn item_is_spent(&self, key: &str) -> bool {
+    self.spent_items.contains(key)
   }
 
   fn thread_is_spent(&self, platform: &str, profile_id: &str, thread: &str) -> bool {
@@ -784,6 +836,13 @@ impl ProspectLedger {
       if r.platform != platform {
         return false;
       }
+      // A completed attempt spends the exact item for the whole fleet. Touches
+      // rather than mutable `state` are the evidence: older ledgers could move
+      // a Failed record back to Claimed for a second profile while retaining
+      // the first profile's append-only touch.
+      if r.has_terminal_evidence() || foreign.item_is_spent(&r.key) {
+        return false;
+      }
       // Account-level hard gate, applied to the whole thread — here and on
       // every other device that has synced its shard to us.
       let thread = r.thread_key();
@@ -808,26 +867,18 @@ impl ProspectLedger {
       if r.url_is_stale(opts.session_url_max_age_secs, now) {
         return false;
       }
-      // `state` records the LAST outcome on this item, not "this item is
-      // finished for everybody". Letting Posted/Skipped block other accounts
-      // here would silently override `per_item_account_cap` — with a cap of 10,
-      // the 2nd account could still never claim. Who may take it is decided by
-      // the account-level gate and the cap above; the only thing `state` itself
-      // withholds is an item someone is actively working on right now.
+      // Normally terminal states also carry a touch and were rejected above.
+      // Reject them here as a fail-safe for legacy/corrupt rows that retained
+      // the mutable outcome but lost their append-only evidence.
       match r.state {
-        // 谁能拿由上面的账号级判断和 cap 决定，`state` 只拦「别人正在做」。
-        ProspectState::Seen
-        | ProspectState::Posted
+        ProspectState::Seen => true,
+        ProspectState::Claimed => r.claim_is_stale(opts.claim_ttl_secs, now),
+        ProspectState::Posted
         | ProspectState::Unconfirmed
         | ProspectState::Skipped
         | ProspectState::Filled
-        | ProspectState::Failed => true,
-        ProspectState::Claimed => r.claim_is_stale(opts.claim_ttl_secs, now),
-        // The single exception to the rule above, and only because it is not a
-        // statement about an account: nobody can comment where commenting is
-        // off, so handing this out again would burn another account's leg to
-        // rediscover the same fact.
-        ProspectState::Blocked => false,
+        | ProspectState::Failed
+        | ProspectState::Blocked => false,
       }
     };
 
@@ -885,6 +936,17 @@ impl ProspectLedger {
         profile_id: profile_id.to_string(),
       });
     }
+    // Old multi-profile writers could leave a new active claim on a record
+    // whose append-only touches already prove that another profile completed
+    // an attempt. `claim_next` now rejects that shape, but an in-flight legacy
+    // browser may cross an upgrade boundary and arrive directly at this final
+    // pre-click guard. Refuse it here too: no migration window may bypass the
+    // exact-item rule.
+    if rec.has_terminal_evidence() {
+      return Err(ProspectError::AlreadySpent {
+        key: key.to_string(),
+      });
+    }
     if rec.send_started_at.is_none() {
       rec.send_started_at = Some(now_secs());
       self.save(&records)?;
@@ -903,10 +965,9 @@ impl ProspectLedger {
     profile_id: &str,
     state: ProspectState,
   ) -> Result<(), ProspectError> {
-    debug_assert!(!matches!(
-      state,
-      ProspectState::Seen | ProspectState::Claimed
-    ));
+    if !state.is_terminal() {
+      return Err(ProspectError::InvalidSettlementState { state });
+    }
     let _guard = self.lock.lock().expect("prospect ledger mutex poisoned");
     let mut records = self.load()?;
     let Some(rec) = records.iter_mut().find(|r| r.key == key) else {
@@ -942,6 +1003,60 @@ impl ProspectLedger {
     });
     self.save(&records)?;
     Ok(())
+  }
+
+  /// Atomically resolve claims left behind when one scheduler leg is stopped.
+  ///
+  /// Only claims owned by `profile_id` on `platform` and created at or after
+  /// `leg_started_at` belong to this leg. A pre-send claim is an intentional
+  /// `Skipped`; once the irreversible send guard was crossed, absence of a
+  /// receipt must be recorded conservatively as `Unconfirmed`.
+  pub fn settle_cancelled_claims(
+    &self,
+    profile_id: &str,
+    platform: &str,
+    leg_started_at: u64,
+  ) -> Result<CancelledClaimsReport, ProspectError> {
+    if !SUPPORTED_PLATFORMS.contains(&platform) {
+      return Err(ProspectError::UnsupportedPlatform(platform.to_string()));
+    }
+
+    let _guard = self.lock.lock().expect("prospect ledger mutex poisoned");
+    let mut records = self.load()?;
+    let now = now_secs();
+    let mut report = CancelledClaimsReport::default();
+
+    for rec in &mut records {
+      let belongs_to_leg = rec.platform == platform
+        && rec.state == ProspectState::Claimed
+        && rec.claimed_by.as_deref() == Some(profile_id)
+        && matches!(rec.claimed_at, Some(at) if at >= leg_started_at);
+      if !belongs_to_leg {
+        continue;
+      }
+
+      let state = if rec.send_started_at.is_some() {
+        report.unconfirmed += 1;
+        ProspectState::Unconfirmed
+      } else {
+        report.skipped += 1;
+        ProspectState::Skipped
+      };
+      rec.state = state;
+      rec.claimed_by = None;
+      rec.claimed_at = None;
+      rec.send_started_at = None;
+      rec.touches.push(AccountTouch {
+        profile_id: profile_id.to_string(),
+        state,
+        at: now,
+      });
+    }
+
+    if report.total() > 0 {
+      self.save(&records)?;
+    }
+    Ok(report)
   }
 
   /// This device's ledger, serialized the way a sync shard must be.
@@ -1087,6 +1202,28 @@ mod tests {
   }
 
   #[test]
+  fn settle_rejects_non_terminal_states_without_mutating_the_claim() {
+    let (l, _g) = ledger();
+    l.ingest(&[cand("bilibili", "BV1", "https://b/1")]).unwrap();
+    let claim = l
+      .claim_next("p1", "bilibili", &ClaimOptions::default())
+      .unwrap()
+      .unwrap();
+
+    for state in [ProspectState::Seen, ProspectState::Claimed] {
+      assert!(matches!(
+        l.settle(&claim.key, "p1", state),
+        Err(ProspectError::InvalidSettlementState { state: actual }) if actual == state
+      ));
+
+      let unchanged = &l.list_local().unwrap()[0];
+      assert_eq!(unchanged.state, ProspectState::Claimed);
+      assert_eq!(unchanged.claimed_by.as_deref(), Some("p1"));
+      assert!(unchanged.touches.is_empty());
+    }
+  }
+
+  #[test]
   fn settling_an_unknown_key_is_not_silently_accepted() {
     let (l, _g) = ledger();
     assert!(matches!(
@@ -1096,7 +1233,7 @@ mod tests {
   }
 
   #[test]
-  fn same_account_never_gets_the_same_item_twice() {
+  fn a_terminal_touch_closes_the_exact_item_for_every_profile() {
     let (l, _g) = ledger();
     l.ingest(&[cand("bilibili", "BV1", "https://b/1")]).unwrap();
     // cap high enough that the content-level rule is not what blocks it
@@ -1110,11 +1247,11 @@ mod tests {
 
     assert!(
       l.claim_next("p1", "bilibili", &o).unwrap().is_none(),
-      "account-level gate must hold even when the content-level cap allows more"
+      "the profile that touched it must not retry"
     );
     assert!(
-      l.claim_next("p2", "bilibili", &o).unwrap().is_some(),
-      "a different account is still allowed under a cap of 10"
+      l.claim_next("p2", "bilibili", &o).unwrap().is_none(),
+      "an exact terminal touch is global even when the footprint cap is 10"
     );
   }
 
@@ -1136,7 +1273,7 @@ mod tests {
   }
 
   #[test]
-  fn skipped_frees_the_item_for_other_accounts_but_not_the_skipper() {
+  fn skipped_closes_the_item_for_every_account() {
     let (l, _g) = ledger();
     l.ingest(&[cand("bilibili", "BV1", "https://b/1")]).unwrap();
     let o = ClaimOptions::default();
@@ -1146,8 +1283,8 @@ mod tests {
 
     assert!(l.claim_next("p1", "bilibili", &o).unwrap().is_none());
     assert!(
-      l.claim_next("p2", "bilibili", &o).unwrap().is_some(),
-      "skipping is not posting, so the cap is untouched"
+      l.claim_next("p2", "bilibili", &o).unwrap().is_none(),
+      "a deliberate skip spends the exact target globally"
     );
   }
 
@@ -1215,7 +1352,38 @@ mod tests {
   }
 
   #[test]
-  fn committed_settle_retry_does_not_disturb_a_new_owner() {
+  fn prepare_send_rejects_an_in_flight_legacy_claim_on_a_spent_item() {
+    let (l, _g) = ledger();
+    l.ingest(&[cand("zhihu", "answer:1", "https://z/1")])
+      .unwrap();
+    let claim = l
+      .claim_next("p1", "zhihu", &ClaimOptions::default())
+      .unwrap()
+      .unwrap();
+    l.settle(&claim.key, "p1", ProspectState::Failed).unwrap();
+
+    // This is a state an older multi-profile writer could persist while a new
+    // app version was starting: the mutable row belongs to p2, but p1's
+    // terminal touch remains as authoritative evidence that the item is spent.
+    let mut records = l.load().unwrap();
+    records[0].state = ProspectState::Claimed;
+    records[0].claimed_by = Some("p2".to_string());
+    records[0].claimed_at = Some(now_secs());
+    l.save(&records).unwrap();
+
+    assert!(matches!(
+      l.prepare_send(&claim.key, "p2"),
+      Err(ProspectError::AlreadySpent { key }) if key == claim.key
+    ));
+    let unchanged = &l.list_local().unwrap()[0];
+    assert_eq!(unchanged.state, ProspectState::Claimed);
+    assert_eq!(unchanged.claimed_by.as_deref(), Some("p2"));
+    assert!(unchanged.send_started_at.is_none());
+    assert_eq!(unchanged.touches.len(), 1);
+  }
+
+  #[test]
+  fn committed_settle_retry_remains_idempotent_after_the_item_is_closed() {
     let (l, _g) = ledger();
     l.ingest(&[cand("bilibili", "BV1", "https://b/1")]).unwrap();
     let opts = ClaimOptions {
@@ -1224,16 +1392,137 @@ mod tests {
     };
     let first = l.claim_next("p1", "bilibili", &opts).unwrap().unwrap();
     l.settle(&first.key, "p1", ProspectState::Skipped).unwrap();
-    l.claim_next("p2", "bilibili", &opts)
-      .unwrap()
-      .expect("a skip should leave the item available to another account");
+    assert!(l.claim_next("p2", "bilibili", &opts).unwrap().is_none());
 
     l.settle(&first.key, "p1", ProspectState::Skipped)
-      .expect("a lost-response retry must remain idempotent after reassignment");
+      .expect("a lost-response retry must remain idempotent after settlement");
     let rec = &l.list_local().unwrap()[0];
-    assert_eq!(rec.state, ProspectState::Claimed);
-    assert_eq!(rec.claimed_by.as_deref(), Some("p2"));
+    assert_eq!(rec.state, ProspectState::Skipped);
+    assert_eq!(rec.claimed_by, None);
     assert_eq!(rec.touches.len(), 1);
+  }
+
+  #[test]
+  fn cancelling_a_leg_settles_only_its_recent_matching_claims() {
+    let (l, _g) = ledger();
+    l.ingest(&[
+      cand("bilibili", "BV_old", "https://b/old"),
+      cand("bilibili", "BV_recent", "https://b/recent"),
+      cand("bilibili", "BV_other", "https://b/other"),
+      cand("zhihu", "answer:1", "https://z/1"),
+    ])
+    .unwrap();
+    let opts = ClaimOptions::default();
+
+    let old = l.claim_next("p1", "bilibili", &opts).unwrap().unwrap();
+    let leg_started_at = now_secs();
+    let mut records = l.load().unwrap();
+    records
+      .iter_mut()
+      .find(|r| r.key == old.key)
+      .unwrap()
+      .claimed_at = Some(leg_started_at.saturating_sub(1));
+    l.save(&records).unwrap();
+
+    let recent = l.claim_next("p1", "bilibili", &opts).unwrap().unwrap();
+    let another_profile = l.claim_next("p2", "bilibili", &opts).unwrap().unwrap();
+    let another_platform = l.claim_next("p1", "zhihu", &opts).unwrap().unwrap();
+
+    let report = l
+      .settle_cancelled_claims("p1", "bilibili", leg_started_at)
+      .unwrap();
+    assert_eq!(
+      report,
+      CancelledClaimsReport {
+        skipped: 1,
+        unconfirmed: 0,
+      }
+    );
+    assert_eq!(report.total(), 1);
+
+    let records = l.list_local().unwrap();
+    let find = |key: &str| records.iter().find(|r| r.key == key).unwrap();
+
+    let old_record = find(&old.key);
+    assert_eq!(old_record.state, ProspectState::Claimed);
+    assert_eq!(old_record.claimed_by.as_deref(), Some("p1"));
+
+    let cancelled = find(&recent.key);
+    assert_eq!(cancelled.state, ProspectState::Skipped);
+    assert_eq!(cancelled.claimed_by, None);
+    assert_eq!(cancelled.claimed_at, None);
+    assert_eq!(cancelled.send_started_at, None);
+    assert_eq!(cancelled.touches.len(), 1);
+    assert_eq!(cancelled.touches[0].profile_id, "p1");
+    assert_eq!(cancelled.touches[0].state, ProspectState::Skipped);
+
+    assert_eq!(find(&another_profile.key).claimed_by.as_deref(), Some("p2"));
+    assert_eq!(
+      find(&another_platform.key).claimed_by.as_deref(),
+      Some("p1")
+    );
+
+    assert_eq!(
+      l.settle_cancelled_claims("p1", "bilibili", leg_started_at)
+        .unwrap(),
+      CancelledClaimsReport::default(),
+      "a repeated stop must not append a second touch"
+    );
+    assert_eq!(
+      l.list_local()
+        .unwrap()
+        .iter()
+        .find(|r| r.key == recent.key)
+        .unwrap()
+        .touches
+        .len(),
+      1
+    );
+  }
+
+  #[test]
+  fn cancelling_after_the_send_guard_is_conservatively_unconfirmed() {
+    let (l, _g) = ledger();
+    l.ingest(&[cand("bilibili", "BV1", "https://b/1")]).unwrap();
+    let leg_started_at = now_secs();
+    let claim = l
+      .claim_next("p1", "bilibili", &ClaimOptions::default())
+      .unwrap()
+      .unwrap();
+    l.prepare_send(&claim.key, "p1").unwrap();
+
+    let report = l
+      .settle_cancelled_claims("p1", "bilibili", leg_started_at)
+      .unwrap();
+    assert_eq!(
+      report,
+      CancelledClaimsReport {
+        skipped: 0,
+        unconfirmed: 1,
+      }
+    );
+
+    let record = &l.list_local().unwrap()[0];
+    assert_eq!(record.state, ProspectState::Unconfirmed);
+    assert_eq!(record.claimed_by, None);
+    assert_eq!(record.claimed_at, None);
+    assert_eq!(record.send_started_at, None);
+    assert_eq!(record.touches.len(), 1);
+    assert_eq!(record.touches[0].state, ProspectState::Unconfirmed);
+    assert_eq!(record.public_footprint_accounts(), vec!["p1"]);
+    assert!(l
+      .claim_next("p2", "bilibili", &ClaimOptions::default())
+      .unwrap()
+      .is_none());
+  }
+
+  #[test]
+  fn cancelling_claims_rejects_an_unknown_platform() {
+    let (l, _g) = ledger();
+    assert!(matches!(
+      l.settle_cancelled_claims("p1", "weibo", 0),
+      Err(ProspectError::UnsupportedPlatform(platform)) if platform == "weibo"
+    ));
   }
 
   #[test]
@@ -1249,22 +1538,16 @@ mod tests {
     let rec = &l.list_local().unwrap()[0];
     assert_eq!(rec.open_url_durability, Durability::Session);
 
-    let fresh = ClaimOptions::default();
-    assert!(l.claim_next("p1", "xiaohongshu", &fresh).unwrap().is_some());
-
     // With a zero freshness window the token is assumed unusable and the
     // candidate must be withheld rather than handed out to fail on open.
     let stale = ClaimOptions {
       session_url_max_age_secs: 0,
       ..Default::default()
     };
-    l.settle(
-      "xiaohongshu:68b6891b000000001c0306b8",
-      "p1",
-      ProspectState::Skipped,
-    )
-    .unwrap();
-    assert!(l.claim_next("p2", "xiaohongshu", &stale).unwrap().is_none());
+    assert!(l.claim_next("p1", "xiaohongshu", &stale).unwrap().is_none());
+
+    let fresh = ClaimOptions::default();
+    assert!(l.claim_next("p1", "xiaohongshu", &fresh).unwrap().is_some());
   }
 
   #[test]
@@ -1343,11 +1626,9 @@ mod tests {
   }
 
   #[test]
-  fn a_filled_draft_blocks_the_same_account_but_not_the_cap() {
+  fn a_filled_draft_closes_the_item_without_becoming_a_public_footprint() {
     // 调试期的终局：草稿已填入但没发出去。
-    //   · 对本账号：等于这条已经用掉了，不能再领（否则会重复填）
-    //   · 对 per-item cap：不占额度 —— 没发出去就没有公开足迹，让它占额度
-    //     只会在调试期白白饿死候选池
+    // 没发出去就没有公开足迹，但实际尝试过的 exact item 仍全局关闭。
     let (l, _g) = ledger();
     l.ingest(&[cand("bilibili", "BV1", "https://b/1")]).unwrap();
     let o = ClaimOptions::default(); // cap = 1
@@ -1360,8 +1641,8 @@ mod tests {
       "同一账号不该再领到自己已经填过的那条"
     );
     assert!(
-      l.claim_next("p2", "bilibili", &o).unwrap().is_some(),
-      "填入不等于发布，不该占用 per-item cap"
+      l.claim_next("p2", "bilibili", &o).unwrap().is_none(),
+      "填入虽不占 footprint cap，但 exact item 已经用过"
     );
     assert_eq!(
       l.list_local().unwrap()[0].public_footprint_accounts().len(),
@@ -1371,8 +1652,8 @@ mod tests {
   }
 
   #[test]
-  fn a_failed_attempt_is_recorded_and_not_retried() {
-    // 决策：发送失败只记录、不重试。所以 Failed 必须挡住同一账号再领。
+  fn a_failed_attempt_is_recorded_and_closes_the_item() {
+    // 决策：发送失败只记录、不重试，而且不能让账号池轮流撞同一个坏目标。
     let (l, _g) = ledger();
     l.ingest(&[cand("zhihu", "answer:1", "https://z/1")])
       .unwrap();
@@ -1384,6 +1665,10 @@ mod tests {
     assert!(
       l.claim_next("p1", "zhihu", &o).unwrap().is_none(),
       "失败不重试 —— 同一账号不该再拿到它"
+    );
+    assert!(
+      l.claim_next("p2", "zhihu", &o).unwrap().is_none(),
+      "另一个账号也不该重新撞同一个失败目标"
     );
     let rec = &l.list_local().unwrap()[0];
     assert_eq!(rec.state, ProspectState::Failed);
@@ -1449,9 +1734,13 @@ mod tests {
   }
 
   #[test]
-  fn drafts_and_pre_click_failures_do_not_consume_the_public_footprint_cap() {
+  fn drafts_and_pre_click_failures_close_only_their_exact_items_without_footprints() {
     let (l, _g) = ledger();
-    l.ingest(&[cand("bilibili", "BV9", "https://b/9")]).unwrap();
+    l.ingest(&[
+      cand("bilibili", "BV_filled", "https://b/filled"),
+      cand("bilibili", "BV_failed", "https://b/failed"),
+    ])
+    .unwrap();
     let o = ClaimOptions {
       per_item_account_cap: 2,
       ..Default::default()
@@ -1462,12 +1751,16 @@ mod tests {
       l.settle(&c.key, p, st).unwrap();
     }
     assert_eq!(
-      l.list_local().unwrap()[0].public_footprint_accounts().len(),
+      l.list_local()
+        .unwrap()
+        .iter()
+        .map(|r| r.public_footprint_accounts().len())
+        .sum::<usize>(),
       0
     );
     assert!(
-      l.claim_next("p3", "bilibili", &o).unwrap().is_some(),
-      "两次非发布的接触不该吃掉 cap=2 的额度"
+      l.claim_next("p3", "bilibili", &o).unwrap().is_none(),
+      "两个 exact item 都已有终局接触，不能再发给第三个账号"
     );
   }
 
@@ -1648,7 +1941,7 @@ mod tests {
     );
   }
 
-  /// 但这是**账号级**闸门：换个账号仍然可以进这个问题（受 cap 约束）。
+  /// 但 thread 是**账号级**闸门：换个账号仍可拿这个问题下另一条未触碰的回答。
   #[test]
   fn another_account_may_still_take_a_different_answer_in_that_question() {
     let (l, _g) = ledger();
@@ -1670,8 +1963,11 @@ mod tests {
       .claim_next("p2", "zhihu", &opts)
       .unwrap()
       .expect("换账号不该被话题级闸门挡住 —— 那是账号级判据，不是内容级");
-    // 拿到哪一条不重要（按位置取，多半还是第一条）；重要的是它**在这个问题里**：
-    // 话题级闸门只拦同一个账号，跨账号仍由 per_item_account_cap 说了算。
+    assert_ne!(
+      second.key, first.key,
+      "跨账号也绝不能重复同一个 exact answer"
+    );
+    // thread 闸门只拦同账号；另一个账号仍可拿问题下未触碰的另一回答。
     assert_eq!(second.thread_key(), format!("zhihu:question:{Q}"));
   }
 
@@ -1823,6 +2119,7 @@ mod tests {
       state: ProspectState::Posted,
       at: 1,
     }];
+    let other_key = other.key.clone();
     write_remote_shard("device-b", &[other]);
 
     let opts = ClaimOptions::default();
@@ -1830,8 +2127,9 @@ mod tests {
       l.claim_next("p1", "zhihu", &opts).unwrap().is_none(),
       "同一账号在别的机器上已经进过这个问题，本机必须挡住"
     );
-    // 换个账号仍然可以（这是账号级闸门，不是内容级）。
-    assert!(l.claim_next("p2", "zhihu", &opts).unwrap().is_some());
+    // 换个账号仍然可以拿本机这条不同回答（thread 是账号级闸门）。
+    let p2 = l.claim_next("p2", "zhihu", &opts).unwrap().unwrap();
+    assert_ne!(p2.key, other_key);
   }
 
   /// cap 是全局的：本机 0 个足迹 + 远端 1 个，cap=1 就该挡住。
@@ -1853,6 +2151,35 @@ mod tests {
       l.claim_next("p1", "bilibili", &opts).unwrap().is_none(),
       "远端已经用掉了唯一的名额"
     );
+  }
+
+  /// Legacy writers could leave a terminal mutable state without its touch.
+  /// A foreign shard must fail safe exactly as the local ledger does.
+  #[test]
+  fn every_terminal_state_in_a_foreign_shard_spends_the_exact_item_without_a_touch() {
+    for state in [
+      ProspectState::Posted,
+      ProspectState::Unconfirmed,
+      ProspectState::Skipped,
+      ProspectState::Filled,
+      ProspectState::Failed,
+      ProspectState::Blocked,
+    ] {
+      let (l, _g) = ledger();
+      l.ingest(&[cand("bilibili", "BV1", "https://b/1")]).unwrap();
+
+      let mut remote = l.list_local().unwrap()[0].clone();
+      remote.state = state;
+      remote.touches.clear();
+      write_remote_shard("legacy-device", &[remote]);
+
+      assert!(
+        l.claim_next("p1", "bilibili", &ClaimOptions::default())
+          .unwrap()
+          .is_none(),
+        "foreign terminal state {state:?} must spend the exact item even without a touch"
+      );
+    }
   }
 
   /// 别的机器发现关了评论，本机不必再白跑一条腿去重新发现。
@@ -1890,6 +2217,23 @@ mod tests {
     assert!(matches!(
       l.claim_next("p1", "bilibili", &ClaimOptions::default()),
       Err(ProspectError::EmptyLedger { .. })
+    ));
+  }
+
+  #[test]
+  fn a_read_dir_entry_error_is_not_silently_dropped() {
+    let dir = PathBuf::from("remote-ledger-fixture");
+    let source = std::io::Error::new(
+      std::io::ErrorKind::PermissionDenied,
+      "synthetic directory entry failure",
+    );
+    let err = ForeignIndex::load_paths(&dir, [Err(source)])
+      .expect_err("one unreadable directory entry must make dedup fail closed");
+
+    assert!(matches!(
+      err,
+      ProspectError::Read { path, source }
+        if path == dir && source.kind() == std::io::ErrorKind::PermissionDenied
     ));
   }
 

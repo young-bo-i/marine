@@ -173,8 +173,13 @@ pub struct RunRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LegOutcome {
-  /// The extension settled at least one item for this profile.
-  Settled,
+  /// The platform confirmed that the comment was published.
+  Posted,
+  /// The publish action crossed the irreversible-send guard, but no
+  /// authoritative platform receipt arrived.
+  Unconfirmed,
+  /// A draft was filled but was not submitted.
+  Filled,
   /// Nothing was settled within the timeout. Also the normal outcome when the
   /// profile is not logged in on that platform, or when the ledger had nothing
   /// eligible left for it.
@@ -206,8 +211,8 @@ pub struct LegReport {
   pub profile_name: String,
   pub platform: String,
   pub outcome: LegOutcome,
-  /// Touches this profile gained during the leg. Zero for every non-`Settled`
-  /// outcome.
+  /// Terminal touches this profile gained during the leg. This is normally one,
+  /// but remains a count so an unexpected late/racing settlement is visible.
   pub settled_count: usize,
   #[serde(default)]
   pub error: Option<String>,
@@ -292,11 +297,10 @@ impl DiscoveryScheduler {
       .unwrap_or_else(idle_progress)
   }
 
-  /// Ask the in-flight run to stop after the current leg's browser is closed.
-  ///
-  /// Deliberately not a hard abort: killing mid-leg would leave a claimed item
-  /// with no terminal touch, which the ledger would only release after its
-  /// stale-claim TTL.
+  /// Ask the in-flight run to stop. The working leg first fences page-side
+  /// automation by closing the browser or unloading it to `about:blank`, then
+  /// resolves its owned claim to `Skipped`/`Unconfirmed`; the run claim is
+  /// released only after that safety cleanup completes.
   pub fn request_cancel(&self) {
     self.cancel.store(true, Ordering::SeqCst);
   }
@@ -383,6 +387,68 @@ fn touch_ends_leg(state: super::prospect::ProspectState) -> bool {
   !matches!(state, super::prospect::ProspectState::Blocked)
 }
 
+/// Per-state completion snapshot for one `(profile, platform)` leg.
+///
+/// A scalar count used to tell us only that *something* reached a terminal
+/// ledger state. That made `Failed`, `Filled`, `Skipped`, and `Unconfirmed`
+/// indistinguishable from a confirmed post and even cleared the platform's
+/// login warning. Keep the same durable ledger signal, but preserve its state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TerminalTouches {
+  posted: usize,
+  unconfirmed: usize,
+  skipped: usize,
+  filled: usize,
+  failed: usize,
+}
+
+impl TerminalTouches {
+  fn observe(&mut self, state: super::prospect::ProspectState) {
+    use super::prospect::ProspectState;
+    match state {
+      ProspectState::Posted => self.posted += 1,
+      ProspectState::Unconfirmed => self.unconfirmed += 1,
+      ProspectState::Skipped => self.skipped += 1,
+      ProspectState::Filled => self.filled += 1,
+      ProspectState::Failed => self.failed += 1,
+      ProspectState::Seen | ProspectState::Claimed | ProspectState::Blocked => {}
+    }
+  }
+
+  fn total(self) -> usize {
+    self.posted + self.unconfirmed + self.skipped + self.filled + self.failed
+  }
+
+  fn since(self, baseline: Self) -> Self {
+    Self {
+      posted: self.posted.saturating_sub(baseline.posted),
+      unconfirmed: self.unconfirmed.saturating_sub(baseline.unconfirmed),
+      skipped: self.skipped.saturating_sub(baseline.skipped),
+      filled: self.filled.saturating_sub(baseline.filled),
+      failed: self.failed.saturating_sub(baseline.failed),
+    }
+  }
+
+  /// One leg is expected to produce one terminal touch. If a race produces
+  /// several, prefer public/possibly-public outcomes, then an explicit failure,
+  /// so reporting never paints an uncertain or failed send as success.
+  fn outcome(self) -> Option<LegOutcome> {
+    if self.unconfirmed > 0 {
+      Some(LegOutcome::Unconfirmed)
+    } else if self.posted > 0 {
+      Some(LegOutcome::Posted)
+    } else if self.failed > 0 {
+      Some(LegOutcome::Failed)
+    } else if self.filled > 0 {
+      Some(LegOutcome::Filled)
+    } else if self.skipped > 0 {
+      Some(LegOutcome::Skipped)
+    } else {
+      None
+    }
+  }
+}
+
 /// Leg-ending touches belonging to `profile_id` across the whole ledger.
 ///
 /// This is the completion signal. Counting touches rather than comparing record
@@ -401,20 +467,22 @@ fn touch_ends_leg(state: super::prospect::ProspectState) -> bool {
 /// 下一条腿会把别人的成果当成自己的 —— 它会立刻「完成」、根本没去发那个平台的
 /// 评论，而报表上是一条漂亮的 Settled。每条腿开关一次浏览器的年代没有这个问题，
 /// 所以老代码不过滤是对的。
-fn count_leg_touches(
+fn summarize_leg_touches(
   records: &[super::prospect::ProspectRecord],
   profile_id: &str,
   platform: &str,
-) -> usize {
+) -> TerminalTouches {
+  let mut summary = TerminalTouches::default();
   records
     .iter()
     .filter(|r| r.platform == platform)
     .flat_map(|r| r.touches.iter())
     .filter(|t| t.profile_id == profile_id && touch_ends_leg(t.state))
-    .count()
+    .for_each(|touch| summary.observe(touch.state));
+  summary
 }
 
-async fn read_touch_count(profile_id: &str, platform: &str) -> Result<usize, String> {
+async fn read_touch_summary(profile_id: &str, platform: &str) -> Result<TerminalTouches, String> {
   let id = profile_id.to_string();
   let plat = platform.to_string();
   // `list_local`, deliberately: this counts *our* progress on the leg that is
@@ -424,7 +492,7 @@ async fn read_touch_count(profile_id: &str, platform: &str) -> Result<usize, Str
   let counted = tokio::task::spawn_blocking(move || {
     super::prospect::PROSPECTS
       .list_local()
-      .map(|records| count_leg_touches(&records, &id, &plat))
+      .map(|records| summarize_leg_touches(&records, &id, &plat))
   })
   .await;
 
@@ -433,7 +501,10 @@ async fn read_touch_count(profile_id: &str, platform: &str) -> Result<usize, Str
     .map_err(|e| format!("could not read the prospect ledger: {e}"))
 }
 
-async fn initial_touch_count(profile_id: &str, platform: &str) -> Result<usize, String> {
+async fn initial_touch_summary(
+  profile_id: &str,
+  platform: &str,
+) -> Result<TerminalTouches, String> {
   let mut last_error = "prospect ledger was not read".to_string();
   for delay in [
     Duration::ZERO,
@@ -443,12 +514,59 @@ async fn initial_touch_count(profile_id: &str, platform: &str) -> Result<usize, 
     if !delay.is_zero() {
       tokio::time::sleep(delay).await;
     }
-    match read_touch_count(profile_id, platform).await {
+    match read_touch_summary(profile_id, platform).await {
       Ok(count) => return Ok(count),
       Err(error) => last_error = error,
     }
   }
   Err(last_error)
+}
+
+/// Whether this leg reached any ledger work before its search-page bootstrap
+/// failed. A browser restart is safe only while this is false: once an ingest,
+/// claim, send guard, or terminal touch exists, retrying the same leg could
+/// overlap the extension's durable handoff.
+fn leg_has_activity_since(
+  records: &[super::prospect::ProspectRecord],
+  profile_id: &str,
+  platform: &str,
+  since: u64,
+) -> bool {
+  records
+    .iter()
+    .filter(|record| record.platform == platform)
+    .any(|record| {
+      // `resolved_at` is refreshed by ingest, including for an existing item.
+      record.resolved_at >= since
+        || (record.claimed_by.as_deref() == Some(profile_id)
+          && record.claimed_at.is_some_and(|at| at >= since))
+        || record
+          .touches
+          .iter()
+          .any(|touch| touch.profile_id == profile_id && touch.at >= since)
+    })
+}
+
+async fn bootstrap_retry_is_safe(profile_id: &str, platform: &str, since: u64) -> bool {
+  let id = profile_id.to_string();
+  let plat = platform.to_string();
+  match tokio::task::spawn_blocking(move || {
+    super::prospect::PROSPECTS
+      .list_local()
+      .map(|records| !leg_has_activity_since(&records, &id, &plat, since))
+  })
+  .await
+  {
+    Ok(Ok(safe)) => safe,
+    Ok(Err(error)) => {
+      log::warn!("Discovery could not verify whether bootstrap retry is safe: {error}");
+      false
+    }
+    Err(error) => {
+      log::warn!("Discovery bootstrap retry ledger task failed: {error}");
+      false
+    }
+  }
 }
 
 fn pause_secs(range: (u64, u64)) -> u64 {
@@ -569,6 +687,49 @@ fn total_legs(profiles: &[ResolvedProfile]) -> usize {
     .sum()
 }
 
+fn report_for(
+  profile: &BrowserProfile,
+  platform: &str,
+  outcome: LegOutcome,
+  error: Option<String>,
+) -> LegReport {
+  LegReport {
+    profile_id: profile.id.to_string(),
+    profile_name: profile.name.clone(),
+    platform: platform.to_string(),
+    outcome,
+    settled_count: 0,
+    error,
+  }
+}
+
+fn append_report_error(report: &mut LegReport, error: impl Into<String>) {
+  let error = error.into();
+  report.error = Some(match report.error.take() {
+    Some(existing) if !existing.is_empty() => format!("{existing}; {error}"),
+    _ => error,
+  });
+}
+
+/// Materialise the unvisited tail of a plan when Stop is pressed.
+///
+/// `total_legs` is the full profile/platform plan. Leaving cancelled legs out
+/// made a 3-platform profile finish as "0/2" and made progress disagree with
+/// the plan shown at start. Explicit reports also tell the operator which work
+/// was deliberately not attempted.
+fn append_cancelled_profiles(profiles: &[ResolvedProfile], finished: &mut Vec<LegReport>) {
+  for resolved in profiles {
+    for platform in &resolved.platforms {
+      finished.push(report_for(
+        &resolved.profile,
+        platform,
+        LegOutcome::Cancelled,
+        None,
+      ));
+    }
+  }
+}
+
 /// Sleep, but notice a cancel request while doing it.
 ///
 /// The pauses between legs and profiles are up to 75 s. A plain `sleep` makes
@@ -644,18 +805,37 @@ async fn run_cycles(
     // `Pausing { running: true }` 上。
     match run_inner(app_handle.clone(), request.clone(), scheduler).await {
       Ok(reports) => {
-        failures = 0;
         last = reports;
         let posted = last
           .iter()
-          .filter(|l| l.outcome == LegOutcome::Settled)
+          .filter(|l| l.outcome == LegOutcome::Posted)
           .count();
-        log::info!(
-          "Discovery cycle {cycle} finished in {}s ({posted}/{} legs settled); resting {} min",
-          started.elapsed().as_secs(),
-          last.len(),
-          gap.as_secs() / 60,
-        );
+        let cancelled = scheduler.cancel.load(Ordering::SeqCst);
+        let total_failure = cycle_is_total_failure(&last);
+        failures = next_cycle_failure_count(failures, &last, cancelled);
+        if cancelled {
+          log::info!(
+            "Discovery cycle {cycle} cancelled after {}s ({posted}/{} legs posted)",
+            started.elapsed().as_secs(),
+            last.len(),
+          );
+        } else if total_failure {
+          log::error!(
+            "Discovery cycle {cycle} produced only failed legs ({failures}/{MAX_CONSECUTIVE_CYCLE_FAILURES})"
+          );
+          if failures >= MAX_CONSECUTIVE_CYCLE_FAILURES {
+            return Err(format!(
+              "all discovery legs failed for {failures} consecutive cycles"
+            ));
+          }
+        } else {
+          log::info!(
+            "Discovery cycle {cycle} finished in {}s ({posted}/{} legs posted); resting {} min",
+            started.elapsed().as_secs(),
+            last.len(),
+            gap.as_secs() / 60,
+          );
+        }
       }
       Err(e) => {
         failures += 1;
@@ -679,6 +859,26 @@ async fn run_cycles(
     }
   }
   Ok(last)
+}
+
+/// A successfully-returned cycle can still be an operational failure: browser
+/// and bootstrap errors are deliberately represented as per-leg data, so
+/// `run_inner` returns `Ok` even when every leg failed. Count that shape toward
+/// the same bounded retry budget as an `Err`, otherwise a broken overnight run
+/// loops forever. Empty/cancelled/normal no-work cycles are not failures.
+fn cycle_is_total_failure(reports: &[LegReport]) -> bool {
+  !reports.is_empty()
+    && reports
+      .iter()
+      .all(|report| report.outcome == LegOutcome::Failed)
+}
+
+fn next_cycle_failure_count(previous: u32, reports: &[LegReport], cancelled: bool) -> u32 {
+  if !cancelled && cycle_is_total_failure(reports) {
+    previous.saturating_add(1)
+  } else {
+    0
+  }
 }
 
 /// 把「每轮之间歇几分钟」变成一个时长。`None` / `0` 表示只跑一轮。
@@ -730,6 +930,8 @@ async fn run_inner(
 
   for (profile_position, resolved) in profiles.iter().enumerate() {
     if scheduler.cancel.load(Ordering::SeqCst) {
+      append_cancelled_profiles(&profiles[profile_position..], &mut finished);
+      leg_index = finished.len();
       break;
     }
 
@@ -747,8 +949,10 @@ async fn run_inner(
       &mut finished,
     )
     .await;
-    leg_index += resolved.platforms.len();
+    leg_index = finished.len();
     if !keep_going {
+      append_cancelled_profiles(&profiles[profile_position + 1..], &mut finished);
+      leg_index = finished.len();
       break;
     }
 
@@ -771,20 +975,23 @@ async fn run_inner(
   }
 
   let cancelled = scheduler.cancel.load(Ordering::SeqCst);
-  scheduler.publish(RunProgress {
-    running: false,
-    leg_index,
-    total_legs,
-    current_profile_id: None,
-    current_profile_name: None,
-    current_platform: None,
-    phase: if cancelled {
+  // Keep the run claim visible until `RunClaim::drop` releases the atomic flag.
+  // Publishing `running: false` here made recurring runs briefly show an enabled
+  // Start button between Done and Pausing; clicking it could only produce
+  // ALREADY_RUNNING because the claim was still held.
+  publish_phase(
+    scheduler,
+    if cancelled {
       RunPhase::Cancelled
     } else {
       RunPhase::Done
     },
-    finished: finished.clone(),
-  });
+    leg_index,
+    total_legs,
+    None,
+    None,
+    &finished,
+  );
   Ok(finished)
 }
 
@@ -844,13 +1051,8 @@ async fn run_profile_session(
   total_legs: usize,
   finished: &mut Vec<LegReport>,
 ) -> bool {
-  let base = |platform: &str, outcome: LegOutcome, error: Option<String>| LegReport {
-    profile_id: profile.id.to_string(),
-    profile_name: profile.name.clone(),
-    platform: platform.to_string(),
-    outcome,
-    settled_count: 0,
-    error,
+  let base = |platform: &str, outcome: LegOutcome, error: Option<String>| {
+    report_for(profile, platform, outcome, error)
   };
 
   // 另一台设备正握着这个 profile 的租约 —— 不要碰它。
@@ -888,12 +1090,20 @@ async fn run_profile_session(
   // 也就是今天的行为。
   let mut restarts_left: u8 = 1;
   let mut cancelled = false;
+  // If cancellation could not initially fence the page, keep enough context
+  // to settle its claim after a later close attempt succeeds. The report index
+  // lets the final profile close replace the provisional Failed result.
+  let mut pending_cancel_cleanup: Option<(usize, PendingCancelledCleanup)> = None;
 
-  for (platform_index, platform) in platforms.iter().enumerate() {
+  let mut platform_index = 0usize;
+  while platform_index < platforms.len() {
+    let platform = &platforms[platform_index];
     let leg_index = leg_base_index + platform_index + 1;
 
     if scheduler.cancel.load(Ordering::SeqCst) {
-      finished.push(base(platform, LegOutcome::Cancelled, None));
+      for rest in &platforms[platform_index..] {
+        finished.push(base(rest, LegOutcome::Cancelled, None));
+      }
       cancelled = true;
       break;
     }
@@ -904,14 +1114,32 @@ async fn run_profile_session(
         "Discovery: browser session for profile {} is gone",
         profile.name
       );
-      close_session(app_handle, session.take()).await;
-      driven_tab = None;
+      if let Err(close_error) =
+        retire_owned_session(app_handle, &mut session, &mut driven_tab).await
+      {
+        let reason = format!(
+          "lost session could not be retired safely; remaining platforms were not launched: {close_error}"
+        );
+        log::error!("Discovery {}: {reason}", profile.name);
+        for rest in &platforms[platform_index..] {
+          finished.push(base(rest, LegOutcome::Failed, Some(reason.clone())));
+        }
+        // One last best effort is allowed, but failure must never transition
+        // this profile back to `session = None` and launch a second process.
+        let _ = retire_owned_session(app_handle, &mut session, &mut driven_tab).await;
+        return !scheduler.cancel.load(Ordering::SeqCst);
+      }
       if restarts_left == 0 {
+        let stopping = scheduler.cancel.load(Ordering::SeqCst);
         for rest in &platforms[platform_index..] {
           finished.push(base(
             rest,
-            LegOutcome::Failed,
-            Some("session lost twice".to_string()),
+            if stopping {
+              LegOutcome::Cancelled
+            } else {
+              LegOutcome::Failed
+            },
+            (!stopping).then(|| "session lost twice".to_string()),
           ));
         }
         return !scheduler.cancel.load(Ordering::SeqCst);
@@ -919,7 +1147,19 @@ async fn run_profile_session(
       restarts_left -= 1;
     }
 
-    let execution = run_leg(
+    // Stop can arrive while the liveness probe or a previous-session close is
+    // awaiting I/O.  Re-check at the last boundary before `run_leg`: otherwise
+    // this iteration can cold-launch and navigate a profile *after* Stop was
+    // accepted, even though the loop-top check ran earlier.
+    if scheduler.cancel.load(Ordering::SeqCst) {
+      for rest in &platforms[platform_index..] {
+        finished.push(base(rest, LegOutcome::Cancelled, None));
+      }
+      cancelled = true;
+      break;
+    }
+
+    let mut execution = run_leg(
       app_handle,
       scheduler,
       profile,
@@ -934,7 +1174,53 @@ async fn run_profile_session(
       &mut driven_tab,
     )
     .await;
-    finished.push(execution.report);
+
+    // A freshly installed/upgraded MV3 worker can miss registration on the
+    // first browser cold start. A page reload cannot register a missing worker,
+    // but a clean browser restart does. This is the sole same-leg retry: it is
+    // offered only by the search-page bootstrap path after proving that the
+    // extension did not ingest, claim, or settle anything, and it consumes the
+    // profile's one session-restart budget. Business failures with a terminal
+    // touch are never retried.
+    if should_retry_on_fresh_session(
+      &execution,
+      restarts_left,
+      scheduler.cancel.load(Ordering::SeqCst),
+    ) {
+      log::warn!(
+        "Discovery: restarting profile {} and retrying the same {platform} leg after a pre-work extension bootstrap failure",
+        profile.name
+      );
+      match retire_owned_session(app_handle, &mut session, &mut driven_tab).await {
+        Ok(()) if !scheduler.cancel.load(Ordering::SeqCst) => {
+          restarts_left -= 1;
+          continue;
+        }
+        Ok(()) => {
+          finished.push(execution.report);
+          for rest in &platforms[platform_index + 1..] {
+            finished.push(base(rest, LegOutcome::Cancelled, None));
+          }
+          return false;
+        }
+        Err(close_error) => {
+          let reason = format!(
+            "bootstrap session could not be retired safely; retry and remaining platforms were aborted: {close_error}"
+          );
+          append_report_error(&mut execution.report, reason.clone());
+          finished.push(execution.report);
+          for rest in &platforms[platform_index + 1..] {
+            finished.push(base(rest, LegOutcome::Failed, Some(reason.clone())));
+          }
+          // Preserve ownership for one last close attempt, but never cold-start
+          // another browser into this profile after a failed kill.
+          let _ = retire_owned_session(app_handle, &mut session, &mut driven_tab).await;
+          return !scheduler.cancel.load(Ordering::SeqCst);
+        }
+      }
+    }
+
+    let session_unusable = execution.session_unusable;
 
     // A CDP page target can survive while its renderer/navigation channel is
     // wedged.  `session_alive` intentionally treats that as alive because it
@@ -942,27 +1228,67 @@ async fn run_profile_session(
     // bounded navigation/readiness/parking operations.  Retire that poisoned
     // session now so it cannot make every remaining platform spend another
     // minute failing against the same visible-but-dead window.
-    if execution.session_unusable {
+    let mut retire_error: Option<String> = None;
+    if session_unusable {
       log::warn!(
         "Discovery: retiring unusable browser session for profile {} after {platform}",
         profile.name
       );
-      close_session(app_handle, session.take()).await;
-      driven_tab = None;
-      if platform_index + 1 < platforms.len() {
-        if restarts_left == 0 {
-          for rest in &platforms[platform_index + 1..] {
-            finished.push(base(
-              rest,
-              LegOutcome::Failed,
-              Some("session became unusable twice".to_string()),
-            ));
+      match retire_owned_session(app_handle, &mut session, &mut driven_tab).await {
+        Ok(()) => {
+          if let Some(pending) = execution.pending_cancel_cleanup.take() {
+            complete_pending_cancel_cleanup(profile, platform, pending, &mut execution.report)
+              .await;
           }
-          return !scheduler.cancel.load(Ordering::SeqCst);
         }
-        restarts_left -= 1;
+        Err(error) => {
+          let reason = format!(
+            "unusable session could not be retired safely; remaining platforms were not launched: {error}"
+          );
+          append_report_error(&mut execution.report, reason.clone());
+          retire_error = Some(reason);
+        }
       }
     }
+
+    let pending = execution.pending_cancel_cleanup.take();
+    let report_index = finished.len();
+    finished.push(execution.report);
+
+    if let Some(reason) = retire_error {
+      if let Some(pending) = pending {
+        pending_cancel_cleanup = Some((report_index, pending));
+      }
+      for rest in &platforms[platform_index + 1..] {
+        finished.push(base(rest, LegOutcome::Failed, Some(reason.clone())));
+      }
+      cancelled = scheduler.cancel.load(Ordering::SeqCst);
+      break;
+    }
+
+    debug_assert!(
+      pending.is_none(),
+      "pending claim cleanup requires a failed session retirement"
+    );
+
+    if session_unusable
+      && platform_index + 1 < platforms.len()
+      && !scheduler.cancel.load(Ordering::SeqCst)
+    {
+      if restarts_left == 0 {
+        for rest in &platforms[platform_index + 1..] {
+          finished.push(base(
+            rest,
+            LegOutcome::Failed,
+            Some("session became unusable twice".to_string()),
+          ));
+        }
+        return true;
+      }
+      restarts_left -= 1;
+    }
+
+    platform_index += 1;
 
     // 平台之间不停顿（运营决定）。
     //
@@ -975,13 +1301,57 @@ async fn run_profile_session(
   publish_phase(
     scheduler,
     RunPhase::Closing,
-    leg_base_index + platforms.len(),
+    finished.len().min(total_legs),
     total_legs,
     Some(profile),
     None,
     finished,
   );
-  close_session(app_handle, session).await;
+  match retire_owned_session(app_handle, &mut session, &mut driven_tab).await {
+    Ok(()) => {
+      if let Some((report_index, pending)) = pending_cancel_cleanup.take() {
+        let platform = finished[report_index].platform.clone();
+        let mut report = finished[report_index].clone();
+        complete_pending_cancel_cleanup(profile, &platform, pending, &mut report).await;
+        finished[report_index] = report;
+        // These rows were provisionally Failed only because the first close
+        // could not prove the page was fenced. Once final shutdown succeeds,
+        // they are ordinary unvisited work from an operator-cancelled run.
+        if scheduler.cancel.load(Ordering::SeqCst) {
+          for tail in &mut finished[report_index + 1..] {
+            if tail.profile_id == profile.id.to_string()
+              && tail.settled_count == 0
+              && tail.outcome == LegOutcome::Failed
+            {
+              tail.outcome = LegOutcome::Cancelled;
+              tail.error = None;
+            }
+          }
+        }
+      }
+    }
+    Err(error) => {
+      log::error!(
+        "Discovery could not release the final browser session for {}: {error}",
+        profile.name
+      );
+      if let Some((report_index, _)) = pending_cancel_cleanup {
+        append_report_error(
+          &mut finished[report_index],
+          format!("final browser shutdown also failed: {error}"),
+        );
+      } else if let Some(report) = finished
+        .iter_mut()
+        .rev()
+        .find(|report| report.profile_id == profile.id.to_string())
+      {
+        append_report_error(report, format!("final browser shutdown failed: {error}"));
+        if report.settled_count == 0 {
+          report.outcome = LegOutcome::Failed;
+        }
+      }
+    }
+  }
   !cancelled && !scheduler.cancel.load(Ordering::SeqCst)
 }
 
@@ -1009,12 +1379,54 @@ async fn session_alive(profile: &BrowserProfile) -> bool {
 
 /// 关掉会话的浏览器。用 launch 返回的那份记录 —— 它带着这次启动真正产生的 pid，
 /// 用启动前的副本会去杀一个早于本次会话的进程号。
-async fn close_session(app_handle: &tauri::AppHandle, session: Option<BrowserProfile>) {
-  let Some(launched) = session else { return };
-  if let Err(e) = crate::browser_runner::kill_browser_profile(app_handle.clone(), launched).await {
+async fn close_session(
+  app_handle: &tauri::AppHandle,
+  session: Option<BrowserProfile>,
+) -> Result<(), String> {
+  let Some(launched) = session else {
+    return Ok(());
+  };
+  let result = crate::browser_runner::kill_browser_profile(app_handle.clone(), launched).await;
+  if let Err(e) = &result {
     log::warn!("Discovery could not close the browser session: {e}");
   }
-  tokio::time::sleep(CLOSE_SETTLE).await;
+  // A confirmed kill gets a short process/lock settle period before reuse. On
+  // failure the page is still live: delaying here gives its content script an
+  // avoidable window to claim or send before cancellation can park it. Return
+  // immediately so `quiesce_cancelled_automation` can attempt `about:blank`.
+  if close_needs_settle_delay(&result) {
+    tokio::time::sleep(CLOSE_SETTLE).await;
+  }
+  result
+}
+
+fn close_needs_settle_delay(result: &Result<(), String>) -> bool {
+  result.is_ok()
+}
+
+/// Close a scheduler-owned browser without ever losing its launch record on a
+/// failed kill. Clearing `session` before success permits the next iteration to
+/// cold-launch a second process into the same profile directory — the one
+/// session shape that can bypass the local at-most-once ledger.
+async fn retire_owned_session(
+  app_handle: &tauri::AppHandle,
+  session: &mut Option<BrowserProfile>,
+  driven_tab: &mut Option<String>,
+) -> Result<(), String> {
+  let result = close_session(app_handle, session.as_ref().cloned()).await;
+  apply_session_close_result(session, driven_tab, result.is_ok());
+  result
+}
+
+fn apply_session_close_result(
+  session: &mut Option<BrowserProfile>,
+  driven_tab: &mut Option<String>,
+  closed: bool,
+) {
+  if closed {
+    *session = None;
+    *driven_tab = None;
+  }
 }
 
 /// profile 的浏览器数据目录 —— CDP 的实例查找就是按这个路径做键的。
@@ -1087,12 +1499,20 @@ async fn wait_for_navigation_commit(
   profile: &BrowserProfile,
   driven_tab: Option<&str>,
   expected: &str,
+  cancel: Option<&AtomicBool>,
 ) -> bool {
   let path = profile_data_path(profile);
   let wayfern = crate::wayfern_manager::WayfernManager::instance();
   let deadline = tokio::time::Instant::now() + NAVIGATION_COMMIT_WAIT;
   loop {
-    if let Some(targets) = wayfern.list_page_targets(&path).await {
+    if cancellation_requested(cancel) {
+      return false;
+    }
+    let targets = tokio::select! {
+      targets = wayfern.list_page_targets(&path) => targets,
+      _ = cancellation_signal(cancel) => return false,
+    };
+    if let Some(targets) = targets {
       let target = driven_tab
         .and_then(|id| targets.iter().find(|t| t.id == id))
         .or_else(|| targets.first());
@@ -1103,7 +1523,10 @@ async fn wait_for_navigation_commit(
     if tokio::time::Instant::now() >= deadline {
       return false;
     }
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::select! {
+      _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+      _ = cancellation_signal(cancel) => return false,
+    }
   }
 }
 
@@ -1122,21 +1545,29 @@ async fn navigate_and_wait(
   profile: &BrowserProfile,
   driven_tab: &mut Option<String>,
   url: &str,
+  cancel: Option<&AtomicBool>,
 ) -> Result<(), String> {
-  tokio::time::timeout(
+  reject_cancelled_navigation(cancel, url)?;
+  let command = tokio::time::timeout(
     NAVIGATION_COMMAND_WAIT,
     wayfern_navigate(profile, driven_tab, url),
-  )
-  .await
-  .map_err(|_| {
+  );
+  let command_result = tokio::select! {
+    result = command => result,
+    _ = cancellation_signal(cancel) => {
+      return Err(format!("navigation cancelled while loading {url}"));
+    }
+  };
+  command_result.map_err(|_| {
     format!(
       "navigation command did not answer within {}s for {url}",
       NAVIGATION_COMMAND_WAIT.as_secs()
     )
   })??;
-  if wait_for_navigation_commit(profile, driven_tab.as_deref(), url).await {
+  if wait_for_navigation_commit(profile, driven_tab.as_deref(), url, cancel).await {
     Ok(())
   } else {
+    reject_cancelled_navigation(cancel, url)?;
     Err(format!(
       "navigation was accepted but did not commit to {url}"
     ))
@@ -1146,6 +1577,7 @@ async fn navigate_and_wait(
 async fn wait_for_extension_ready(
   profile: &BrowserProfile,
   driven_tab: Option<&str>,
+  cancel: Option<&AtomicBool>,
 ) -> Result<(), String> {
   use crate::wayfern_manager::MarineAutomationReadiness;
 
@@ -1153,6 +1585,9 @@ async fn wait_for_extension_ready(
   let wayfern = crate::wayfern_manager::WayfernManager::instance();
   let deadline = tokio::time::Instant::now() + EXTENSION_READY_WAIT;
   loop {
+    if cancellation_requested(cancel) {
+      return Err("extension readiness cancelled".to_string());
+    }
     let now = tokio::time::Instant::now();
     if now >= deadline {
       return Err(format!(
@@ -1163,12 +1598,16 @@ async fn wait_for_extension_ready(
     let budget = deadline
       .saturating_duration_since(now)
       .min(Duration::from_secs(3));
-    match tokio::time::timeout(
+    let readiness = tokio::select! {
+      result = tokio::time::timeout(
       budget,
       wayfern.marine_automation_readiness(&path, driven_tab),
-    )
-    .await
-    {
+      ) => result,
+      _ = cancellation_signal(cancel) => {
+        return Err("extension readiness cancelled".to_string());
+      }
+    };
+    match readiness {
       Ok(MarineAutomationReadiness::Ready) => return Ok(()),
       Ok(MarineAutomationReadiness::Failed(reason)) => {
         return Err(format!(
@@ -1177,8 +1616,108 @@ async fn wait_for_extension_ready(
       }
       Ok(MarineAutomationReadiness::Pending) | Err(_) => {}
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::select! {
+      _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+      _ = cancellation_signal(cancel) => {
+        return Err("extension readiness cancelled".to_string());
+      }
+    }
   }
+}
+
+fn debug_entry_matches_leg(
+  entry: &super::debug_log::LogEntry,
+  profile_id: &str,
+  platform: &str,
+  since: u64,
+) -> bool {
+  if entry.at < since || entry.profile_id.as_deref() != Some(profile_id) {
+    return false;
+  }
+  entry.url.as_deref().is_some_and(|url| match platform {
+    "bilibili" => url.contains("bilibili.com"),
+    "zhihu" => url.contains("zhihu.com"),
+    "douyin" => url.contains("douyin.com"),
+    "xiaohongshu" => url.contains("xiaohongshu.com") || url.contains("xhslink.com"),
+    _ => true,
+  })
+}
+
+/// Preserve the extension's actionable reason for a failed/uncertain terminal
+/// touch. The durable ledger intentionally stores the state, not the adapter's
+/// selector-level error; the debug sink is the evidence source for that detail.
+fn terminal_touch_error(
+  profile_id: &str,
+  platform: &str,
+  since: u64,
+  outcome: LegOutcome,
+) -> Option<String> {
+  if !matches!(outcome, LegOutcome::Failed | LegOutcome::Unconfirmed) {
+    return None;
+  }
+
+  if let Ok(entries) = super::debug_log::DEBUG_LOG.tail(400) {
+    for entry in entries.iter().rev() {
+      if entry.at < since {
+        break;
+      }
+      if !debug_entry_matches_leg(entry, profile_id, platform, since) {
+        continue;
+      }
+      let Some(json_start) = entry.msg.find('{') else {
+        continue;
+      };
+      let Ok(value) = serde_json::from_str::<serde_json::Value>(&entry.msg[json_start..]) else {
+        continue;
+      };
+      let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("");
+      let state = value.get("state").and_then(|v| v.as_str()).unwrap_or("");
+      let matches_outcome = match outcome {
+        LegOutcome::Failed => {
+          state == "failed"
+            || matches!(
+              status,
+              "fill_failed" | "send_failed" | "prepare_send_failed" | "target_changed_before_send"
+            )
+        }
+        LegOutcome::Unconfirmed => state == "unconfirmed" || status == "send_unconfirmed",
+        _ => false,
+      };
+      if !matches_outcome {
+        continue;
+      }
+      if let Some(error) = value
+        .get("error")
+        .and_then(|v| v.as_str())
+        .filter(|error| !error.trim().is_empty())
+      {
+        return Some(error.to_string());
+      }
+      return Some(
+        match status {
+          "fill_failed" => "the comment editor could not be filled",
+          "send_failed" => "the platform submit action failed before a confirmed click",
+          "prepare_send_failed" => "the ledger send guard could not be established",
+          "target_changed_before_send" => "the active page changed before submit",
+          "send_unconfirmed" => "send was attempted, but the platform receipt was not confirmed",
+          _ if outcome == LegOutcome::Unconfirmed => {
+            "send was attempted, but the platform receipt was not confirmed"
+          }
+          _ => "the extension recorded a failed terminal outcome",
+        }
+        .to_string(),
+      );
+    }
+  }
+
+  Some(
+    if outcome == LegOutcome::Unconfirmed {
+      "send was attempted, but the platform receipt was not confirmed"
+    } else {
+      "the extension recorded a failed terminal outcome"
+    }
+    .to_string(),
+  )
 }
 
 /// 扩展是不是已经明确说了「这条腿没戏」。
@@ -1194,132 +1733,184 @@ async fn wait_for_extension_ready(
 /// 用日志 sink 而不是新开一条通道：它就在同一个进程里，而且这些状态本来就
 /// 已经写进去了。这不违反「完成信号是台账」那条原则 —— 这里判定的不是「干完了」
 /// 而是「不可能干成」，台账仍然是唯一记录成果的地方。
-fn leg_is_hopeless(profile_id: &str, platform: &str, since: u64) -> Option<&'static str> {
-  const HOPELESS: [(&str, &str); 20] = [
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HopelessKind {
+  /// An expected account/content condition: the leg had nothing legitimate to
+  /// do, but the automation stack itself is healthy.
+  NoWork,
+  /// An adapter, navigation, persistence, or bootstrap failure. If every leg
+  /// has one of these, the recurring-run fuse must eventually stop the job.
+  SystemFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HopelessReason {
+  message: &'static str,
+  kind: HopelessKind,
+}
+
+impl HopelessReason {
+  fn outcome(self) -> LegOutcome {
+    match self.kind {
+      HopelessKind::NoWork => LegOutcome::TimedOut,
+      HopelessKind::SystemFailure => LegOutcome::Failed,
+    }
+  }
+}
+
+fn classify_hopeless_message(message: &str) -> Option<HopelessReason> {
+  use HopelessKind::{NoWork, SystemFailure};
+
+  const HOPELESS: [(&str, &str, HopelessKind); 20] = [
     (
       "\"status\":\"not_logged_in\"",
       "not logged in on this platform",
+      NoWork,
     ),
     (
       "\"status\":\"nothing_to_claim\"",
       "no eligible targets left for this account",
+      NoWork,
     ),
     (
       "\"status\":\"no_profile_id\"",
       "extension could not resolve the active profile",
+      SystemFailure,
     ),
     (
       "\"status\":\"handoff_write_failed\"",
       "extension could not persist the target handoff",
+      SystemFailure,
     ),
     (
       "\"status\":\"handoff_in_progress\"",
       "an unresolved handoff already owns this browser tab",
+      SystemFailure,
     ),
     (
       "\"status\":\"target_navigation_stalled\"",
       "the old page stayed alive after two exact target navigation attempts",
+      SystemFailure,
     ),
     (
       "\"status\":\"handoff_url_mismatch\"",
       "target navigation did not reach the claimed item",
+      SystemFailure,
     ),
     (
       "\"status\":\"aborted_no_context\"",
       "target page could not obtain a generation context",
+      SystemFailure,
     ),
     (
       "\"status\":\"blocked_hop_limit\"",
       "target replacement limit reached",
+      NoWork,
     ),
     (
       "\"status\":\"blocked_no_hop\"",
       "target replacement is unavailable",
+      SystemFailure,
     ),
     (
       "\"status\":\"blocked_hop_failed\"",
       "target replacement failed",
+      SystemFailure,
     ),
     (
       "\"status\":\"blocked_nothing_left\"",
       "no replacement target remains",
+      NoWork,
     ),
     (
       "\"status\":\"handoff_read_failed\"",
       "extension handoff storage did not become ready",
+      SystemFailure,
     ),
     (
       "\"status\":\"handoff_expired\"",
       "the pre-send target handoff expired before it could run",
+      SystemFailure,
     ),
     (
       "\"status\":\"handoff_redirect_persist_failed\"",
       "extension could not persist the target navigation repair",
+      SystemFailure,
     ),
     (
       "\"status\":\"send_guard_persist_failed\"",
       "extension could not persist the at-most-once send guard",
+      SystemFailure,
     ),
     (
       "\"status\":\"send_already_started\"",
       "extension refused to repeat an already-started send",
+      SystemFailure,
     ),
     (
       "\"status\":\"target_changed_before_send\"",
       "the active SPA target changed before the guarded send",
+      SystemFailure,
     ),
     (
       "\"status\":\"prospect_bootstrap_failed\"",
       "the search-page automation dependencies did not become ready",
+      SystemFailure,
     ),
     (
       "\"status\":\"target_bootstrap_failed\"",
       "the target-page automation dependencies did not become ready",
+      SystemFailure,
     ),
   ];
+  for (needle, reason, kind) in HOPELESS {
+    if message.contains(needle) {
+      return Some(HopelessReason {
+        message: reason,
+        kind,
+      });
+    }
+  }
+
+  // A recoverable settlement failure owns a persistent, at-most-once handoff
+  // and keeps retrying settlement without generating or clicking again.
+  // Parking that document immediately destroys its recovery loop. Only an
+  // explicitly non-recoverable failure can end the leg here.
+  if message.contains("\"status\":\"settle_failed\"") && message.contains("\"recoverable\":false") {
+    return Some(HopelessReason {
+      message: "extension could not safely recover the terminal ledger state",
+      kind: SystemFailure,
+    });
+  }
+
+  // 重试阶梯跑完了还没能开工 —— 搜索页始终解析不出结果。
+  //
+  // **这就是验证墙的真实表现**。不要去检测「页面上有没有验证码元素」：抖音会
+  // 预加载 `rc-verifycenter` 组件，实测一条带着那个 iframe 的腿照样发成功了，
+  // 按元素判会误杀能成的腿。而阶梯（6 次退避重试、约 30 秒）跑完仍然不成，
+  // 意思是「渲染完了也没有结果卡片」—— 页面塌陷、被验证墙顶掉、或者搜索被拦，
+  // 三种都一样没戏，再等两分钟不会变。这是整条自动化链路不可用，不是正常空池。
+  if message.contains("[6/6]") && !message.contains("\"status\":\"claimed\"") {
+    return Some(HopelessReason {
+      message:
+        "search page never yielded results (collapsed, blocked, or behind a verification wall)",
+      kind: SystemFailure,
+    });
+  }
+  None
+}
+
+fn leg_is_hopeless(profile_id: &str, platform: &str, since: u64) -> Option<HopelessReason> {
   let entries = super::debug_log::DEBUG_LOG.tail(400).ok()?;
   for entry in entries.iter().rev() {
     if entry.at < since {
       break;
     }
-    if entry.profile_id.as_deref() != Some(profile_id) {
+    if !debug_entry_matches_leg(entry, profile_id, platform, since) {
       continue;
     }
-    let matches_platform = entry.url.as_deref().is_some_and(|url| match platform {
-      "bilibili" => url.contains("bilibili.com"),
-      "zhihu" => url.contains("zhihu.com"),
-      "douyin" => url.contains("douyin.com"),
-      "xiaohongshu" => url.contains("xiaohongshu.com") || url.contains("xhslink.com"),
-      _ => true,
-    });
-    if !matches_platform {
-      continue;
-    }
-    for (needle, reason) in HOPELESS {
-      if entry.msg.contains(needle) {
-        return Some(reason);
-      }
-    }
-    // A recoverable settlement failure owns a persistent, at-most-once
-    // handoff and keeps retrying settlement without generating or clicking
-    // again.  Parking that document immediately destroys its recovery loop.
-    // Only an explicitly non-recoverable failure can end the leg here.
-    if entry.msg.contains("\"status\":\"settle_failed\"")
-      && entry.msg.contains("\"recoverable\":false")
-    {
-      return Some("extension could not safely recover the terminal ledger state");
-    }
-    // 重试阶梯跑完了还没能开工 —— 搜索页始终解析不出结果。
-    //
-    // **这就是验证墙的真实表现**。不要去检测「页面上有没有验证码元素」：抖音会
-    // 预加载 `rc-verifycenter` 组件，实测一条带着那个 iframe 的腿照样发成功了，
-    // 按元素判会误杀能成的腿。而阶梯（6 次退避重试、约 30 秒）跑完仍然不成，
-    // 意思是「渲染完了也没有结果卡片」—— 页面塌陷、被验证墙顶掉、或者搜索被拦，
-    // 三种都一样没戏，再等两分钟不会变。
-    if entry.msg.contains("[6/6]") && !entry.msg.contains("\"status\":\"claimed\"") {
-      return Some(
-        "search page never yielded results (collapsed, blocked, or behind a verification wall)",
-      );
+    if let Some(reason) = classify_hopeless_message(&entry.msg) {
+      return Some(reason);
     }
   }
   None
@@ -1329,15 +1920,29 @@ fn leg_is_hopeless(profile_id: &str, platform: &str, since: u64) -> Option<&'sta
 ///
 /// 等不到也照常往下走：下一次导航自带 30 秒上限，最坏是那条腿失败，
 /// 而不是在这里把整轮拖死。
-async fn wait_until_idle(profile: &BrowserProfile, driven_tab: Option<&str>) {
+async fn wait_until_idle(
+  profile: &BrowserProfile,
+  driven_tab: Option<&str>,
+  cancel: Option<&AtomicBool>,
+) {
   let path = profile_data_path(profile);
   let wayfern = crate::wayfern_manager::WayfernManager::instance();
   let deadline = tokio::time::Instant::now() + IDLE_WAIT;
   while tokio::time::Instant::now() < deadline {
-    if wayfern.renderer_responds(&path, driven_tab).await {
+    if cancellation_requested(cancel) {
       return;
     }
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let responds = tokio::select! {
+      responds = wayfern.renderer_responds(&path, driven_tab) => responds,
+      _ = cancellation_signal(cancel) => return,
+    };
+    if responds {
+      return;
+    }
+    tokio::select! {
+      _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+      _ = cancellation_signal(cancel) => return,
+    }
   }
   log::warn!(
     "Discovery: renderer still busy after parking profile {}",
@@ -1354,19 +1959,24 @@ async fn wait_until_idle(profile: &BrowserProfile, driven_tab: Option<&str>) {
 ///
 /// 预热失败不致命：直接试搜索页，最坏退回到今天的失败形态，而不是凭空多一种。
 async fn navigate_with_warmup(
+  scheduler: &DiscoveryScheduler,
   profile: &BrowserProfile,
   driven_tab: &mut Option<String>,
   slot: &super::search_slot::SearchSlot,
 ) -> Result<(), String> {
   if let Some(warmup) = slot.warmup_url.as_deref() {
-    match navigate_retrying(profile, driven_tab, warmup).await {
-      Ok(()) => tokio::time::sleep(WARMUP_SETTLE).await,
+    match navigate_retrying(profile, driven_tab, warmup, Some(&scheduler.cancel)).await {
+      Ok(()) => {
+        if !sleep_or_cancel(scheduler, WARMUP_SETTLE).await {
+          return Err("navigation cancelled during search-page warm-up".to_string());
+        }
+      }
       Err(e) => {
         log::warn!("Discovery warm-up navigation failed ({e}); trying the search page anyway")
       }
     }
   }
-  navigate_retrying(profile, driven_tab, &slot.url).await
+  navigate_retrying(profile, driven_tab, &slot.url, Some(&scheduler.cancel)).await
 }
 
 /// 导航，超时就等渲染进程空下来再试一次。
@@ -1381,16 +1991,52 @@ async fn navigate_retrying(
   profile: &BrowserProfile,
   driven_tab: &mut Option<String>,
   url: &str,
+  cancel: Option<&AtomicBool>,
 ) -> Result<(), String> {
-  match navigate_and_wait(profile, driven_tab, url).await {
+  reject_cancelled_navigation(cancel, url)?;
+  match navigate_and_wait(profile, driven_tab, url, cancel).await {
     Ok(()) => Ok(()),
     Err(first) => {
+      reject_cancelled_navigation(cancel, url)?;
       log::warn!(
         "Discovery navigation failed ({first}); waiting for the renderer and retrying once"
       );
-      wait_until_idle(profile, driven_tab.as_deref()).await;
-      navigate_and_wait(profile, driven_tab, url).await
+      wait_until_idle(profile, driven_tab.as_deref(), cancel).await;
+      // A failed navigation followed by the idle wait is a wide cancellation
+      // window. Never start its retry after Stop. Cancellation's deliberate
+      // `about:blank` fence calls this helper with `cancel = None`; normal leg
+      // parking remains interruptible.
+      reject_cancelled_navigation(cancel, url)?;
+      navigate_and_wait(profile, driven_tab, url, cancel).await
     }
+  }
+}
+
+fn reject_cancelled_navigation(cancel: Option<&AtomicBool>, url: &str) -> Result<(), String> {
+  if cancellation_requested(cancel) {
+    Err(format!("navigation cancelled before loading {url}"))
+  } else {
+    Ok(())
+  }
+}
+
+fn cancellation_requested(cancel: Option<&AtomicBool>) -> bool {
+  cancel.is_some_and(|flag| flag.load(Ordering::SeqCst))
+}
+
+/// Async edge for `tokio::select!` around CDP calls. Atomic cancellation has no
+/// notifier, so sample it frequently; 100ms is short relative to the humanized
+/// typing/send pipeline and keeps Stop responsive without a hot loop.
+async fn cancellation_signal(cancel: Option<&AtomicBool>) {
+  let Some(cancel) = cancel else {
+    std::future::pending::<()>().await;
+    return;
+  };
+  loop {
+    if cancel.load(Ordering::SeqCst) {
+      return;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
   }
 }
 
@@ -1449,6 +2095,18 @@ struct LegExecution {
   /// Strong evidence that the current browser session must not be reused for
   /// another platform, even when `/json` still exposes a page target.
   session_unusable: bool,
+  /// A search-page extension bootstrap failed before any ledger work. This is
+  /// the only failure allowed to retry the same platform on a fresh session.
+  retry_on_fresh_session: bool,
+  /// Stop was requested, but the page could not yet be fenced. Claims must not
+  /// be settled until a later close attempt succeeds.
+  pending_cancel_cleanup: Option<PendingCancelledCleanup>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingCancelledCleanup {
+  leg_started_at: u64,
+  baseline: TerminalTouches,
 }
 
 impl LegExecution {
@@ -1456,6 +2114,8 @@ impl LegExecution {
     Self {
       report,
       session_unusable: false,
+      retry_on_fresh_session: false,
+      pending_cancel_cleanup: None,
     }
   }
 
@@ -1463,7 +2123,283 @@ impl LegExecution {
     Self {
       report,
       session_unusable: true,
+      retry_on_fresh_session: false,
+      pending_cancel_cleanup: None,
     }
+  }
+
+  fn bootstrap_failure(report: LegReport, retry_is_safe: bool) -> Self {
+    Self {
+      report,
+      session_unusable: true,
+      retry_on_fresh_session: retry_is_safe,
+      pending_cancel_cleanup: None,
+    }
+  }
+}
+
+fn should_retry_on_fresh_session(
+  execution: &LegExecution,
+  restarts_left: u8,
+  cancelled: bool,
+) -> bool {
+  execution.retry_on_fresh_session && restarts_left > 0 && !cancelled
+}
+
+/// Stop page-side automation before releasing this leg's claims.
+///
+/// Killing the owned browser is the strongest fence: after it succeeds no
+/// content script can claim another target or cross the send guard.  If the
+/// process manager cannot kill it, parking the driven document on
+/// `about:blank` is an acceptable fallback because committing that navigation
+/// destroys the document and its timers.  A final kill retry covers the case
+/// where both the first process lookup and CDP briefly raced shutdown.
+async fn quiesce_cancelled_automation(
+  app_handle: &tauri::AppHandle,
+  profile: &BrowserProfile,
+  session: &mut Option<BrowserProfile>,
+  driven_tab: &mut Option<String>,
+) -> Result<(), String> {
+  if session.is_none() {
+    // `driven_tab` is meaningful only inside an owned session. There is no
+    // scheduler-started page left that could create a new claim.
+    *driven_tab = None;
+    return Ok(());
+  }
+
+  match retire_owned_session(app_handle, session, driven_tab).await {
+    Ok(()) => Ok(()),
+    Err(first_kill_error) => {
+      log::warn!(
+        "Discovery stop could not kill {} immediately ({first_kill_error}); parking its page before claim cleanup",
+        profile.name
+      );
+
+      if navigate_retrying(profile, driven_tab, "about:blank", None)
+        .await
+        .is_ok()
+      {
+        return Ok(());
+      }
+
+      // Do not settle while a target document might still be alive. One final
+      // process-level attempt is safer than manufacturing Skipped/Unconfirmed
+      // and then allowing the page to claim or send again behind the ledger.
+      match retire_owned_session(app_handle, session, driven_tab).await {
+        Ok(()) => Ok(()),
+        Err(second_kill_error) => Err(format!(
+          "could not stop page automation before cancelled-claim cleanup: first kill failed ({first_kill_error}); parking failed; final kill failed ({second_kill_error})"
+        )),
+      }
+    }
+  }
+}
+
+/// Settle claims only after the caller has established a page-automation
+/// fence, then read back the durable result. The prospect layer preserves the
+/// irreversible boundary: pre-send claims become Skipped; `send_started`
+/// claims become Unconfirmed.
+async fn settle_cancelled_leg_after_quiescence(
+  profile: &BrowserProfile,
+  profile_id: &str,
+  platform: &str,
+  leg_started_at: u64,
+  baseline: TerminalTouches,
+) -> (TerminalTouches, Vec<String>) {
+  let mut errors = Vec::new();
+  let mut cleanup_fallback = TerminalTouches::default();
+  let cancelled_profile = profile_id.to_string();
+  let cancelled_platform = platform.to_string();
+  match tokio::task::spawn_blocking(move || {
+    super::prospect::PROSPECTS.settle_cancelled_claims(
+      &cancelled_profile,
+      &cancelled_platform,
+      leg_started_at,
+    )
+  })
+  .await
+  {
+    Ok(Ok(report)) => {
+      cleanup_fallback.skipped = report.skipped;
+      cleanup_fallback.unconfirmed = report.unconfirmed;
+      if report.total() > 0 {
+        log::info!(
+          "Discovery cancellation resolved {} claim(s) for {} on {platform}: {} skipped, {} unconfirmed",
+          report.total(),
+          profile.name,
+          report.skipped,
+          report.unconfirmed,
+        );
+      }
+    }
+    Ok(Err(error)) => {
+      let error = format!("could not safely settle this leg's claim while stopping: {error}");
+      log::warn!(
+        "Discovery cancellation could not resolve {} on {platform}: {error}",
+        profile.name
+      );
+      errors.push(error);
+    }
+    Err(error) => {
+      let error = format!("cancelled-claim cleanup task failed while stopping: {error}");
+      log::warn!(
+        "Discovery cancellation cleanup task failed for {} on {platform}: {error}",
+        profile.name
+      );
+      errors.push(error);
+    }
+  }
+
+  // Re-read instead of manufacturing a state from the cleanup report: the
+  // extension may have settled concurrently just before it was quiesced. Its
+  // real touch (especially Posted/Unconfirmed) must win.
+  let terminal_touches = match read_touch_summary(profile_id, platform).await {
+    Ok(now) => now.since(baseline),
+    Err(error) if cleanup_fallback.total() > 0 => {
+      errors.push(format!(
+        "cancelled claims were resolved, but their terminal state could not be re-read: {error}"
+      ));
+      cleanup_fallback
+    }
+    Err(error) => {
+      errors.push(format!(
+        "could not verify the ledger while stopping this leg: {error}"
+      ));
+      TerminalTouches::default()
+    }
+  };
+  (terminal_touches, errors)
+}
+
+async fn complete_pending_cancel_cleanup(
+  profile: &BrowserProfile,
+  platform: &str,
+  pending: PendingCancelledCleanup,
+  report: &mut LegReport,
+) {
+  let (terminal_touches, errors) = settle_cancelled_leg_after_quiescence(
+    profile,
+    &report.profile_id,
+    platform,
+    pending.leg_started_at,
+    pending.baseline,
+  )
+  .await;
+  let outcome = terminal_touches.outcome().unwrap_or(LegOutcome::Cancelled);
+  report.outcome = outcome;
+  report.settled_count = terminal_touches.total();
+  report.error = if errors.is_empty() {
+    terminal_touch_error(
+      &report.profile_id,
+      platform,
+      pending.leg_started_at,
+      outcome,
+    )
+  } else {
+    Some(errors.join("; "))
+  };
+
+  if outcome == LegOutcome::Posted {
+    if let Err(error) =
+      super::login_status::LOGIN_STATUS.clear_platform(&report.profile_id, platform)
+    {
+      log::warn!("Could not clear Marine login flag: {error}");
+    }
+  }
+}
+
+/// Finalize one operator-cancelled leg.  Ordering is the safety contract:
+/// quiesce the browser document first, then settle owned claims, then read the
+/// durable terminal state used by the report.  Reversing the first two steps
+/// leaves a window where the live page can claim again after cleanup.
+#[allow(clippy::too_many_arguments)]
+async fn finish_cancelled_leg(
+  app_handle: &tauri::AppHandle,
+  scheduler: &DiscoveryScheduler,
+  profile: &BrowserProfile,
+  platform: &str,
+  leg_index: usize,
+  total_legs: usize,
+  finished: &[LegReport],
+  profile_id: &str,
+  leg_started_at: u64,
+  baseline: TerminalTouches,
+  base: LegReport,
+  session: &mut Option<BrowserProfile>,
+  driven_tab: &mut Option<String>,
+) -> LegExecution {
+  publish_leg(
+    scheduler,
+    RunPhase::Closing,
+    leg_index,
+    total_legs,
+    profile,
+    platform,
+    finished,
+  );
+
+  let quiesce_result = quiesce_cancelled_automation(app_handle, profile, session, driven_tab).await;
+  let session_unusable = quiesce_result.is_err();
+  let (terminal_touches, errors) = if let Err(error) = quiesce_result {
+    // Crucially, do not release claims while page automation may still be
+    // running. Their TTL is preferable to a false terminal state followed by
+    // a late send. The caller will make another best-effort session close.
+    log::error!(
+      "Discovery cancellation could not quiesce {} on {platform}: {error}",
+      profile.name
+    );
+    let mut errors = vec![error];
+    let terminal_touches = match read_touch_summary(profile_id, platform).await {
+      Ok(now) => now.since(baseline),
+      Err(error) => {
+        errors.push(format!(
+          "could not verify the ledger while stopping this leg: {error}"
+        ));
+        TerminalTouches::default()
+      }
+    };
+    (terminal_touches, errors)
+  } else {
+    settle_cancelled_leg_after_quiescence(profile, profile_id, platform, leg_started_at, baseline)
+      .await
+  };
+
+  let outcome = terminal_touches.outcome().unwrap_or(if session_unusable {
+    LegOutcome::Failed
+  } else {
+    LegOutcome::Cancelled
+  });
+  let error = if errors.is_empty() {
+    terminal_touch_error(profile_id, platform, leg_started_at, outcome)
+  } else {
+    Some(errors.join("; "))
+  };
+
+  if outcome == LegOutcome::Posted {
+    if let Err(error) = super::login_status::LOGIN_STATUS.clear_platform(profile_id, platform) {
+      log::warn!("Could not clear Marine login flag: {error}");
+    }
+  }
+
+  log::info!(
+    "Discovery leg {leg_index}/{total_legs} stopped: {} on {platform} → {outcome:?} ({} terminal touch(es))",
+    profile.name,
+    terminal_touches.total(),
+  );
+
+  LegExecution {
+    report: LegReport {
+      outcome,
+      settled_count: terminal_touches.total(),
+      error,
+      ..base
+    },
+    session_unusable,
+    retry_on_fresh_session: false,
+    pending_cancel_cleanup: session_unusable.then_some(PendingCancelledCleanup {
+      leg_started_at,
+      baseline,
+    }),
   }
 }
 
@@ -1496,6 +2432,15 @@ async fn run_leg(
     error: None,
   };
 
+  // Defensive boundary in addition to the caller's pre-leg check. No work for
+  // this leg has started yet, so there is no owned claim to settle.
+  if scheduler.cancel.load(Ordering::SeqCst) {
+    return LegExecution::healthy(LegReport {
+      outcome: LegOutcome::Cancelled,
+      ..base
+    });
+  }
+
   let Some(slot) = super::search_slot::slot_for(platform, keyword, account_index) else {
     log::info!("Discovery: no search slot for platform {platform}, skipping");
     return LegExecution::healthy(base);
@@ -1514,8 +2459,8 @@ async fn run_leg(
   // Baseline BEFORE the browser opens. Anything appended after this point is
   // this leg's work. Never invent a zero baseline: if this profile/platform has
   // historical touches, a later successful read would credit all of them to
-  // this leg and falsely report Settled without doing any work.
-  let baseline = match initial_touch_count(&profile_id, platform).await {
+  // this leg and falsely report a new terminal outcome without doing any work.
+  let baseline = match initial_touch_summary(&profile_id, platform).await {
     Ok(count) => count,
     Err(error) => {
       return LegExecution::healthy(LegReport {
@@ -1531,6 +2476,13 @@ async fn run_leg(
   // is still applying CDP setup.  Correlating only from Working onward misses
   // that evidence and turns a known no-op into a full leg timeout.
   let leg_started_at = crate::proxy_manager::now_secs();
+
+  if scheduler.cancel.load(Ordering::SeqCst) {
+    return LegExecution::healthy(LegReport {
+      outcome: LegOutcome::Cancelled,
+      ..base
+    });
+  }
 
   log::info!(
     "Discovery leg {leg_index}/{total_legs}: profile {} on {platform} → {} ({})",
@@ -1553,14 +2505,20 @@ async fn run_leg(
     // 个旧页，再逐页串行跑 CDP 设置，窗口虽然开了，scheduler 却可能几分钟都
     // 拿不回控制权。更重要的是：启动器的初始 Page.navigate 失败只记日志，不能
     // 作为编排的就绪契约。因此 URL 一律在 launch 返回、页签身份确定后由这里驱动。
-    match crate::browser_runner::launch_browser_profile_for_automation(
+    let launch_result = crate::browser_runner::launch_browser_profile_for_automation(
       app_handle.clone(),
       profile.clone(),
     )
-    .await
-    {
+    .await;
+    match launch_result {
       Ok(p) => *session = Some(p),
       Err(e) => {
+        if scheduler.cancel.load(Ordering::SeqCst) {
+          return LegExecution::healthy(LegReport {
+            outcome: LegOutcome::Cancelled,
+            ..base
+          });
+        }
         log::error!(
           "Discovery leg failed to launch profile {}: {e}",
           profile.name
@@ -1572,11 +2530,69 @@ async fn run_leg(
         });
       }
     }
+
+    if scheduler.cancel.load(Ordering::SeqCst) {
+      return finish_cancelled_leg(
+        app_handle,
+        scheduler,
+        profile,
+        platform,
+        leg_index,
+        total_legs,
+        finished,
+        &profile_id,
+        leg_started_at,
+        baseline,
+        base,
+        session,
+        driven_tab,
+      )
+      .await;
+    }
+
     // 防御性收敛：策略上不再恢复会话，但平台/浏览器仍可能自己产生额外页签。
     *driven_tab = sweep_tabs(profile, driven_tab.as_deref()).await;
   }
 
-  if let Err(e) = navigate_with_warmup(profile, driven_tab, &slot).await {
+  if scheduler.cancel.load(Ordering::SeqCst) {
+    return finish_cancelled_leg(
+      app_handle,
+      scheduler,
+      profile,
+      platform,
+      leg_index,
+      total_legs,
+      finished,
+      &profile_id,
+      leg_started_at,
+      baseline,
+      base,
+      session,
+      driven_tab,
+    )
+    .await;
+  }
+
+  let navigation_result = navigate_with_warmup(scheduler, profile, driven_tab, &slot).await;
+  if scheduler.cancel.load(Ordering::SeqCst) {
+    return finish_cancelled_leg(
+      app_handle,
+      scheduler,
+      profile,
+      platform,
+      leg_index,
+      total_legs,
+      finished,
+      &profile_id,
+      leg_started_at,
+      baseline,
+      base,
+      session,
+      driven_tab,
+    )
+    .await;
+  }
+  if let Err(e) = navigation_result {
     log::warn!(
       "Discovery leg could not navigate profile {} to {platform}: {e}",
       profile.name
@@ -1593,25 +2609,110 @@ async fn run_leg(
   // Marine content script actually bootstrapped.  One exact reload heals a
   // transient injection/navigation race.  A second miss fails in ~24s instead
   // of looking frozen for the full leg timeout.
-  if let Err(first_error) = wait_for_extension_ready(profile, driven_tab.as_deref()).await {
+  let first_readiness =
+    wait_for_extension_ready(profile, driven_tab.as_deref(), Some(&scheduler.cancel)).await;
+  if scheduler.cancel.load(Ordering::SeqCst) {
+    return finish_cancelled_leg(
+      app_handle,
+      scheduler,
+      profile,
+      platform,
+      leg_index,
+      total_legs,
+      finished,
+      &profile_id,
+      leg_started_at,
+      baseline,
+      base,
+      session,
+      driven_tab,
+    )
+    .await;
+  }
+  if let Err(first_error) = first_readiness {
     log::warn!(
       "Discovery: Marine extension did not become ready on {platform} ({first_error}); reloading the search page once"
     );
-    if let Err(e) = navigate_retrying(profile, driven_tab, &slot.url).await {
+    let reload_result =
+      navigate_retrying(profile, driven_tab, &slot.url, Some(&scheduler.cancel)).await;
+    if scheduler.cancel.load(Ordering::SeqCst) {
+      return finish_cancelled_leg(
+        app_handle,
+        scheduler,
+        profile,
+        platform,
+        leg_index,
+        total_legs,
+        finished,
+        &profile_id,
+        leg_started_at,
+        baseline,
+        base,
+        session,
+        driven_tab,
+      )
+      .await;
+    }
+    if let Err(e) = reload_result {
       return LegExecution::unusable(LegReport {
         outcome: LegOutcome::Failed,
         error: Some(format!("extension bootstrap reload failed: {e}")),
         ..base
       });
     }
-    if let Err(second_error) = wait_for_extension_ready(profile, driven_tab.as_deref()).await {
-      return LegExecution::unusable(LegReport {
-        outcome: LegOutcome::Failed,
-        error: Some(format!(
-          "Marine extension bootstrap failed after one reload: {second_error}"
-        )),
-        ..base
-      });
+    let second_readiness =
+      wait_for_extension_ready(profile, driven_tab.as_deref(), Some(&scheduler.cancel)).await;
+    if scheduler.cancel.load(Ordering::SeqCst) {
+      return finish_cancelled_leg(
+        app_handle,
+        scheduler,
+        profile,
+        platform,
+        leg_index,
+        total_legs,
+        finished,
+        &profile_id,
+        leg_started_at,
+        baseline,
+        base,
+        session,
+        driven_tab,
+      )
+      .await;
+    }
+    if let Err(second_error) = second_readiness {
+      let retry_is_safe = tokio::select! {
+        safe = bootstrap_retry_is_safe(&profile_id, platform, leg_started_at) => Some(safe),
+        _ = cancellation_signal(Some(&scheduler.cancel)) => None,
+      };
+      let Some(retry_is_safe) = retry_is_safe else {
+        return finish_cancelled_leg(
+          app_handle,
+          scheduler,
+          profile,
+          platform,
+          leg_index,
+          total_legs,
+          finished,
+          &profile_id,
+          leg_started_at,
+          baseline,
+          base,
+          session,
+          driven_tab,
+        )
+        .await;
+      };
+      return LegExecution::bootstrap_failure(
+        LegReport {
+          outcome: LegOutcome::Failed,
+          error: Some(format!(
+            "Marine extension bootstrap failed after one reload: {second_error}"
+          )),
+          ..base
+        },
+        retry_is_safe,
+      );
     }
   }
 
@@ -1632,9 +2733,31 @@ async fn run_leg(
   // 却和内容失败一模一样，候选就这么被白烧掉。这里先把它记下来，别让它继续伪装
   // 成内容问题。真正的解法（AllowSetForegroundWindow / AttachThreadInput 提权序列
   // + GetForegroundWindow 实测校验）要在 Windows 上写和验，不能在这里盲写。
-  let focused = crate::wayfern_manager::WayfernManager::instance()
-    .bring_to_front(&profile_data_path(profile), driven_tab.as_deref())
+  let focus_profile_path = profile_data_path(profile);
+  let focused = tokio::select! {
+    focused = crate::wayfern_manager::WayfernManager::instance()
+      .bring_to_front(&focus_profile_path, driven_tab.as_deref()) => Some(focused),
+    _ = cancellation_signal(Some(&scheduler.cancel)) => None,
+  };
+  if focused.is_none() || scheduler.cancel.load(Ordering::SeqCst) {
+    return finish_cancelled_leg(
+      app_handle,
+      scheduler,
+      profile,
+      platform,
+      leg_index,
+      total_legs,
+      finished,
+      &profile_id,
+      leg_started_at,
+      baseline,
+      base,
+      session,
+      driven_tab,
+    )
     .await;
+  }
+  let focused = focused.unwrap_or(false);
   if !focused {
     log::warn!(
       "Could not bring {}'s window to the front for {platform}. On Windows this is expected \
@@ -1655,7 +2778,7 @@ async fn run_leg(
   );
 
   let deadline = tokio::time::Instant::now() + leg_timeout;
-  let mut settled = 0usize;
+  let mut terminal_touches = TerminalTouches::default();
   // 渲染进程卡死是个**真实且可复现**的形态（实测：小红书搜索页会稳定把它搞死，
   // 两次两中）。它的阴险之处在于从外面看什么都正常 —— `/json` 里 target 还在，
   // `Page.navigate` 也照常返回，因为那些是浏览器进程处理的。没有探针的话这条腿
@@ -1666,7 +2789,7 @@ async fn run_leg(
   // 连续两次不应答才算数 —— 一次可能只是页面正忙。
   let mut wedged = 0u8;
   let mut wedge_error: Option<String> = None;
-  let mut hopeless: Option<&'static str> = None;
+  let mut hopeless: Option<HopelessReason> = None;
   let mut target_bridge_pending_since: Option<tokio::time::Instant> = None;
   let mut target_bridge_reloaded = false;
   let mut target_bridge_url: Option<String> = None;
@@ -1674,9 +2797,16 @@ async fn run_leg(
     if scheduler.cancel.load(Ordering::SeqCst) {
       break;
     }
-    match read_touch_count(&profile_id, platform).await {
-      Ok(now) if now > baseline => {
-        settled = now - baseline;
+    let touch_summary = tokio::select! {
+      summary = read_touch_summary(&profile_id, platform) => Some(summary),
+      _ = cancellation_signal(Some(&scheduler.cancel)) => None,
+    };
+    let Some(touch_summary) = touch_summary else {
+      break;
+    };
+    match touch_summary {
+      Ok(now) if now.since(baseline).total() > 0 => {
+        terminal_touches = now.since(baseline);
         break;
       }
       Ok(_) => {}
@@ -1696,7 +2826,17 @@ async fn run_leg(
     // leaves a healthy renderer with no logs or touch until the full leg
     // timeout.  Give that document the same bounded one-reload contract while
     // retaining the tab-scoped handoff in the service worker.
-    if let Some(current_url) = driven_tab_url(profile, driven_tab.as_deref()).await {
+    let current_url = tokio::select! {
+      url = driven_tab_url(profile, driven_tab.as_deref()) => Some(url),
+      _ = cancellation_signal(Some(&scheduler.cancel)) => None,
+    };
+    let Some(current_url) = current_url else {
+      break;
+    };
+    if scheduler.cancel.load(Ordering::SeqCst) {
+      break;
+    }
+    if let Some(current_url) = current_url {
       let on_target = current_url != "about:blank" && !navigation_reached(&slot.url, &current_url);
       if on_target {
         // A blocked item can hop to another target in the same leg.  Each new
@@ -1709,13 +2849,21 @@ async fn run_leg(
           target_bridge_reloaded = false;
         }
         use crate::wayfern_manager::MarineAutomationReadiness;
-        let readiness = tokio::time::timeout(
-          Duration::from_secs(3),
-          crate::wayfern_manager::WayfernManager::instance()
-            .marine_automation_readiness(&profile_data_path(profile), driven_tab.as_deref()),
-        )
-        .await
-        .unwrap_or(MarineAutomationReadiness::Pending);
+        let readiness_profile_path = profile_data_path(profile);
+        let readiness = tokio::select! {
+          result = tokio::time::timeout(
+            Duration::from_secs(3),
+            crate::wayfern_manager::WayfernManager::instance()
+              .marine_automation_readiness(&readiness_profile_path, driven_tab.as_deref()),
+          ) => Some(result.unwrap_or(MarineAutomationReadiness::Pending)),
+          _ = cancellation_signal(Some(&scheduler.cancel)) => None,
+        };
+        let Some(readiness) = readiness else {
+          break;
+        };
+        if scheduler.cancel.load(Ordering::SeqCst) {
+          break;
+        }
         match readiness {
           MarineAutomationReadiness::Ready => target_bridge_pending_since = None,
           MarineAutomationReadiness::Failed(reason) => {
@@ -1738,7 +2886,9 @@ async fn run_leg(
               log::warn!(
                 "Discovery: target Marine bridge did not become ready on {platform}; reloading the target once"
               );
-              if let Err(error) = navigate_retrying(profile, driven_tab, &current_url).await {
+              if let Err(error) =
+                navigate_retrying(profile, driven_tab, &current_url, Some(&scheduler.cancel)).await
+              {
                 wedge_error = Some(format!("target extension bootstrap reload failed: {error}"));
                 break;
               }
@@ -1756,15 +2906,22 @@ async fn run_leg(
     }
     if let Some(reason) = leg_is_hopeless(&profile_id, platform, leg_started_at) {
       log::info!(
-        "Discovery leg {leg_index}/{total_legs}: {platform} has nothing to do ({reason}); ending early"
+        "Discovery leg {leg_index}/{total_legs}: {platform} cannot continue ({}); ending early",
+        reason.message,
       );
       hopeless = Some(reason);
       break;
     }
-    if crate::wayfern_manager::WayfernManager::instance()
-      .renderer_responds(&profile_data_path(profile), driven_tab.as_deref())
-      .await
-    {
+    let renderer_profile_path = profile_data_path(profile);
+    let renderer_responds = tokio::select! {
+      responds = crate::wayfern_manager::WayfernManager::instance()
+        .renderer_responds(&renderer_profile_path, driven_tab.as_deref()) => Some(responds),
+      _ = cancellation_signal(Some(&scheduler.cancel)) => None,
+    };
+    let Some(renderer_responds) = renderer_responds else {
+      break;
+    };
+    if renderer_responds {
       wedged = 0;
     } else {
       wedged += 1;
@@ -1776,7 +2933,29 @@ async fn run_leg(
         break;
       }
     }
-    tokio::time::sleep(POLL_INTERVAL).await;
+    tokio::select! {
+      _ = tokio::time::sleep(POLL_INTERVAL) => {}
+      _ = cancellation_signal(Some(&scheduler.cancel)) => break,
+    }
+  }
+
+  if scheduler.cancel.load(Ordering::SeqCst) {
+    return finish_cancelled_leg(
+      app_handle,
+      scheduler,
+      profile,
+      platform,
+      leg_index,
+      total_legs,
+      finished,
+      &profile_id,
+      leg_started_at,
+      baseline,
+      base,
+      session,
+      driven_tab,
+    )
+    .await;
   }
 
   publish_leg(
@@ -1789,6 +2968,28 @@ async fn run_leg(
     finished,
   );
 
+  // `publish_leg` is synchronous but still emits through the desktop event
+  // layer. Close the tiny loop-check → park gap: if Stop landed there, enter
+  // the kill/blank fence directly instead of beginning a normal bounded park.
+  if scheduler.cancel.load(Ordering::SeqCst) {
+    return finish_cancelled_leg(
+      app_handle,
+      scheduler,
+      profile,
+      platform,
+      leg_index,
+      total_legs,
+      finished,
+      &profile_id,
+      leg_started_at,
+      baseline,
+      base,
+      session,
+      driven_tab,
+    )
+    .await;
+  }
+
   // 腿结束 = 把页面停掉，不是把浏览器关掉。
   //
   // 导航到 about:blank 才算真的收尾：页面留在原地的话，它的编排重试阶梯还在跑
@@ -1797,35 +2998,55 @@ async fn run_leg(
   // 一起消失，效果等价于以前那次 kill，但浏览器活着给下一个平台用。
   //
   // 顺手再收一次页签：平台自己可能开过新标签页（外链、播放页）。
-  let close_error = match navigate_retrying(profile, driven_tab, "about:blank").await {
-    Ok(()) => {
-      // 等渲染进程真的空下来再交给下一条腿。
-      //
-      // 上面的 commit 校验只证明 URL 已经切到 about:blank，不代表旧的重型 SPA
-      // 已经完成拆卸。B 站/抖音 加上注入脚本，卸载会继续占住渲染进程一会儿 ——
-      // 下一条腿若立刻导航，仍可能撞上一个不应答的 renderer。
-      //
-      // 实测规律干净得没有歧义：上一条腿**真发出去了**（B站、抖音）→ 下一次导航
-      // 必超时；上一条腿立刻失败、根本没干活（知乎那次）→ 下一次导航正常。
-      wait_until_idle(profile, driven_tab.as_deref()).await;
-      *driven_tab = sweep_tabs(profile, driven_tab.as_deref()).await;
-      None
-    }
-    Err(e) => {
-      log::warn!("Discovery leg could not park profile {}: {e}", profile.name);
-      Some(e)
-    }
-  };
+  let close_error =
+    match navigate_retrying(profile, driven_tab, "about:blank", Some(&scheduler.cancel)).await {
+      Ok(()) => {
+        // 等渲染进程真的空下来再交给下一条腿。
+        //
+        // 上面的 commit 校验只证明 URL 已经切到 about:blank，不代表旧的重型 SPA
+        // 已经完成拆卸。B 站/抖音 加上注入脚本，卸载会继续占住渲染进程一会儿 ——
+        // 下一条腿若立刻导航，仍可能撞上一个不应答的 renderer。
+        //
+        // 实测规律干净得没有歧义：上一条腿**真发出去了**（B站、抖音）→ 下一次导航
+        // 必超时；上一条腿立刻失败、根本没干活（知乎那次）→ 下一次导航正常。
+        if !scheduler.cancel.load(Ordering::SeqCst) {
+          wait_until_idle(profile, driven_tab.as_deref(), Some(&scheduler.cancel)).await;
+          *driven_tab = sweep_tabs(profile, driven_tab.as_deref()).await;
+        }
+        None
+      }
+      Err(e) => {
+        log::warn!("Discovery leg could not park profile {}: {e}", profile.name);
+        Some(e)
+      }
+    };
 
-  let outcome = if scheduler.cancel.load(Ordering::SeqCst) && settled == 0 {
-    LegOutcome::Cancelled
-  } else if settled > 0 {
-    LegOutcome::Settled
-  } else if hopeless.is_some() {
-    // 和「超时」分开表达不了 —— 没有专门的 outcome 变体，加一个要连带改前端
-    // union、颜色表和九个 locale。但 `error` 里写明原因，跑 20 个 profile 时
-    // 「哪几个账号没登录」一眼就能看出来，这才是运营真正要的信息。
-    LegOutcome::TimedOut
+  // Stop may land while the bounded about:blank navigation / idle wait is in
+  // flight. The document is already parked if that succeeded, but any claim it
+  // owned still needs the same conservative Skipped/Unconfirmed settlement.
+  if scheduler.cancel.load(Ordering::SeqCst) {
+    return finish_cancelled_leg(
+      app_handle,
+      scheduler,
+      profile,
+      platform,
+      leg_index,
+      total_legs,
+      finished,
+      &profile_id,
+      leg_started_at,
+      baseline,
+      base,
+      session,
+      driven_tab,
+    )
+    .await;
+  }
+
+  let outcome = if let Some(outcome) = terminal_touches.outcome() {
+    outcome
+  } else if let Some(reason) = hopeless {
+    reason.outcome()
   } else if wedge_error.is_some() {
     // 卡死和「没找到可发的靶子」是两回事，别混成同一个 TimedOut ——
     // 后者是正常的，前者是页面出事了，混在一起就看不出该去查什么。
@@ -1834,34 +3055,38 @@ async fn run_leg(
     LegOutcome::TimedOut
   };
   let session_unusable = wedge_error.is_some() || close_error.is_some();
-  let close_error = wedge_error
-    .or_else(|| hopeless.map(|r| r.to_string()))
+  let report_error = wedge_error
+    .or_else(|| hopeless.map(|r| r.message.to_string()))
     .or(close_error)
+    .or_else(|| terminal_touch_error(&profile_id, platform, leg_started_at, outcome))
     // 最低优先级：只有在没有任何其它解释、而且这条腿确实什么都没做成时才写。
     // 否则「窗口没到前台」会盖掉真正的原因。
-    .or_else(|| focus_hint(focused, settled));
+    .or_else(|| focus_hint(focused, terminal_touches.total()));
 
   // 发出去了就等于登录有效 —— 比任何探测都硬。顺手把这个平台的掉登录标记清掉，
   // 否则「只报失败」的设计会让标记变成永久的：人补了登录，界面还是红的。
-  if outcome == LegOutcome::Settled {
+  if outcome == LegOutcome::Posted {
     if let Err(e) = super::login_status::LOGIN_STATUS.clear_platform(&profile_id, platform) {
       log::warn!("Could not clear Marine login flag: {e}");
     }
   }
 
   log::info!(
-    "Discovery leg {leg_index}/{total_legs} finished: {} on {platform} → {outcome:?} ({settled} settled)",
-    profile.name
+    "Discovery leg {leg_index}/{total_legs} finished: {} on {platform} → {outcome:?} ({} terminal touch(es))",
+    profile.name,
+    terminal_touches.total(),
   );
 
   LegExecution {
     report: LegReport {
       outcome,
-      settled_count: settled,
-      error: close_error,
+      settled_count: terminal_touches.total(),
+      error: report_error,
       ..base
     },
     session_unusable,
+    retry_on_fresh_session: false,
+    pending_cancel_cleanup: None,
   }
 }
 
@@ -1968,15 +3193,15 @@ mod tests {
       rec("zhihu", &[("p1", ProspectState::Posted)]),
       rec("xiaohongshu", &[]),
     ];
-    assert_eq!(count_leg_touches(&records, "p1", "bilibili"), 1);
-    assert_eq!(count_leg_touches(&records, "p1", "zhihu"), 1);
+    assert_eq!(summarize_leg_touches(&records, "p1", "bilibili").posted, 1);
+    assert_eq!(summarize_leg_touches(&records, "p1", "zhihu").posted, 1);
     assert_eq!(
-      count_leg_touches(&records, "p1", "xiaohongshu"),
+      summarize_leg_touches(&records, "p1", "xiaohongshu").total(),
       0,
       "小红书这条腿一个 touch 都没有 —— B站和知乎的成果绝不能算到它头上"
     );
     assert_eq!(
-      count_leg_touches(&records, "p2", "bilibili"),
+      summarize_leg_touches(&records, "p2", "bilibili").total(),
       0,
       "别的账号的 touch 不算"
     );
@@ -1987,7 +3212,125 @@ mod tests {
   fn blocked_touches_do_not_end_a_leg() {
     use super::super::prospect::ProspectState;
     let records = vec![rec("bilibili", &[("p1", ProspectState::Blocked)])];
-    assert_eq!(count_leg_touches(&records, "p1", "bilibili"), 0);
+    assert_eq!(summarize_leg_touches(&records, "p1", "bilibili").total(), 0);
+  }
+
+  #[test]
+  fn terminal_touch_states_are_not_collapsed_into_success() {
+    use super::super::prospect::ProspectState as S;
+    for (state, outcome) in [
+      (S::Posted, LegOutcome::Posted),
+      (S::Unconfirmed, LegOutcome::Unconfirmed),
+      (S::Filled, LegOutcome::Filled),
+      (S::Failed, LegOutcome::Failed),
+      (S::Skipped, LegOutcome::Skipped),
+    ] {
+      let records = vec![rec("zhihu", &[("p1", state)])];
+      let summary = summarize_leg_touches(&records, "p1", "zhihu");
+      assert_eq!(summary.total(), 1);
+      assert_eq!(summary.outcome(), Some(outcome));
+    }
+
+    let records = vec![rec("zhihu", &[("p1", S::Failed), ("p1", S::Posted)])];
+    assert_eq!(
+      summarize_leg_touches(&records, "p1", "zhihu").outcome(),
+      Some(LegOutcome::Posted),
+      "a confirmed post must win over a racing failure touch"
+    );
+
+    let records = vec![rec("zhihu", &[("p1", S::Posted), ("p1", S::Unconfirmed)])];
+    assert_eq!(
+      summarize_leg_touches(&records, "p1", "zhihu").outcome(),
+      Some(LegOutcome::Unconfirmed),
+      "an uncertain public action is the safest state to surface"
+    );
+  }
+
+  #[test]
+  fn bootstrap_retry_requires_zero_ingest_claim_or_touch_activity() {
+    use super::super::prospect::ProspectState as S;
+    let since = 100;
+
+    let untouched = vec![rec("zhihu", &[])];
+    assert!(!leg_has_activity_since(&untouched, "p1", "zhihu", since));
+
+    let mut ingested = rec("zhihu", &[]);
+    ingested.resolved_at = since;
+    assert!(leg_has_activity_since(&[ingested], "p1", "zhihu", since));
+
+    let mut claimed = rec("zhihu", &[]);
+    claimed.state = S::Claimed;
+    claimed.claimed_by = Some("p1".to_string());
+    claimed.claimed_at = Some(since + 1);
+    assert!(leg_has_activity_since(&[claimed], "p1", "zhihu", since));
+
+    let mut touched = rec("zhihu", &[("p1", S::Failed)]);
+    touched.touches[0].at = since + 1;
+    assert!(leg_has_activity_since(&[touched], "p1", "zhihu", since));
+
+    let mut another_profile = rec("zhihu", &[("p2", S::Failed)]);
+    another_profile.touches[0].at = since + 1;
+    assert!(!leg_has_activity_since(
+      &[another_profile],
+      "p1",
+      "zhihu",
+      since
+    ));
+  }
+
+  #[test]
+  fn only_pre_work_bootstrap_failure_retries_the_same_platform() {
+    let profile = wayfern_profile("one", None);
+    let report = report_for(&profile, "zhihu", LegOutcome::Failed, None);
+    let bootstrap = LegExecution::bootstrap_failure(report.clone(), true);
+    assert!(should_retry_on_fresh_session(&bootstrap, 1, false));
+    assert!(!should_retry_on_fresh_session(&bootstrap, 0, false));
+    assert!(!should_retry_on_fresh_session(&bootstrap, 1, true));
+
+    let unsafe_bootstrap = LegExecution::bootstrap_failure(report.clone(), false);
+    assert!(!should_retry_on_fresh_session(&unsafe_bootstrap, 1, false));
+    let business_or_navigation_failure = LegExecution::unusable(report);
+    assert!(!should_retry_on_fresh_session(
+      &business_or_navigation_failure,
+      1,
+      false
+    ));
+  }
+
+  #[test]
+  fn failed_close_keeps_the_owned_session_and_blocks_a_second_launch() {
+    let original = wayfern_profile("owned", None);
+    let original_id = original.id;
+    let mut session = Some(original);
+    let mut driven_tab = Some("tab-1".to_string());
+
+    apply_session_close_result(&mut session, &mut driven_tab, false);
+    assert_eq!(
+      session.as_ref().map(|profile| profile.id),
+      Some(original_id)
+    );
+    assert_eq!(driven_tab.as_deref(), Some("tab-1"));
+
+    apply_session_close_result(&mut session, &mut driven_tab, true);
+    assert!(session.is_none());
+    assert!(driven_tab.is_none());
+  }
+
+  #[test]
+  fn failed_close_skips_the_settle_delay_so_cancellation_can_park_immediately() {
+    assert!(close_needs_settle_delay(&Ok(())));
+    assert!(!close_needs_settle_delay(&Err("still running".to_string())));
+  }
+
+  #[test]
+  fn only_explicit_quiescence_can_navigate_after_stop() {
+    let cancel = AtomicBool::new(true);
+    assert!(
+      reject_cancelled_navigation(Some(&cancel), "https://www.zhihu.com/search?q=marine").is_err()
+    );
+    assert!(reject_cancelled_navigation(Some(&cancel), "about:blank").is_err());
+    assert!(reject_cancelled_navigation(None, "about:blank").is_ok());
+    assert!(reject_cancelled_navigation(None, "https://example.test").is_ok());
   }
 
   // 这条是整个「清页签」里唯一真正危险的失败模式：Chromium 关掉最后一个标签页
@@ -2115,6 +3458,19 @@ mod tests {
     assert_eq!(p.phase, RunPhase::Done);
   }
 
+  #[test]
+  fn cycle_done_does_not_unlock_start_before_the_run_claim_is_released() {
+    let s = DiscoveryScheduler::new();
+    s.running.store(true, Ordering::SeqCst);
+    publish_phase(&s, RunPhase::Done, 1, 1, None, None, &[]);
+    assert!(s.snapshot().running);
+    assert!(s.is_running());
+
+    drop(RunClaim { scheduler: &s });
+    assert!(!s.snapshot().running);
+    assert!(!s.is_running());
+  }
+
   /// 终态进度得保住这一轮的成果，否则界面在收尾时把刚跑完的腿全抹掉。
   #[test]
   fn the_terminal_progress_keeps_the_leg_reports() {
@@ -2123,7 +3479,7 @@ mod tests {
       profile_id: "p1".to_string(),
       profile_name: "one".to_string(),
       platform: "bilibili".to_string(),
-      outcome: LegOutcome::Settled,
+      outcome: LegOutcome::Posted,
       settled_count: 1,
       error: None,
     }];
@@ -2162,6 +3518,81 @@ mod tests {
     assert_eq!(
       cycle_gap(Some(u64::MAX)),
       Some(Duration::from_secs(MAX_CYCLE_GAP_MINUTES * 60))
+    );
+  }
+
+  #[test]
+  fn all_failed_cycles_reach_the_cutoff_but_normal_or_cancelled_cycles_reset_it() {
+    let profile = wayfern_profile("one", None);
+    let all_failed = vec![
+      report_for(&profile, "zhihu", LegOutcome::Failed, Some("boom".into())),
+      report_for(&profile, "douyin", LegOutcome::Failed, Some("boom".into())),
+    ];
+    let mut failures = 0;
+    for expected in 1..=MAX_CONSECUTIVE_CYCLE_FAILURES {
+      failures = next_cycle_failure_count(failures, &all_failed, false);
+      assert_eq!(failures, expected);
+    }
+    assert_eq!(failures, MAX_CONSECUTIVE_CYCLE_FAILURES);
+
+    let normal = vec![report_for(&profile, "zhihu", LegOutcome::TimedOut, None)];
+    assert_eq!(next_cycle_failure_count(failures, &normal, false), 0);
+    assert_eq!(next_cycle_failure_count(failures, &all_failed, true), 0);
+    assert_eq!(next_cycle_failure_count(failures, &[], false), 0);
+  }
+
+  #[test]
+  fn hopeless_statuses_distinguish_normal_no_work_from_system_failure() {
+    for status in [
+      "not_logged_in",
+      "nothing_to_claim",
+      "blocked_nothing_left",
+      "blocked_hop_limit",
+    ] {
+      let message = format!(r#"{{"status":"{status}"}}"#);
+      let reason = classify_hopeless_message(&message).unwrap();
+      assert_eq!(reason.kind, HopelessKind::NoWork, "{status}");
+      assert_eq!(reason.outcome(), LegOutcome::TimedOut, "{status}");
+    }
+
+    for status in [
+      "no_profile_id",
+      "handoff_write_failed",
+      "handoff_in_progress",
+      "target_navigation_stalled",
+      "handoff_url_mismatch",
+      "aborted_no_context",
+      "blocked_no_hop",
+      "blocked_hop_failed",
+      "handoff_read_failed",
+      "handoff_expired",
+      "handoff_redirect_persist_failed",
+      "send_guard_persist_failed",
+      "send_already_started",
+      "target_changed_before_send",
+      "prospect_bootstrap_failed",
+      "target_bootstrap_failed",
+    ] {
+      let message = format!(r#"{{"status":"{status}"}}"#);
+      let reason = classify_hopeless_message(&message).unwrap();
+      assert_eq!(reason.kind, HopelessKind::SystemFailure, "{status}");
+      assert_eq!(reason.outcome(), LegOutcome::Failed, "{status}");
+    }
+
+    assert_eq!(
+      classify_hopeless_message(r#"{"status":"settle_failed","recoverable":false}"#)
+        .unwrap()
+        .kind,
+      HopelessKind::SystemFailure
+    );
+    assert!(
+      classify_hopeless_message(r#"{"status":"settle_failed","recoverable":true}"#).is_none()
+    );
+    assert_eq!(
+      classify_hopeless_message(r#"Marine retry [6/6] {"status":"empty"}"#)
+        .unwrap()
+        .kind,
+      HopelessKind::SystemFailure
     );
   }
 
@@ -2305,7 +3736,9 @@ mod tests {
     // These strings are the UI's lookup keys (marine.prospects.outcome.*), so a
     // rename here silently renders a raw key path to the operator.
     for (value, expected) in [
-      (LegOutcome::Settled, "\"settled\""),
+      (LegOutcome::Posted, "\"posted\""),
+      (LegOutcome::Unconfirmed, "\"unconfirmed\""),
+      (LegOutcome::Filled, "\"filled\""),
       (LegOutcome::TimedOut, "\"timed_out\""),
       (LegOutcome::NoSlot, "\"no_slot\""),
       (LegOutcome::AlreadyOpen, "\"already_open\""),
@@ -2413,6 +3846,35 @@ mod tests {
     assert_eq!(resolved.len(), 1);
     assert_eq!(resolved[0].profile.id, enabled.id);
     assert_eq!(resolved[0].platforms, vec!["douyin"]);
+  }
+
+  #[test]
+  fn cancelling_materialises_every_unvisited_profile_platform_leg() {
+    let first = with_platforms(
+      wayfern_profile("first", None),
+      &["zhihu", "douyin", "xiaohongshu"],
+    );
+    let second = with_platforms(wayfern_profile("second", None), &["zhihu", "douyin"]);
+    let plan = resolve_from(&[first, second]);
+    assert_eq!(total_legs(&plan), 5);
+
+    let mut reports = Vec::new();
+    append_cancelled_profiles(&plan, &mut reports);
+    assert_eq!(reports.len(), 5);
+    assert!(reports
+      .iter()
+      .all(|report| report.outcome == LegOutcome::Cancelled));
+    assert!(reports.iter().all(|report| report.settled_count == 0));
+    assert_eq!(
+      reports
+        .iter()
+        .map(|report| report.platform.as_str())
+        .collect::<Vec<_>>(),
+      plan
+        .iter()
+        .flat_map(|resolved| resolved.platforms.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+    );
   }
 
   #[test]

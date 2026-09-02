@@ -2250,6 +2250,7 @@
         "hint": "キーワードを入力してください。自動実行プラットフォームが設定されたプロファイルだけが実行され、未設定のプロファイルはスキップされます。",
         "progress": "{{done}}/{{total}} · {{phase}} · {{target}}",
         "settledCount": "{{n}} 件を記録",
+        "errorDetail": "理由を表示（ホバー）",
         "startFailed": "実行を開始できませんでした",
         "stopFailed": "実行を停止できませんでした",
         "cycleGap": "巡回間隔（分）",
@@ -2273,7 +2274,9 @@
         "cancelled": "キャンセル済み"
       },
       "outcome": {
-        "settled": "記録済み",
+        "posted": "投稿済み",
+        "unconfirmed": "送信済み・確認待ち",
+        "filled": "下書き入力済み・未送信",
         "timed_out": "記録なし",
         "no_slot": "未対応のプラットフォーム",
         "already_open": "すでに起動中のためスキップ",

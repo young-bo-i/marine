@@ -2250,6 +2250,7 @@
         "hint": "请填写关键词。已配置自动执行平台的 Profile 会运行，未配置的平台为空时会跳过该 Profile。",
         "progress": "{{done}}/{{total}} · {{phase}} · {{target}}",
         "settledCount": "落账 {{n}} 条",
+        "errorDetail": "查看原因（悬停）",
         "startFailed": "无法启动任务",
         "stopFailed": "无法停止任务",
         "cycleGap": "循环间隔（分钟）",
@@ -2273,7 +2274,9 @@
         "cancelled": "已取消"
       },
       "outcome": {
-        "settled": "已落账",
+        "posted": "已发布",
+        "unconfirmed": "已发送，回执待确认",
+        "filled": "已填入草稿，未发送",
         "timed_out": "未落账",
         "no_slot": "平台不支持",
         "already_open": "已在运行，已跳过",

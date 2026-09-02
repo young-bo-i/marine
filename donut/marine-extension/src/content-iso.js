@@ -3613,25 +3613,85 @@
    *
    * 只写实测过的平台，其余返回 false（照 commentsClosed 那条纪律）。
    */
+  function marineProspectZhihuRouteTarget() {
+    let pathname = '';
+    try { pathname = String(location && location.pathname || ''); } catch (e) { return null; }
+    const answer = pathname.match(/\/answer\/(\d+)(?:\/|$)/);
+    if (answer) return { id: answer[1], kind: 'answer' };
+    const article = pathname.match(/\/p\/(\d+)(?:\/|$)/);
+    return article ? { id: article[1], kind: 'article' } : null;
+  }
+
+  /**
+   * 用 URL 里的内容 id/type 把入口约束到唯一知乎内容 scope。
+   *
+   * 问题页会同时渲染很多 `.ContentItem-actions`，DOM 第一条通常不是当前 URL
+   * 指向的回答。知乎在回答卡片的 `data-zop` JSON 里留下了 itemId；只有它与
+   * `/answer/:id` 精确相等且 type=answer 时才能选中回答卡。
+   *
+   * 专栏 `/p/:id` 同样受支持，但它的权威锚点是唯一的
+   * `.Post-content[data-zop]` 且 type=article。两类路径只要重复、类型不符或证据
+   * 缺失都 fail closed，不能退回「页面第一个添加评论」。
+   */
+  function marineProspectFindZhihuTargetScope() {
+    const target = marineProspectZhihuRouteTarget();
+    if (!target) return null;
+    let markers;
+    try { markers = Array.prototype.slice.call(document.querySelectorAll('[data-zop]')); }
+    catch (e) { return null; }
+
+    const scopes = [];
+    for (let i = 0; i < markers.length; i++) {
+      const marker = markers[i];
+      let meta;
+      try { meta = JSON.parse(String(marker.getAttribute('data-zop') || '')); }
+      catch (e) { continue; }
+      if (!meta || String(meta.itemId == null ? '' : meta.itemId) !== target.id) continue;
+      if (String(meta.type || '').toLowerCase() !== target.kind) continue;
+
+      let scope = null;
+      try {
+        if (target.kind === 'answer') {
+          scope = marker.closest('.AnswerItem,.ContentItem');
+        } else if (marker.matches && marker.matches('.Post-content')) {
+          scope = marker;
+        }
+      }
+      catch (e) { continue; }
+      if (!scope || /^(?:body|html)$/i.test(String(scope.tagName || ''))) continue;
+      if (scopes.indexOf(scope) < 0) scopes.push(scope);
+    }
+    return scopes.length === 1 ? { element: scopes[0], kind: target.kind } : null;
+  }
+
   function marineProspectOpenCommentPanel(platform) {
     if (platform === 'douyin') return marineProspectOpenDouyinComments();
     if (platform !== 'zhihu') return false;
-    // 知乎的入口是 BUTTON.ContentItem-action，文本「添加评论」。
-    // 文本前面带零宽字符（\u200b），所以用 indexOf 而不是相等匹配。
+    const target = marineProspectFindZhihuTargetScope();
+    if (!target) return false;
+    const scope = target.element;
+
+    // 文本前面可能带零宽字符；规范化后只认完整的「添加评论」或「N条评论」。
+    // 候选还必须属于目标卡片自己的操作栏，嵌套/推荐卡片里的按钮不能借外层 scope
+    // 混进来。入口不是唯一时同样不点。
     let all;
-    try { all = document.querySelectorAll('button'); } catch (e) { return false; }
-    for (let i = 0; i < all.length; i++) {
-      const el = all[i];
-      const text = String(el.textContent || '');
-      if (text.indexOf('添加评论') < 0 && text.indexOf('条评论') < 0) continue;
-      if (el.offsetParent === null) continue;
-      // 页面上有多个（问题头部一个、每条回答各一个）。只认回答自己那条操作栏里
-      // 的，否则会展开别人回答的评论区，直评就变成评到别处去了。
-      if (!el.closest || !el.closest('.ContentItem-actions')) continue;
-      try { el.scrollIntoView({ block: 'center' }); el.click(); } catch (e) { continue; }
-      return true;
-    }
-    return false;
+    try { all = Array.prototype.slice.call(scope.querySelectorAll('button')); }
+    catch (e) { return false; }
+    const candidates = all.filter(function (el) {
+      if (!el || !marineVisible(el) || !el.closest) return false;
+      const text = String(el.textContent || '').replace(/[\u200b-\u200d\ufeff\s]/g, '');
+      if (text !== '添加评论' && !/^\d+条评论$/.test(text)) return false;
+      const actions = el.closest('.ContentItem-actions');
+      if (!actions || !scope.contains(actions)) return false;
+      const owner = el.closest('.AnswerItem,.ContentItem,.Post-content,[data-zop]');
+      return owner === scope;
+    });
+    if (candidates.length !== 1) return false;
+    try {
+      candidates[0].scrollIntoView({ block: 'center' });
+      candidates[0].click();
+    } catch (e) { return false; }
+    return true;
   }
 
   /**
@@ -3644,6 +3704,7 @@
    */
   // 评论图标每个文档只点一次。精选页点它只是开合抽屉，反复点会把刚开的关上。
   let marineProspectDouyinIconClicked = false;
+  let marineProspectDouyinCommentTabClicked = false;
 
   // 这个函数有五个「没成功」的出口，以前一个都不吭声，失败一律表现为 40 秒后
   // 的「未能定位到直评输入框」—— 五种完全不同的原因长成同一个样子，只能靠猜。
@@ -3658,24 +3719,201 @@
     return false;
   }
 
+  // 输入条的文字和层级都改过：/note/ 实测已有 comment-list，但输入条不再是它的
+  // 前一个兄弟，也不一定还写「留下你的精彩评论」。类名里带完整 comment-input 的
+  // 是语义壳（适配器也用同一信号确认真正的 editor），可以和一组保守提示文案一起用。
+  const MARINE_PROSPECT_DOUYIN_INPUT_HINT_RE =
+    /留下你的精彩评论|说点什么|发一条友善的评论|善语结善缘|平等表达|写下(?:你的)?评论|请输入评论|评论一下/;
+  const MARINE_PROSPECT_DOUYIN_INPUT_ENTRY_SELECTOR =
+    '.comment-input-container,.comment-input-inner-container,[class*="comment-input" i],' +
+    '[data-e2e*="comment-input" i]';
+
+  function marineProspectDouyinInputEntrySignal(el) {
+    if (!el || !marineVisible(el)) return 0;
+    try {
+      if (el.disabled === true ||
+          (el.getAttribute && el.getAttribute('aria-disabled') === 'true')) return 0;
+      // 裸 role=textbox / textarea 不是评论信号：右栏搜索框和播放器弹幕框也满足。
+      // 只有 comment-input 语义壳，或明确的评论提示文案，才有资格成为入口。
+      const semantic = el.matches && el.matches(MARINE_PROSPECT_DOUYIN_INPUT_ENTRY_SELECTOR);
+      const label = [
+        el.getAttribute && el.getAttribute('placeholder'),
+        el.getAttribute && el.getAttribute('data-placeholder'),
+        el.getAttribute && el.getAttribute('aria-label'),
+        el.getAttribute && el.getAttribute('title'),
+        String(el.textContent || '').length <= 120 ? el.textContent : '',
+      ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+      const hinted = MARINE_PROSPECT_DOUYIN_INPUT_HINT_RE.test(label);
+      return semantic ? 2 : (hinted ? 1 : 0);
+    } catch (e) { return 0; }
+  }
+
+  function marineProspectPickDouyinInputEntry(root) {
+    if (!root) return null;
+    let all;
+    try {
+      all = [root].concat(Array.prototype.slice.call(root.querySelectorAll('*')));
+    } catch (e) { return null; }
+    const candidates = [];
+    for (let i = 0; i < all.length; i++) {
+      const el = all[i];
+      const signal = marineProspectDouyinInputEntrySignal(el);
+      if (!signal) continue;
+      candidates.push({ el: el, signal: signal });
+    }
+    if (!candidates.length) return null;
+
+    // 同一占位文案会让外壳到叶子整条链都命中；只留最内层。若同一个邻接子树
+    // 里仍有两个互不包含的入口则无法证明哪个是直评，宁可本轮失败也不误点。
+    const leaves = candidates.filter(function (candidate) {
+      return !candidates.some(function (other) {
+        if (candidate === other || candidate.el === other.el) return false;
+        try { return candidate.el.contains(other.el); } catch (e) { return false; }
+      });
+    });
+    if (leaves.length === 1) return leaves[0].el;
+    const strongest = leaves.filter(function (candidate) { return candidate.signal === 2; });
+    return strongest.length === 1 ? strongest[0].el : null;
+  }
+
+  /**
+   * 只检查 comment-list 旁边的有限 sibling 子树。
+   *
+   * 输入条可能与 list 同级，也可能与包着 list 的一层/两层容器同级；逐层向上看
+   * sibling 能覆盖这些布局，又不会退化成全页面搜 `[role=textbox]`（播放器弹幕栏
+   * 也有一个）。每层最多八个兄弟、最多三层，到 body/html 就停。
+   */
+  function marineProspectFindDouyinInputEntry(list) {
+    if (!list) return null;
+    const roots = [];
+    let branch = list;
+    for (let depth = 0; branch && depth < 3; depth++) {
+      const parent = branch.parentElement;
+      // 向上到页面级布局后不能再横扫 sibling：那里会出现搜索框、弹幕框等完全
+      // 无关的 textbox。只有 list 自己恰好直属 body 时才允许检查它的直接兄弟。
+      if (depth > 0 && parent && /^(?:body|html)$/i.test(String(parent.tagName || ''))) break;
+      let prev = branch.previousElementSibling;
+      let next = branch.nextElementSibling;
+      for (let distance = 0; distance < 8 && (prev || next); distance++) {
+        if (prev) { roots.push(prev); prev = prev.previousElementSibling; }
+        if (next) { roots.push(next); next = next.nextElementSibling; }
+      }
+      if (!parent || /^(?:body|html)$/i.test(String(parent.tagName || ''))) break;
+      branch = parent;
+    }
+
+    for (let r = 0; r < roots.length; r++) {
+      const candidate = marineProspectPickDouyinInputEntry(roots[r]);
+      if (candidate) return candidate;
+    }
+    return null;
+  }
+
+  function marineProspectDouyinCommentTabAnchor(tab) {
+    if (!tab) return null;
+    try {
+      const tablist = tab.closest('[role="tablist"]');
+      if (tablist) return tablist;
+      if (tab.matches && tab.matches('[role="tab"]')) return tab;
+    } catch (e) { return null; }
+
+    // 抖音当前 /note/ 与 /jingxuan 的 tab 没有统一 role/class，但同一 tab strip
+    // 至少还有一个稳定同伴（相关推荐 / 详情 / TA的作品 / AI抖音）。要求这个同伴
+    // 能排除评论正文里恰好只有「评论」二字的叶子节点。
+    for (let scope = tab.parentElement, depth = 0; scope && depth < 4;
+         scope = scope.parentElement, depth++) {
+      if (/^(?:body|html)$/i.test(String(scope.tagName || ''))) return null;
+      let all;
+      try { all = [scope].concat(Array.prototype.slice.call(scope.querySelectorAll('*'))); }
+      catch (e) { return null; }
+      const hasPeer = all.some(function (candidate) {
+        if (!candidate || candidate === tab || !marineVisible(candidate)) return false;
+        if (candidate.children && candidate.children.length > 1) return false;
+        return /^(?:相关推荐|详情|TA的作品|AI抖音)$/.test(
+          String(candidate.textContent || '').replace(/\s+/g, '').trim(),
+        );
+      });
+      if (hasPeer) return scope;
+    }
+    return null;
+  }
+
+  /**
+   * 精选页没有 comment-list，只能从「评论」tab 反向证明局部边界。
+   *
+   * 接受三类明确边界：dialog/aria-modal、语义 drawer/comment panel，或带真实
+   * role=tablist（没有 role 时则要求同组稳定 tab）的组件。绝不退回 document.body；
+   * 找不到这些证据就返回 null。入口本身仍须通过 comment-input/评论提示文案信号。
+   */
+  function marineProspectFindDouyinNoListInputEntry(tab) {
+    if (!tab || !marineVisible(tab)) return null;
+    const tabAnchor = marineProspectDouyinCommentTabAnchor(tab);
+    if (!tabAnchor) return null;
+    let boundary = null;
+    try {
+      boundary = tab.closest(
+        '[role="dialog"],[aria-modal="true"],[class*="comment-drawer" i],' +
+        '[class*="comment-panel" i],[class*="comment-main" i],[class*="drawer" i]',
+      );
+    } catch (e) { return null; }
+    if (boundary && !/^(?:body|html)$/i.test(String(boundary.tagName || ''))) {
+      return marineProspectPickDouyinInputEntry(boundary);
+    }
+
+    for (let scope = tabAnchor.parentElement, depth = 0; scope && depth < 3;
+         scope = scope.parentElement, depth++) {
+      if (/^(?:body|html)$/i.test(String(scope.tagName || ''))) return null;
+      const candidate = marineProspectPickDouyinInputEntry(scope);
+      if (candidate) return candidate;
+    }
+    return null;
+  }
+
   function marineProspectOpenDouyinComments() {
     try {
-      // 输入框已经在了就什么都不做
-      if (document.querySelector('[contenteditable="true"], textarea')) return true;
+      // 页面同时可能有搜索框/弹幕框；必须复用平台适配器确认这是评论 editor，不能
+      // 因为全文档恰好有任意 contenteditable 就误以为评论输入已经就绪。
+      if (marineProspectFindCommentEditor(marineCommentSearchRoot())) return true;
 
       // 第一步：把评论区调出来。
       //
-      // 抖音有**两种页面形态**，入口完全不同：
+      // 抖音有三种页面形态，入口和评论 DOM 不完全相同：
       //   · 视频页 `/video/…` —— 播放器右侧有评论图标 `feed-comment-icon`
       //   · 图文笔记页 `/note/…` —— 右栏是「相关推荐 | 评论(N)」两个 tab，
       //     默认停在「相关推荐」上，必须先点「评论」那个 tab 才切过去
       // 只处理视频页的话，笔记页永远找不到输入框（实测：那条链路上
       // `feed-comment-icon` 根本不存在）。
-      if (!document.querySelector('[data-e2e="comment-list"]')) {
+      const list = document.querySelector('[data-e2e="comment-list"]');
+      if (!list) {
+        // 先看 tab：它可见就证明抽屉已经开着，此时再点 feed icon 反而会把抽屉
+        // 关掉。文本严格匹配，避免命中评论正文里的「评论」二字。
+        const tabCandidates = Array.prototype.slice
+          .call(document.querySelectorAll('*'))
+          .filter((el) => /^评论\s*\(?\d*\)?$/.test(String(el.textContent || '').trim()) &&
+            el.children.length <= 1 && marineVisible(el) &&
+            marineProspectDouyinCommentTabAnchor(el));
+        // 同页可能同时留着两套抽屉/预渲染 tab。过去 `.pop()` 会静默挑 DOM 最后
+        // 一个，等同于随机切换别处的评论区；有多个可见且有边界证据的候选时停住。
+        if (tabCandidates.length > 1) {
+          return marineProspectDouyinWhy(
+            '找到多个「评论」tab，无法唯一定位当前评论面板',
+            'count=' + tabCandidates.length,
+          );
+        }
+        const tab = tabCandidates.length === 1 ? tabCandidates[0] : null;
         // 图标只点一次。它在**三种**形态下都存在，但只有视频页点了会出评论区；
         // 精选页点它只是开合右侧抽屉，反复点等于把刚开的又关上。
-        const icon = document.querySelector('[data-e2e="feed-comment-icon"]');
-        if (icon && !marineProspectDouyinIconClicked) {
+        const iconCandidates = Array.prototype.slice
+          .call(document.querySelectorAll('[data-e2e="feed-comment-icon"]'))
+          .filter(function (candidate) { return marineVisible(candidate); });
+        const icon = iconCandidates.length === 1 ? iconCandidates[0] : null;
+        if (!tab && iconCandidates.length !== 1) {
+          return marineProspectDouyinWhy(
+            '无法唯一定位可见评论图标',
+            'count=' + iconCandidates.length,
+          );
+        }
+        if (!tab && icon && !marineProspectDouyinIconClicked) {
           marineProspectDouyinIconClicked = true;
           icon.scrollIntoView({ block: 'center' });
           icon.click();
@@ -3687,21 +3925,29 @@
         //     「详情 | TA的作品 | 评论 | AI抖音 | 相关推荐」，默认停在别的 tab 上，
         //     而 `feed-comment-icon` **存在**——老代码因此永远走不到这里，
         //     一轮轮点图标直到超时（实测卡满 240 秒）。
-        // 文本严格匹配，避免命中评论正文里出现的「评论」二字。
-        const tab = Array.prototype.slice
-          .call(document.querySelectorAll('*'))
-          .filter((el) => /^评论\s*\(?\d*\)?$/.test(String(el.textContent || '').trim()) &&
-            el.children.length <= 1 && marineVisible(el))
-          .pop();
         if (!tab) {
           return marineProspectDouyinWhy(
             '既没有评论图标也找不到「评论」tab',
             'icon=' + (icon ? '有' : '无') + ' 已点过=' + marineProspectDouyinIconClicked,
           );
         }
-        tab.scrollIntoView({ block: 'center' });
-        tab.click();
-        return false;
+        if (!marineProspectDouyinCommentTabClicked) {
+          tab.scrollIntoView({ block: 'center' });
+          tab.click();
+          marineProspectDouyinCommentTabClicked = true;
+          return false;   // tab panel 异步挂载；下一轮在同一个局部边界内找输入条
+        }
+
+        const noListSpot = marineProspectFindDouyinNoListInputEntry(tab);
+        if (!noListSpot) {
+          return marineProspectDouyinWhy(
+            '无评论列表且评论 tab 的局部面板内找不到输入条',
+            'tab=' + String(tab.tagName || '?').toLowerCase(),
+          );
+        }
+        noListSpot.scrollIntoView({ block: 'center' });
+        noListSpot.click();
+        return true;
       }
 
       // 第二步：点开输入条。
@@ -3711,41 +3957,23 @@
       // 套）。实测：只点评论图标的话，`comment-list` 有了、`[contenteditable]`
       // 仍然是 0 个。
       //
-      // 锚点用**语义结构**不用类名：抖音的类名是混淆的，而且**每个视频页都不
-      // 一样**（实测同一份代码在两个视频上分别是 `McY63d8B` 和 `Ii031XNo`）。
-      // 唯一稳定的是「输入条是 `[data-e2e=comment-list]` 的前一个兄弟」，
-      // 占位文案在它内部。
-      // 输入条的锚点有两种，因为**精选页根本没有 `comment-list`**（实测那一页
-      // 一个带 comment 的 data-e2e 都没有）。所以：有 `comment-list` 就用它的
-      // 前一个兄弟（视频页/笔记页最稳），没有就退回全文档按占位文案找。
-      const list = document.querySelector('[data-e2e="comment-list"]');
-      const head = (list && list.previousElementSibling) || document.body;
-      if (!head) return marineProspectDouyinWhy('评论列表没有前一个兄弟节点');
-      const spots = Array.prototype.slice
-        .call(head.querySelectorAll('*'))
-        .filter((el) => String(el.textContent || '').trim().indexOf('留下你的精彩评论') === 0 &&
-          marineVisible(el));
-      // 取最内层：外层容器同样命中这段文本，点外层不一定触发挂载
-      // （B 站的发布按钮踩过同样的坑）。
-      const spot = spots[spots.length - 1];
+      // 不再假设输入条就是 list.previousElementSibling：/note/ 的 2026-09 DOM
+      // 已经把它移到 list 包装层附近的另一棵 sibling 子树。限定在最多三层局部
+      // 邻域里，用 comment-input 语义壳 / 保守提示文案定位；这样
+      // 能适配新层级，也不会命中页面另一侧的弹幕发送框。
+      const spot = marineProspectFindDouyinInputEntry(list);
       if (!spot) {
-        // 占位文案是这里唯一的锚点，抖音改一次文案就会整条链路失效，而外在表现
-        // 只是「定位不到输入框」。把**实际看到的**候选文案打出来，下次一跑就知道
-        // 该把哪个字符串加进来，不用靠猜。
-        let seen = '';
-        try {
-          seen = Array.prototype.slice
-            .call(head.querySelectorAll('*'))
-            .filter((el) => el.children.length === 0 && marineVisible(el))
-            .map((el) => String(el.textContent || '').trim())
-            .filter((t) => t && t.length <= 30)
-            .slice(0, 8)
-            .join(' | ');
-        } catch (e) {}
+        const shape = function (el) {
+          if (!el) return '无';
+          let cls = '';
+          try { cls = String(el.className || '').replace(/\s+/g, '.').slice(0, 60); } catch (e) {}
+          return String(el.tagName || '?').toLowerCase() + (cls ? '.' + cls : '');
+        };
         return marineProspectDouyinWhy(
-          '找不到「留下你的精彩评论」占位条',
-          'comment-list=' + (list ? '有' : '无') + ' 锚点=' + (list ? '兄弟节点' : 'body') +
-            ' 附近文案=[' + seen + ']',
+          '评论列表附近找不到直评输入条',
+          'prev=' + shape(list && list.previousElementSibling) +
+            ' next=' + shape(list && list.nextElementSibling) +
+            ' parent=' + shape(list && list.parentElement),
         );
       }
       spot.scrollIntoView({ block: 'center' });
@@ -4034,21 +4262,79 @@
   /**
    * 知乎的发送控件。
    *
-   * 比 B 站干净得多：草稿填好后，页面上恰好只有一个可见且未禁用的
-   * `<button>` 文本为「发布」（实测 `Button--primary Button--blue`，62×30）。
-   * 不在 shadow DOM 里，也没有多层同文本包装。
-   *
-   * 仍然要求 `!disabled`：输入框为空时知乎会把它置灰，点了没用还白跑一次。
+   * 2026-09 的评论弹层把「发布」从原来的 `<button>` 换过一版 `[role=button]`，
+   * 而页面本身还可能同时有创作入口的「发布」。所以不能再全局扫按钮：从当前
+   * 直评 editor 往上逐层找，第一个含发布控件的共同祖先才有资格；若必须扩大到
+   * 整个评论容器，则该容器里还必须只有当前这一个评论 editor。
    */
   function marineProspectFindZhihuSendButton() {
-    let all;
-    try { all = document.querySelectorAll('button'); } catch (e) { return null; }
-    for (let i = 0; i < all.length; i++) {
-      const el = all[i];
-      if (String(el.textContent || '').trim() !== '发布') continue;
-      if (el.offsetParent === null || el.disabled === true) continue;
-      if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') continue;
-      return el;
+    const editor = marineProspectResolveEditor();
+    if (!editor) return null;
+    try { if (!marineRimeIsCommentEditor(editor)) return null; }
+    catch (e) { return null; }
+
+    let localOwner = null;
+    let boundary = null;
+    try {
+      localOwner = editor.closest('.CommentEditorV2,.CommentBox');
+      boundary = editor.closest('.Modal-content') ||
+        editor.closest('.Comments-container,.CommentListV2') || localOwner;
+    } catch (e) { return null; }
+    if (!boundary) return null;
+
+    const eligible = function (el) {
+      try {
+        const text = String(el.textContent || '').replace(/\s+/g, '').trim();
+        const aria = String(el.getAttribute('aria-label') || '').replace(/\s+/g, '').trim();
+        const title = String(el.getAttribute('title') || '').replace(/\s+/g, '').trim();
+        if (![text, aria, title].some(function (value) {
+          return value === '发布' || value === '发布评论';
+        })) return false;
+        if (!marineVisible(el) || el.disabled === true) return false;
+        if (el.getAttribute('aria-disabled') === 'true' || el.getAttribute('aria-hidden') === 'true') {
+          return false;
+        }
+        const rect = el.getBoundingClientRect();
+        return rect.width * rect.height <= 240 * 60;
+      } catch (e) { return false; }
+    };
+
+    for (let scope = editor, depth = 0;
+         scope && depth < 14; scope = scope.parentElement, depth++) {
+      let all;
+      try { all = Array.prototype.slice.call(scope.querySelectorAll('button,[role="button"]')); }
+      catch (e) { return null; }
+      const hits = all.filter(eligible);
+      if (hits.length) {
+        // local owner 外才遇到按钮（或改版后根本没有已知 owner），只能靠共同容器
+        // 证明归属。此时里面必须只有当前这一个可识别 editor；若还有回复框，就
+        // 无法证明按钮归谁。
+        const locallyOwned = !!localOwner && hits.every(function (candidate) {
+          try { return localOwner.contains(candidate); } catch (e) { return false; }
+        });
+        if (!locallyOwned) {
+          let editors;
+          try {
+            editors = Array.prototype.slice.call(scope.querySelectorAll(
+              '.public-DraftEditor-content[role="textbox"]',
+            )).filter(function (candidate) {
+              try { return marineRimeIsCommentEditor(candidate); } catch (e) { return false; }
+            });
+          } catch (e) { return null; }
+          if (editors.length !== 1 || editors[0] !== editor) return null;
+        }
+
+        // `[role=button]` 外壳里偶尔还会套真正的 <button>；只接受唯一最内层，
+        // 两个互不包含的发布控件属于歧义，fail closed。
+        const leaves = hits.filter(function (candidate) {
+          return !hits.some(function (other) {
+            if (candidate === other) return false;
+            try { return candidate.contains(other); } catch (e) { return false; }
+          });
+        });
+        return leaves.length === 1 ? leaves[0] : null;
+      }
+      if (scope === boundary) break;
     }
     return null;
   }
@@ -4126,21 +4412,45 @@
    * 还有发笔记的入口），全局找必然选错。
    */
   function marineProspectFindXhsSendButton() {
-    const editor = document.querySelector('#content-textarea');
-    const bar = editor && editor.closest && editor.closest('.engage-bar-container');
-    const scope = bar || document;
-    let all;
-    try { all = scope.querySelectorAll('button, [role="button"], .btn, [class*="submit" i], [class*="send" i]'); }
+    const editor = marineProspectResolveEditor();
+    if (!editor || !editor.getAttribute || editor.getAttribute('id') !== 'content-textarea') {
+      return null;
+    }
+    try { if (!marineRimeIsCommentEditor(editor)) return null; }
     catch (e) { return null; }
+    const bar = editor.closest && editor.closest('.engage-bar-container');
+    // 发送是不可逆动作。已知 editor/bar 任一缺失时绝不能退回 document 全局搜：
+    // 页面右上角正好还有一个「发布」入口。
+    if (!bar) return null;
+    let all;
+    try {
+      all = Array.prototype.slice.call(bar.querySelectorAll(
+        'button, [role="button"], .btn, [class*="submit" i], [class*="send" i]',
+      ));
+    }
+    catch (e) { return null; }
+    const hits = [];
     for (let i = 0; i < all.length; i++) {
       const el = all[i];
       const text = String(el.textContent || '').trim();
       if (text !== '发送' && text !== '发布') continue;
-      if (el.offsetParent === null || el.disabled === true) continue;
+      if (!marineVisible(el) || el.disabled === true) continue;
       if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') continue;
-      return el;
+      try {
+        const rect = el.getBoundingClientRect();
+        if (rect.width * rect.height > 240 * 60) continue;
+      } catch (e) { continue; }
+      hits.push(el);
     }
-    return null;
+    // 同一控件可能有 role 外壳 + button 内层，只留最内层；两个独立可见发送控件
+    // 归属不唯一，fail closed。
+    const leaves = hits.filter(function (candidate) {
+      return !hits.some(function (other) {
+        if (candidate === other) return false;
+        try { return candidate.contains(other); } catch (e) { return false; }
+      });
+    });
+    return leaves.length === 1 ? leaves[0] : null;
   }
 
   /**
@@ -4153,25 +4463,118 @@
    * 锚在输入框的祖先容器里找，不全局搜 —— 页面别处还有播放器的弹幕发送框。
    */
   function marineProspectFindDouyinSendButton() {
-    const editor = document.querySelector('[contenteditable="true"]');
+    const editor = marineProspectResolveEditor();
     if (!editor) return null;
-    let box = editor;
-    for (let i = 0; i < 6 && box.parentElement; i++) box = box.parentElement;
-    let all;
-    try { all = box.querySelectorAll('span'); } catch (e) { return null; }
+    try { if (!marineRimeIsCommentEditor(editor)) return null; }
+    catch (e) { return null; }
 
-    let best = null;
-    let bestLeft = -Infinity;
-    for (let i = 0; i < all.length; i++) {
-      const el = all[i];
-      if (el.offsetParent === null) continue;
-      if (String(el.textContent || '').trim() !== '') continue;
-      let r;
-      try { r = el.getBoundingClientRect(); } catch (e) { continue; }
-      if (Math.abs(r.width - 36) > 6 || Math.abs(r.height - 36) > 6) continue;
-      if (r.left > bestLeft) { bestLeft = r.left; best = el; }
+    let inputOwner = null;
+    let boundary = null;
+    try {
+      inputOwner = editor.closest(
+        '.comment-input-container,.comment-input-inner-container,[class*="comment-input" i]',
+      );
+      boundary = inputOwner || editor.closest(
+        '.comment-mainContent,[data-e2e*="comment" i],[class*="comment" i]',
+      );
+    } catch (e) { return null; }
+    if (!boundary) return null;
+
+    // closest 可能先拿到 comment-input-inner；最多向上四层寻找同样带
+    // comment-input 语义的外壳（中间允许一层混淆 wrapper），但上限只会落在
+    // 语义壳上，绝不落到普通页面容器里猜工具栏。
+    let limit = boundary;
+    if (inputOwner) {
+      for (let parent = inputOwner.parentElement, i = 0; parent && i < 4;
+           parent = parent.parentElement, i++) {
+        if (/^(?:body|html)$/i.test(String(parent.tagName || ''))) break;
+        try {
+          if (parent.matches(
+            '.comment-input-container,.comment-input-inner-container,[class*="comment-input" i]',
+          )) limit = parent;
+        } catch (e) { break; }
+      }
     }
-    return best;
+
+    let editorRect = null;
+    try { editorRect = editor.getBoundingClientRect(); } catch (e) { return null; }
+
+    const toolbarIn = function (scope) {
+      let all;
+      try { all = Array.prototype.slice.call(scope.querySelectorAll('span')); }
+      catch (e) { return { button: null, ambiguous: false }; }
+      const icons = [];
+      for (let i = 0; i < all.length; i++) {
+        const el = all[i];
+        if (!marineVisible(el) || String(el.textContent || '').trim() !== '') continue;
+        if (el.disabled === true ||
+            (el.getAttribute && el.getAttribute('aria-disabled') === 'true')) continue;
+        let rect;
+        try { rect = el.getBoundingClientRect(); } catch (e) { continue; }
+        if (Math.abs(rect.width - 36) > 6 || Math.abs(rect.height - 36) > 6) continue;
+        icons.push({ el: el, rect: rect, centerY: rect.top + rect.height / 2 });
+      }
+
+      const rows = [];
+      icons.forEach(function (icon) {
+        let row = rows.find(function (candidate) {
+          return Math.abs(candidate.centerY - icon.centerY) <= 6;
+        });
+        if (!row) {
+          row = { centerY: icon.centerY, icons: [] };
+          rows.push(row);
+        }
+        row.icons.push(icon);
+      });
+      const proven = rows.map(function (row) {
+        const ordered = row.icons.slice().sort(function (a, b) { return a.rect.left - b.rect.left; });
+        const distinct = ordered.filter(function (icon, index) {
+          return index === 0 || Math.abs(icon.rect.left - ordered[index - 1].rect.left) > 4;
+        });
+        const spread = distinct.length > 1
+          ? distinct[distinct.length - 1].rect.left - distinct[0].rect.left
+          : 0;
+        const top = distinct.reduce(function (value, icon) {
+          return Math.min(value, icon.rect.top);
+        }, Infinity);
+        const bottom = distinct.reduce(function (value, icon) {
+          return Math.max(value, icon.rect.top + icon.rect.height);
+        }, -Infinity);
+        const left = distinct.length ? distinct[0].rect.left : Infinity;
+        const right = distinct.length
+          ? distinct[distinct.length - 1].rect.left + distinct[distinct.length - 1].rect.width
+          : -Infinity;
+        return { icons: distinct, spread: spread, top: top, bottom: bottom, left: left, right: right };
+      }).filter(function (row) {
+        const verticalGap = Math.max(
+          0,
+          row.top - (editorRect.top + editorRect.height),
+          editorRect.top - row.bottom,
+        );
+        const horizontalGap = Math.max(
+          0,
+          row.left - (editorRect.left + editorRect.width),
+          editorRect.left - row.right,
+        );
+        return row.icons.length >= 3 && row.icons.length <= 6 &&
+          row.spread >= 24 && row.spread <= 320 &&
+          verticalGap <= 160 && horizontalGap <= 200;
+      });
+      if (proven.length !== 1) {
+        return { button: null, ambiguous: proven.length > 1 };
+      }
+      const row = proven[0].icons;
+      return { button: row[row.length - 1].el, ambiguous: false };
+    };
+
+    for (let scope = editor, depth = 0;
+         scope && depth < 12; scope = scope.parentElement, depth++) {
+      const result = toolbarIn(scope);
+      if (result.ambiguous) return null;
+      if (result.button) return result.button;
+      if (scope === limit) break;
+    }
+    return null;
   }
 
   /**
@@ -4353,8 +4756,9 @@
       // 不会把浏览器抢到前台。
       let refocusDelay = 0;
       try {
-        const activeTarget = marineRimeTarget && marineRimeTarget.active;
-        const editor = activeTarget && activeTarget.editor;
+        // Draft.js 填入时可能重挂载 editor；沿用 activeTarget 里的旧引用会跳过
+        // 聚焦，随后也无法把发布按钮绑定到当前这棵评论 DOM。
+        const editor = marineProspectResolveEditor();
         if (editor && editor.isConnected && marineDeepActiveElement(document) !== editor) {
           editor.focus();
           refocusDelay = 400;   // 给工具栏重新展开的时间

@@ -2250,6 +2250,7 @@
         "hint": "키워드를 입력하세요. 자동 실행 플랫폼이 설정된 프로필만 실행되고 설정되지 않은 프로필은 건너뜁니다.",
         "progress": "{{done}}/{{total}} · {{phase}} · {{target}}",
         "settledCount": "{{n}}건 기록",
+        "errorDetail": "원인 보기(마우스 올리기)",
         "startFailed": "실행을 시작할 수 없습니다",
         "stopFailed": "실행을 중지할 수 없습니다",
         "cycleGap": "반복 간격(분)",
@@ -2273,7 +2274,9 @@
         "cancelled": "취소됨"
       },
       "outcome": {
-        "settled": "기록됨",
+        "posted": "게시됨",
+        "unconfirmed": "전송됨 · 확인 대기",
+        "filled": "초안 입력됨 · 미전송",
         "timed_out": "기록 없음",
         "no_slot": "지원하지 않는 플랫폼",
         "already_open": "이미 실행 중이라 건너뜀",

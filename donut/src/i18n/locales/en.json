@@ -2250,6 +2250,7 @@
         "hint": "Enter a keyword. Profiles with configured automation platforms will run; profiles with none are skipped.",
         "progress": "{{done}}/{{total}} · {{phase}} · {{target}}",
         "settledCount": "{{n}} settled",
+        "errorDetail": "View reason (hover)",
         "startFailed": "Could not start the run",
         "stopFailed": "Could not stop the run",
         "cycleGap": "Cycle gap (min)",
@@ -2273,7 +2274,9 @@
         "cancelled": "Cancelled"
       },
       "outcome": {
-        "settled": "Settled",
+        "posted": "Posted",
+        "unconfirmed": "Sent — receipt unconfirmed",
+        "filled": "Draft filled — not sent",
         "timed_out": "Nothing settled",
         "no_slot": "Platform not supported",
         "already_open": "Already open — skipped",

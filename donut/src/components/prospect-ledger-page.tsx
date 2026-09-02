@@ -78,7 +78,9 @@ export interface ProspectRecord {
 }
 
 type LegOutcome =
-  | "settled"
+  | "posted"
+  | "unconfirmed"
+  | "filled"
   | "timed_out"
   | "no_slot"
   | "already_open"
@@ -137,7 +139,11 @@ const ALL_FILTER = "__all__";
 const AUTOMATABLE_BROWSERS = new Set(["wayfern"]);
 
 const OUTCOME_CLASS: Record<LegOutcome, string> = {
-  settled: "text-success",
+  posted: "text-success",
+  unconfirmed: "text-warning",
+  // A filled draft is durable work, but it has no public footprint and must
+  // never share the success colour used by a receipt-confirmed post.
+  filled: "text-muted-foreground",
   timed_out: "text-muted-foreground",
   no_slot: "text-muted-foreground",
   // Not a failure, but the operator has to act on it (close the window and
@@ -185,7 +191,97 @@ export function ProspectLedgerPage() {
   const [cycleGap, setCycleGap] = useState("");
   const [progress, setProgress] = useState<RunProgress>(idleProgress);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
+  const [isRestartCoolingDown, setIsRestartCoolingDown] = useState(false);
   const [logs, setLogs] = useState<MarineLogLocations | null>(null);
+
+  // `marine_stop_discovery` only requests cancellation; the run claim remains
+  // held until claim cleanup and browser shutdown finish. Keep the old button
+  // disabled through that interval, then for one short guard window. Without
+  // it, the terminal event swaps Stop for Start under the pointer and a double
+  // click immediately launches a fresh cycle (observed in the live run).
+  const stopRequestedRef = useRef(false);
+  const restartCooldownTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+
+  const finishStopTransition = useCallback(() => {
+    if (!stopRequestedRef.current) return;
+    stopRequestedRef.current = false;
+    setIsStopping(false);
+    setIsRestartCoolingDown(true);
+    if (restartCooldownTimerRef.current !== null) {
+      clearTimeout(restartCooldownTimerRef.current);
+    }
+    restartCooldownTimerRef.current = setTimeout(() => {
+      restartCooldownTimerRef.current = null;
+      setIsRestartCoolingDown(false);
+    }, 650);
+  }, []);
+
+  const acceptProgress = useCallback(
+    (next: RunProgress) => {
+      setProgress(next);
+      if (!next.running) finishStopTransition();
+    },
+    [finishStopTransition],
+  );
+
+  // The terminal progress event is the fast path, but desktop event delivery
+  // can be lost during a route/window transition. While Stop is pending, poll
+  // the authoritative backend snapshot for up to 30s. Each request schedules
+  // the next only after it resolves, so calls never overlap; cleanup cancels
+  // its timers and ignores an in-flight response after unmount/state exit.
+  useEffect(() => {
+    if (!isStopping) return;
+
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    let attempts = 0;
+    const maxAttempts = 120;
+
+    const poll = async () => {
+      if (disposed) return;
+      try {
+        const current = await invoke<RunProgress>("marine_discovery_status");
+        if (disposed) return;
+        acceptProgress(current);
+        if (!current.running) return;
+      } catch (error) {
+        if (disposed) return;
+        console.warn("Failed to poll discovery stop status:", error);
+      }
+
+      attempts += 1;
+      if (attempts >= maxAttempts) {
+        // Keep the backend's last `running` snapshot, which leaves Stop (not
+        // Start) on screen, but allow the operator to request cancellation
+        // again instead of trapping the UI in an eternal spinner.
+        stopRequestedRef.current = false;
+        setIsStopping(false);
+        return;
+      }
+      timer = setTimeout(() => {
+        void poll();
+      }, 250);
+    };
+
+    timer = setTimeout(() => {
+      void poll();
+    }, 250);
+    watchdog = setTimeout(() => {
+      // Also bounds a pathological invoke that never resolves.
+      disposed = true;
+      stopRequestedRef.current = false;
+      setIsStopping(false);
+    }, 30_000);
+    return () => {
+      disposed = true;
+      if (timer !== undefined) clearTimeout(timer);
+      if (watchdog !== undefined) clearTimeout(watchdog);
+    };
+  }, [acceptProgress, isStopping]);
 
   // 路径在进程生命周期内不变，挂载取一次即可。取不到就不显示这一块 ——
   // 排查入口本身不该成为新的报错来源。
@@ -235,7 +331,7 @@ export function ProspectLedgerPage() {
       try {
         const stop = await listen<RunProgress>(PROGRESS_EVENT, (event) => {
           if (disposed) return;
-          setProgress(event.payload);
+          acceptProgress(event.payload);
           // Each progress tick is a chance the ledger moved. Reloading here is
           // what makes the table update live during a run instead of only when
           // the operator remembers to hit refresh.
@@ -260,7 +356,7 @@ export function ProspectLedgerPage() {
       if (disposed) return;
       try {
         const current = await invoke<RunProgress>("marine_discovery_status");
-        if (!disposed) setProgress(current);
+        if (!disposed) acceptProgress(current);
       } catch (error) {
         console.error("Failed to read discovery status:", error);
       }
@@ -272,10 +368,14 @@ export function ProspectLedgerPage() {
     return () => {
       disposed = true;
       requestSequenceRef.current += 1;
+      if (restartCooldownTimerRef.current !== null) {
+        clearTimeout(restartCooldownTimerRef.current);
+        restartCooldownTimerRef.current = null;
+      }
       unlistenProgress?.();
       unlistenProfiles?.();
     };
-  }, [loadRecords, loadProfiles]);
+  }, [acceptProgress, loadRecords, loadProfiles]);
 
   const dateFormatter = useMemo(
     () =>
@@ -367,6 +467,8 @@ export function ProspectLedgerPage() {
   const canStart =
     !progress.running &&
     !isSubmitting &&
+    !isStopping &&
+    !isRestartCoolingDown &&
     keyword.trim().length > 0 &&
     hasConfiguredProfiles;
 
@@ -393,17 +495,34 @@ export function ProspectLedgerPage() {
   }, [keyword, t, cycleGap]);
 
   const handleStop = useCallback(async () => {
+    if (stopRequestedRef.current) return;
+    stopRequestedRef.current = true;
+    setIsStopping(true);
     try {
       await invoke("marine_stop_discovery");
     } catch (error) {
+      stopRequestedRef.current = false;
+      setIsStopping(false);
       console.error("Failed to stop discovery run:", error);
       showToast({
         type: "error",
         title: t("marine.prospects.run.stopFailed"),
         description: translateBackendError(t, error),
       });
+      return;
     }
-  }, [t]);
+
+    try {
+      // Covers the narrow race where the terminal event landed between the
+      // click and listener delivery. The status read uses the same stored
+      // progress and is read-only. If this read fails, the bounded poll above
+      // remains active; the cancellation request itself still succeeded.
+      const current = await invoke<RunProgress>("marine_discovery_status");
+      acceptProgress(current);
+    } catch (error) {
+      console.warn("Failed to read discovery status after Stop:", error);
+    }
+  }, [acceptProgress, t]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-4 pt-4 pb-8 sm:px-6">
@@ -457,7 +576,9 @@ export function ProspectLedgerPage() {
               </span>
               <Input
                 value={keyword}
-                disabled={progress.running}
+                disabled={
+                  progress.running || isStopping || isRestartCoolingDown
+                }
                 placeholder={t("marine.prospects.run.keywordPlaceholder")}
                 onChange={(event) => {
                   setKeyword(event.target.value);
@@ -471,7 +592,9 @@ export function ProspectLedgerPage() {
               </span>
               <Input
                 value={cycleGap}
-                disabled={progress.running}
+                disabled={
+                  progress.running || isStopping || isRestartCoolingDown
+                }
                 inputMode="numeric"
                 placeholder={t("marine.prospects.run.cycleGapPlaceholder")}
                 onChange={(event) => {
@@ -484,16 +607,21 @@ export function ProspectLedgerPage() {
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
-            {progress.running ? (
+            {progress.running || isStopping || isRestartCoolingDown ? (
               <Button
                 type="button"
                 size="sm"
                 variant="destructive"
+                disabled={isStopping || isRestartCoolingDown}
                 onClick={() => {
                   void handleStop();
                 }}
               >
-                <LuCircleStop />
+                {isStopping || isRestartCoolingDown ? (
+                  <LuLoaderCircle className="animate-spin" />
+                ) : (
+                  <LuCircleStop />
+                )}
                 {t("marine.prospects.run.stop")}
               </Button>
             ) : (
@@ -552,6 +680,14 @@ export function ProspectLedgerPage() {
                       {t("marine.prospects.run.settledCount", {
                         n: leg.settled_count,
                       })}
+                    </span>
+                  )}
+                  {leg.error && (
+                    <span
+                      className="basis-full cursor-help text-[11px] text-destructive underline decoration-dotted underline-offset-2"
+                      title={leg.error}
+                    >
+                      {t("marine.prospects.run.errorDetail")}
                     </span>
                   )}
                 </li>
