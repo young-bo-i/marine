@@ -158,7 +158,22 @@ fn resolve_provider_name(settings: &AppSettings) -> String {
 fn select_provider(settings: &AppSettings) -> Result<Box<dyn Provider>, String> {
   match resolve_provider_name(settings).as_str() {
     "codex" => Ok(Box::new(cli::CodexProvider {
-      model: settings.marine_cli_model.clone(),
+      // Substituted here rather than left to Codex: an unset model used to mean
+      // "whatever `~/.codex/config.toml` says", which made the model behind
+      // every comment depend on an unrelated terminal preference.
+      model: Some(
+        settings
+          .marine_cli_model
+          .clone()
+          .map(|value| value.trim().to_string())
+          .filter(|value| !value.is_empty())
+          .unwrap_or_else(|| cli::DEFAULT_CODEX_MODEL.to_string()),
+      ),
+      reasoning_effort: Some(
+        cli::normalize_codex_reasoning_effort(settings.marine_cli_reasoning_effort.as_deref())
+          .map_err(|message| err_with("MARINE_PROVIDER_INVALID", message))?
+          .unwrap_or_else(|| cli::DEFAULT_CODEX_REASONING_EFFORT.to_string()),
+      ),
     })),
     "claude" => Ok(Box::new(cli::ClaudeProvider {
       model: settings.marine_cli_model.clone(),
@@ -402,9 +417,56 @@ pub async fn generate_blocks_stream_with_quality(
   run_validated_provider(skill, payload, quality_spec, deltas, cancellation).await
 }
 
+/// Does this provider failure say the configured model is unusable?
+///
+/// `map_provider_error` deliberately keeps provider internals off the page, but
+/// a rejected model is not an internal detail — it is a value the user typed
+/// into the connector settings. Collapsed into the generic bucket it renders as
+/// "生成失败，请重试", which sends them to retry forever instead of to the
+/// field they got wrong; the model is pinned now, so this failure is permanent
+/// rather than transient.
+///
+/// Matched on the message because the app-server reports it as a plain terminal
+/// error: Codex 0.144.4 answers a bad model with
+/// `"The 'x' model is not supported when using Codex with a ChatGPT account."`
+/// inside a 400 `invalid_request_error`.
+fn rejected_model_detail(error: &str) -> Option<String> {
+  let lowered = error.to_ascii_lowercase();
+  let names_a_model = lowered.contains("model is not supported")
+    || lowered.contains("model_not_found")
+    || lowered.contains("unknown model")
+    || (lowered.contains("invalid_request_error") && lowered.contains("model"));
+  if !names_a_model {
+    return None;
+  }
+  // Prefer the innermost human sentence; the raw payload is nested JSON.
+  let detail = error
+    .rsplit_once("\"message\":")
+    .map(|(_, tail)| tail)
+    .unwrap_or(error)
+    .trim()
+    .trim_start_matches('"')
+    .split("\",")
+    .next()
+    .unwrap_or(error)
+    .trim()
+    .trim_matches('"')
+    .replace("\\\"", "\"")
+    .trim()
+    .to_string();
+  Some(if detail.is_empty() {
+    error.chars().take(200).collect()
+  } else {
+    detail.chars().take(200).collect()
+  })
+}
+
 fn map_provider_error(error: String) -> String {
   if error == "MARINE_GENERATE_TIMEOUT" || error == "MARINE_GENERATE_CANCELLED" {
     err(&error)
+  } else if let Some(detail) = rejected_model_detail(&error) {
+    log::warn!("Marine generation rejected the configured model: {detail}");
+    err_with("MARINE_MODEL_REJECTED", detail)
   } else {
     log::warn!(
       "Marine generation provider failed: {}",
@@ -420,6 +482,44 @@ fn map_provider_error(error: String) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// The exact payload Codex 0.144.4 returns for a mistyped model, captured
+  /// from a real run. Collapsing this into MARINE_GENERATE_FAILED is what makes
+  /// a one-character typo look like a permanent unexplained outage.
+  #[test]
+  fn a_rejected_model_is_named_instead_of_becoming_a_generic_failure() {
+    let real = "Codex reported an error: {\"type\":\"error\",\"status\":400,\"error\":\
+                {\"type\":\"invalid_request_error\",\"message\":\"The 'gpt5.3-spark-typo' \
+                model is not supported when using Codex with a ChatGPT account.\"}}";
+    let detail = rejected_model_detail(real).expect("a rejected model must be recognised");
+    assert!(detail.contains("gpt5.3-spark-typo"), "{detail}");
+    assert!(
+      !detail.contains("invalid_request_error"),
+      "raw payload leaked: {detail}"
+    );
+
+    let mapped = map_provider_error(real.to_string());
+    assert!(mapped.contains("MARINE_MODEL_REJECTED"), "{mapped}");
+    assert!(mapped.contains("gpt5.3-spark-typo"), "{mapped}");
+  }
+
+  /// Ordinary failures must stay in the generic bucket — promoting them would
+  /// leak provider internals onto the page.
+  #[test]
+  fn unrelated_provider_failures_stay_generic() {
+    for ordinary in [
+      "Codex produced no answer",
+      "spawn Codex app-server failed: No such file or directory",
+      "Codex closed without exactly one successful result event",
+    ] {
+      assert_eq!(rejected_model_detail(ordinary), None, "{ordinary}");
+      assert!(map_provider_error(ordinary.to_string()).contains("MARINE_GENERATE_FAILED"));
+    }
+    // Cancellation and timeout keep their own codes.
+    assert!(
+      map_provider_error("MARINE_GENERATE_TIMEOUT".to_string()).contains("MARINE_GENERATE_TIMEOUT")
+    );
+  }
 
   fn valid_quality_spec() -> CommentQualitySpec {
     CommentQualitySpec {

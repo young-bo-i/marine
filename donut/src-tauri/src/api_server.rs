@@ -462,8 +462,16 @@ struct MarineGenerateRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 struct MarineProviderConfig {
   provider: Option<String>,
+  /// Model for the local CLI connector. `null` means Marine's own default
+  /// (`DEFAULT_CODEX_MODEL` for Codex), never "inherit `~/.codex/config.toml`".
+  #[serde(default)]
   cli_model: Option<String>,
+  /// Codex reasoning effort; `null` means `DEFAULT_CODEX_REASONING_EFFORT`.
+  #[serde(default)]
+  cli_reasoning_effort: Option<String>,
+  #[serde(default)]
   openai_base_url: Option<String>,
+  #[serde(default)]
   openai_model: Option<String>,
 }
 
@@ -1207,6 +1215,7 @@ async fn marine_get_provider_config() -> Result<Json<MarineProviderConfig>, (Sta
   Ok(Json(MarineProviderConfig {
     provider: settings.marine_provider,
     cli_model: settings.marine_cli_model,
+    cli_reasoning_effort: settings.marine_cli_reasoning_effort,
     openai_base_url: settings.marine_openai_base_url,
     openai_model: settings.marine_openai_model,
   }))
@@ -1232,16 +1241,46 @@ async fn marine_set_provider_config(
       ));
     }
   }
+  // Reject an unusable effort at the edge, where the caller still gets a 400
+  // naming the accepted values. Deeper down it would surface as a failed
+  // generation with nothing pointing back at this setting.
+  let cli_reasoning_effort = crate::marine::generate::cli::normalize_codex_reasoning_effort(
+    config.cli_reasoning_effort.as_deref(),
+  )
+  .map_err(|message| {
+    (
+      StatusCode::BAD_REQUEST,
+      crate::marine::err_with("MARINE_PROVIDER_INVALID", message),
+    )
+  })?;
   let manager = SettingsManager::instance();
   let mut settings = manager.load_settings().map_err(marine_settings_error)?;
   settings.marine_provider = config.provider.clone();
-  settings.marine_cli_model = config.cli_model.clone();
+  // Trimmed on the way in, not at each use: the codex path trimmed while the
+  // claude path passed the raw value straight to `--model`, so a stray space
+  // produced two different behaviours from one stored setting.
+  settings.marine_cli_model = config
+    .cli_model
+    .as_deref()
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(str::to_string);
+  settings.marine_cli_reasoning_effort = cli_reasoning_effort;
   settings.marine_openai_base_url = config.openai_base_url.clone();
   settings.marine_openai_model = config.openai_model.clone();
   manager
     .save_settings(&settings)
     .map_err(marine_settings_error)?;
-  Ok(Json(config))
+  // Answer with what was persisted, not what was sent. They differ whenever a
+  // value was normalized, and a client that trusts the echo would then show a
+  // setting the backend does not actually hold.
+  Ok(Json(MarineProviderConfig {
+    provider: settings.marine_provider,
+    cli_model: settings.marine_cli_model,
+    cli_reasoning_effort: settings.marine_cli_reasoning_effort,
+    openai_base_url: settings.marine_openai_base_url,
+    openai_model: settings.marine_openai_model,
+  }))
 }
 
 /// Auto-detect local agents (codex / claude) with connection status, so the
@@ -4208,6 +4247,76 @@ mod tests {
   use axum::http::{header, Request};
   use http_body_util::BodyExt;
   use tower::ServiceExt;
+
+  /// The popup is the only writer of this endpoint, so its payload shape is the
+  /// contract. A field renamed on one side and not the other would silently
+  /// deserialize to `None` — i.e. the user picks a model, sees "已保存", and
+  /// generation keeps using the default.
+  #[test]
+  fn the_popup_payload_round_trips_through_the_provider_config_dto() {
+    let sent_by_popup = serde_json::json!({
+      "provider": "codex",
+      "cli_model": "gpt-5.3-codex-spark",
+      "cli_reasoning_effort": "low",
+      "openai_base_url": null,
+      "openai_model": null
+    });
+    let config: MarineProviderConfig = serde_json::from_value(sent_by_popup).unwrap();
+    assert_eq!(config.provider.as_deref(), Some("codex"));
+    assert_eq!(config.cli_model.as_deref(), Some("gpt-5.3-codex-spark"));
+    assert_eq!(config.cli_reasoning_effort.as_deref(), Some("low"));
+
+    // An older popup that predates the field must still save, falling back to
+    // Marine's default rather than failing the request outright.
+    let older_popup = serde_json::json!({"provider": "codex", "cli_model": null});
+    let config: MarineProviderConfig = serde_json::from_value(older_popup).unwrap();
+    assert_eq!(config.cli_reasoning_effort, None);
+  }
+
+  /// The dropdown and the backend allowlist must not drift.
+  ///
+  /// Read out of `popup.html` rather than restated here: a hand-copied list
+  /// would agree with the markup only until someone edits one of them, and the
+  /// failure mode is a user picking a tier that saves with a 400.
+  #[test]
+  fn every_effort_the_popup_offers_is_accepted_and_nothing_else_is() {
+    use crate::marine::generate::cli::{normalize_codex_reasoning_effort, CODEX_REASONING_EFFORTS};
+
+    let popup = include_str!("../../marine-extension/popup.html");
+    let dropdown = popup
+      .split_once(r#"<select id="cfg-cli-effort""#)
+      .expect("popup.html no longer has the reasoning-effort dropdown")
+      .1
+      .split_once("</select>")
+      .expect("unterminated reasoning-effort dropdown")
+      .0;
+    let offered: Vec<&str> = dropdown
+      .match_indices(r#"<option value=""#)
+      .map(|(at, marker)| {
+        let rest = &dropdown[at + marker.len()..];
+        &rest[..rest.find('"').expect("unterminated option value")]
+      })
+      // The empty value is "use Marine's default", not a tier.
+      .filter(|value| !value.is_empty())
+      .collect();
+
+    assert!(!offered.is_empty(), "parsed no options out of popup.html");
+    for value in &offered {
+      assert!(
+        normalize_codex_reasoning_effort(Some(value)).is_ok(),
+        "popup offers {value} but the endpoint rejects it"
+      );
+    }
+    // And the converse: a tier the backend accepts but the popup hides is a
+    // setting the user cannot reach.
+    for accepted in CODEX_REASONING_EFFORTS {
+      assert!(
+        offered.contains(accepted),
+        "{accepted} is accepted but the popup does not offer it"
+      );
+    }
+    assert!(normalize_codex_reasoning_effort(Some("turbo")).is_err());
+  }
 
   #[tokio::test]
   async fn readiness_requires_a_live_task_and_reachable_loopback_port() {

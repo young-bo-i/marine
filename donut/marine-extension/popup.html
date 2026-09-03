@@ -108,7 +108,24 @@
         </select>
         <button id="cfg-connector-save" class="cta-2 brand-mini-btn">保存</button>
       </div>
+      <div class="brand-row" style="margin-top:8px">
+        <span class="brand-row-label">模型</span>
+        <input id="cfg-cli-model" class="cfg-input brand-select" type="text" autocomplete="off"
+               spellcheck="false" placeholder="留空＝Codex 用 gpt-5.3-codex-spark">
+      </div>
+      <div class="brand-row" style="margin-top:8px">
+        <span class="brand-row-label">推理深度</span>
+        <select id="cfg-cli-effort" class="cfg-input brand-select">
+          <option value="">默认（low）</option>
+          <option value="minimal">minimal（最快）</option>
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="high">high</option>
+          <option value="xhigh">xhigh（最慢）</option>
+        </select>
+      </div>
       <div id="cfg-connector-status" class="note" style="margin-top:6px">正在检测本机智能体…</div>
+      <div class="note" style="margin-top:6px">「模型」对 Codex 与 Claude 都生效（留空时 Codex 用 <code>gpt-5.3-codex-spark</code>，Claude 用它自己的默认）；「推理深度」只对 Codex 生效。两者保存后由 Marine 显式下发，<strong>不再跟随 <code>~/.codex/config.toml</code></strong>——你在 Codex 桌面端换模型、或把 <code>model_reasoning_effort</code> 调到 <code>xhigh</code>，都不会再悄悄改掉评论生成。评论是短文本且带质量校验重试，<code>low</code> 通常够用。</div>
     </section>
 
     <!-- 调试 -->

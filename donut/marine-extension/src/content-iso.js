@@ -1805,10 +1805,16 @@
       MARINE_RIME_PROMPT_TOO_LARGE: '页面内容过大，无法生成',
       MARINE_OPENAI_NOT_CONFIGURED: '未配置 OpenAI 兼容端点',
       MARINE_OPENAI_KEY_MISSING: '缺少 OpenAI 兼容端点密钥',
+      MARINE_PROVIDER_INVALID: '连接器配置无效，请在扩展「配置」里检查模型与推理深度',
       MARINE_SETTINGS_FAILED: '读取设置失败',
       MARINE_COMMENT_QUALITY_FAILED: '候选文案未通过质量校验，请重试',
       MARINE_GENERATE_FAILED: '生成失败，请重试',
     };
+    // 模型被拒时，唯一有用的信息在 message 里（它点名了是哪个模型），
+    // 固定文案会把它盖掉，所以这一类反过来以 message 为主。
+    if (code === 'MARINE_MODEL_REJECTED') {
+      return '模型不可用：' + (message ? String(message) : '请在扩展「配置」里检查模型名');
+    }
     return map[code] || (message ? String(message) : '生成失败，请重试');
   }
 

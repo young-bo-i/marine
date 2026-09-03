@@ -23,6 +23,8 @@ pnpm tauri dev
 
 引擎：本机 **codex**（`~/.codex` 订阅）/ **claude**（`~/.claude`）自动识别；或 **OpenAI 兼容端点**（key 走 `DONUT_MARINE_OPENAI_API_KEY` 环境变量）。
 
+走 codex 时，模型与推理深度由 Marine 显式下发（默认 `gpt-5.3-codex-spark` + `low`），**不继承 `~/.codex/config.toml`**——否则终端里换个模型或把 `model_reasoning_effort` 调到 `xhigh`，就会悄悄改掉每一条评论的生成模型和耗时。两者都在扩展「配置 → AI 模型连接器」里可改；推理深度走 `-c` 下发、回包独立校验，掉了会直接报错；模型名则不做存在性校验（codex 0.144.4 在 `thread/start` 阶段原样回显，不解析），写错要到真正发起请求时才知道——这种情况会报 `MARINE_MODEL_REJECTED` 并带上模型名，而不是笼统的"生成失败"。
+
 ## 许可
 
 `donut/` 衍生自 Donut Browser，遵循 **AGPL-3.0**：衍生作品需开源并保留同一许可。

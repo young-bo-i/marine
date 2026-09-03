@@ -106,6 +106,11 @@ pub struct AppSettings {
   pub marine_provider: Option<String>, // "codex" | "claude" | "openai"
   #[serde(default)]
   pub marine_cli_model: Option<String>,
+  /// Reasoning effort for the local CLI connector (Codex only). `None` means
+  /// Marine's own default, not "inherit config.toml" — see
+  /// `marine::generate::cli::DEFAULT_CODEX_REASONING_EFFORT`.
+  #[serde(default)]
+  pub marine_cli_reasoning_effort: Option<String>,
   #[serde(default)]
   pub marine_openai_base_url: Option<String>,
   #[serde(default)]
@@ -148,6 +153,7 @@ impl Default for AppSettings {
       keep_decrypted_profiles_in_ram: false,
       marine_provider: None,
       marine_cli_model: None,
+      marine_cli_reasoning_effort: None,
       marine_openai_base_url: None,
       marine_openai_model: None,
     }
@@ -1320,6 +1326,7 @@ mod tests {
       keep_decrypted_profiles_in_ram: false,
       marine_provider: None,
       marine_cli_model: None,
+      marine_cli_reasoning_effort: None,
       marine_openai_base_url: None,
       marine_openai_model: None,
     };

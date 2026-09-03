@@ -55,6 +55,14 @@ async function apiFetch(path, options) {
   if (!res.ok) {
     let detail = '';
     try { detail = await res.text(); } catch (e) {}
+    // Marine 的错误体是 {"code":…,"params":{"message":…}}；直接回显整段 JSON 会把
+    // 唯一有用的那句话埋起来（比如"推理深度必须是 … 之一"），所以先剥出 message。
+    try {
+      const body = JSON.parse(detail);
+      const message = body && body.params && body.params.message;
+      if (message) detail = message;
+      else if (body && body.code) detail = body.code;
+    } catch (e) {}
     throw new Error('HTTP ' + res.status + (detail ? ' · ' + detail.slice(0, 200) : ''));
   }
   const ct = res.headers.get('content-type') || '';
@@ -275,9 +283,29 @@ const SKILL_BRAND = 'scholay';
 // ---- 导入本地 .md 作为补充范文（存 chrome.storage，生成时并入 skill）----
 // ---- AI 模型连接器：自动探测本机 codex/claude + 读写 provider-config ----
 const CONNECTOR_LABEL = { codex: 'Codex', claude: 'Claude Code', openai: '通用 OpenAI 兼容端点' };
-// PUT /provider-config 是整体替换：保留 GET 到的完整配置，保存时只改 provider，
-// 不清空经 API 设置的 cli_model / openai_base_url / openai_model。
+// PUT /provider-config 是整体替换：保留 GET 到的完整配置。provider / cli_model /
+// cli_reasoning_effort 现在都有 UI，按控件当前值下发；openai_base_url / openai_model
+// 仍无 UI，原样回填，避免把经 API 设置的值清空。
 let marineConnectorConfig = {};
+// 只有真正 GET 成功过才允许保存——否则一次读失败会被当成"全空配置"写回去。
+let marineConnectorConfigLoaded = false;
+
+// 模型输入框的提示语与推理深度可用性，取决于当前选中的连接器。
+function applyConnectorFieldState(provider) {
+  const modelInput = $('#cfg-cli-model');
+  const effortSelect = $('#cfg-cli-effort');
+  // 空＝自动，优先 Codex。
+  const codexLike = provider === '' || provider === 'codex';
+  if (modelInput) {
+    modelInput.placeholder = provider === 'claude'
+      ? '留空＝Claude Code 自己的默认'
+      : '留空＝Codex 用 gpt-5.3-codex-spark';
+  }
+  if (effortSelect) {
+    // 推理深度只有 Codex 认；在别的连接器下禁用，免得看着已设置、实则被忽略。
+    effortSelect.disabled = !codexLike;
+  }
+}
 
 async function loadConnectorOptions() {
   const select = $('#cfg-connector');
@@ -289,7 +317,16 @@ async function loadConnectorOptions() {
   catch (e) { status.textContent = '检测智能体失败：' + String(e && e.message || e); return; }
   if (!Array.isArray(agents)) agents = [];
   let config = {};
-  try { config = await apiFetch('/provider-config') || {}; } catch (e) {}
+  try {
+    config = await apiFetch('/provider-config') || {};
+    marineConnectorConfigLoaded = true;
+  } catch (e) {
+    // 读失败时控件会全部显示为空，和"从没配过"长得一模一样；此时若点保存，
+    // 就会把 provider/模型/推理深度一起写成 null。标记未加载，让保存拒绝执行。
+    marineConnectorConfigLoaded = false;
+    status.textContent = '读取连接器配置失败，请稍后重试：' + String(e && e.message || e);
+    return;
+  }
   marineConnectorConfig = config || {};
   const provider = typeof config.provider === 'string' ? config.provider : '';
   // 若经 API 配了 popup 下拉里没有的 provider（如 openai），动态补一项，保证保存时不被复位。
@@ -300,6 +337,21 @@ async function loadConnectorOptions() {
     select.appendChild(opt);
   }
   select.value = provider;
+  const modelInput = $('#cfg-cli-model');
+  const effortSelect = $('#cfg-cli-effort');
+  if (modelInput) modelInput.value = typeof config.cli_model === 'string' ? config.cli_model : '';
+  if (effortSelect) {
+    const effort = typeof config.cli_reasoning_effort === 'string' ? config.cli_reasoning_effort : '';
+    // 后端可能存了下拉里没有的档位（经 API 直接配置），补一项，避免保存时被复位成默认。
+    if (effort && !Array.from(effortSelect.options).some(o => o.value === effort)) {
+      const opt = document.createElement('option');
+      opt.value = effort;
+      opt.textContent = effort + '（经 API 配置）';
+      effortSelect.appendChild(opt);
+    }
+    effortSelect.value = effort;
+  }
+  applyConnectorFieldState(provider);
   const ready = agents.filter(a => a && a.detected && a.authed).map(a => a.id);
   const parts = agents.map(a => {
     const name = CONNECTOR_LABEL[a.id] || a.id;
@@ -314,15 +366,34 @@ async function loadConnectorOptions() {
   status.textContent = parts.join('　') + (parts.length ? ' · ' : '') + hint;
 }
 
+if ($('#cfg-connector')) $('#cfg-connector').addEventListener('change', () => {
+  // cli_model 是 codex/claude 共用的同一个字段。把 Codex 的模型名带到 Claude 上，
+  // 会让之后每一次生成都失败，而且错误里看不出是这里引起的。换连接器就清空，
+  // 让模型要么显式重填，要么回落到新连接器自己的默认值。
+  const modelInput = $('#cfg-cli-model');
+  if (modelInput) modelInput.value = '';
+  applyConnectorFieldState($('#cfg-connector').value);
+});
+
 if ($('#cfg-connector-save')) $('#cfg-connector-save').addEventListener('click', async () => {
   const select = $('#cfg-connector');
   const status = $('#cfg-connector-status');
   if (!select) return;
+  if (!marineConnectorConfigLoaded) {
+    if (status) status.textContent = '尚未读到当前连接器配置，拒绝保存（避免把现有设置清空）。请重开配置页重试。';
+    return;
+  }
   try {
     const c = marineConnectorConfig || {};
+    const modelInput = $('#cfg-cli-model');
+    const effortSelect = $('#cfg-cli-effort');
+    // 留空＝交回 Marine 的默认值（gpt-5.3-codex-spark / low），不是"继承 config.toml"。
+    const cliModel = modelInput ? modelInput.value.trim() : '';
+    const cliEffort = effortSelect ? effortSelect.value.trim() : '';
     await apiFetch('/provider-config', { method: 'PUT', body: JSON.stringify({
       provider: select.value || null,
-      cli_model: c.cli_model != null ? c.cli_model : null,
+      cli_model: cliModel || null,
+      cli_reasoning_effort: cliEffort || null,
       openai_base_url: c.openai_base_url != null ? c.openai_base_url : null,
       openai_model: c.openai_model != null ? c.openai_model : null,
     }) });
