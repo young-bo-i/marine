@@ -2278,6 +2278,7 @@
         "unconfirmed": "Enviado; confirmación pendiente",
         "filled": "Borrador rellenado; no enviado",
         "timed_out": "Nada registrado",
+        "no_work": "Nada que hacer",
         "no_slot": "Plataforma no admitida",
         "already_open": "Ya abierto: omitido",
         "skipped": "Omitido",

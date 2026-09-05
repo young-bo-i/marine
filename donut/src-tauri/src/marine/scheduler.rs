@@ -140,6 +140,18 @@ const WARMUP_SETTLE: Duration = Duration::from_secs(4);
 const NAVIGATION_COMMAND_WAIT: Duration = Duration::from_secs(10);
 const NAVIGATION_COMMIT_WAIT: Duration = Duration::from_secs(12);
 
+/// `Page.navigate` 超过 [`NAVIGATION_COMMAND_WAIT`] 没应答之后，再给这次导航
+/// 多少时间「其实已经落地了」。
+///
+/// 命令没应答**不等于**导航没发生：应答走的是渲染进程，而 `/json` 里的 URL 由
+/// 浏览器进程维护 —— 渲染进程卡住时前者不回、后者照常更新。所以超时之后先花很
+/// 小一笔钱去看一眼页面到底跳没跳，再决定要不要走「等渲染进程 + 重发」那条
+/// 三十多秒的阶梯。
+///
+/// 故意远小于 [`NAVIGATION_COMMIT_WAIT`]：这里赌的是「已经到了」，没到就该赶紧
+/// 去走重试阶梯，而不是在这里再等一轮完整的提交窗口。
+const NAVIGATION_LATE_COMMIT_WAIT: Duration = Duration::from_secs(3);
+
 /// How long a freshly committed platform page gets to expose Marine's content
 /// script readiness marker before one controlled reload is attempted.
 const EXTENSION_READY_WAIT: Duration = Duration::from_secs(12);
@@ -180,10 +192,17 @@ pub enum LegOutcome {
   Unconfirmed,
   /// A draft was filled but was not submitted.
   Filled,
-  /// Nothing was settled within the timeout. Also the normal outcome when the
-  /// profile is not logged in on that platform, or when the ledger had nothing
-  /// eligible left for it.
+  /// The leg reached its deadline with nothing settled and no explanation.
+  ///
+  /// 只剩「真的等满了」这一种含义。以前它还兼着「没登录」和「候选池空了」，
+  /// 于是 B 站 53 条腿全报 TimedOut、同时又写了 53 行「未登录」—— 两个数字互相
+  /// 矛盾，看日志的人只能去查一个根本不存在的卡顿。那两类现在是 [`Self::NoWork`]。
   TimedOut,
+  /// 这条腿没活可干：这个平台没登录，或者台账里已经没有该账号能碰的候选了。
+  ///
+  /// 不是失败，也不是超时 —— 扩展在几秒内就给出了明确结论（实测 B 站 6.1s、
+  /// 知乎 4.5s），腿是**提前**结束的。单列出来，`TimedOut` 才重新等于「卡住了」。
+  NoWork,
   /// The platform has no search slot (unsupported platform), so there was
   /// nothing to launch. Not an error.
   NoSlot,
@@ -1495,15 +1514,62 @@ fn navigation_reached(expected: &str, actual: &str) -> bool {
   true
 }
 
+/// 「这次导航提交了吗」—— 比 [`navigation_reached`] 宽，只在**预热页**上宽。
+///
+/// 两个判定的契约不一样，用同一个是这套调度器最贵的一个 bug：
+/// 预热 URL 是站点首页（`https://www.xiaohongshu.com/`），而小红书会把首页重定向
+/// 到 `/explore`。[`navigation_reached`] 要求路径完全相等，`"" != "/explore"`，
+/// 于是**每一条小红书腿**的预热都要白等满两个 `NAVIGATION_COMMIT_WAIT` 才报
+/// 「accepted but did not commit」—— 页面其实早就好了。10 天的日志里 53/53 条小红
+/// 书腿都是这个形态，而其它三个平台一次都没有：它们的搜索 URL 自带路径。
+///
+/// 所以放宽只对「没指定路径」的 URL 生效：一个只说了 origin 的 URL，本来就该允许
+/// 站点把你送到它自己的落地页；而任何搜索 URL（`/all`、`/search`、`/search/<kw>`、
+/// `/search_result`）路径非空，判定和以前逐字节一样严 —— 包括那条防「恢复出来的
+/// 旧标签页刚好同关键词、不同 sort」的 keyword/order/sort 检查。
+/// 跨 origin 的弹转（登录页、验证码域名）照样是 false。
+fn navigation_committed(expected: &str, actual: &str) -> bool {
+  if navigation_reached(expected, actual) {
+    return true;
+  }
+  let (Ok(want), Ok(got)) = (url::Url::parse(expected), url::Url::parse(actual)) else {
+    return false;
+  };
+  // 带路径或带查询参数的 URL 说明调用方要的是某一页，不是「这个站」。
+  if !want.path().trim_end_matches('/').is_empty() || want.query().is_some() {
+    return false;
+  }
+  want.scheme() == got.scheme()
+    && want.host_str() == got.host_str()
+    && want.port_or_known_default() == got.port_or_known_default()
+}
+
+/// 轮询时判断：标签页是不是已经离开搜索页、跳到 claim 下来的那个靶子上了。
+///
+/// 三个否定条件缺一不可，最容易漏的是第一个：`/json` 对一个刚创建、还没开始
+/// 导航的 target 会报**空 URL**。空串既不是 `about:blank`，`navigation_reached`
+/// 对它也必然 false（`Url::parse("")` 直接报错），取反之后就被当成「已经在靶子
+/// 页上」—— 接着这条腿会拿这个空串去 `navigate_retrying`，连赔两次导航失败，
+/// 最后把整个浏览器会话判成不可用。一个短暂的空 URL 不该有这个后果。
+fn is_target_page(search_url: &str, current_url: &str) -> bool {
+  !current_url.is_empty()
+    && current_url != "about:blank"
+    && !navigation_reached(search_url, current_url)
+}
+
+/// 轮询到导航提交为止。`budget` 由调用方给：正常路径是
+/// [`NAVIGATION_COMMIT_WAIT`]，命令超时后的补看一眼是
+/// [`NAVIGATION_LATE_COMMIT_WAIT`]。
 async fn wait_for_navigation_commit(
   profile: &BrowserProfile,
   driven_tab: Option<&str>,
   expected: &str,
+  budget: Duration,
   cancel: Option<&AtomicBool>,
 ) -> bool {
   let path = profile_data_path(profile);
   let wayfern = crate::wayfern_manager::WayfernManager::instance();
-  let deadline = tokio::time::Instant::now() + NAVIGATION_COMMIT_WAIT;
+  let deadline = tokio::time::Instant::now() + budget;
   loop {
     if cancellation_requested(cancel) {
       return false;
@@ -1516,7 +1582,7 @@ async fn wait_for_navigation_commit(
       let target = driven_tab
         .and_then(|id| targets.iter().find(|t| t.id == id))
         .or_else(|| targets.first());
-      if target.is_some_and(|t| navigation_reached(expected, &t.url)) {
+      if target.is_some_and(|t| navigation_committed(expected, &t.url)) {
         return true;
       }
     }
@@ -1558,13 +1624,51 @@ async fn navigate_and_wait(
       return Err(format!("navigation cancelled while loading {url}"));
     }
   };
-  command_result.map_err(|_| {
-    format!(
-      "navigation command did not answer within {}s for {url}",
-      NAVIGATION_COMMAND_WAIT.as_secs()
-    )
-  })??;
-  if wait_for_navigation_commit(profile, driven_tab.as_deref(), url, cancel).await {
+  match command_result {
+    Ok(inner) => inner?,
+    Err(_) => {
+      // 命令没应答 ≠ 导航没发生。
+      //
+      // `Page.navigate` 的应答要经渲染进程，渲染进程一忙就不回；而 `/json` 里的
+      // URL 是浏览器进程维护的，照常更新。直接判失败等于把一次**可能已经成功**
+      // 的导航扔掉，然后去走「等渲染进程 20s + 重发 + 再等一个提交窗口」那条
+      // 三十多秒的阶梯 —— 实测每条小红书腿都在这里赔掉 37 秒，人看到的就是标签
+      // 页停在 about:blank 不动。
+      //
+      // 所以先花 [`NAVIGATION_LATE_COMMIT_WAIT`] 看一眼页面到底跳没跳。跳了就
+      // 直接算成功；没跳再照旧报错，交给 [`navigate_retrying`] 的阶梯。赌输了
+      // 只多赔 3 秒，赌赢了省下整条阶梯。
+      if wait_for_navigation_commit(
+        profile,
+        driven_tab.as_deref(),
+        url,
+        NAVIGATION_LATE_COMMIT_WAIT,
+        cancel,
+      )
+      .await
+      {
+        log::info!(
+          "Discovery: navigation command did not answer within {}s for {url}, but the page had already committed",
+          NAVIGATION_COMMAND_WAIT.as_secs()
+        );
+        return Ok(());
+      }
+      reject_cancelled_navigation(cancel, url)?;
+      return Err(format!(
+        "navigation command did not answer within {}s for {url}",
+        NAVIGATION_COMMAND_WAIT.as_secs()
+      ));
+    }
+  }
+  if wait_for_navigation_commit(
+    profile,
+    driven_tab.as_deref(),
+    url,
+    NAVIGATION_COMMIT_WAIT,
+    cancel,
+  )
+  .await
+  {
     Ok(())
   } else {
     reject_cancelled_navigation(cancel, url)?;
@@ -1752,7 +1856,7 @@ struct HopelessReason {
 impl HopelessReason {
   fn outcome(self) -> LegOutcome {
     match self.kind {
-      HopelessKind::NoWork => LegOutcome::TimedOut,
+      HopelessKind::NoWork => LegOutcome::NoWork,
       HopelessKind::SystemFailure => LegOutcome::Failed,
     }
   }
@@ -1916,36 +2020,56 @@ fn leg_is_hopeless(profile_id: &str, platform: &str, since: u64) -> Option<Hopel
   None
 }
 
-/// 等渲染进程重新开始应答，最多等 `IDLE_WAIT`。
+/// 等渲染进程重新开始应答，最多等 [`IDLE_WAIT`]。
 ///
-/// 等不到也照常往下走：下一次导航自带 30 秒上限，最坏是那条腿失败，
+/// 等不到也照常往下走：下一次导航自带上限，最坏是那条腿失败，
 /// 而不是在这里把整轮拖死。
+///
+/// `IDLE_WAIT` 是**硬上限**，所以每次探针都要按剩余预算裁一刀。
+/// [`crate::wayfern_manager::WayfernManager::renderer_responds`] 自带 8 秒超时，
+/// 循环条件却只在**进入下一轮之前**看时钟：t=18s 时还能再起一次探针，于是 20 秒
+/// 的预算实测跑成 27 秒（3×(8s 探针 + 1s 间歇)）。日志里那 40 次「renderer still
+/// busy」全是 27.0–27.1 秒，一秒不差。
+///
+/// `reason` 由调用方给：这行警告过去写死「after parking」，可它 41 次里有 40 次
+/// 其实来自**导航重试**，把每一次从这条日志出发的排查都带偏了。
 async fn wait_until_idle(
   profile: &BrowserProfile,
   driven_tab: Option<&str>,
+  reason: &str,
   cancel: Option<&AtomicBool>,
 ) {
   let path = profile_data_path(profile);
   let wayfern = crate::wayfern_manager::WayfernManager::instance();
   let deadline = tokio::time::Instant::now() + IDLE_WAIT;
-  while tokio::time::Instant::now() < deadline {
+  loop {
     if cancellation_requested(cancel) {
       return;
     }
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+      break;
+    }
     let responds = tokio::select! {
-      responds = wayfern.renderer_responds(&path, driven_tab) => responds,
+      responds = tokio::time::timeout(remaining, wayfern.renderer_responds(&path, driven_tab))
+        => matches!(responds, Ok(true)),
       _ = cancellation_signal(cancel) => return,
     };
     if responds {
       return;
     }
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+      break;
+    }
     tokio::select! {
-      _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+      _ = tokio::time::sleep(remaining.min(Duration::from_secs(1))) => {}
       _ = cancellation_signal(cancel) => return,
     }
   }
   log::warn!(
-    "Discovery: renderer still busy after parking profile {}",
+    "Discovery: renderer still busy after {}s ({reason}) on profile {}",
+    IDLE_WAIT.as_secs(),
     profile.name
   );
 }
@@ -2001,7 +2125,13 @@ async fn navigate_retrying(
       log::warn!(
         "Discovery navigation failed ({first}); waiting for the renderer and retrying once"
       );
-      wait_until_idle(profile, driven_tab.as_deref(), cancel).await;
+      wait_until_idle(
+        profile,
+        driven_tab.as_deref(),
+        &format!("waiting to retry the navigation to {url}"),
+        cancel,
+      )
+      .await;
       // A failed navigation followed by the idle wait is a wide cancellation
       // window. Never start its retry after Stop. Cancellation's deliberate
       // `about:blank` fence calls this helper with `cancel = None`; normal leg
@@ -2837,7 +2967,7 @@ async fn run_leg(
       break;
     }
     if let Some(current_url) = current_url {
-      let on_target = current_url != "about:blank" && !navigation_reached(&slot.url, &current_url);
+      let on_target = is_target_page(&slot.url, &current_url);
       if on_target {
         // A blocked item can hop to another target in the same leg.  Each new
         // document gets its own one-reload bootstrap budget; carrying the bool
@@ -3010,7 +3140,13 @@ async fn run_leg(
         // 实测规律干净得没有歧义：上一条腿**真发出去了**（B站、抖音）→ 下一次导航
         // 必超时；上一条腿立刻失败、根本没干活（知乎那次）→ 下一次导航正常。
         if !scheduler.cancel.load(Ordering::SeqCst) {
-          wait_until_idle(profile, driven_tab.as_deref(), Some(&scheduler.cancel)).await;
+          wait_until_idle(
+            profile,
+            driven_tab.as_deref(),
+            "after parking the page",
+            Some(&scheduler.cancel),
+          )
+          .await;
           *driven_tab = sweep_tabs(profile, driven_tab.as_deref()).await;
         }
         None
@@ -3395,6 +3531,120 @@ mod tests {
     assert!(navigation_reached("about:blank", "about:blank"));
   }
 
+  /// 这条腿的实际形态：预热 URL 只写了 origin，小红书把首页重定向到 `/explore`。
+  /// `navigation_reached` 判 false 是**对的**（它是「到没到这一页」），
+  /// 错的是拿它去当提交判定 —— 于是 53/53 条小红书腿白等两个提交窗口。
+  #[test]
+  fn warm_up_commit_accepts_the_platform_landing_page() {
+    let warm_up = super::super::search_slot::slot_for("xiaohongshu", "科研工具", 0)
+      .expect("xiaohongshu has slots")
+      .warmup_url
+      .expect("xiaohongshu has a warm-up page");
+    assert_eq!(warm_up, "https://www.xiaohongshu.com/");
+
+    // 今天的形态：严格判定说没到，提交判定说到了。
+    assert!(!navigation_reached(
+      &warm_up,
+      "https://www.xiaohongshu.com/explore"
+    ));
+    assert!(navigation_committed(
+      &warm_up,
+      "https://www.xiaohongshu.com/explore"
+    ));
+    assert!(navigation_committed(
+      &warm_up,
+      "https://www.xiaohongshu.com/explore?channel_id=homefeed_recommend"
+    ));
+    // 落地页哪天再搬家也不用改代码 —— 这正是不写死 `/explore` 的原因。
+    assert!(navigation_committed(
+      &warm_up,
+      "https://www.xiaohongshu.com/some/new/home"
+    ));
+  }
+
+  /// 放宽只对「没指定路径」的 URL 生效。搜索页的判定必须一个字节都没松。
+  #[test]
+  fn warm_up_relaxation_never_loosens_a_search_url() {
+    for (expected, actual) in [
+      // 别的平台的搜索页 —— 路径非空，照旧严格。
+      (
+        "https://www.douyin.com/search/marine",
+        "https://www.douyin.com/jingxuan",
+      ),
+      (
+        "https://search.bilibili.com/all?keyword=marine&order=click",
+        "https://search.bilibili.com/all?keyword=marine&order=pubdate",
+      ),
+      (
+        "https://www.zhihu.com/search?q=marine&type=content",
+        "https://www.zhihu.com/search?q=other&type=content",
+      ),
+      (
+        "https://www.zhihu.com/search?q=marine&type=content&sort=created_time",
+        "https://www.zhihu.com/search?q=marine&type=content&sort=upvoted_count",
+      ),
+      (
+        "https://www.xiaohongshu.com/search_result?keyword=marine",
+        "https://www.xiaohongshu.com/explore",
+      ),
+      // 跨 origin 的弹转（登录墙、验证码域名）不算提交。
+      (
+        "https://www.xiaohongshu.com/",
+        "https://passport.xiaohongshu.com/login",
+      ),
+      (
+        "https://www.bilibili.com/",
+        "https://passport.bilibili.com/login",
+      ),
+      // 空白页不是任何平台页；空 URL / 解析不了的 URL 也不是。
+      ("https://www.xiaohongshu.com/", "about:blank"),
+      ("https://www.xiaohongshu.com/", ""),
+      ("about:blank", "https://www.xiaohongshu.com/"),
+      // 只有 origin 但带了查询参数，说明调用方要的是具体一页。
+      (
+        "https://www.example.com/?tab=x",
+        "https://www.example.com/other",
+      ),
+    ] {
+      assert!(
+        !navigation_committed(expected, actual),
+        "{expected} must not be considered committed at {actual}"
+      );
+    }
+  }
+
+  /// 四个平台的真实搜索 URL 都必须能被自己精确命中，也都必须自带路径 ——
+  /// 后者正是「放宽只影响预热页」这个结论的前提。
+  #[test]
+  fn every_search_slot_url_carries_a_path() {
+    for platform in ["bilibili", "zhihu", "douyin", "xiaohongshu"] {
+      let slot = super::super::search_slot::slot_for(platform, "科研工具", 0)
+        .unwrap_or_else(|| panic!("{platform} has slots"));
+      let parsed = url::Url::parse(&slot.url).expect("slot url parses");
+      assert!(
+        !parsed.path().trim_end_matches('/').is_empty(),
+        "{platform}: {} 没有路径，放宽会把它一起放松",
+        slot.url
+      );
+      assert!(navigation_committed(&slot.url, &slot.url));
+    }
+  }
+
+  /// `/json` 对一个刚建好的 target 会报空 URL。它不该被当成「已经在靶子页上」——
+  /// 那条路会拿空串去导航，两次失败之后把整个会话判成不可用。
+  #[test]
+  fn a_blank_or_empty_tab_is_not_the_claimed_target() {
+    let search = "https://www.xiaohongshu.com/search_result?keyword=marine";
+    assert!(!is_target_page(search, ""));
+    assert!(!is_target_page(search, "about:blank"));
+    assert!(!is_target_page(search, search));
+    // 真的跳到笔记详情页了才算。
+    assert!(is_target_page(
+      search,
+      "https://www.xiaohongshu.com/explore/68b0c0ff000000001b0212ab"
+    ));
+  }
+
   #[test]
   fn profile_pause_stays_inside_its_range() {
     for _ in 0..200 {
@@ -3552,7 +3802,7 @@ mod tests {
       let message = format!(r#"{{"status":"{status}"}}"#);
       let reason = classify_hopeless_message(&message).unwrap();
       assert_eq!(reason.kind, HopelessKind::NoWork, "{status}");
-      assert_eq!(reason.outcome(), LegOutcome::TimedOut, "{status}");
+      assert_eq!(reason.outcome(), LegOutcome::NoWork, "{status}");
     }
 
     for status in [
@@ -3740,6 +3990,7 @@ mod tests {
       (LegOutcome::Unconfirmed, "\"unconfirmed\""),
       (LegOutcome::Filled, "\"filled\""),
       (LegOutcome::TimedOut, "\"timed_out\""),
+      (LegOutcome::NoWork, "\"no_work\""),
       (LegOutcome::NoSlot, "\"no_slot\""),
       (LegOutcome::AlreadyOpen, "\"already_open\""),
       (LegOutcome::Skipped, "\"skipped\""),

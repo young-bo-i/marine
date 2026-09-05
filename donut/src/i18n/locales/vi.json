@@ -2278,6 +2278,7 @@
         "unconfirmed": "Đã gửi — chưa xác nhận",
         "filled": "Đã điền bản nháp — chưa gửi",
         "timed_out": "Không ghi được gì",
+        "no_work": "Không có việc để làm",
         "no_slot": "Nền tảng không hỗ trợ",
         "already_open": "Đang mở — đã bỏ qua",
         "skipped": "Đã bỏ qua",

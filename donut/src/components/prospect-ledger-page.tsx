@@ -82,6 +82,7 @@ type LegOutcome =
   | "unconfirmed"
   | "filled"
   | "timed_out"
+  | "no_work"
   | "no_slot"
   | "already_open"
   | "skipped"
@@ -145,6 +146,8 @@ const OUTCOME_CLASS: Record<LegOutcome, string> = {
   // never share the success colour used by a receipt-confirmed post.
   filled: "text-muted-foreground",
   timed_out: "text-muted-foreground",
+  // 「没活干」不是失败也不是卡住：未登录 / 台账里没有该账号能碰的候选了。
+  no_work: "text-muted-foreground",
   no_slot: "text-muted-foreground",
   // Not a failure, but the operator has to act on it (close the window and
   // re-run), so it does not get the same grey as "nothing to do".

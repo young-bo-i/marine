@@ -2278,6 +2278,7 @@
         "unconfirmed": "Sent — receipt unconfirmed",
         "filled": "Draft filled — not sent",
         "timed_out": "Nothing settled",
+        "no_work": "Nothing to do",
         "no_slot": "Platform not supported",
         "already_open": "Already open — skipped",
         "skipped": "Skipped",

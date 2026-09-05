@@ -2278,6 +2278,7 @@
         "unconfirmed": "전송됨 · 확인 대기",
         "filled": "초안 입력됨 · 미전송",
         "timed_out": "기록 없음",
+        "no_work": "처리할 항목 없음",
         "no_slot": "지원하지 않는 플랫폼",
         "already_open": "이미 실행 중이라 건너뜀",
         "skipped": "건너뜀",

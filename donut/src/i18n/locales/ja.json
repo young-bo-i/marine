@@ -2278,6 +2278,7 @@
         "unconfirmed": "送信済み・確認待ち",
         "filled": "下書き入力済み・未送信",
         "timed_out": "記録なし",
+        "no_work": "対象なし",
         "no_slot": "未対応のプラットフォーム",
         "already_open": "すでに起動中のためスキップ",
         "skipped": "スキップ",

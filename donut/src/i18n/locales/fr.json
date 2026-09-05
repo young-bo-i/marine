@@ -2278,6 +2278,7 @@
         "unconfirmed": "Envoyé — confirmation en attente",
         "filled": "Brouillon rempli — non envoyé",
         "timed_out": "Rien enregistré",
+        "no_work": "Rien à faire",
         "no_slot": "Plateforme non prise en charge",
         "already_open": "Déjà ouvert — ignoré",
         "skipped": "Ignoré",
