@@ -1240,6 +1240,7 @@ async fn run_profile_session(
     }
 
     let session_unusable = execution.session_unusable;
+    let session_poisoned = execution.session_poisoned;
 
     // A CDP page target can survive while its renderer/navigation channel is
     // wedged.  `session_alive` intentionally treats that as alive because it
@@ -1290,10 +1291,15 @@ async fn run_profile_session(
       "pending claim cleanup requires a failed session retirement"
     );
 
-    if session_unusable
-      && platform_index + 1 < platforms.len()
-      && !scheduler.cancel.load(Ordering::SeqCst)
-    {
+    // 只有中毒才计入预算。一条只是 park 失败的腿已经退役了会话，下一条腿会冷启动
+    // 一个干净的浏览器 —— 那是安全路径（走 retire_owned_session 先关干净，不是
+    // `open_url_in_existing_browser` 那条可能开出第二个实例的路），代价只是慢。
+    // 让它消耗预算，等于让「发布成功」这件事去害死后面的平台。
+    if consumes_session_restart(
+      session_poisoned,
+      platforms.len() - (platform_index + 1),
+      scheduler.cancel.load(Ordering::SeqCst),
+    ) {
       if restarts_left == 0 {
         for rest in &platforms[platform_index + 1..] {
           finished.push(base(
@@ -2225,6 +2231,18 @@ struct LegExecution {
   /// Strong evidence that the current browser session must not be reused for
   /// another platform, even when `/json` still exposes a page target.
   session_unusable: bool,
+  /// The renderer itself stopped answering — the session is not merely stale,
+  /// this profile is in a state worth being afraid of.
+  ///
+  /// 和 `session_unusable` 分开，是因为它们的代价差着一个量级。「不能复用」的补救
+  /// 是退役 + 冷启动，那正是每个 profile 第一条腿的正常状态，代价只是慢一点；
+  /// 「渲染进程死了」才值得动用重启预算、并在第二次发生时放弃整个 profile。
+  ///
+  /// 混在一起会产生一个恶性回路：park 到 about:blank 就是「下一次导航」，而本文件
+  /// 自己的实测注释写着「上一条腿**真发出去了** → 下一次导航必超时」。于是发布成功
+  /// 恰恰是最容易 park 失败的条件，而 park 失败被记成会话中毒 —— **干成活的腿反而
+  /// 最可能害死后面所有平台**。
+  session_poisoned: bool,
   /// A search-page extension bootstrap failed before any ledger work. This is
   /// the only failure allowed to retry the same platform on a fresh session.
   retry_on_fresh_session: bool,
@@ -2244,15 +2262,18 @@ impl LegExecution {
     Self {
       report,
       session_unusable: false,
+      session_poisoned: false,
       retry_on_fresh_session: false,
       pending_cancel_cleanup: None,
     }
   }
 
+  /// 用于渲染进程/导航真的不应答的那些路径。
   fn unusable(report: LegReport) -> Self {
     Self {
       report,
       session_unusable: true,
+      session_poisoned: true,
       retry_on_fresh_session: false,
       pending_cancel_cleanup: None,
     }
@@ -2262,10 +2283,25 @@ impl LegExecution {
     Self {
       report,
       session_unusable: true,
+      session_poisoned: true,
       retry_on_fresh_session: retry_is_safe,
       pending_cancel_cleanup: None,
     }
   }
+}
+
+/// 这条腿的麻烦，值不值得花掉这个 profile 唯一的一次会话重启 —— 以及第二次发生时
+/// 放弃它还没跑到的所有平台？
+///
+/// 只有**中毒**算数：渲染进程不再应答。park 到 about:blank 失败只说明这个会话不该
+/// 再复用，补救是退役 + 冷启动，而那正是每个 profile 第一条腿的正常形态，代价只是慢。
+///
+/// 分开的理由是一个恶性回路：park 就是「下一次导航」，而本文件自己的实测注释写着
+/// 「上一条腿**真发出去了** → 下一次导航必超时」。两者混为一谈时，发布成功恰恰是最
+/// 容易 park 失败的条件，于是**干成活的腿反而害死后面所有平台** —— 用户看到的正是
+/// 「知乎发出去了，浏览器却关了，后面的平台一个都没跑」。
+fn consumes_session_restart(session_poisoned: bool, remaining: usize, cancelled: bool) -> bool {
+  session_poisoned && remaining > 0 && !cancelled
 }
 
 fn should_retry_on_fresh_session(
@@ -2525,6 +2561,10 @@ async fn finish_cancelled_leg(
       ..base
     },
     session_unusable,
+    // 取消路径不放宽。这里的 `session_unusable` 来自 quiesce 失败，而 quiesce 的
+    // 第一个动作就是 retire_owned_session —— 它失败意味着会话**关都关不掉**，
+    // 那是比 park 超时强得多的证据，保持原样。
+    session_poisoned: session_unusable,
     retry_on_fresh_session: false,
     pending_cancel_cleanup: session_unusable.then_some(PendingCancelledCleanup {
       leg_started_at,
@@ -3190,7 +3230,11 @@ async fn run_leg(
   } else {
     LegOutcome::TimedOut
   };
+  // park 失败只说明这个会话不该再用，不说明这个 profile 不能碰 —— 补救是退役 +
+  // 冷启动，而那本来就是每个 profile 第一条腿的形态。只有渲染进程不应答
+  // (`wedge_error`) 才算中毒，才该动用重启预算。
   let session_unusable = wedge_error.is_some() || close_error.is_some();
+  let session_poisoned = wedge_error.is_some();
   let report_error = wedge_error
     .or_else(|| hopeless.map(|r| r.message.to_string()))
     .or(close_error)
@@ -3221,6 +3265,7 @@ async fn run_leg(
       ..base
     },
     session_unusable,
+    session_poisoned,
     retry_on_fresh_session: false,
     pending_cancel_cleanup: None,
   }
@@ -3419,6 +3464,16 @@ mod tests {
     let profile = wayfern_profile("one", None);
     let report = report_for(&profile, "zhihu", LegOutcome::Failed, None);
     let bootstrap = LegExecution::bootstrap_failure(report.clone(), true);
+    // park 失败退役会话就够了，不该动用预算 —— 否则一条**发布成功**的腿会害死
+    // 它后面的所有平台，这正是用户报的那个现象。
+    assert!(!consumes_session_restart(false, 3, false));
+    // 渲染进程不应答才算中毒。
+    assert!(consumes_session_restart(true, 3, false));
+    // 最后一个平台之后没有东西可救，不必花预算。
+    assert!(!consumes_session_restart(true, 0, false));
+    // 已经在停机，别再重启浏览器。
+    assert!(!consumes_session_restart(true, 3, true));
+
     assert!(should_retry_on_fresh_session(&bootstrap, 1, false));
     assert!(!should_retry_on_fresh_session(&bootstrap, 0, false));
     assert!(!should_retry_on_fresh_session(&bootstrap, 1, true));
