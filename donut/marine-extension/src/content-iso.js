@@ -35,7 +35,21 @@
   let lastGrabParts = null;     // 缓存上次抓取的字幕/正文，供「加载更多评论」重建 bundle
   let commentNotifyTimer = null;
   function marineIngestComment(d) {
-    commentCaptures.push({ url: d.url, body: d.body, ts: Date.now() });
+    // method/status/ok 一路从 content-main.js 带过来（同一次分发里就已经放进载荷，
+    // content-main.js:452），此前在这里被丢掉，于是这份捕获只能当「评论列表」用。
+    //
+    // 留住它们的理由很具体：content-main 把每条评论响应**分叉成两条通道** ——
+    // post() 是无条件 window.postMessage，而 postPublishedCandidate() 在 MessagePort
+    // 握手没建起来时是静默 return。也就是说回执链断掉时，发布 POST 的响应体其实
+    // 还好端端躺在这里，只是少了「这是一次 POST 且成功了」这个判据而无法使用。
+    commentCaptures.push({
+      url: d.url,
+      body: d.body,
+      method: d.method || '',
+      status: d.status || 0,
+      ok: !!d.ok,
+      ts: Date.now(),
+    });
     if (commentCaptures.length > 400) commentCaptures.shift();
     marineRimeContextDataChanged();
     // 只做一个廉价的「本条响应约几条」计数用于日志（不跑完整 builder，
@@ -4715,6 +4729,37 @@
     });
   }
 
+  // 从被动捕获里找出「刚才那次发布 POST 的响应」，交给桥补构回执。
+  //
+  // 判据一个字都不在这里写：直接把捕获交给桥里那个实测过的构造器。在第二个地方复制
+  // 一套判据，正是两处各自漂移的开始 —— 而漂移的表现就是「发出去了却查不到」，也就是
+  // 这次要修的这个问题本身。
+  //
+  // 全程只读：没有 click / focus / dispatchEvent，也不发任何网络请求，所以它不可能
+  // 造成第二次发送。它唯一能改变的，是这次已经发生的发送被记成 posted 还是 unconfirmed。
+  function marineTryReceiptReadback(beforeId, since) {
+    let state = null;
+    try { state = globalThis['__marinePublishedBridgeStateV1']; } catch (e) {}
+    if (!state || typeof state.buildFromCapture !== 'function') return null;
+    const targetUrl = location.href;
+    const pageTitle = (typeof document !== 'undefined' && document.title) || '';
+    // 宽限 5 秒：响应可能在 click 返回、轮询起点落定之前就到了。
+    const floor = since ? since - 5000 : 0;
+    // 由新到旧 —— 同一个页面可能有多条历史捕获，最近那条才可能是刚发出去的。
+    for (let i = commentCaptures.length - 1; i >= 0; i--) {
+      const cap = commentCaptures[i];
+      if (!cap || !cap.body) continue;
+      if (cap.ts && cap.ts < floor) break;
+      if (String(cap.method || '').toUpperCase() !== 'POST') continue;
+      if (!cap.ok) continue;
+      let built = null;
+      try { built = state.buildFromCapture(cap, targetUrl, pageTitle); } catch (e) { continue; }
+      // beforeId 是发送前就已存在的那条回执；相等说明这是上一条评论的响应，不是这次的。
+      if (built && built.eventId && built.eventId !== beforeId) return built;
+    }
+    return null;
+  }
+
   function marineProspectSendComment(
     platform,
     expectedText,
@@ -4876,18 +4921,56 @@
         });
       }
 
-      // 等回执。20s 够一次正常往返；超时按失败处理。
+      // 等回执。20s 够一次正常往返；超时前先做一次捕获回读，仍拿不到才按失败处理。
       const deadline = Date.now() + 20000;
+      const pollStartedAt = Date.now();
       (function poll() {
         const now = (typeof window !== 'undefined' && window.marineLastPublishedReceipt) || null;
         if (now && now.eventId && now.eventId !== beforeId) {
           return resolve({ ok: true, eventId: now.eventId, platformCommentId: now.platformCommentId });
         }
         if (Date.now() > deadline) {
+          // 放弃之前先「捕获回读」一次。
+          //
+          // content-main 把每条评论响应分叉成两条通道，而只有 postPublishedCandidate
+          // 那条会因为 MessagePort 握手失败而静默丢弃；无条件的 post() 那条早就把
+          // 发布 POST 的响应体送进 commentCaptures 了。所以断链时证据往往一直在手上，
+          // 缺的只是投递。用桥里同一个实测构造器补构一次，拿到的是平台自己的评论 id，
+          // 证据强度和正常路径完全相同。
+          //
+          // 只读：整个过程没有任何 click/focus/网络请求，不可能造成第二次发送。
+          const readback = marineTryReceiptReadback(beforeId, pollStartedAt);
+          if (readback) {
+            marineLog('warn', 'publish-receipt', '回执链断链，已由捕获回读补回',
+              JSON.stringify(readback));
+            return resolve({
+              ok: true,
+              eventId: readback.eventId,
+              platformCommentId: readback.platformCommentId,
+            });
+          }
+          // 把桥那边的实时状态一起抓下来。原来这里只写「可能被风控拦截」，是纯
+          // 猜测 —— 而真实原因大多是接口形状没匹配上；一个接口 bug 被说成风控
+          // 问题，就没人会去查了。diag() 只活在本页内存里，收尾一停页面就没了，
+          // 所以必须在这一刻落进 marine-debug.jsonl。
+          let diag = null;
+          try {
+            const state = globalThis['__marinePublishedBridgeStateV1'];
+            if (state && typeof state.diag === 'function') diag = state.diag();
+          } catch (e) {}
+          marineLog('error', 'publish-receipt', '回执 20s 超时', JSON.stringify({
+            hasPort: diag ? diag.hasPort : null,
+            builderFor: diag ? diag.builderFor : null,
+            forwards: diag ? diag.forwards : null,
+            lastPost: diag ? diag.lastPost : null,
+            recent: diag ? diag.recent : null,
+          }));
           return resolve({
             ok: false,
             attempted: true,
-            error: '已点发送但未收到平台回执（可能被风控拦截）',
+            error: diag && diag.lastPost && diag.lastPost.built === 'null'
+              ? '已点发送，平台回了 ' + diag.lastPost.status + '，但回执判据未通过（接口形状变了，见调试日志）'
+              : '已点发送但未收到平台回执（可能被风控拦截）',
           });
         }
         setTimeout(poll, 500);

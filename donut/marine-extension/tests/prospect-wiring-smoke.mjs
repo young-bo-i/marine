@@ -1097,9 +1097,44 @@ class ProspectDomFixture {
       impl.slice(targetCheck, click).includes("target_changed_before_send"),
     "btn.click 前必须 target→durable unconfirmed→再验 target，SPA A→B/崩溃都不能重发",
   );
+  // 距离放宽到 600：超时分支现在会先抓一份 diag() 落进 marine-debug.jsonl，再按
+  // lastPost.built 决定说「判据未通过」还是「可能被风控拦截」。断言的意图没变 ——
+  // 超时必须标 attempted 供台账 settle unconfirmed —— 只是中间多了那段取证。
   assert.ok(
-    /attempted:\s*true[\s\S]{0,160}已点发送但未收到平台回执/.test(impl),
+    /attempted:\s*true[\s\S]{0,600}未收到平台回执/.test(impl),
     "click 成功返回后回执超时必须标 attempted，供台账 settle unconfirmed",
+  );
+  // 捕获回读：断链兜底。这三条钉的是**为什么它不可能造成重复评论** —— 全程只读。
+  // 从整份 iso 里取：这个 helper 定义在 marineProspectSendComment 之上，不在 impl 切片内。
+  const readback = iso.slice(
+    iso.indexOf('function marineTryReceiptReadback'),
+    iso.indexOf('function marineProspectSendComment'),
+  );
+  assert.ok(readback.length > 200, '找不到 marineTryReceiptReadback，回读兜底不见了');
+  assert.ok(
+    !/\.click\(|\.focus\(|dispatchEvent|scrollIntoView|fetch\(|XMLHttpRequest/.test(readback),
+    '捕获回读必须全程只读：任何点击/聚焦/网络请求都可能变成第二次发送',
+  );
+  // 判据不能在这里复制一份 —— 必须转交桥里那个实测过的构造器，否则两处会各自漂移。
+  assert.ok(
+    /state\.buildFromCapture\(/.test(readback) && !/comment_v5|JSON\.parse/.test(readback),
+    '回读必须把判据交给桥的 buildFromCapture，不能自己解析响应体',
+  );
+  // beforeId 守卫：否则会把上一条评论的回执当成这次的。
+  assert.ok(
+    /built\.eventId\s*!==\s*beforeId/.test(readback),
+    '回读必须排除发送前就已存在的那条回执',
+  );
+  // 捕获必须留住 method/status/ok，否则回读根本无从判断「这是一次成功的 POST」。
+  assert.ok(
+    /commentCaptures\.push\(\{[\s\S]{0,300}method:[\s\S]{0,120}status:[\s\S]{0,120}ok:/.test(iso),
+    'marineIngestComment 必须保留 method/status/ok',
+  );
+
+  // 取证本身也钉住：没有它，下一次「发出去了却没回执」又会只剩一句猜测。
+  assert.ok(
+    /__marinePublishedBridgeStateV1[\s\S]{0,400}marineLog\(\s*'error',\s*'publish-receipt'/.test(impl),
+    "回执超时必须把桥的 diag() 落进持久日志，否则收尾一停页面证据就没了",
   );
   assert.ok(
     /btn\.click\(\);[\s\S]{0,240}catch \(e\)[\s\S]{0,180}attempted:\s*true/.test(impl),

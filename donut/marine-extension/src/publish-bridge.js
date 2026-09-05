@@ -92,7 +92,14 @@
   function scheduleReadyRetry(generation) {
     if (generation !== readyGeneration || readyRetryTimer != null || !pendingNonce) return;
     const delay = READY_RETRY_DELAYS[readyAttempts - 1];
-    if (!delay) return;
+    if (!delay) {
+      // 整条链最沉默的一环：握手用尽重试后就**永久**放弃，而 MAIN 侧的
+      // postPublishedCandidate 在端口没建起来时是无声丢弃的。这之后这个文档里
+      // 发生的每一次发布都不会产生任何回执，也不留任何痕迹 —— 外部只会看到
+      // 「未收到平台回执」，和接口形状不对完全无法区分。
+      bridgeLog('error', 'MAIN↔ISOLATED 回执端口握手失败，已放弃重试', 'attempts=' + readyAttempts);
+      return;
+    }
     readyRetryTimer = setTimeout(function () {
       readyRetryTimer = null;
       sendReady(generation);
@@ -346,6 +353,28 @@
   const recentForwards = [];
   let lastPost = null;
 
+  // 回执链上每一环的失败都必须留下**持久**痕迹。
+  //
+  // 在此之前这个文件一条 marineLog 都没有：六个环里任何一环断掉，外部看到的都是
+  // 同一句「已点发送但未收到平台回执（可能被风控拦截）」—— 一个接口形状的 bug 被
+  // 说成风控问题，于是它活了下来。唯一的证据 diag() 只活在页面内存里，而收尾动作
+  // 恰好是把这个页面导航到 about:blank，等于亲手销毁排查现场。
+  //
+  // marineLog 由 debug-panel.js 声明，和本文件同属 ISOLATED world、共享全局作用域；
+  // 但本文件跑在 document_start 而它在 document_idle，所以加载期它还不存在 ——
+  // 必须每次调用前探测，不能在模块顶层缓存引用。
+  function bridgeLog(level, msg, data) {
+    try {
+      if (typeof marineLog === 'function') marineLog(level, 'publish-bridge', msg, data);
+    } catch (e) {}
+  }
+
+  // 页面自己拉评论列表的 GET 非常密集，全记会把账本冲垮，也会把真正要看的那一条挤掉。
+  // 发布必然是 POST，所以只有 POST 的失败才值得留痕。
+  function isPost(value) {
+    return String((value && value.method) || '').toUpperCase() === 'POST';
+  }
+
   function forward(value) {
     forwardCount += 1;
     try {
@@ -370,14 +399,31 @@
       }
       while (recentForwards.length > 12) recentForwards.shift();
     } catch (e) {}
-    if (!value || !value.page_context) return;
+    if (!value || !value.page_context) {
+      if (isPost(value)) bridgeLog('warn', 'POST 捕获到了，但 MAIN 侧没带 page_context', value && value.url);
+      return;
+    }
     const targetUrl = boundedString(value.page_context.target_url, 4096);
-    if (!targetUrl) return;
+    if (!targetUrl) {
+      if (isPost(value)) bridgeLog('warn', 'POST 捕获到了，但 page_context 没有 target_url', value.url);
+      return;
+    }
     const builder = receiptBuilderFor(targetUrl);
-    if (typeof builder !== 'function') return;
+    if (typeof builder !== 'function') {
+      // 这一条最容易被误读成「没发出去」：请求发了、也成功了，只是这个页面 URL
+      // 匹配不到任何平台的回执构造器，于是整条链在这里悄悄断掉。
+      if (isPost(value)) bridgeLog('warn', '这个页面没有对应的回执构造器', targetUrl);
+      return;
+    }
     let pageHostname = '';
-    try { pageHostname = new URL(targetUrl).hostname; } catch (e) { return; }
-    if (typeof value.body === 'string' && value.body.length > 2_000_000) return;
+    try { pageHostname = new URL(targetUrl).hostname; } catch (e) {
+      if (isPost(value)) bridgeLog('warn', 'target_url 解析失败', targetUrl);
+      return;
+    }
+    if (typeof value.body === 'string' && value.body.length > 2_000_000) {
+      if (isPost(value)) bridgeLog('warn', '响应体超过 2MB，放弃构造回执', value.url);
+      return;
+    }
     let built;
     try {
       built = builder({
@@ -394,16 +440,34 @@
       if (lastPost && String((value && value.method) || '').toUpperCase() === 'POST') {
         lastPost.built = built ? (built.event_id || 'built') : 'null';
       }
-    } catch (e) { return; }
+    } catch (e) {
+      if (isPost(value)) {
+        bridgeLog('error', '回执构造器抛异常：' + String(e && e.message || e), value.url);
+      }
+      return;
+    }
+    if (!built && isPost(value)) {
+      // 决定性的一条：POST 到达了、构造器也跑了，但判据没过。排查时唯一要问的
+      // 就是「实际路径/响应体长什么样」，所以两者都带上 —— 否则只能靠再发一条
+      // 真评论去抓包，每次都在平台上多留一条公开痕迹。
+      bridgeLog('error', '发布 POST 已捕获，但回执判据未通过', JSON.stringify({
+        url: String(value.url || '').slice(0, 200),
+        status: value.status || 0,
+        ok: !!value.ok,
+        bodySample: String(value.body || '').slice(0, 300),
+      }));
+    }
     if (built) {
       const receipt = sanitize(Object.assign({}, built, {
         target_url: targetUrl,
         page_title: value.page_context.page_title,
       }));
       if (receipt) {
+        bridgeLog('info', '回执已构造并投递', built.event_id || '');
         sendReceipt(receipt);
         return;
       }
+      bridgeLog('error', '回执构造成功但被 sanitize 丢弃', built.event_id || '');
     }
     void recoverPublished(value, targetUrl, value.page_context.page_title)
       .catch(function (error) {
@@ -464,8 +528,53 @@
   // 真实评论）。
   //
   // 全部只读，且只暴露在 ISOLATED world，页面 JS 看不到。
+  // 用一份**已捕获**的响应补构回执 —— 回执链断掉时的兜底。
+  //
+  // 证据强度和正常路径完全相同：同一个实测过的构造器、同一个 sanitize，一个字段都
+  // 没有改写，所以 confirmation_source 仍然是平台自己的接口判断，拿到的也是平台
+  // 自己的评论 id。它绕开的只是**投递通道**（MessagePort 握手 → forward），而那正是
+  // 会静默失效的那几环。
+  //
+  // 必须放在这个文件里：publish-bridge 在开头把五个构造器收进闭包后就从 globalThis
+  // 删掉了（见上方 delete），document_idle 才加载的 content-iso 根本看不到它们。
+  function buildFromCapture(capture, targetUrl, pageTitle) {
+    if (!capture || !targetUrl) return null;
+    const builder = receiptBuilderFor(targetUrl);
+    if (typeof builder !== 'function') return null;
+    let pageHostname = '';
+    try { pageHostname = new URL(targetUrl).hostname; } catch (e) { return null; }
+    let built = null;
+    try {
+      built = builder({
+        pageHostname,
+        observedAt: capture.ts || Date.now(),
+        url: capture.url,
+        method: capture.method,
+        status: capture.status,
+        ok: capture.ok,
+        body: capture.body,
+      });
+    } catch (e) {
+      bridgeLog('error', '回读补构回执时构造器抛异常：' + String(e && e.message || e), capture.url);
+      return null;
+    }
+    if (!built) return null;
+    const receipt = sanitize(Object.assign({}, built, {
+      target_url: targetUrl,
+      page_title: pageTitle,
+    }));
+    if (!receipt) {
+      bridgeLog('error', '回读补构成功但被 sanitize 丢弃', built.event_id || '');
+      return null;
+    }
+    bridgeLog('warn', '回执链断了，改用捕获回读补构成功', built.event_id || '');
+    sendReceipt(receipt);
+    return { eventId: receipt.event_id, platformCommentId: receipt.platform_comment_id };
+  }
+
   const bridgeState = Object.freeze({
     signalReady,
+    buildFromCapture,
     diag: function () {
       return {
         hasPort: !!currentPort,
