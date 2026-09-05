@@ -2571,8 +2571,7 @@
     published.publishedAt = Date.now();
     // 发布成功了，上一轮的失败原因就不再是任何东西的解释——留着它只会让下一次
     // 真正的超时报出一个早已过期的理由。
-    marineRimeTarget.lastSkipReason = '';
-    marineRimeTarget.lastPublishError = '';
+    marineRimeForgetFailureReason();
     marineLog('ok', 'rime-target', '已锁定 ' + context.label + '：' + context.targetSummary);
     // 发布成功后补一次渲染，让「生成」按钮在 publishedContext 置上后立即出现：
     // marineRimeGenSync 只在 render 时跑，而 activate 那次 render 时 publishedContext
@@ -2611,6 +2610,7 @@
       return;
     }
     if (current) {
+      marineRimeForgetFailureReason();
       marineRimeTarget.active = null;
       const clearRevision = ++marineRimeTarget.revision;
       // Revoke the old lease before any subtitle/comment network work for the
@@ -2649,9 +2649,19 @@
     published.publishedAt = Date.now();
   }
 
+  // 两个失败原因都是「某一个目标为什么没发布」，目标一走它们就不再解释任何事。
+  // 不清掉的话，A 上一次失败的理由会原样出现在 B 的超时提示里——而 B 可能只是还
+  // 在途中（光抓取就允许 8 秒，再加最多 3×6 秒 ACK），于是那句话不只是过期，还是
+  // 假的：它把一个正在进行的发布说成失败了。这比原来的泛泛文案更糟。
+  function marineRimeForgetFailureReason() {
+    marineRimeTarget.lastSkipReason = '';
+    marineRimeTarget.lastPublishError = '';
+  }
+
   function marineRimeClear(reason) {
     const previous = marineRimeTarget.active;
     if (!previous) return;
+    marineRimeForgetFailureReason();
     marineRimeTarget.active = null;
     const revision = ++marineRimeTarget.revision;
     marineRimeRender();
@@ -4150,7 +4160,8 @@
             return resolve({
               ok: false,
               reason: 'context_unavailable',
-              error: '上下文槽位未获得：' + String(marineRimeTarget.lastSkipReason || '无响应'),
+              error: '上下文槽位未获得：'
+                + String(marineRimeTarget.lastSkipReason || marineRimeTarget.lastPublishError || '无响应'),
             });
           }
           setTimeout(tick, 300);

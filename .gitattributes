@@ -1,22 +1,30 @@
 # Keep the Marine extension byte-identical on every platform.
 #
 # tauri.conf.json ships `../marine-extension` into the app verbatim, so whatever
-# git writes into a checkout is exactly what reaches the user's browser.
-donut/marine-extension/** text=auto eol=lf
-
-# ...and never translate the Scholay generated assets at all.
-#
-# sw.js (`marineLoadGeneratedSkillAssets`) SHA-256s each of these files and
-# compares it against `assetHashes` in manifest.json. That check runs inside the
-# PUT branch of `marineContextFetch`, *before* the fetch — so a mismatch does not
-# corrupt a diff, it throws, the rime-context PUT is never sent, the comment
-# target never publishes, and the 「生成」 button sits at 「准备中…」 until it fails
-# with 「目标准备超时」. The message blames the input box and the local service;
-# both are wrong, which makes this near-impossible to diagnose from the symptom.
+# git writes into a checkout is exactly what reaches the user's browser. And
+# three of those files are hashed: sw.js (`marineLoadGeneratedSkillAssets`)
+# SHA-256s each asset under skills/scholay/generated/ and compares it against
+# `assetHashes` in manifest.json. That check runs inside the PUT branch of
+# `marineContextFetch`, *before* the fetch — so a mismatch does not corrupt a
+# diff, it throws, the rime-context PUT is never sent, the comment target never
+# publishes, and the 「生成」 button sits at 「准备中…」 until it fails with
+# 「目标准备超时」. The message blames the input box and the local service; both
+# are wrong, which makes this near-impossible to diagnose from the symptom.
 #
 # Git for Windows defaults to core.autocrlf=true and CI checks out with a bare
-# actions/checkout@v4 on windows-latest, so without this rule these files arrive
+# actions/checkout@v4 on windows-latest, so without this rule the assets arrive
 # CRLF on the Windows runner and every hash misses — breaking comment generation
-# on Windows builds only, while macOS builds work. Marking them binary is what
-# guarantees the bytes the hashes were computed over are the bytes that ship.
-donut/marine-extension/skills/scholay/generated/*.json -text
+# on Windows builds only, while macOS builds work. Reproduced directly: a fresh
+# clone under core.autocrlf=true yields CRLF and a mismatched hash without this
+# file, and LF with a matching hash with it.
+#
+# `text=auto eol=lf` is deliberately the ONLY rule. Marking the hashed assets
+# `-text` looks stronger and is actually worse: it adds no checkout protection
+# (this rule already pins LF regardless of core.autocrlf), but it disables
+# check-IN normalization too. A contributor whose clone predates this file still
+# has CRLF on disk — git does not rewrite existing files on pull — and under
+# `-text` their next `git add` would commit those CRLF bytes into the index,
+# breaking the hashes for everyone on every platform, permanently. Under
+# `text=auto` that same `git add` normalizes back to LF and the situation heals
+# itself.
+donut/marine-extension/** text=auto eol=lf
