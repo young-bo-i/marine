@@ -99,7 +99,17 @@ fn base_url(platform: &str, keyword: &str) -> Option<String> {
       "https://www.zhihu.com/search?type=content&q={}",
       enc(keyword)
     ),
-    "douyin" => format!("https://www.douyin.com/search/{}", enc(keyword)),
+    // `?type=general` 不是装饰：不带它的 `/search/<kw>` 会被抖音边缘直接返回
+    // 502 Bad Gateway（实测，浏览器里手工复现），整条腿从此永远拿不到搜索页。
+    //
+    // 它同时把这个平台拉回和其它三个一致的形态 —— base 带上了 `?`，所以
+    // `slot_for` 里 `format!("{base}&{p}")` 拼排序参数才是合法 URL。抖音今天三个
+    // 排序档的参数都是 None，一旦哪天补上，不带 `?` 的旧写法会拼出
+    // `/search/<kw>&sort=x` 这种废 URL。
+    "douyin" => format!(
+      "https://www.douyin.com/search/{}?type=general",
+      enc(keyword)
+    ),
     "xiaohongshu" => format!(
       "https://www.xiaohongshu.com/search_result?keyword={}",
       enc(keyword)
@@ -255,6 +265,13 @@ mod tests {
       .unwrap()
       .url
       .starts_with("https://www.zhihu.com/search?type=content&q="));
+    // 抖音必须带上 `type=general`，否则边缘返 502。注意它也是
+    // `navigation_reached` 会逐字比对的键之一（keyword/q/order/sort/type），所以
+    // 这个参数既决定页面能不能打开，也决定导航判定认不认。
+    assert_eq!(
+      slot_for("douyin", "科研工具", 0).unwrap().url,
+      "https://www.douyin.com/search/%E7%A7%91%E7%A0%94%E5%B7%A5%E5%85%B7?type=general"
+    );
     assert!(slot_for("douyin", "k", 0)
       .unwrap()
       .url
