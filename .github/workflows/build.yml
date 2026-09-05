@@ -55,6 +55,16 @@ jobs:
           cache: pnpm
           cache-dependency-path: donut/pnpm-lock.yaml
 
+      # Catch a checkout that rewrote the Scholay assets' line endings before we
+      # spend 90 minutes building an artifact that cannot generate comments.
+      # sw.js SHA-256s those files and throws inside the rime-context PUT branch,
+      # *before* the fetch — so a mismatched build fails silently: the comment
+      # target never publishes and 「生成」 dies with 「目标准备超时」. Git for
+      # Windows defaults to core.autocrlf=true, so this is a Windows-only trap;
+      # .gitattributes prevents it and this step proves the prevention held.
+      - name: Verify bundled Scholay assets
+        run: node marine-extension/tests/scholay-asset-integrity-smoke.mjs
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 

@@ -615,6 +615,12 @@
     lifecycleTimer: null,
     diagnosticSequence: 0,
     diagnosticLastAt: new Map(),
+    // 上一次发布失败的原因，让「目标准备超时」能说出真话。两者来源不同：
+    // lastSkipReason 是 SW 收下了但拒写（归属闸 / 推迟闸），lastPublishError 是
+    // PUT 压根没送出去（技能包构建抛异常、ACK 超时……）。后者以前无人记录，于是
+    // 整条链路一个字都不出，超时文案只能去甩锅输入框和本地服务。
+    lastSkipReason: '',
+    lastPublishError: '',
   };
   let marineRimeSendQueue = Promise.resolve();
 
@@ -729,6 +735,9 @@
       }
     }
     const detail = String(lastError && lastError.message || lastError || '未知错误');
+    // 只有 PUT 失败会让目标停在「未发布」——DELETE 失败无非留个墓碑，不该顶掉
+    // 一条真正解释得了「生成」为什么点不动的原因。
+    if (operation.op === 'put') marineRimeTarget.lastPublishError = detail;
     marineLog('warn', 'rime-target', operation.op + ' 失败：' + detail);
     return { ok: false, applied: false, error: detail };
   }
@@ -2351,9 +2360,12 @@
         // 而绝大多数情况下真实原因是 SW 的归属闸把 PUT 挡了（reason: authority /
         // suspended-lease / …），照它指的两个方向查一定查不到。
         const skip = marineRimeTarget.lastSkipReason;
+        const failed = marineRimeTarget.lastPublishError;
         marineRimeGenFail(skip
           ? '目标准备超时（上下文未落地：' + String(skip) + '）'
-          : '目标准备超时，请重新点选输入框再试（若持续，请检查 Marine 本地服务连接）');
+          : failed
+            ? '目标准备超时（上下文发布失败：' + String(failed) + '）'
+            : '目标准备超时，请重新点选输入框再试（若持续，请检查 Marine 本地服务连接）');
         return;
       }
       setTimeout(tick, 300);
@@ -2557,6 +2569,10 @@
     published.publishedContext = context;
     published.publishedRevision = revision;
     published.publishedAt = Date.now();
+    // 发布成功了，上一轮的失败原因就不再是任何东西的解释——留着它只会让下一次
+    // 真正的超时报出一个早已过期的理由。
+    marineRimeTarget.lastSkipReason = '';
+    marineRimeTarget.lastPublishError = '';
     marineLog('ok', 'rime-target', '已锁定 ' + context.label + '：' + context.targetSummary);
     // 发布成功后补一次渲染，让「生成」按钮在 publishedContext 置上后立即出现：
     // marineRimeGenSync 只在 render 时跑，而 activate 那次 render 时 publishedContext

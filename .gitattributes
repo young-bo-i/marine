@@ -1,0 +1,22 @@
+# Keep the Marine extension byte-identical on every platform.
+#
+# tauri.conf.json ships `../marine-extension` into the app verbatim, so whatever
+# git writes into a checkout is exactly what reaches the user's browser.
+donut/marine-extension/** text=auto eol=lf
+
+# ...and never translate the Scholay generated assets at all.
+#
+# sw.js (`marineLoadGeneratedSkillAssets`) SHA-256s each of these files and
+# compares it against `assetHashes` in manifest.json. That check runs inside the
+# PUT branch of `marineContextFetch`, *before* the fetch — so a mismatch does not
+# corrupt a diff, it throws, the rime-context PUT is never sent, the comment
+# target never publishes, and the 「生成」 button sits at 「准备中…」 until it fails
+# with 「目标准备超时」. The message blames the input box and the local service;
+# both are wrong, which makes this near-impossible to diagnose from the symptom.
+#
+# Git for Windows defaults to core.autocrlf=true and CI checks out with a bare
+# actions/checkout@v4 on windows-latest, so without this rule these files arrive
+# CRLF on the Windows runner and every hash misses — breaking comment generation
+# on Windows builds only, while macOS builds work. Marking them binary is what
+# guarantees the bytes the hashes were computed over are the bytes that ship.
+donut/marine-extension/skills/scholay/generated/*.json -text

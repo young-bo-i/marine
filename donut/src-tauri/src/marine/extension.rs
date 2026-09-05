@@ -17,6 +17,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use tauri::Manager;
 
+/// The stamped connection file. Generated per profile — never copied in from
+/// the bundle, which ships only an empty placeholder. See [`sync_dir`].
+const RUNTIME_CONFIG_FILE: &str = "marine-runtime-config.json";
+
 fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
   #[cfg(unix)]
   {
@@ -125,6 +129,18 @@ fn read_extension_version(dir: &Path) -> io::Result<String> {
 /// from the bundle are pruned from the profile copy, and the root manifest is
 /// copied last so Chromium never observes the new extension version before its
 /// worker and other assets are in place.
+///
+/// The runtime config is deliberately NOT copied. The bundle ships it as an
+/// empty placeholder (`{"apiBase":"","token":"","profileId":""}`), and copying
+/// that in would blank the profile's stamped connection *before*
+/// [`ensure_for_profile`] has obtained the token and port it needs to write the
+/// real one back. Every failure between those two points — the API not ready
+/// inside its 10s budget, a token error, a failed write — would then leave the
+/// profile holding the placeholder, which the extension cannot tell apart from
+/// "never configured": it reports 「Marine 本地服务未连接」 and no request ever
+/// reaches the local API, so nothing about it appears in the app log either.
+/// Skipping the copy means a previously working config survives every launch
+/// that fails to produce a new one.
 fn sync_dir(src: &Path, dst: &Path, defer_manifest: bool) -> io::Result<()> {
   fs::create_dir_all(dst)?;
   let entries = fs::read_dir(src)?.collect::<Result<Vec<_>, _>>()?;
@@ -135,6 +151,12 @@ fn sync_dir(src: &Path, dst: &Path, defer_manifest: bool) -> io::Result<()> {
 
   for entry in &entries {
     if defer_manifest && entry.file_name() == "manifest.json" {
+      continue;
+    }
+    // Only at the extension root, where `defer_manifest` marks the top-level
+    // call. It stays in `source_names`, so the prune below still leaves the
+    // stamped file alone.
+    if defer_manifest && entry.file_name() == RUNTIME_CONFIG_FILE {
       continue;
     }
     let from = entry.path();
@@ -216,19 +238,20 @@ pub async fn ensure_for_profile(
   let token = match manager.get_or_create_api_token(app_handle).await {
     Ok(token) => token,
     Err(e) => {
-      log::warn!("Marine: failed to obtain API token: {e}");
+      log::error!("Marine: failed to obtain API token: {e}");
       return None;
     }
   };
 
-  let port =
-    match crate::api_server::wait_for_api_server_ready(std::time::Duration::from_secs(10)).await {
-      Ok(port) => port,
-      Err(e) => {
-        log::warn!("Marine: local API is not ready; refusing to stamp a stale runtime config: {e}");
-        return None;
-      }
-    };
+  let port = match crate::api_server::wait_for_api_server_ready(std::time::Duration::from_secs(10))
+    .await
+  {
+    Ok(port) => port,
+    Err(e) => {
+      log::error!("Marine: local API is not ready; refusing to stamp a stale runtime config: {e}");
+      return None;
+    }
+  };
 
   // Stamp the derived capability, never the full bearer: this file lives inside
   // the browser profile, and the extension only needs `/v1/marine/*`.
@@ -240,8 +263,8 @@ pub async fn ensure_for_profile(
     "profileId": profile_id,
     "personaId": normalized_persona_id(bound_persona_id),
   });
-  if let Err(e) = write_runtime_config(&dst.join("marine-runtime-config.json"), &cfg) {
-    log::warn!("Marine: failed to stamp runtime config: {e}");
+  if let Err(e) = write_runtime_config(&dst.join(RUNTIME_CONFIG_FILE), &cfg) {
+    log::error!("Marine: failed to stamp runtime config: {e}");
     return None;
   }
 
@@ -337,6 +360,40 @@ mod tests {
       b"new worker"
     );
     assert!(!destination.join("stale.js").exists());
+  }
+
+  /// The bug this guards against cost a full investigation: an upgrade copied
+  /// the bundle's empty placeholder over a working stamped config, and every
+  /// path that then failed to re-stamp left the profile reporting
+  /// 「Marine 本地服务未连接」 with nothing in the app log to explain it.
+  #[test]
+  fn sync_dir_keeps_a_stamped_runtime_config() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let destination = directory.path().join("destination");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&destination).unwrap();
+    fs::write(
+      source.join("manifest.json"),
+      br#"{"manifest_version":3,"version":"0.1.5"}"#,
+    )
+    .unwrap();
+    // The bundle ships the placeholder, exactly as it exists in the repo.
+    fs::write(
+      source.join(RUNTIME_CONFIG_FILE),
+      br#"{"apiBase":"","token":"","profileId":""}"#,
+    )
+    .unwrap();
+    let stamped = br#"{"apiBase":"http://127.0.0.1:10108/v1/marine","token":"real"}"#;
+    fs::write(destination.join(RUNTIME_CONFIG_FILE), stamped).unwrap();
+
+    sync_dir(&source, &destination, true).unwrap();
+
+    assert_eq!(
+      fs::read(destination.join(RUNTIME_CONFIG_FILE)).unwrap(),
+      stamped,
+      "a stamped runtime config must survive an extension upgrade"
+    );
   }
 
   #[test]
