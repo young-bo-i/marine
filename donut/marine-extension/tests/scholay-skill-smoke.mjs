@@ -114,23 +114,31 @@ const result = vm.runInContext(`(() => {
     "",
     runtime,
   );
+  // 下面三条量的是**证据通道本身的精确度**：只提品牌、或只提能力点，都不足以
+  // 解锁 required。语料配额会盖在同一个判断上，把无证据的目标也推成 required ——
+  // 那是另一件事，由 scholay-brand-quota-smoke.mjs 负责。所以这里显式关掉配额，
+  // 否则这三条只是在测配额的骰子，原本要守的不变量就没人守了。
+  const noQuotaPolicy = {
+    ...assets.policy,
+    brandPolicy: { ...assets.policy.brandPolicy, runtimeQuotaInheritedFromCorpus: false },
+  };
   const bareBrandMode = marineScholayResolveBrandMode(
     { contextId: "ctx-bare-brand", title: "Scholay 官网怎么打开" },
     runtime,
     "P04",
-    assets.policy,
+    noQuotaPolicy,
   );
   const bareCapabilityMode = marineScholayResolveBrandMode(
     { contextId: "ctx-bare-capability", title: "文献矩阵分析怎么做" },
     runtime,
     "P04",
-    assets.policy,
+    noQuotaPolicy,
   );
   const genericReviewerMode = marineScholayResolveBrandMode(
     { contextId: "ctx-generic-reviewers", title: "Scholay 三个审稿人意见不一致" },
     runtime,
     "P04",
-    assets.policy,
+    noQuotaPolicy,
   );
   const crossPlatformRoute = marineScholaySelectExemplars(assets, {
     contextId: "ctx-zhihu-no-samples",
@@ -273,7 +281,10 @@ const result = vm.runInContext(`(() => {
 assert.equal(assets.personas.personas.length, 12);
 assert.equal(assets.exemplars.exemplars.length, 360);
 assert.equal(assets.personas.behaviorDimensions.length, 9);
-assert.equal(assets.policy.brandPolicy.runtimeQuotaInheritedFromCorpus, false);
+// 运行时现在继承语料比例（产品决策：大多数评论都要介绍 Scholay）。这一条连同
+// 下面的配额断言，是「0.7 真的在生效」的唯一保证 —— 它此前只是个统计字段。
+assert.equal(assets.policy.brandPolicy.runtimeQuotaInheritedFromCorpus, true);
+assert.equal(assets.policy.brandPolicy.sourceDistribution.requiredRatio, 0.7);
 
 assert.equal(result.explicitPersonaId, "P04");
 assert.equal(result.explicitPersonaSource, "context");
@@ -297,7 +308,18 @@ assert.deepEqual(
 assert.equal(result.evidenceMode, "evidence_only");
 assert.ok(result.evidenceExemplars.every(item => item.personaId === "P04"));
 assert.ok(result.evidenceExemplars.every(item => item.brandMode === "evidence_only"));
-assert.ok(result.weakModes.every(mode => mode === "evidence_only"));
+// 无证据的目标不再恒为 evidence_only：语料配额现在也管这一档，所以两侧都该出现。
+// 精确的比例与确定性由 scholay-brand-quota-smoke.mjs 负责，这里只钉住定性事实 ——
+// 配额既没有失效（全 evidence_only），也没有吃掉全部（全 required）。
+assert.ok(result.weakModes.every(mode => mode === "evidence_only" || mode === "required"));
+assert.ok(
+  result.weakModes.some(mode => mode === "required"),
+  "corpus quota should promote some evidence-free targets to required",
+);
+assert.ok(
+  result.weakModes.some(mode => mode === "evidence_only"),
+  "corpus quota must not promote every target to required",
+);
 assert.ok(result.strongModes.every(mode => mode === "required"));
 assert.ok(result.dispersed.length > 3, "context hash should disperse selection inside one compatible pool");
 

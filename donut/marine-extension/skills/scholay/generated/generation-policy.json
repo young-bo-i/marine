@@ -22,13 +22,13 @@
         "freshEvidenceRequired": true
       }
     },
-    "runtimeQuotaInheritedFromCorpus": false,
+    "runtimeQuotaInheritedFromCorpus": true,
     "sourceDistribution": {
       "evidence_only": 108,
       "required": 252,
       "requiredRatio": 0.7,
       "total": 360,
-      "trainingDistributionOnly": true
+      "trainingDistributionOnly": false
     }
   },
   "generation": {

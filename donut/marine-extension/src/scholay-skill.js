@@ -400,15 +400,61 @@ function marineScholayHasProductContext(fields, policy) {
   return fields.topic.includes(brandToken) || fields.topic.includes('scholay.com');
 }
 
+// 语料里 70% 的样例是 required，但那一直只是**训练分布**：策略里的
+// `trainingDistributionOnly` / `runtimeQuotaInheritedFromCorpus` 两个标记就是在说
+// 「运行时不要继承它」。默认关闭时，只有页面自己已经提到 Scholay 且命中某个能力点
+// 才会提品牌 —— 实际结果接近于永不。打开后，没有页面证据的目标也按 requiredRatio
+// 分配 brandMode。
+//
+// 这是产品决策，不是调参：required 的评论会在没有任何页面依据的情况下推荐产品，
+// 而策略里的 freshEvidenceRequiredForProductClaims 本来是为了挡这件事。开关留在
+// 策略文件里，就是为了让这个取舍是显式的、可以一行改回去的。
+function marineScholayCorpusRequiredRatio(policy) {
+  const brandPolicy = (policy && policy.brandPolicy) || {};
+  if (brandPolicy.runtimeQuotaInheritedFromCorpus !== true) return 0;
+  const distribution = brandPolicy.sourceDistribution || {};
+  const ratio = Number(distribution.requiredRatio);
+  if (!Number.isFinite(ratio) || ratio <= 0) return 0;
+  return Math.min(ratio, 1);
+}
+
+// 配额必须是**确定性**的，不能用 Math.random。质量校验失败后会带着同一个目标重跑，
+// 一旦 brandMode 中途翻面，上一轮按 required 写出来的稿子就会被 evidence_only 的
+// 规则判死（反之亦然），表现成随机的「候选文案未通过质量校验」。同一个目标每次都
+// 必须落在同一侧。
+function marineScholayQuotaKey(fields) {
+  return [
+    fields.platform,
+    fields.actionId,
+    fields.mode,
+    fields.targetId,
+    fields.contextId || fields.title || 'no-context',
+    fields.targetText.slice(0, 256),
+  ].join('|');
+}
+
 function marineScholayResolveBrandDecision(input, policy) {
   const explicit = marineScholayExplicitBrandMode(input);
   const fields = marineScholayRoutingFields(input);
   const evidence = marineScholayMatchedCapabilities(fields, policy);
   const productContext = marineScholayHasProductContext(fields, policy);
-  if (explicit) return { mode: explicit, source: 'context', evidence, productContext };
-  return productContext && evidence.length
-    ? { mode: 'required', source: 'product_capability_evidence', evidence, productContext }
-    : { mode: 'evidence_only', source: 'default', evidence: [], productContext };
+  const quotaKey = marineScholayQuotaKey(fields);
+  if (explicit) return { mode: explicit, source: 'context', evidence, productContext, quotaKey };
+  if (productContext && evidence.length) {
+    return {
+      mode: 'required',
+      source: 'product_capability_evidence',
+      evidence,
+      productContext,
+      quotaKey,
+    };
+  }
+  const ratio = marineScholayCorpusRequiredRatio(policy);
+  if (ratio > 0
+    && marineScholayStableHash('brand-quota|' + quotaKey) / 4294967296 < ratio) {
+    return { mode: 'required', source: 'corpus_quota', evidence, productContext, quotaKey };
+  }
+  return { mode: 'evidence_only', source: 'default', evidence: [], productContext, quotaKey };
 }
 
 function marineScholayExplicitCapabilityTerms(input, policy) {
@@ -442,7 +488,20 @@ function marineScholayRequiredCapabilityTerms(input, brandDecision, policy) {
   // term, then the most specific matched evidence phrase. A bare brand mention
   // is not itself a capability and must never satisfy this rule.
   const candidates = explicit.length ? explicit : evidence;
-  if (candidates.length === 0) return [];
+  if (candidates.length === 0) {
+    // 配额把这条推成了 required，可页面上没有任何能力点证据。required 必须且只能绑定
+    // 一个能力点 —— 少了它 marineScholayBuildBundle 会抛，而那个抛发生在 rime-context
+    // 的 PUT 之前，整条链路一个字都不出，只会在 12 秒后报「目标准备超时」。所以这里
+    // 按同一个确定性槽位从能力目录里挑一个。
+    //
+    // 这就是「按比例提品牌」的直接代价，写在这里而不是藏起来：能力点来自目录，不是
+    // 来自页面。证据驱动的路径（product_capability_evidence）不受影响。
+    if (!brandDecision || brandDecision.source !== 'corpus_quota') return [];
+    const catalog = Array.from(marineScholayCapabilityCatalog(policy).values());
+    if (!catalog.length) return [];
+    const slot = marineScholayStableHash('capability|' + (brandDecision.quotaKey || ''));
+    return [catalog[slot % catalog.length]];
+  }
   candidates.sort((left, right) => Array.from(right).length - Array.from(left).length);
   return [candidates[0]];
 }

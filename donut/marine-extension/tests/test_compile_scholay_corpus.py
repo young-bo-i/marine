@@ -156,14 +156,18 @@ class ScholayCorpusCompilerTest(unittest.TestCase):
             self.assertFalse(excluded_source_fields & set(exemplar["source"]))
             self.assertIsNone(risky_experience.search(exemplar["text"]), exemplar["id"])
 
-    def test_brand_modes_are_explicit_and_corpus_ratio_is_not_runtime_policy(self) -> None:
+    def test_brand_modes_are_explicit_and_corpus_ratio_drives_runtime_quota(self) -> None:
         brand_policy = self.policy["brandPolicy"]
         self.assertEqual(brand_policy["modes"]["required"]["brandOccurrences"], 1)
         self.assertEqual(brand_policy["modes"]["evidence_only"]["brandOccurrences"], 0)
         self.assertEqual(brand_policy["sourceDistribution"]["required"], 252)
         self.assertEqual(brand_policy["sourceDistribution"]["evidence_only"], 108)
-        self.assertTrue(brand_policy["sourceDistribution"]["trainingDistributionOnly"])
-        self.assertFalse(brand_policy["runtimeQuotaInheritedFromCorpus"])
+        # 语料比例现在就是运行时配额：scholay-skill.js 的
+        # marineScholayCorpusRequiredRatio 读的正是这两个字段，关掉任意一个都会让
+        # 品牌模式退回「只有页面自己提到 Scholay 才提」，实际结果接近于永不。
+        self.assertFalse(brand_policy["sourceDistribution"]["trainingDistributionOnly"])
+        self.assertTrue(brand_policy["runtimeQuotaInheritedFromCorpus"])
+        self.assertAlmostEqual(brand_policy["sourceDistribution"]["requiredRatio"], 0.7)
 
 
 if __name__ == "__main__":

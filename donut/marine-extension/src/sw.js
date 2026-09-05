@@ -1,7 +1,7 @@
 // sw.js — 侧边栏与 Marine 本地 API 桥接
 // 版本查询不是装饰：sw.js 与它导入的路由脚本是两个独立缓存条目。
 // 改任一文件时都必须同步移动 sw-entry 和两个 importScripts URL，测试会拦。
-importScripts('scholay-skill.js?v=0.1.35');
+importScripts('scholay-skill.js?v=0.1.36');
 chrome.runtime.onInstalled.addListener(() => {
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
   void marineRetryPublishedOutbox('installed');

@@ -506,13 +506,13 @@ def _compile_policy(
                     "freshEvidenceRequired": True,
                 },
             },
-            "runtimeQuotaInheritedFromCorpus": False,
+            "runtimeQuotaInheritedFromCorpus": True,
             "sourceDistribution": {
                 "evidence_only": brand_counts["evidence_only"],
                 "required": brand_counts["required"],
                 "requiredRatio": brand_counts["required"] / len(exemplars),
                 "total": len(exemplars),
-                "trainingDistributionOnly": True,
+                "trainingDistributionOnly": False,
             },
         },
         "generation": {

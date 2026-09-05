@@ -276,9 +276,21 @@ assert.equal(routedBody.profileId, "11111111-1111-4111-8111-111111111111");
 assert.equal(routedBody.qualitySpec.schemaVersion, 2);
 assert.equal(routedBody.qualitySpec.personaId, "P02");
 assert.equal(routedBody.qualitySpec.brandCaseSensitive, true);
-assert.deepEqual(routedBody.qualitySpec.requiredCapabilityTerms, []);
 assert.match(routedBody.skill, /人格 ID：P02/);
-assert.match(routedBody.skill, /品牌模式：evidence_only/);
+// brandMode 现在由语料配额决定（generation-policy.json 的 requiredRatio），所以这条
+// 固定用例落在哪一侧不再是稳定事实。这里断言真正的不变量：两者必须自洽 ——
+// required 恰好绑定一个能力点，evidence_only 一个都不能带。少了这条自洽性，
+// marineScholayBuildBundle 会抛，而那个抛发生在 PUT 之前，页面上只会看到超时。
+const routedMode = routedBody.qualitySpec.brandMode;
+assert.ok(
+  routedMode === "required" || routedMode === "evidence_only",
+  `unexpected brandMode: ${routedMode}`,
+);
+assert.equal(
+  routedBody.qualitySpec.requiredCapabilityTerms.length,
+  routedMode === "required" ? 1 : 0,
+);
+assert.match(routedBody.skill, new RegExp("品牌模式：" + routedMode));
 const callsBeforeStaleRevision = apiCalls.length;
 assert.equal((await sendContext(2, putMessage("tab-two-stale", 0))).skipped, undefined);
 // Revision zero is reserved for compatibility and is therefore accepted.
