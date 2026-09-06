@@ -1779,6 +1779,72 @@ async fn marine_type_text(
   Ok(StatusCode::OK)
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+struct MarineClickAtRequest {
+  profile_id: String,
+  /// 视口坐标（CSS 像素），由扩展按编辑器矩形中心算出。
+  x: f64,
+  y: f64,
+  #[serde(default)]
+  debug_cdp_port: Option<u16>,
+}
+
+/// 在编辑器上投递一次浏览器层面的可信点击，把站点的编辑态唤回来。
+///
+/// 存在的理由见 [`crate::marine::automation::send_trusted_click`]：知乎会在打字
+/// 过程中把整条底栏（含「发布」）从 DOM 上摘掉，而页内合成的点击撑不开它。
+///
+/// **这不是发送。** 它只把指针落在一片文本区域上；真正的发送仍然是页面自己那颗
+/// 按钮，由扩展在通过全部发送前校验之后点击。坐标做上界校验，避免一个畸形请求
+/// 把点击投到视口外或非数值位置。
+#[utoipa::path(
+  post, path = "/v1/marine/click-at", request_body = MarineClickAtRequest,
+  responses((status = 200, description = "Clicked")),
+  security(("bearer_auth" = [])), tag = "marine"
+)]
+async fn marine_click_at(
+  State(_state): State<ApiServerState>,
+  Json(req): Json<MarineClickAtRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+  if !req.x.is_finite() || !req.y.is_finite() || req.x < 0.0 || req.y < 0.0 {
+    return Err((
+      StatusCode::BAD_REQUEST,
+      "coordinates must be finite and non-negative".into(),
+    ));
+  }
+  // 没有哪块视口有这么大；越界坐标只可能来自算错或构造请求。
+  if req.x > 20_000.0 || req.y > 20_000.0 {
+    return Err((
+      StatusCode::BAD_REQUEST,
+      "coordinates are out of any plausible viewport".into(),
+    ));
+  }
+
+  let debug_port = if cfg!(debug_assertions) {
+    req.debug_cdp_port
+  } else {
+    None
+  };
+  let port = match debug_port {
+    Some(p) => p,
+    None => {
+      let profile = crate::marine::cdp::resolve_running_profile(&req.profile_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+      crate::marine::cdp::get_cdp_port_for_profile(&profile)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?
+    }
+  };
+  let ws = crate::marine::cdp::get_cdp_ws_url(port)
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+  crate::marine::automation::send_trusted_click(&ws, req.x, req.y)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+  Ok(StatusCode::OK)
+}
+
 // ---------------------------------------------------------------- debug log
 //
 // The extension's own log, made durable. Its live consumer (the side panel's
@@ -2198,6 +2264,7 @@ impl ApiServer {
       .routes(routes!(marine_list_prospects))
       .routes(routes!(marine_append_debug_logs, marine_get_debug_logs))
       .routes(routes!(marine_type_text))
+      .routes(routes!(marine_click_at))
       .routes(routes!(marine_append_published_history))
       .routes(routes!(marine_get_agents))
       .routes(routes!(marine_get_rime_status))

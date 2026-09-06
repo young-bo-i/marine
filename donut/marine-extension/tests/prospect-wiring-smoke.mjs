@@ -1104,6 +1104,54 @@ class ProspectDomFixture {
     /attempted:\s*true[\s\S]{0,600}未收到平台回执/.test(impl),
     "click 成功返回后回执超时必须标 attempted，供台账 settle unconfirmed",
   );
+  // 找按钮必须是有界轮询，而且必须是纯读的 —— 后者是「不会造成重复发送」的依据。
+  const lookupBlock = impl.slice(
+    impl.indexOf('async function afterRefocus'),
+    impl.indexOf('记下点击那一刻'),
+  );
+  assert.ok(lookupBlock.length > 300, '找不到 afterRefocus 里的查找块');
+  assert.ok(
+    /for \(;;\)[\s\S]{0,400}marineProspectFindSendButton/.test(lookupBlock),
+    '发送按钮查找必须轮询，一次落空就放弃会让候选按「失败不重试」永久作废',
+  );
+  assert.ok(
+    !/\.click\(|\.focus\(|dispatchEvent|fetch\(|XMLHttpRequest/.test(lookupBlock),
+    '查找轮询必须纯读：任何点击/聚焦/请求都可能变成第二次发送',
+  );
+  assert.ok(
+    /MARINE_SEND_BUTTON_LOOKUP_MS\s*=\s*\d+/.test(iso),
+    '轮询预算要有具名常量，便于按实测调整',
+  );
+
+  // 知乎找发送按钮：2026-09-06 真机实测的三条结论，防回退。
+  const zhihuFinder = iso.slice(
+    iso.indexOf('function marineProspectFindZhihuSendButton'),
+    iso.indexOf('function marineProspectResolveEditor'),
+  );
+  assert.ok(zhihuFinder.length > 500, '找不到 marineProspectFindZhihuSendButton');
+  // 1) 这两个类名在今天的知乎已不存在（实测 false/false），留着只会让人以为
+  //    还有第二条归属证明路径。
+  assert.ok(
+    !/CommentEditorV2|CommentBox/.test(zhihuFinder),
+    '.CommentEditorV2/.CommentBox 早已不存在，不该再作为归属依据',
+  );
+  // 2) `\s` 不含 U+200B，而知乎确实在按钮文案里放零宽（实测「​14条评论」）。
+  assert.ok(
+    /\\u200b/.test(zhihuFinder),
+    '发布文案比较必须去零宽字符，否则知乎哪天加一个就会静默失配',
+  );
+  // 3) 七个 fail-closed 出口必须各自留痕，否则「未找到发送按钮」又变成一句猜测。
+  for (const exit of ['no-editor', 'no-boundary', 'ambiguous:', 'no-eligible-candidate', 'found:']) {
+    assert.ok(
+      zhihuFinder.includes(exit),
+      `找按钮的出口 ${exit} 必须写进 marineZhihuSendLookup`,
+    );
+  }
+  assert.ok(
+    /marineLog\('error', 'send'[\s\S]{0,120}未找到发送按钮/.test(iso),
+    '未找到发送按钮必须落进持久日志并带上具体出口',
+  );
+
   // 捕获回读：断链兜底。这三条钉的是**为什么它不可能造成重复评论** —— 全程只读。
   // 从整份 iso 里取：这个 helper 定义在 marineProspectSendComment 之上，不在 impl 切片内。
   const readback = iso.slice(

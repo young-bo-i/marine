@@ -1,7 +1,7 @@
 // sw.js — 侧边栏与 Marine 本地 API 桥接
 // 版本查询不是装饰：sw.js 与它导入的路由脚本是两个独立缓存条目。
 // 改任一文件时都必须同步移动 sw-entry 和两个 importScripts URL，测试会拦。
-importScripts('scholay-skill.js?v=0.1.36');
+importScripts('scholay-skill.js?v=0.1.37');
 chrome.runtime.onInstalled.addListener(() => {
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
   void marineRetryPublishedOutbox('installed');
@@ -1216,6 +1216,17 @@ const MARINE_PROSPECT_ROUTES = new Set([
   //   · Rust 侧拒绝控制字符（否则一个回车就能绕过发送闸）和超长文本
   //   · 目标必须是**正在运行的** profile，由 resolve_running_profile 把关
   'type-text',
+  // 可信点击。和 `type-text` 同一类危险 —— 它同样操作浏览器本身 —— 所以用同一套
+  // 约束兜住：
+  //   · Rust 侧只在给定坐标投递 mouseMoved/Pressed/Released，**不选目标**、
+  //     不导航、不打字；点哪儿完全由扩展算出来的坐标决定
+  //   · Rust 侧校验坐标是有限非负数且在任何真实视口的上界内，畸形请求直接 400
+  //   · 扩展只会传**编辑器矩形的中心**，那是一大片文本区域，不是任何按钮
+  //   · 目标必须是正在运行的 profile，由 resolve_running_profile 把关
+  //
+  // 它存在的唯一理由：知乎会在打字过程中把整条底栏（含「发布」）从 DOM 上摘掉，
+  // 而页内合成的点击撑不开它。发送本身仍然是扩展点站点自己的按钮，一步没少。
+  'click-at',
 ]);
 
 const MARINE_PROSPECT_READY_ROUTE = 'prospects/ready';

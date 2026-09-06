@@ -402,7 +402,7 @@ mod tests {
       serde_json::from_str(include_str!("../../../marine-extension/manifest.json")).unwrap();
     let version = manifest["version"].as_str().unwrap();
     let worker = manifest["background"]["service_worker"].as_str().unwrap();
-    assert_eq!(version, "0.1.36");
+    assert_eq!(version, "0.1.37");
     assert_eq!(worker, format!("src/sw-entry-{version}.js"));
     let entry = fs::read_to_string(
       Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -453,7 +453,7 @@ mod tests {
       (
         "sw.js",
         hex(include_bytes!("../../../marine-extension/src/sw.js")),
-        "f0f4a7b89567783b3083bd9c49fe10b07e4433e81504c9ebed3afa82abbf80dd",
+        "31da9102c3a92ef820ec70318319031212ea04fdc86cba70cd9e731d3d06dfe8",
       ),
       (
         "scholay-skill.js",

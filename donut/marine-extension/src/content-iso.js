@@ -2208,7 +2208,9 @@
         return;
       }
       g.cdpDelegated = true;
+      marineStartTypingTrace();
       void marineProspectTypeViaCdp(g.wanted, cdpMode).then(function (ok) {
+        marineStopTypingTrace();
         // 无论成败都把 typed 推到终点：成了就是真敲完了，败了让上层的
         // 「发送前核对输入框内容」那道闸去拦，不在这里静默继续敲。
         g.typed = ok ? g.wanted : g.typed;
@@ -4306,34 +4308,65 @@
     return chosen;
   }
 
+  // 上一次知乎找按钮走到了哪个出口。七个 fail-closed 出口原来共用一句
+  // 「未找到发送按钮」，从外面完全分不清是「按钮没挂载」还是「有回复框开着所以
+  // 拒绝点」—— 这两者的下一步完全不同。
+  let marineZhihuSendLookup = '';
+
   /**
    * 知乎的发送控件。
    *
-   * 2026-09 的评论弹层把「发布」从原来的 `<button>` 换过一版 `[role=button]`，
-   * 而页面本身还可能同时有创作入口的「发布」。所以不能再全局扫按钮：从当前
-   * 直评 editor 往上逐层找，第一个含发布控件的共同祖先才有资格；若必须扩大到
-   * 整个评论容器，则该容器里还必须只有当前这一个评论 editor。
+   * 2026-09-06 在真实登录账号的知乎回答页上实测（CDP 直接量的，不是推的）：
+   *
+   *   - 「发布」仍是真 `<button class="Button Button--primary Button--blue …">`，
+   *     62×30 = 1860px²。之前注释说的「换成了 `[role=button]`」在回答页上不成立，
+   *     240×60 的面积兜底也**不是**失败原因（差着一个数量级）。
+   *   - 文本码点是干净的 `53d1 5e03`，没有零宽字符。但同一页面的「评论」按钮是
+   *     `"\u200b14条评论"` —— 所以下面的比较仍然要去零宽：JS 的 `\s` **不包含**
+   *     U+200B（字符类止于 `\u200a`），哪天知乎给「发布」也加一个就会静默失配。
+   *   - 空输入框时按钮 `disabled=true`，CDP `Input.insertText` 之后变 `false`。
+   *     禁用态也不是失败原因。
+   *   - **整个弹层永远只有一个「发布」，它归属于当前展开的那个编辑器，而且
+   *     重新聚焦别的编辑器夺不回来**（实测：聚焦主评论框后按钮仍属于回复框）。
+   *
+   * 所以归属证明是这里唯一真正的判据：从 editor 往上走，第一个含发布控件的
+   * 祖先就是两者的最近共同祖先；该祖先内必须只有当前这一个评论 editor。实测
+   * 三种情形都符合预期：
+   *
+   *   干净直评（1 个编辑器）        → 命中，depth=7
+   *   靶子是回复（回复框那个编辑器）→ 命中，depth=7
+   *   有回复框开着时做直评          → 歧义（scope 内 2 个编辑器），拒绝
+   *
+   * 第三种**拒绝是对的**：那个按钮属于回复框，点下去会发成回复而不是直评。
+   * 已知的 `未找到发送按钮` 主要就是这一种，根因在「为什么有个回复框开着」，
+   * 不在这个函数。
+   *
+   * 原来还有一条 `.CommentEditorV2,.CommentBox` 的 localOwner 捷径 —— 这两个
+   * 类名在今天的知乎**已经不存在**（实测 false/false），所以它恒为 null，那条
+   * 分支从来没生效过。删掉，免得下一个人以为还有第二条证明路径。
    */
   function marineProspectFindZhihuSendButton() {
     const editor = marineProspectResolveEditor();
-    if (!editor) return null;
-    try { if (!marineRimeIsCommentEditor(editor)) return null; }
-    catch (e) { return null; }
+    if (!editor) { marineZhihuSendLookup = 'no-editor'; return null; }
+    try { if (!marineRimeIsCommentEditor(editor)) { marineZhihuSendLookup = 'not-comment-editor'; return null; } }
+    catch (e) { marineZhihuSendLookup = 'editor-check-threw'; return null; }
 
-    let localOwner = null;
     let boundary = null;
     try {
-      localOwner = editor.closest('.CommentEditorV2,.CommentBox');
       boundary = editor.closest('.Modal-content') ||
-        editor.closest('.Comments-container,.CommentListV2') || localOwner;
-    } catch (e) { return null; }
-    if (!boundary) return null;
+        editor.closest('.Comments-container,.CommentListV2');
+    } catch (e) { marineZhihuSendLookup = 'boundary-threw'; return null; }
+    if (!boundary) { marineZhihuSendLookup = 'no-boundary'; return null; }
 
     const eligible = function (el) {
       try {
-        const text = String(el.textContent || '').replace(/\s+/g, '').trim();
-        const aria = String(el.getAttribute('aria-label') || '').replace(/\s+/g, '').trim();
-        const title = String(el.getAttribute('title') || '').replace(/\s+/g, '').trim();
+        // 去零宽：`\s` 不含 U+200B，而知乎确实在按钮文案里放零宽（实测「评论」）。
+        const clean = function (value) {
+          return String(value || '').replace(/[\s\u200b-\u200f\ufeff]+/g, '').trim();
+        };
+        const text = clean(el.textContent);
+        const aria = clean(el.getAttribute('aria-label'));
+        const title = clean(el.getAttribute('title'));
         if (![text, aria, title].some(function (value) {
           return value === '发布' || value === '发布评论';
         })) return false;
@@ -4353,22 +4386,21 @@
       catch (e) { return null; }
       const hits = all.filter(eligible);
       if (hits.length) {
-        // local owner 外才遇到按钮（或改版后根本没有已知 owner），只能靠共同容器
-        // 证明归属。此时里面必须只有当前这一个可识别 editor；若还有回复框，就
-        // 无法证明按钮归谁。
-        const locallyOwned = !!localOwner && hits.every(function (candidate) {
-          try { return localOwner.contains(candidate); } catch (e) { return false; }
-        });
-        if (!locallyOwned) {
-          let editors;
-          try {
-            editors = Array.prototype.slice.call(scope.querySelectorAll(
-              '.public-DraftEditor-content[role="textbox"]',
-            )).filter(function (candidate) {
-              try { return marineRimeIsCommentEditor(candidate); } catch (e) { return false; }
-            });
-          } catch (e) { return null; }
-          if (editors.length !== 1 || editors[0] !== editor) return null;
+        // 这里的 scope 就是 editor 与该按钮的最近共同祖先（因为是从 editor 往上
+        // 走到第一次命中）。祖先内只有当前这一个 editor，才证明得了按钮归它。
+        let editors;
+        try {
+          editors = Array.prototype.slice.call(scope.querySelectorAll(
+            '.public-DraftEditor-content[role="textbox"]',
+          )).filter(function (candidate) {
+            try { return marineRimeIsCommentEditor(candidate); } catch (e) { return false; }
+          });
+        } catch (e) { marineZhihuSendLookup = 'editors-query-threw'; return null; }
+        if (editors.length !== 1 || editors[0] !== editor) {
+          // 最常见的真实情形：评论区里还开着一个回复框。那个按钮属于回复框，
+          // 点下去会发成回复 —— 拒绝是对的，但必须说清楚是这一种。
+          marineZhihuSendLookup = 'ambiguous:scope 内 ' + editors.length + ' 个编辑器,depth=' + depth;
+          return null;
         }
 
         // `[role=button]` 外壳里偶尔还会套真正的 <button>；只接受唯一最内层，
@@ -4379,10 +4411,16 @@
             try { return candidate.contains(other); } catch (e) { return false; }
           });
         });
-        return leaves.length === 1 ? leaves[0] : null;
+        if (leaves.length !== 1) {
+          marineZhihuSendLookup = 'ambiguous:' + leaves.length + ' 个互不包含的发布控件';
+          return null;
+        }
+        marineZhihuSendLookup = 'found:depth=' + depth;
+        return leaves[0];
       }
       if (scope === boundary) break;
     }
+    marineZhihuSendLookup = 'no-eligible-candidate:走到 boundary 都没有可用的发布控件';
     return null;
   }
 
@@ -4688,6 +4726,214 @@
   }
   let marineProspectDebugPortCache;
 
+  // 找发送按钮的轮询预算。
+  //
+  // 3 秒是按实测取的：知乎的按钮在 CDP 写入后 1.5 秒内解禁；B 站那条注释记着
+  // 「等 2.5 秒也一样」的收起工具栏是另一回事（那种情况轮询也救不回来，只会
+  // 多花 3 秒后照常报错，代价可接受）。
+  const MARINE_SEND_BUTTON_LOOKUP_MS = 3000;
+
+  // 打字期间的状态快照。
+  //
+  // 操作者的直接观察：输入到多行之后编辑器 UI 会「切换」一次，发布按钮就是在那时
+  // 消失的 —— 也就是说事故发生在**打字过程中**，而不是打完之后。原来的采样挂在
+  // 查找按钮的那 3 秒轮询上，等于全程错过；而且它按弹层作用域计数，在页面内联布局
+  // （`.Comments-container`，没有 Modal）下恒为 0，量了个寂寞。
+  //
+  // 这里两处都改：作用域跟着编辑器自己的容器走，采样从 CDP 写入开始。只在**发生
+  // 变化**时记一行，否则几十秒的人类打字速度会刷出上百条完全一样的。
+  let marineTypingTrace = [];
+  let marineTypingTraceTimer = 0;
+
+  function marineTypingSnapshot() {
+    const norm = function (v) {
+      return String(v || '').replace(/[\s\u200b-\u200f\ufeff]+/g, '');
+    };
+    const ed = marineProspectResolveEditor();
+    const scope = (ed && ed.closest
+      && ed.closest('.Modal-content,.Comments-container,.CommentListV2,.CommentEditorV2,.CommentBox'))
+      || document;
+    const btns = Array.prototype.slice.call(scope.querySelectorAll('button,[role="button"]'));
+    const box = ed ? ed.getBoundingClientRect() : null;
+    return {
+      按钮数: btns.length,
+      有发布: btns.some(function (b) { return norm(b.textContent) === '发布'; }),
+      有添加评论: btns.some(function (b) { return norm(b.textContent) === '添加评论'; }),
+      高: box ? Math.round(box.height) : -1,
+      字数: ed ? norm(ed.innerText).length : -1,
+      聚焦: !!(ed && (document.activeElement === ed || ed.contains(document.activeElement))),
+      作用域: scope === document ? 'document' : String(scope.className || '').split(/\s+/)[0],
+      轮廓: Array.prototype.slice.call(
+        document.querySelectorAll('[data-marine-rime-target]'),
+      ).map(function (el) {
+        const r = el.getBoundingClientRect();
+        return el.getAttribute('data-marine-rime-target') + ':'
+          + (el.style.display === 'none' ? 'hidden' : Math.round(r.width) + 'x' + Math.round(r.height));
+      }).join(','),
+    };
+  }
+
+  // 谁把工具栏摘走的。
+  //
+  // 时间线已经证明：换行不是原因（两次换行按钮都活着）、失焦不是（全程聚焦）、
+  // 我们的轮廓也不是（尺寸一次没变过）。剩下的事实是「3 个按钮在同一拍原子消失，
+  // 而编辑器活着、焦点还在、打字继续」—— 那只能是一次 DOM 变更摘掉的。
+  //
+  // 观察器只读，记录**移除了含「发布」子树**的那次 mutation：被移除节点长什么样、
+  // 它的父节点是谁、同一批里加了几个删了几个。整批替换（addedNodes 也多）说明是
+  // 站点自己的 React 重渲染；只删不加则是针对性移除，两者的改法完全不同。
+  let marineToolbarMutations = [];
+  let marineToolbarObserver = null;
+
+  function marineDescribeNode(node) {
+    try {
+      if (!node) return 'null';
+      if (node.nodeType !== 1) return '#' + node.nodeType;
+      const cls = String(node.className || '').split(/\s+/).filter(Boolean).slice(0, 3).join('.');
+      const txt = String(node.textContent || '').replace(/\s+/g, '').slice(0, 24);
+      return node.tagName.toLowerCase() + (cls ? '.' + cls : '') + (txt ? '「' + txt + '」' : '');
+    } catch (e) { return '?'; }
+  }
+
+  function marineSubtreeHasPublish(node) {
+    try {
+      if (!node || node.nodeType !== 1) return false;
+      const norm = function (v) {
+        return String(v || '').replace(/[\s\u200b-\u200f\ufeff]+/g, '');
+      };
+      if (node.matches && node.matches('button,[role="button"]') && norm(node.textContent) === '发布') {
+        return true;
+      }
+      return Array.prototype.some.call(
+        node.querySelectorAll ? node.querySelectorAll('button,[role="button"]') : [],
+        function (b) { return norm(b.textContent) === '发布'; },
+      );
+    } catch (e) { return false; }
+  }
+
+  function marineStartToolbarObserver(scope, startedAt) {
+    marineStopToolbarObserver();
+    marineToolbarMutations = [];
+    if (!scope || typeof MutationObserver !== 'function') return;
+    try {
+      marineToolbarObserver = new MutationObserver(function (records) {
+        for (const record of records) {
+          if (!record.removedNodes || !record.removedNodes.length) continue;
+          for (const removed of record.removedNodes) {
+            if (!marineSubtreeHasPublish(removed)) continue;
+            if (marineToolbarMutations.length >= 12) return;
+            marineToolbarMutations.push({
+              t: Date.now() - startedAt,
+              被移除: marineDescribeNode(removed),
+              父节点: marineDescribeNode(record.target),
+              同批新增: record.addedNodes.length,
+              同批移除: record.removedNodes.length,
+              判读: record.addedNodes.length > 0 ? '整批替换（疑似站点重渲染）' : '只删不加（针对性移除）',
+            });
+          }
+        }
+      });
+      marineToolbarObserver.observe(scope, { childList: true, subtree: true });
+    } catch (e) {}
+  }
+
+  function marineStopToolbarObserver() {
+    if (marineToolbarObserver) {
+      try { marineToolbarObserver.disconnect(); } catch (e) {}
+      marineToolbarObserver = null;
+    }
+  }
+
+  function marineStartTypingTrace() {
+    marineStopTypingTrace();
+    marineTypingTrace = [];
+    const startedAt = Date.now();
+    try {
+      const ed0 = marineProspectResolveEditor();
+      const scope0 = (ed0 && ed0.closest
+        && ed0.closest('.Modal-content,.Comments-container,.CommentListV2,.CommentEditorV2,.CommentBox'))
+        || document.body;
+      marineStartToolbarObserver(scope0, startedAt);
+    } catch (e) {}
+    let last = '';
+    const tick = function () {
+      try {
+        const snap = marineTypingSnapshot();
+        // 只记变化。「发布」的出现与消失一定是变化，所以一定会被记下来。
+        const key = JSON.stringify(snap);
+        if (key !== last) {
+          last = key;
+          snap.t = Date.now() - startedAt;
+          if (marineTypingTrace.length < 240) marineTypingTrace.push(snap);
+        }
+      } catch (e) {}
+    };
+    tick();
+    marineTypingTraceTimer = setInterval(tick, 200);
+  }
+
+  function marineStopTypingTrace() {
+    marineStopToolbarObserver();
+    if (marineTypingTraceTimer) {
+      clearInterval(marineTypingTraceTimer);
+      marineTypingTraceTimer = 0;
+    }
+  }
+
+  // 在编辑器上投递一次**浏览器层面**的可信点击。
+  //
+  // 用途只有一个：知乎会在打字过程中把整条底栏（「同时发布到想法」+「发布」）从
+  // DOM 上摘掉 —— MutationObserver 实测 `同批新增: 0`，是 React 的条件渲染关掉了
+  // 它，不是重渲染替换；此时编辑器还活着、DOM 焦点也还在，只是没有按钮可点。
+  // 已逐一排除：换行（两次换行按钮都活着）、失焦（全程 activeElement 是编辑器）、
+  // 我们自己的轮廓（尺寸一次没变过）、定时器（裸浏览器逐字打 60 秒不复现）。
+  //
+  // 页内合成的点击撑不开它 —— 这是仓库里早就用血换来的结论（见发送前重聚焦那段
+  // 注释：带正确坐标的 pointerdown/mousedown/click 同样无效）。打字早就走了 CDP，
+  // 点击一直没有，这里补上。
+  //
+  // 落点是编辑器矩形中心，一大片文本区域，不是任何按钮：它只负责把站点的编辑态
+  // 唤回来。真正的发送仍然是页面自己那颗按钮，而且要再过一遍发送前的目标校验。
+  function marineProspectClickEditorViaCdp(editor) {
+    let point = null;
+    try {
+      const r = editor && editor.getBoundingClientRect ? editor.getBoundingClientRect() : null;
+      if (!r || r.width <= 0 || r.height <= 0) return Promise.resolve(false);
+      point = { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+    } catch (e) { return Promise.resolve(false); }
+    if (!point || point.x < 0 || point.y < 0) return Promise.resolve(false);
+
+    return marineProspectSend(
+      { __marineProspectProfileId: true },
+      MARINE_PROSPECT_CONTROL_TIMEOUT_MS,
+    ).then(function (who) {
+      const profileId = who && who.profileId;
+      if (!profileId) return false;
+      return marineProspectSend(
+        {
+          __marineProspectApi: true,
+          route: 'click-at',
+          body: {
+            profile_id: profileId,
+            x: point.x,
+            y: point.y,
+            debug_cdp_port: marineProspectDebugCdpPort(),
+          },
+        },
+        MARINE_PROSPECT_CONTROL_TIMEOUT_MS,
+      ).then(function (reply) {
+        const ok = !!(reply && reply.ok);
+        marineLog(ok ? 'info' : 'warn', 'send',
+          '可信点击编辑器 @' + point.x + ',' + point.y
+            + (ok ? ' → 已投递' : ' → 失败：' + ((reply && reply.error) || '未知')));
+        return ok;
+      });
+    }).catch(function (e) {
+      marineLog('warn', 'send', '可信点击异常：' + String((e && e.message) || e));
+      return false;
+    });
+  }
+
   function marineProspectTypeViaCdp(text, inputMode) {
     return marineProspectSend(
       { __marineProspectProfileId: true },
@@ -4845,8 +5091,154 @@
       setTimeout(afterRefocus, refocusDelay);
 
       async function afterRefocus() {
-      const btn = marineProspectFindSendButton(platform);
-      if (!btn) return resolve({ ok: false, error: '未找到发送按钮' });
+      // 找按钮改成**有界轮询**，不再一次定生死。
+      //
+      // 原来只查一次，而且编辑器已经是 activeElement 时 refocusDelay 是 0 —— 等于
+      // CDP 写完的下一拍就去找。但 Draft.js 写入会重挂载编辑器，发送按钮的挂载与
+      // 解禁都是异步的：早看一拍就什么都没有。而这条腿没有第二次机会，那条候选会
+      // 按「失败不重试」永久作废，外部只看到一句「未找到发送按钮」。
+      //
+      // 实测（2026-09-06，真实知乎账号）：空输入框时按钮 disabled=true，CDP
+      // insertText 之后才变 false —— 这个状态翻转本身就是异步的。
+      //
+      // 轮询是**纯读**的：marineProspectFindSendButton 只做 querySelector 与几何
+      // 判断，不点击、不聚焦、不发请求，所以不可能造成第二次发送；点击前的目标
+      // 校验（target_changed_before_send）仍然在它之后，一步没少。
+      const lookupDeadline = Date.now() + MARINE_SEND_BUTTON_LOOKUP_MS;
+      const lookupStartedAt = Date.now();
+      // 轮询期间连续采样，而不是失败后补拍一张。
+      //
+      // 上一版的快照拍在轮询跑完之后 —— 记录的是「失败后 3 秒」的 DOM，而按钮
+      // 消失那一刻早就过去了。实测线索指向工具栏**整体**被卸载（失败现场弹层里
+      // 只剩 2 个 button，正常时是 5 个），所以真正要看的是它什么时候、在什么
+      // 变化之后消失的。采样只读，成本是每 150ms 几次 querySelector。
+      const lookupTrace = [];
+      const sample = function () {
+        try {
+          const ed = marineProspectResolveEditor();
+          const modal = ed && ed.closest ? ed.closest('.Modal-content') : null;
+          const box = ed ? ed.getBoundingClientRect() : null;
+          const norm = function (v) {
+            return String(v || '').replace(/[\s\u200b-\u200f\ufeff]+/g, '');
+          };
+          const btns = modal ? Array.prototype.slice.call(modal.querySelectorAll('button')) : [];
+          lookupTrace.push({
+            t: Date.now() - lookupStartedAt,
+            按钮数: btns.length,
+            有发布: btns.some(function (b) { return norm(b.textContent) === '发布'; }),
+            编辑器高: box ? Math.round(box.height) : -1,
+            字数: ed ? norm(ed.innerText).length : -1,
+            聚焦: !!(ed && (document.activeElement === ed || ed.contains(document.activeElement))),
+            // 我们自己画的那圈轮廓。操作者的观察是「换行 → 轮廓重算 → 发布消失」，
+            // 而轮廓的尺寸就是重算的直接证据：把它和 `编辑器高` 放在同一拍上，才分得清
+            // 到底是换行本身干掉了工具栏，还是我们的重定位干的。
+            //
+            // 覆盖层挂在 documentElement 上、position:fixed、pointerEvents:none，
+            // 没有插进知乎的 React 树，所以真要是它，机制只能是那个 rAF 重定位循环
+            // 高频读 getBoundingClientRect 触发的同步布局和站点渲染打架 —— 时间线能验。
+            我们的轮廓: Array.prototype.slice.call(
+              document.querySelectorAll('[data-marine-rime-target]'),
+            ).map(function (el) {
+              const r = el.getBoundingClientRect();
+              return el.getAttribute('data-marine-rime-target') + ':'
+                + (el.style.display === 'none'
+                  ? 'hidden'
+                  : Math.round(r.width) + 'x' + Math.round(r.height));
+            }),
+          });
+        } catch (e) {}
+      };
+      let btn = null;
+      let revived = false;
+      for (;;) {
+        sample();
+        btn = marineProspectFindSendButton(platform);
+        if (btn || Date.now() >= lookupDeadline) break;
+        // 头 600ms 先留给站点自己 —— 按钮的挂载和解禁本来就是异步的，别把正常的
+        // 慢一拍也当成故障去点。过了还没有，才说明底栏是真被摘了，这时投一次可信
+        // 点击把编辑态唤回来。只做一次；失败也继续轮询，最坏是照常报错。
+        if (!revived && Date.now() - lookupStartedAt > 600) {
+          revived = true;
+          try {
+            const ed = marineProspectResolveEditor();
+            if (ed && ed.isConnected) await marineProspectClickEditorViaCdp(ed);
+          } catch (e) {}
+        }
+        await new Promise(function (r) { setTimeout(r, 150); });
+      }
+      if (btn && revived) {
+        // 这一行就是这次改动到底管不管用的判据。
+        marineLog('info', 'send', platform + ' 底栏是在可信点击之后回来的');
+      }
+      if (btn && Date.now() - lookupStartedAt > 200) {
+        // 第一拍没找到、后来才出现 —— 这正是上面那个异步窗口，值得留痕：
+        // 它能告诉我们 3 秒够不够，以及这个竞态到底多常见。
+        marineLog('info', 'send', platform + ' 发送按钮在 '
+          + (Date.now() - lookupStartedAt) + 'ms 后才出现（首次查找落空）');
+      }
+      if (!btn) {
+        const why = platform === 'zhihu' && marineZhihuSendLookup ? marineZhihuSendLookup : '';
+        // 把失败现场整个存下来。
+        //
+        // 「未找到发送按钮」在页面上不留任何痕迹，而收尾会把这一页导航到 about:blank
+        // 或直接关掉浏览器 —— 想复现只能再跑一轮，再赌一次同样的 DOM。所以在这一刻
+        // 把判定过程、按钮清单和弹层 HTML 一起落进 marine-debug.jsonl，事后能离线还原。
+        try {
+          const clean = function (v) {
+            return String(v || '').replace(/[\s\u200b-\u200f\ufeff]+/g, '').trim();
+          };
+          const editor = marineProspectResolveEditor();
+          const modal = editor && editor.closest ? editor.closest('.Marine-none,.Modal-content') : null;
+          const allButtons = Array.prototype.slice.call(
+            (modal || document).querySelectorAll('button,[role="button"]'),
+          );
+          const snapshot = {
+            url: location.href,
+            出口: why,
+            闸门: (function () { try { return globalThis.__marineZhihuEditorGate || null; } catch (e) { return null; } })(),
+            编辑器: editor ? {
+              tag: editor.tagName,
+              匹配DraftJS选择器: !!(editor.matches && editor.matches('.public-DraftEditor-content[role="textbox"]')),
+              可编辑: !!editor.isContentEditable,
+              仍在文档上: !!editor.isConnected,
+              可见: (function () { const r = editor.getBoundingClientRect(); return r.width > 0 && r.height > 0; })(),
+              类名: String(editor.className || '').slice(0, 120),
+            } : null,
+            编辑器总数: document.querySelectorAll('.public-DraftEditor-content[role="textbox"]').length,
+            弹层存在: !!modal,
+            类名存在: {
+              CommentEditorV2: !!document.querySelector('.CommentEditorV2'),
+              CommentBox: !!document.querySelector('.CommentBox'),
+              CommentsContainer: !!document.querySelector('.Comments-container'),
+              CommentListV2: !!document.querySelector('.CommentListV2'),
+              ModalContent: !!document.querySelector('.Modal-content'),
+            },
+            按钮总数: allButtons.length,
+            // 时间序列：按钮到底是「一直没有」还是「有过又没了」，只有这条能分开。
+            轮询采样: lookupTrace,
+            // 真正要看的是这条：切换发生在打字过程中，轮询开始时早就结束了。
+            打字期采样: marineTypingTrace,
+            // 决定性的一条：到底是谁把工具栏摘走的。
+            工具栏移除记录: marineToolbarMutations,
+            发布候选: allButtons
+              .map(function (b, i) { return { i: i, t: clean(b.textContent).slice(0, 12), tag: b.tagName.toLowerCase(), disabled: b.disabled === true }; })
+              .filter(function (x) { return x.t.indexOf('发布') >= 0 || x.t.indexOf('回复') >= 0 || x.t.indexOf('评论') >= 0; })
+              .slice(0, 40),
+          };
+          marineLog('error', 'send-snapshot', platform + ' 未找到发送按钮 · 现场', JSON.stringify(snapshot));
+          // HTML 单独一条：它体积大，混在结构化诊断里会把那条也读不动。
+          const html = modal ? modal.outerHTML : document.body.innerHTML;
+          marineLog('error', 'send-snapshot-html', platform + ' 弹层 HTML（截断 120KB）',
+            String(html || '').slice(0, 120000));
+        } catch (e) {
+          marineLog('error', 'send-snapshot', '现场采集自身失败：' + String(e && e.message || e));
+        }
+        marineLog('error', 'send', platform + ' 未找到发送按钮' + (why ? '：' + why : ''));
+        return resolve({
+          ok: false,
+          error: '未找到发送按钮' + (why ? '（' + why + '）' : ''),
+        });
+      }
       // 记下点击那一刻**到底点了什么**。
       //
       // 「点了但没回执」和「点错了元素」的外部症状完全一样，都是一句

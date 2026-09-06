@@ -181,6 +181,57 @@ pub async fn send_human_input(
 /// Send a CDP command and wait for the page to finish loading. Uses a single
 /// WebSocket to: enable Page events, send the command, wait for the command
 /// response, then wait for `Page.loadEventFired`.
+/// 在指定视口坐标上投递一次**浏览器层面**的可信点击。
+///
+/// 为什么非要走 CDP，而不是页内 `el.click()`：本仓库已经用血换过这条经验
+/// （见 content-iso.js 里发送前重聚焦那段注释）——「页内合成的
+/// pointerdown/mousedown/click（带正确坐标）同样无效，只有浏览器层面的可信输入
+/// 能撑开收起的工具栏」。打字早就走了 CDP（`Input.insertText`），点击一直没有。
+///
+/// 真实事故：知乎评论弹层在打字过程中会把整条底栏（「同时发布到想法」+「发布」）
+/// 从 DOM 上摘掉——实测 MutationObserver 抓到 `同批新增: 0`，是 React 条件渲染
+/// 关掉了它，而不是重渲染替换。此时编辑器还活着、焦点也还在，只是没有按钮可点。
+/// 已排除换行、失焦、我们自己的轮廓、以及定时器（裸浏览器打 60 秒不复现）。
+///
+/// 坐标由调用方按编辑器的矩形中心算，落点是一大片文本区域，不是任何按钮——这个
+/// 点击只负责把站点的编辑态唤回来，真正的发送仍然由页面自己那颗按钮完成，且要
+/// 再过一遍发送前的目标校验。
+pub async fn send_trusted_click(ws_url: &str, x: f64, y: f64) -> Result<(), String> {
+  use futures_util::SinkExt as _;
+  use futures_util::StreamExt as _;
+
+  let (mut ws_stream, _) = connect_async(ws_url)
+    .await
+    .map_err(|e| format!("Failed to connect to CDP WebSocket: {e}"))?;
+
+  // 先 moved 再 pressed/released：有些站点只在指针真的经过时才认这次交互，
+  // 缺了 move 的「瞬移点击」会被当成脚本行为。
+  for (id, params) in [
+    (
+      1u64,
+      serde_json::json!({ "type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0 }),
+    ),
+    (
+      2,
+      serde_json::json!({ "type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1 }),
+    ),
+    (
+      3,
+      serde_json::json!({ "type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0, "clickCount": 1 }),
+    ),
+  ] {
+    let message =
+      serde_json::json!({ "id": id, "method": "Input.dispatchMouseEvent", "params": params });
+    ws_stream
+      .send(Message::Text(message.to_string().into()))
+      .await
+      .map_err(|e| format!("Failed to send mouse event: {e}"))?;
+    // 排掉应答，避免和下一条消息串位。
+    let _ = ws_stream.next().await;
+  }
+  Ok(())
+}
+
 pub async fn send_cdp_and_wait_for_load(
   ws_url: &str,
   method: &str,

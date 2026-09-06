@@ -384,17 +384,44 @@
     return null;
   }
 
+  // 五道闸各自留痕。
+  //
+  // 这个函数返回 false 时，外面只会看到一句 `not-comment-editor` —— 而五种原因的
+  // 下一步互不相干：选择器过时、编辑器已经失效、弹层没找到、发布按钮被 160 的扫描
+  // 上限截在外面。实测（2026-09-06，真实账号）：`.CommentEditorV2 / .CommentBox /
+  // .Comments-container / .CommentListV2` **四个类名今天全都不存在**，所以第三道闸
+  // 恒不命中，判定实际上全压在最后那次按钮扫描上；而「发布」在弹层的最底部，评论
+  // 一多就排到 160 之后。把每一道闸的结果都留下来，下次一眼看得出是哪一种。
   function isZhihuCommentEditor(editor) {
-    if (!safeMatches(editor, '.public-DraftEditor-content[role="textbox"]')) return false;
-    if (!isEditableElement(editor)) return false;
-    if (safeClosest(editor, '.CommentEditorV2,.CommentBox,.Comments-container,.CommentListV2')) {
-      return true;
-    }
+    const gate = { at: Date.now() };
+    try { root.__marineZhihuEditorGate = gate; } catch (error) {}
+
+    gate.matchesSelector = safeMatches(editor, '.public-DraftEditor-content[role="textbox"]');
+    if (!gate.matchesSelector) { gate.fail = 'selector-not-draftjs'; return false; }
+
+    gate.editable = isEditableElement(editor);
+    if (!gate.editable) { gate.fail = 'not-editable'; return false; }
+
+    gate.legacyOwner =
+      !!safeClosest(editor, '.CommentEditorV2,.CommentBox,.Comments-container,.CommentListV2');
+    if (gate.legacyOwner) { gate.fail = null; return true; }
+
     const modal = safeClosest(editor, '.Modal-content');
-    if (!modal) return false;
-    return safeQueryAll(modal, 'button', 160).some(function (button) {
-      return elementText(button, 24) === '发布';
-    });
+    gate.modal = !!modal;
+    if (!modal) { gate.fail = 'no-modal-ancestor'; return false; }
+
+    // 故意分开量：扫描窗口内有没有，和整个弹层里到底有没有、排第几。两者不同就
+    // 说明是被 160 截掉的，而不是页面上真的没有这个按钮。
+    const scanned = safeQueryAll(modal, 'button', 160);
+    const all = safeQueryAll(modal, 'button', 100000);
+    const isPublish = function (button) { return elementText(button, 24) === '发布'; };
+    gate.buttonsScanned = scanned.length;
+    gate.buttonsTotal = all.length;
+    gate.publishIndex = all.findIndex(isPublish);
+    const found = scanned.some(isPublish);
+    gate.fail = found ? null
+      : (gate.publishIndex >= 0 ? 'publish-button-beyond-scan-cap' : 'no-publish-button-in-modal');
+    return found;
   }
 
   function uniqueZhihuScope(documentLike) {
