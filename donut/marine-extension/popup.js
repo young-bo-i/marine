@@ -299,7 +299,7 @@ function applyConnectorFieldState(provider) {
   if (modelInput) {
     modelInput.placeholder = provider === 'claude'
       ? '留空＝Claude Code 自己的默认'
-      : '留空＝Codex 用 gpt-5.3-codex-spark';
+      : '留空＝Codex 用 gpt-5.6-luna';
   }
   if (effortSelect) {
     // 推理深度只有 Codex 认；在别的连接器下禁用，免得看着已设置、实则被忽略。
@@ -387,7 +387,7 @@ if ($('#cfg-connector-save')) $('#cfg-connector-save').addEventListener('click',
     const c = marineConnectorConfig || {};
     const modelInput = $('#cfg-cli-model');
     const effortSelect = $('#cfg-cli-effort');
-    // 留空＝交回 Marine 的默认值（gpt-5.3-codex-spark / low），不是"继承 config.toml"。
+    // 留空＝交回 Marine 的默认值（gpt-5.6-luna / medium），不是"继承 config.toml"。
     const cliModel = modelInput ? modelInput.value.trim() : '';
     const cliEffort = effortSelect ? effortSelect.value.trim() : '';
     await apiFetch('/provider-config', { method: 'PUT', body: JSON.stringify({

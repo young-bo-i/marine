@@ -76,14 +76,18 @@ const CODEX_DISABLED_FEATURES: &[&str] = &[
 /// for interactive terminal work silently became the model behind every
 /// generated comment, so a `xhigh` terminal preference made the extension's
 /// "generate" button slow for reasons nothing in Marine could explain.
-pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.3-codex-spark";
+pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-luna";
 
 /// Reasoning effort Marine asks for when the user has not chosen one.
 ///
 /// Comment copy is short, schema-constrained text with a validation/repair loop
-/// around it; it does not need deep reasoning, and the effort setting is the
-/// single biggest lever on how long the button takes.
-pub const DEFAULT_CODEX_REASONING_EFFORT: &str = "low";
+/// around it, and the effort setting is the single biggest lever on how long the
+/// button takes — so this is deliberately not the top of the scale.
+///
+/// `medium` 而不是 `low`：低档下评论更容易写成泛泛的套话，而质量校验只挡硬规则
+/// （字数、品牌出现次数），挡不住"没说到点上"。中档是运营取的折中——比 low 稳，
+/// 又远没有 high/xhigh 那么慢。
+pub const DEFAULT_CODEX_REASONING_EFFORT: &str = "medium";
 
 /// Accepted reasoning-effort values, lowest first.
 ///
@@ -2174,8 +2178,8 @@ mod stream_tests {
   /// `allowProviderModelFallback` and echoes the resolved model back.
   #[test]
   fn thread_start_carries_the_model_and_refuses_a_substitute() {
-    let params = codex_thread_params(Path::new("/tmp/marine"), Some("gpt-5.3-codex-spark"));
-    assert_eq!(params["model"], Value::String("gpt-5.3-codex-spark".into()));
+    let params = codex_thread_params(Path::new("/tmp/marine"), Some("gpt-5.6-luna"));
+    assert_eq!(params["model"], Value::String("gpt-5.6-luna".into()));
     assert_eq!(params["allowProviderModelFallback"], Value::Bool(false));
     // The isolation posture must survive the refactor that made this testable.
     assert_eq!(params["ephemeral"], Value::Bool(true));
@@ -2196,8 +2200,8 @@ mod stream_tests {
       assert!(params.get("allowProviderModelFallback").is_none());
     }
     // Whitespace around a real value is the user's typo, not a new model name.
-    let params = codex_thread_params(Path::new("/tmp/marine"), Some("  gpt-5.3-codex-spark "));
-    assert_eq!(params["model"], Value::String("gpt-5.3-codex-spark".into()));
+    let params = codex_thread_params(Path::new("/tmp/marine"), Some("  gpt-5.6-luna "));
+    assert_eq!(params["model"], Value::String("gpt-5.6-luna".into()));
   }
 
   #[test]
@@ -2271,27 +2275,25 @@ mod stream_tests {
   fn a_reported_mismatch_is_refused_rather_than_generated_against() {
     let served = |model: &str, effort: &str| serde_json::json!({"result": {"model": model, "reasoningEffort": effort}});
 
-    let ok = served("gpt-5.3-codex-spark", "low");
+    let ok = served("gpt-5.6-luna", "medium");
     assert_eq!(
-      verify_codex_thread_settings(&ok, Some("gpt-5.3-codex-spark"), Some("low")),
+      verify_codex_thread_settings(&ok, Some("gpt-5.6-luna"), Some("medium")),
       Ok(())
     );
 
     let wrong_model = served("gpt-5.6-sol", "low");
-    let error =
-      verify_codex_thread_settings(&wrong_model, Some("gpt-5.3-codex-spark"), Some("low"))
-        .expect_err("a substituted model must not be accepted");
+    let error = verify_codex_thread_settings(&wrong_model, Some("gpt-5.6-luna"), Some("medium"))
+      .expect_err("a substituted model must not be accepted");
     assert!(
-      error.contains("gpt-5.6-sol") && error.contains("gpt-5.3-codex-spark"),
+      error.contains("gpt-5.6-sol") && error.contains("gpt-5.6-luna"),
       "{error}"
     );
 
     // The inherited `xhigh` from the user's config.toml is exactly the value
     // this change exists to stop; it must not pass silently.
-    let wrong_effort = served("gpt-5.3-codex-spark", "xhigh");
-    let error =
-      verify_codex_thread_settings(&wrong_effort, Some("gpt-5.3-codex-spark"), Some("low"))
-        .expect_err("an ignored reasoning effort must not be accepted");
+    let wrong_effort = served("gpt-5.6-luna", "xhigh");
+    let error = verify_codex_thread_settings(&wrong_effort, Some("gpt-5.6-luna"), Some("medium"))
+      .expect_err("an ignored reasoning effort must not be accepted");
     assert!(error.contains("xhigh"), "{error}");
   }
 
@@ -2300,7 +2302,7 @@ mod stream_tests {
   fn an_unreported_setting_is_not_treated_as_a_mismatch() {
     let silent = serde_json::json!({"result": {"thread": {"id": "t-1"}}});
     assert_eq!(
-      verify_codex_thread_settings(&silent, Some("gpt-5.3-codex-spark"), Some("low")),
+      verify_codex_thread_settings(&silent, Some("gpt-5.6-luna"), Some("medium")),
       Ok(())
     );
     // Nothing requested means nothing to disagree with.
