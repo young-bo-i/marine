@@ -567,8 +567,41 @@ impl ProfileLockManager {
               .collect()
           };
 
+          // 只续**真的在跑**的那些。
+          //
+          // 原来这里无条件续租缓存里每一把带本机 id 的锁。而缓存是服务端列表的镜像，
+          // 服务端又只保留被心跳续着的锁 —— 于是形成闭环：一把锁只要进过缓存，就会
+          // 被一直续到进程退出，哪怕那个 profile 早就关了。从另一台机器看，它和真正
+          // 在用的租约**逐字节无法区分**。
+          //
+          // 实测代价：一台只是开着 Marine、并没有跑那个 profile 的机器，让另一台连着
+          // 19 个周期拿不到它，57 条腿从未执行，而周期统计还把它们算进分母。
+          //
+          // 判据用只读的进程扫描（命令行里的 profile 目录），不用 check_browser_status
+          // —— 那个在零标签页时会杀掉浏览器。
+          let running = {
+            let runner = crate::browser_runner::BrowserRunner::instance();
+            match runner.profile_manager.list_profiles() {
+              Ok(profiles) => crate::browser_runner::running_profile_ids(&profiles),
+              // 读不到就退回旧行为：宁可多续一会儿，也不要在看不清的情况下松手 ——
+              // 释放一把别人真正持有的锁，才是这套机制在防的那件事。
+              Err(_) => held_locks.iter().cloned().collect(),
+            }
+          };
+
           for profile_id in held_locks {
-            PROFILE_LOCK.heartbeat_self_hosted(&cfg, &profile_id).await;
+            if running.contains(&profile_id) {
+              PROFILE_LOCK.heartbeat_self_hosted(&cfg, &profile_id).await;
+            } else {
+              // 不续 = 90 秒 TTL 到期后服务端自动放行。这里额外主动释放一次，把等待
+              // 从「最多 90 秒」压到「下一轮」；释放的只可能是本机自己的锁。
+              log::info!(
+                "Team lock: releasing {profile_id} — this device holds the lease but the profile is not running"
+              );
+              PROFILE_LOCK
+                .release_lock_self_hosted(&cfg, &profile_id)
+                .await;
+            }
           }
         }
 

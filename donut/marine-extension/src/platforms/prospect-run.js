@@ -143,9 +143,42 @@ var marineProspectRun = marineProspectRun || {};
       };
     }
 
-    // ---- 2. 解析 ----------------------------------------------------------
-    const raw = deps.pageHtml();
-    const items = deps.parse(platform, raw) || [];
+    // ---- 2. 解析（滚动加深，按 id 取并集）---------------------------------
+    //
+    // 供给的天花板原来就是搜索首页那一屏：整条腿只调一次 pageHtml()，既不滚动也
+    // 不翻页。实测代价是 141 条腿以「no eligible targets left for this account」
+    // 结束 —— 知乎连着四个周期 7/7 打满，第五个周期起硬生生卡在每轮 7 个 NoWork，
+    // 就是把首页那点存量吃干净了。台账那边每条内容全舰队只允许一次终态（连
+    // Failed 也算），所以池子只会减不会回。
+    //
+    // 为什么必须**边滚边解析**、而不是滚到底再抓一次：这几个站都是虚拟列表，
+    // 卡片滚出视口就从 DOM 里回收掉。先滚后抓会把前面的卡片弄丢，比不滚还少。
+    //
+    // 深度 3 是按预算取的：腿超时 120s，Posted 腿实测中位 37–43s、NoWork 腿 5–6s，
+    // 多两轮 × 1.2s 沉淀完全在 p90 以内。
+    const seenIds = new Set();
+    const items = [];
+    let rounds = 0;
+    for (let depth = 0; depth < MARINE_HARVEST_DEPTH; depth++) {
+      if (depth > 0) {
+        // 没有滚动能力（老宿主、单元测试）就退回单屏，行为和以前完全一致。
+        if (typeof deps.scrollMore !== 'function') break;
+        let moved = false;
+        try { moved = await deps.scrollMore(); } catch (e) { moved = false; }
+        if (!moved) break;
+      }
+      rounds += 1;
+      const batch = deps.parse(platform, deps.pageHtml()) || [];
+      for (const item of batch) {
+        const id = String(item && item.id || '');
+        if (!id || seenIds.has(id)) continue;
+        seenIds.add(id);
+        items.push(item);
+      }
+    }
+    if (typeof deps.log === 'function') {
+      deps.log('滚动采集：' + rounds + ' 轮，去重后 ' + items.length + ' 条候选');
+    }
 
     // ---- 3. 体检 ----------------------------------------------------------
     // 解析器失败时是静默返回短列表，不是抛错。没有这道闸，一次页面改版或抓取
@@ -226,6 +259,9 @@ var marineProspectRun = marineProspectRun || {};
   // 到的条数不够，canary 就会判 unhealthy —— 这时候把页面标记成跑过，等渲染
   // 完了也永远不会再跑。（实测：知乎自动跑零 API 调用，手动清掉标记重跑一次
   // 立刻 claimed 15 条。B 站是 SSR 所以没暴露这个问题。）
+  // 一条腿最多解析几屏。见下方「滚动加深」那段注释的预算推导。
+  const MARINE_HARVEST_DEPTH = 3;
+
   const TERMINAL = [
     'claimed',
     'nothing_to_claim',
@@ -1086,6 +1122,14 @@ var marineProspectRun = marineProspectRun || {};
     try {
       await deps.api('prospects/settle', {
         key: handoff.key, profile_id: handoff.profileId, state,
+        // 「发送闸从未武装」是台账放开这条候选的唯一依据，而只有这里能证明它：
+        // sendStarted 和 pendingSettlement 是原子写进交接单的，是跨 document
+        // 唯一持久的不可逆边界。
+        //
+        // 只对 failed 有意义；其余状态台账一律忽略这一位。注意用的是 `!==  true`
+        // 而不是 `!`：交接单里缺这个字段（老版本、恢复路径）时必须当成「可能发过」，
+        // 而不是「没发过」。
+        pre_send: state === 'failed' && handoff.sendStarted !== true,
       });
       return { ok: true };
     } catch (e) {

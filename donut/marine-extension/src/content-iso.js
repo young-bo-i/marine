@@ -3554,6 +3554,23 @@
           void marineProspectSend({ __marineLoginReport: true, result });
         },
         pageHtml: () => document.documentElement.outerHTML,
+        // 往下滚一屏，等新卡片渲染出来；返回「这一滚有没有真的带来新内容」。
+        //
+        // 只读语义上的注意点：搜索结果页是整页滚动的长列表，所以滚 window 就够；
+        // 若哪天某个平台把结果放进内层滚动容器，这里会返回 false，采集自动退回
+        // 单屏 —— 退化而不是出错。
+        //
+        // 判据用「文档变高 或 滚动位置前进」而不是只看高度：虚拟列表回收节点时
+        // 总高可能不变，但位置前进本身就说明还有内容可看。
+        scrollMore: async () => {
+          const doc = document.documentElement;
+          const before = { y: window.scrollY || 0, h: doc.scrollHeight || 0 };
+          try { window.scrollTo(0, doc.scrollHeight); } catch (e) { return false; }
+          await new Promise((r) => setTimeout(r, MARINE_HARVEST_SETTLE_MS));
+          const after = { y: window.scrollY || 0, h: doc.scrollHeight || 0 };
+          return after.h > before.h || after.y > before.y;
+        },
+        log: (msg) => marineLog('info', 'prospect', msg),
         parse: (platform, raw) => marineDiscovery.parseFor(platform, raw),
         canary: (platform, items) => marineDiscovery.canary.check(platform, items),
         api: async (route, body) => {
@@ -4716,6 +4733,10 @@
    * 任意页面通过占用 9333 来诱导代打。runtime-config 的 profileId 是 app 写
    * 进去的，调试副本沿用真实 profileId，所以这里靠**扩展目录路径**区分。
    */
+  // 滚一屏之后等多久再解析。1.2s 是按「腿超时 120s、Posted 腿中位 37–43s」的
+  // 预算取的：多滚两轮只多花 2.4s，完全在 p90 以内，而它换来的是三倍的候选面。
+  const MARINE_HARVEST_SETTLE_MS = 1200;
+
   function marineProspectDebugCdpPort() {
     // 由 SW 从 runtime-config 里读出来（那个文件只有调试脚手架会写这个字段，
     // app 打包的正式 profile 永远没有）。
@@ -4895,11 +4916,27 @@
   // 落点是编辑器矩形中心，一大片文本区域，不是任何按钮：它只负责把站点的编辑态
   // 唤回来。真正的发送仍然是页面自己那颗按钮，而且要再过一遍发送前的目标校验。
   function marineProspectClickEditorViaCdp(editor) {
+    // 命中检测：这一点必须真的落在编辑器上。
+    //
+    // 之前只算矩形中心就投递，没有任何目标校验 —— 而这段代码存在的前提恰恰是
+    // 「DOM 正在被拆掉重建」，矩形随时可能过期。后端也只校验坐标有限、非负、
+    // ≤20000，那是合理性边界，不是目标校验。一次落错位置的浏览器级可信点击，
+    // 打进的是一个**装着完整草稿**的页面 —— 万一落在发布上，就是一次计划外发送。
+    //
+    // elementFromPoint 是最后一道、也是唯一一道能证明「点的是文本区」的闸：
+    // 命中必须是编辑器本身或它的后代，否则宁可不点（最坏退回照常报错）。
     let point = null;
     try {
       const r = editor && editor.getBoundingClientRect ? editor.getBoundingClientRect() : null;
       if (!r || r.width <= 0 || r.height <= 0) return Promise.resolve(false);
       point = { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      // 视口外的点 elementFromPoint 一律返回 null，等于自动挡掉。
+      const hit = document.elementFromPoint(point.x, point.y);
+      if (!hit || !(hit === editor || editor.contains(hit))) {
+        marineLog('warn', 'send', '可信点击已取消：落点不在编辑器上（命中 '
+          + (hit ? hit.tagName.toLowerCase() + '.' + String(hit.className || '').split(/\s+/)[0] : 'null') + '）');
+        return Promise.resolve(false);
+      }
     } catch (e) { return Promise.resolve(false); }
     if (!point || point.x < 0 || point.y < 0) return Promise.resolve(false);
 
@@ -4917,6 +4954,9 @@
             profile_id: profileId,
             x: point.x,
             y: point.y,
+            // 后端原来取的是 /json 里**第一个** page 目标，不是产生这个坐标的
+            // 那一个。多开一个标签页，这一点就会打到别的页面上去。
+            expect_url: String((typeof location !== 'undefined' && location.href) || ''),
             debug_cdp_port: marineProspectDebugCdpPort(),
           },
         },
@@ -5101,9 +5141,16 @@
       // 实测（2026-09-06，真实知乎账号）：空输入框时按钮 disabled=true，CDP
       // insertText 之后才变 false —— 这个状态翻转本身就是异步的。
       //
-      // 轮询是**纯读**的：marineProspectFindSendButton 只做 querySelector 与几何
-      // 判断，不点击、不聚焦、不发请求，所以不可能造成第二次发送；点击前的目标
-      // 校验（target_changed_before_send）仍然在它之后，一步没少。
+      // 注意：这个循环**不再是纯读的**。600ms 之后它会投递一次浏览器级可信点击
+      // （见下方 marineProspectClickEditorViaCdp）。原来这里写着「纯读、不可能造成
+      // 第二次发送」，在可信点击加进来之后那句话就不成立了 —— 留着会变成一条骗人的
+      // 安全依据。
+      //
+      // 现在真正的保证有三条，缺一不可：
+      //   · 投递前用 elementFromPoint 验证落点确实在编辑器上，验不过就不点
+      //   · 带上本页 URL，后端只对同一个页面目标投递
+      //   · 点击对象是文本区，不是任何按钮；发送仍由页面自己那颗按钮完成，
+      //     且要再过一遍发送前的目标校验（target_changed_before_send）
       const lookupDeadline = Date.now() + MARINE_SEND_BUTTON_LOOKUP_MS;
       const lookupStartedAt = Date.now();
       // 轮询期间连续采样，而不是失败后补拍一张。

@@ -185,12 +185,29 @@ impl ProspectState {
   }
 }
 
+/// 一条内容最多容忍几次「闸前失败」。
+///
+/// 放开失败复用是运营决策，但不能变成对着坏靶子无限锤 —— 那正是原来「失败不重试」
+/// 想避免的。3 次之后仍然失败，就当作这条内容确实用不了，按终态关闭。
+const MAX_FAILED_ATTEMPTS: usize = 3;
+
 /// One account's interaction with one candidate. Append-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct AccountTouch {
   pub profile_id: String,
   pub state: ProspectState,
   pub at: u64,
+  /// 这次失败是否发生在**发送闸武装之前**。
+  ///
+  /// 只有 `Failed` 会带 true。它是唯一能把「点击绝无可能发生过」和「点击也许发生
+  /// 过」分开的证据 —— 扩展在 `prospect-run.js` 里把 `sendStarted` 连同
+  /// `pendingSettlement` 一起原子写进交接单，那是跨 document 唯一持久的不可逆边界。
+  ///
+  /// `serde(default)` 是刻意的：磁盘上的旧 touch 和所有外部分片反序列化成 `false`，
+  /// 于是它们继续按「已用掉」处理，一条都不会被误放回池子。放开只对本次改动之后
+  /// 新产生、且明确证明未发送的失败生效。
+  #[serde(default)]
+  pub pre_send: bool,
 }
 
 /// A discovered piece of content, plus every account that has touched it.
@@ -270,7 +287,50 @@ impl ProspectRecord {
   /// omitted the append-only touch. This fail-safe is intentionally broader
   /// than [`Self::has_terminal_touch`]: losing history must not make a spent
   /// target claimable again, locally or after shard sync.
+  /// 只因失败而不可用、且还在重试预算内的候选。
+  ///
+  /// 运营决策：失败不该永久烧掉一条内容。实测一次 7 小时的运行里，171 条被消耗的
+  /// 候选只有 120 条产出了公开评论 —— 29.8% 颗粒无收；光一次 LLM 配额中断就永久
+  /// 烧掉最多 27 条。那些失败连点击都没发生过，没有任何公开足迹。
+  ///
+  /// 但**只放开证明未发送的那部分**（`pre_send`）。审计逐点验过七个写 `failed` 的
+  /// 位置：跨平台遗留、fill_failed、target_changed_before_send 三类在发送闸之前，
+  /// 可以回收；prepare_send_failed 之后的几类都落在闸内，即使没点到按钮，页面上也
+  /// 可能已经发生过浏览器级的可信输入，一律仍按用掉处理。
+  fn recyclable_failures(&self) -> usize {
+    if !matches!(
+      self.state,
+      ProspectState::Seen | ProspectState::Claimed | ProspectState::Failed
+    ) {
+      return 0;
+    }
+    if self.touches.is_empty() {
+      return 0;
+    }
+    // 只要有一条不是「闸前失败」，这条内容就真的用掉了。
+    if !self
+      .touches
+      .iter()
+      .all(|t| t.state == ProspectState::Failed && t.pre_send)
+    {
+      return 0;
+    }
+    self.touches.len()
+  }
+
+  /// 还能不能再试一次。
+  ///
+  /// 上限存在的理由和放开一样硬：原设计写着「失败是数据，不是拿来反复锤的」。
+  /// 对着一条永远打不开的内容无限重试，只会把每一轮的腿都喂给同一个坏靶子。
+  fn failure_is_recyclable(&self) -> bool {
+    let n = self.recyclable_failures();
+    n > 0 && n < MAX_FAILED_ATTEMPTS
+  }
+
   fn has_terminal_evidence(&self) -> bool {
+    if self.failure_is_recyclable() {
+      return false;
+    }
     self.has_terminal_touch() || self.state.is_terminal()
   }
 
@@ -832,7 +892,21 @@ impl ProspectLedger {
       .map(|r| r.thread_key())
       .collect();
 
-    let eligible = |r: &ProspectRecord| -> bool {
+    // 为什么统计拒绝原因，而不是只回一个 bool：
+    //
+    // 实测一次 7 小时的运行里，**141 条腿**以「no eligible targets left for this
+    // account」结束，占全部腿的 42.5% —— 而这个函数返回 `Ok(None)` 时不写任何
+    // 日志。六个互不相同的拒绝判据，零可观测性：运维看到的只有「没有可执行任务」，
+    // 分不清是池子真的用完了、还是被线程闸挡了、还是 URL 过期了，而这三者的下一
+    // 步完全不同（去翻页 / 换账号 / 重新搜索）。
+    //
+    // 只在**一条都没领到**时才落一行汇总，正常路径零成本。
+    let mut rejects: std::collections::BTreeMap<&'static str, usize> =
+      std::collections::BTreeMap::new();
+    let mut bump = |reason: &'static str| {
+      *rejects.entry(reason).or_insert(0) += 1;
+    };
+    let eligible = |r: &ProspectRecord, bump: &mut dyn FnMut(&'static str)| -> bool {
       if r.platform != platform {
         return false;
       }
@@ -841,6 +915,7 @@ impl ProspectLedger {
       // a Failed record back to Claimed for a second profile while retaining
       // the first profile's append-only touch.
       if r.has_terminal_evidence() || foreign.item_is_spent(&r.key) {
+        bump("已被舰队用掉（含失败）");
         return false;
       }
       // Account-level hard gate, applied to the whole thread — here and on
@@ -848,6 +923,7 @@ impl ProspectLedger {
       let thread = r.thread_key();
       if touched_threads.contains(&thread) || foreign.thread_is_spent(platform, profile_id, &thread)
       {
+        bump("本账号已在该主题下出现过");
         return false;
       }
       // Content-level cap, counted across devices. An account present in both
@@ -855,16 +931,19 @@ impl ProspectLedger {
       let local_accounts = r.public_footprint_accounts();
       let footprints = local_accounts.len() + foreign.extra_footprints(&r.key, &local_accounts);
       if footprints >= opts.per_item_account_cap {
+        bump("内容级账号配额已满");
         return false;
       }
       // Commenting being switched off is a property of the content, so another
       // device discovering it spares this one a wasted leg.
       if foreign.is_blocked(&r.key) {
+        bump("该内容已关闭评论");
         return false;
       }
       // A session URL we can no longer trust must be re-resolved by a fresh
       // search before it is handed out; serving it would just fail to open.
       if r.url_is_stale(opts.session_url_max_age_secs, now) {
+        bump("会话 URL 已过期，需重新搜索");
         return false;
       }
       // Normally terminal states also carry a touch and were rejected above.
@@ -873,6 +952,11 @@ impl ProspectLedger {
       match r.state {
         ProspectState::Seen => true,
         ProspectState::Claimed => r.claim_is_stale(opts.claim_ttl_secs, now),
+        // `Failed` 不再一律拒绝：证明过发送闸从未武装、且还没撞上重试上限的，
+        // 放回池子。判据仍然是**append-only 的 touch**，不是这个可变字段 ——
+        // 旧账本可能保留了 Failed 却丢了 touch，那种行 recyclable_failures()
+        // 返回 0，照旧被这里挡掉。
+        ProspectState::Failed if r.failure_is_recyclable() => true,
         ProspectState::Posted
         | ProspectState::Unconfirmed
         | ProspectState::Skipped
@@ -899,7 +983,7 @@ impl ProspectLedger {
     let pick = records
       .iter()
       .enumerate()
-      .filter(|(_, r)| eligible(r))
+      .filter(|(_, r)| eligible(r, &mut bump))
       .min_by_key(|(_, r)| {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&device, &mut hasher);
@@ -908,7 +992,28 @@ impl ProspectLedger {
       })
       .map(|(i, _)| i);
 
-    let Some(i) = pick else { return Ok(None) };
+    let Some(i) = pick else {
+      // 领不到就把「为什么」写出来。这是 141 条腿的头号结局，而在此之前它在任何
+      // 地方都不留证据 —— 运维只能看到「无可执行任务」，无从判断该去翻页、换账号
+      // 还是重新搜索。
+      //
+      // 同时给出这个平台的库存总量：分母不写出来，「拒了 40 条」既可能是池子干了，
+      // 也可能是这个平台压根就没入过账。
+      let total = records.iter().filter(|r| r.platform == platform).count();
+      let breakdown = if rejects.is_empty() {
+        "无候选可评估".to_string()
+      } else {
+        rejects
+          .iter()
+          .map(|(reason, n)| format!("{reason}×{n}"))
+          .collect::<Vec<_>>()
+          .join("，")
+      };
+      log::info!(
+        "Prospect claim: {profile_id} 在 {platform} 上无可领取靶子（该平台库存 {total} 条）：{breakdown}"
+      );
+      return Ok(None);
+    };
     records[i].state = ProspectState::Claimed;
     records[i].claimed_by = Some(profile_id.to_string());
     records[i].claimed_at = Some(now);
@@ -959,11 +1064,28 @@ impl ProspectLedger {
   /// Anything except `Seen`/`Claimed`: a caller must not be able to walk an item
   /// back to "not touched yet", because that erases the dedup evidence this
   /// ledger exists to hold.
+  /// 结算，不带「闸前」证据 —— 等价于 `pre_send = false`，即按最保守处理。
+  ///
+  /// **只保留给测试。** 生产路径一律走 [`Self::settle_with_evidence`]：证据是台账
+  /// 敢不敢把一条失败的候选放回池子的唯一依据，让调用方「忘了传」而默默落到保守
+  /// 一侧，会把一个安全决定变成一个笔误。clippy 会盯着这一点——真有生产调用方回到
+  /// 这个签名，`dead_code` 就不再触发，那正是我们想被提醒的时刻。
+  #[cfg(test)]
   pub fn settle(
     &self,
     key: &str,
     profile_id: &str,
     state: ProspectState,
+  ) -> Result<(), ProspectError> {
+    self.settle_with_evidence(key, profile_id, state, false)
+  }
+
+  pub fn settle_with_evidence(
+    &self,
+    key: &str,
+    profile_id: &str,
+    state: ProspectState,
+    pre_send: bool,
   ) -> Result<(), ProspectError> {
     if !state.is_terminal() {
       return Err(ProspectError::InvalidSettlementState { state });
@@ -1000,6 +1122,9 @@ impl ProspectLedger {
       profile_id: profile_id.to_string(),
       state,
       at: now_secs(),
+      // 只有明确证明「发送闸从未武装」的失败才带 true。其余一律 false —— 包括
+      // 所有非 Failed 状态，以及调用方没给出证据的失败。
+      pre_send: state == ProspectState::Failed && pre_send,
     });
     self.save(&records)?;
     Ok(())
@@ -1050,6 +1175,9 @@ impl ProspectLedger {
         profile_id: profile_id.to_string(),
         state,
         at: now,
+        // 取消路径只写 Unconfirmed / Skipped，都不是 Failed —— 回收判据只看
+        // Failed，所以这里恒为 false，写死比传参更不容易被后人改错。
+        pre_send: false,
       });
     }
 
@@ -1764,6 +1892,73 @@ mod tests {
     );
   }
 
+  /// 闸前失败要能放回池子 —— 这是本次运营决策的核心。
+  ///
+  /// 实测依据：一次 7 小时的运行里 171 条被消耗的候选只有 120 条产出公开评论，
+  /// 29.8% 颗粒无收；光一次 LLM 配额中断就永久烧掉最多 27 条，而那些连点击都
+  /// 没发生过。
+  #[test]
+  fn a_pre_send_failure_returns_the_candidate_to_the_pool() {
+    let (l, _g) = ledger();
+    l.ingest(&[cand("bilibili", "BV1", "https://b/1")]).unwrap();
+    let opts = ClaimOptions::default();
+
+    let first = l.claim_next("p1", "bilibili", &opts).unwrap().unwrap();
+    l.settle_with_evidence(&first.key, "p1", ProspectState::Failed, true)
+      .unwrap();
+
+    // 另一个账号必须还能领到它。
+    let again = l.claim_next("p2", "bilibili", &opts).unwrap();
+    assert!(again.is_some(), "闸前失败不该永久烧掉候选");
+  }
+
+  /// 但闸**后**的失败不行 —— 页面上可能已经发生过浏览器级可信输入。
+  #[test]
+  fn a_failure_past_the_send_guard_still_spends_the_item() {
+    let (l, _g) = ledger();
+    l.ingest(&[cand("bilibili", "BV1", "https://b/1")]).unwrap();
+    let opts = ClaimOptions::default();
+
+    let first = l.claim_next("p1", "bilibili", &opts).unwrap().unwrap();
+    // 没有证据 = 保守处理，等价于旧行为。
+    l.settle(&first.key, "p1", ProspectState::Failed).unwrap();
+
+    assert!(
+      l.claim_next("p2", "bilibili", &opts).unwrap().is_none(),
+      "无法证明未发送的失败必须继续按用掉处理",
+    );
+  }
+
+  /// 放开不等于无限重试：坏靶子撞满上限后按终态关闭。
+  #[test]
+  fn recycled_failures_are_capped() {
+    let (l, _g) = ledger();
+    l.ingest(&[cand("bilibili", "BV1", "https://b/1")]).unwrap();
+    let opts = ClaimOptions::default();
+
+    for i in 0..MAX_FAILED_ATTEMPTS {
+      let profile = format!("p{i}");
+      let claimed = l
+        .claim_next(&profile, "bilibili", &opts)
+        .unwrap()
+        .unwrap_or_else(|| panic!("第 {i} 次应当还能领到"));
+      l.settle_with_evidence(&claimed.key, &profile, ProspectState::Failed, true)
+        .unwrap();
+    }
+    assert!(
+      l.claim_next("pX", "bilibili", &opts).unwrap().is_none(),
+      "撞满 MAX_FAILED_ATTEMPTS 之后必须停手",
+    );
+  }
+
+  /// 磁盘上的旧 touch 没有这个字段，反序列化成 false —— 一条都不能被误放回。
+  #[test]
+  fn legacy_touches_without_the_flag_stay_spent() {
+    let touch: AccountTouch =
+      serde_json::from_str(r#"{"profile_id":"p1","state":"failed","at":1}"#).unwrap();
+    assert!(!touch.pre_send, "缺字段必须落到保守的一侧");
+  }
+
   #[test]
   fn an_unconfirmed_click_consumes_the_public_footprint_cap() {
     let (l, _g) = ledger();
@@ -2118,6 +2313,7 @@ mod tests {
       profile_id: "p1".to_string(),
       state: ProspectState::Posted,
       at: 1,
+      pre_send: false,
     }];
     let other_key = other.key.clone();
     write_remote_shard("device-b", &[other]);
@@ -2143,6 +2339,7 @@ mod tests {
       profile_id: "p9".to_string(),
       state: ProspectState::Posted,
       at: 1,
+      pre_send: false,
     }];
     write_remote_shard("device-b", &[remote]);
 

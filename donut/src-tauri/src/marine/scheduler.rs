@@ -942,6 +942,25 @@ async fn run_inner(
       .unwrap_or(DEFAULT_LEG_TIMEOUT_SECS),
   );
   let total_legs = total_legs(&profiles);
+
+  // 把这一轮**实际要跑什么**写下来。
+  //
+  // 此前完全没人记录解析后的计划，于是「B 站整段日志里一条腿都没有」这种事无从
+  // 解释：是它被从 marine_platforms 里去掉了、还是引擎不支持、还是根本没进计划？
+  // 三者的下一步完全不同，而日志里都长成「没有 bilibili」。
+  //
+  // 一轮一行，成本可以忽略，但它是所有「为什么少了/多了」问题的第一站。
+  log::info!(
+    "Discovery plan: 关键词「{}」，{} 个 profile / {total_legs} 条腿 —— {}",
+    request.keyword.trim(),
+    profiles.len(),
+    profiles
+      .iter()
+      .map(|p| format!("{}[{}]", p.profile.name, p.platforms.join("+")))
+      .collect::<Vec<_>>()
+      .join("，"),
+  );
+
   let mut finished: Vec<LegReport> = Vec::with_capacity(total_legs);
   let mut leg_index = 0usize;
 
@@ -3251,10 +3270,21 @@ async fn run_leg(
     }
   }
 
+  // 把 `report_error` 一起写出来。
+  //
+  // 它是这条腿**唯一可行动的**那句话（扩展报上来的真实失败原因、没登录、窗口没到
+  // 前台……），此前只塞进上报结构给界面看，从不落盘。结果就是运维在 Marine.log 里
+  // 只能看到 `→ Failed`，得去界面里逐条悬停才知道为什么 —— 而界面只显示最近一轮。
+  //
+  // 实测一次 7 小时的运行有 332 条腿结束，其中 141 条没有任何可解释的痕迹。
   log::info!(
-    "Discovery leg {leg_index}/{total_legs} finished: {} on {platform} → {outcome:?} ({} terminal touch(es))",
+    "Discovery leg {leg_index}/{total_legs} finished: {} on {platform} → {outcome:?} ({} terminal touch(es)){}",
     profile.name,
     terminal_touches.total(),
+    report_error
+      .as_deref()
+      .map(|reason| format!("：{reason}"))
+      .unwrap_or_default(),
   );
 
   LegExecution {
@@ -3358,6 +3388,7 @@ mod tests {
           profile_id: pid.to_string(),
           state: *st,
           at: 0,
+          pre_send: false,
         })
         .collect(),
     }

@@ -68,6 +68,42 @@ pub async fn get_cdp_port_for_profile(profile: &BrowserProfile) -> Result<u16, S
 
 /// Resolve the WebSocket debugger URL for the first `page` target on `port`.
 /// Retries while the browser is still starting up.
+/// 挑一个**指定 URL** 的页面目标；没有匹配就退回第一个。
+///
+/// `get_cdp_ws_url` 取的是 `/json` 里第一个 `type == "page"`，而调用方（可信点击）
+/// 的坐标是某一个具体页面算出来的。只要多出一个标签页，那一点就会打到别的页面上
+/// —— 而这一点是浏览器级的可信输入，打进的可能是一个装着完整草稿的评论框。
+pub async fn get_cdp_ws_url_for(port: u16, expect_url: &str) -> Result<String, String> {
+  if expect_url.trim().is_empty() {
+    return get_cdp_ws_url(port).await;
+  }
+  let url = format!("http://127.0.0.1:{port}/json");
+  let client = reqwest::Client::new();
+  let targets = client
+    .get(&url)
+    .timeout(std::time::Duration::from_secs(3))
+    .send()
+    .await
+    .map_err(|e| format!("Failed to reach browser CDP endpoint: {e}"))?
+    .json::<Vec<serde_json::Value>>()
+    .await
+    .map_err(|e| format!("Failed to parse CDP targets: {e}"))?;
+  let matched = targets.iter().find(|t| {
+    t.get("type").and_then(|v| v.as_str()) == Some("page")
+      && t.get("url").and_then(|v| v.as_str()) == Some(expect_url)
+  });
+  match matched
+    .and_then(|t| t.get("webSocketDebuggerUrl"))
+    .and_then(|v| v.as_str())
+  {
+    Some(ws) => Ok(ws.to_string()),
+    // 找不到就说清楚，而不是悄悄打到别的标签页上去。
+    None => Err(format!(
+      "no page target is currently at {expect_url}; refusing to dispatch a trusted click elsewhere"
+    )),
+  }
+}
+
 pub async fn get_cdp_ws_url(port: u16) -> Result<String, String> {
   let url = format!("http://127.0.0.1:{port}/json");
   let client = reqwest::Client::new();

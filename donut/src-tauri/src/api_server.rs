@@ -1466,6 +1466,10 @@ struct MarineProspectSettleRequest {
   profile_id: String,
   /// `posted`, `unconfirmed`, `skipped`, `filled`, `failed`, or `blocked`.
   state: String,
+  /// 这次失败是否发生在**发送闸武装之前**。只有扩展能证明它 —— `sendStarted` 是
+  /// 跨 document 唯一持久的不可逆边界。缺省 false = 按最保守处理（永久用掉）。
+  #[serde(default)]
+  pre_send: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1511,6 +1515,17 @@ async fn marine_ingest_prospects(
   State(_state): State<ApiServerState>,
   Json(req): Json<MarineProspectIngestRequest>,
 ) -> Result<Json<crate::marine::prospect::IngestReport>, (StatusCode, String)> {
+  // 供给侧的唯一读数，此前只回给调用方、从不落盘。
+  //
+  // 没有它，「无可领取靶子」就分不清是**搜索没抓到东西**还是**抓到了但全被去重
+  // 挡了** —— 两者的下一步一个是去查采集器/页面改版，一个是去扩大供给（翻页、
+  // 换关键词）。平台和候选数从请求里就能拿到，成本是一行。
+  let platform = req
+    .candidates
+    .first()
+    .map(|c| c.platform.clone())
+    .unwrap_or_else(|| "?".to_string());
+  let offered = req.candidates.len();
   let report =
     tokio::task::spawn_blocking(move || crate::marine::prospect::PROSPECTS.ingest(&req.candidates))
       .await
@@ -1521,6 +1536,12 @@ async fn marine_ingest_prospects(
         )
       })?
       .map_err(prospect_error)?;
+  log::info!(
+    "Prospect ingest: {platform} 提交 {offered} 条 → 新增 {} / 刷新 {} / 已知 {}",
+    report.inserted,
+    report.refreshed,
+    report.already_known,
+  );
   Ok(Json(report))
 }
 
@@ -1647,15 +1668,17 @@ async fn marine_settle_prospect(
       ))
     }
   };
-  tokio::task::spawn_blocking(move || PROSPECTS.settle(&req.key, &req.profile_id, state))
-    .await
-    .map_err(|e| {
-      (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        format!("settle task failed: {e}"),
-      )
-    })?
-    .map_err(prospect_error)?;
+  tokio::task::spawn_blocking(move || {
+    PROSPECTS.settle_with_evidence(&req.key, &req.profile_id, state, req.pre_send)
+  })
+  .await
+  .map_err(|e| {
+    (
+      StatusCode::INTERNAL_SERVER_ERROR,
+      format!("settle task failed: {e}"),
+    )
+  })?
+  .map_err(prospect_error)?;
   Ok(StatusCode::OK)
 }
 
@@ -1785,6 +1808,9 @@ struct MarineClickAtRequest {
   /// 视口坐标（CSS 像素），由扩展按编辑器矩形中心算出。
   x: f64,
   y: f64,
+  /// 坐标是在哪个页面上算出来的。后端据此挑目标页，而不是盲取第一个。
+  #[serde(default)]
+  expect_url: Option<String>,
   #[serde(default)]
   debug_cdp_port: Option<u16>,
 }
@@ -1835,7 +1861,7 @@ async fn marine_click_at(
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?
     }
   };
-  let ws = crate::marine::cdp::get_cdp_ws_url(port)
+  let ws = crate::marine::cdp::get_cdp_ws_url_for(port, req.expect_url.as_deref().unwrap_or(""))
     .await
     .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 

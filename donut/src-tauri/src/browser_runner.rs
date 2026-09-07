@@ -3053,6 +3053,35 @@ fn profile_process_ids(profile: &BrowserProfile) -> std::collections::HashSet<u3
 ///
 /// One process-table scan for all profiles; the caller is running inside
 /// `RunEvent::Exit` and does not get to spend a scan per profile.
+/// 哪些 profile 此刻**真的**有浏览器进程在跑。
+///
+/// 只读：和 `launched_browser_roots` 一样靠命令行里的 profile 目录认人，不碰
+/// `check_browser_status` —— 那个在零标签页时会**杀掉浏览器**，绝不能拿来当查询。
+///
+/// 存在的理由是团队租约的心跳：它原来会续租缓存里所有带本机 id 的锁，完全不管那个
+/// profile 有没有在跑。一旦一把锁进了缓存就被续到进程死为止，和真正在用的租约逐字节
+/// 无法区分 —— 实测让另一台机器连着 19 个周期、57 条腿拿不到那个 profile。
+pub(crate) fn running_profile_ids(
+  profiles: &[BrowserProfile],
+) -> std::collections::HashSet<String> {
+  let system = System::new_all();
+  let mut running = std::collections::HashSet::new();
+  for profile in profiles {
+    let paths: Vec<PathBuf> = profile_launch_paths(profile).into_iter().collect();
+    if paths.is_empty() {
+      continue;
+    }
+    if system
+      .processes()
+      .iter()
+      .any(|(_pid, process)| command_line_uses_profile(process.cmd(), &paths))
+    {
+      running.insert(profile.id.to_string());
+    }
+  }
+  running
+}
+
 pub(crate) fn launched_browser_roots(profiles: &[BrowserProfile]) -> Vec<(u32, u64)> {
   let paths: Vec<PathBuf> = profiles.iter().flat_map(profile_launch_paths).collect();
   if paths.is_empty() {

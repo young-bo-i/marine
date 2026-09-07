@@ -127,6 +127,51 @@ assert.equal(R.platformOfSearchPage("not a url"), null, "坏 URL 不该抛");
   }
 }
 
+// ------------------------------------------------- 滚动加深（深度 3，按 id 取并集）
+//
+// 供给的天花板原来就是首页一屏：整条腿只调一次 pageHtml。实测 141 条腿以
+// 「no eligible targets left for this account」结束，而台账里每条内容全舰队只
+// 允许一次终态（连 Failed 也算），池子只减不增。
+{
+  // 三屏各给一条新的，外加一条跨屏重复 —— 重复必须被吃掉。
+  const screens = [
+    [{ id: "BV1aaaaaaaaa", title: "A", open_url: "https://www.bilibili.com/video/BV1aaaaaaaaa/" }],
+    [{ id: "BV1aaaaaaaaa", title: "A", open_url: "https://www.bilibili.com/video/BV1aaaaaaaaa/" },
+     { id: "BV1bbbbbbbbb", title: "B", open_url: "https://www.bilibili.com/video/BV1bbbbbbbbb/" }],
+    [{ id: "BV1ccccccccc", title: "C", open_url: "https://www.bilibili.com/video/BV1ccccccccc/" }],
+    [{ id: "BV1ddddddddd", title: "D", open_url: "https://www.bilibili.com/video/BV1ddddddddd/" }],
+  ];
+  let screen = 0;
+  let scrolls = 0;
+  const [d, dCalls] = deps({
+    parse: () => screens[Math.min(screen, screens.length - 1)],
+    scrollMore: async () => { scrolls += 1; screen += 1; return true; },
+  });
+  await R.run(d);
+  const ingest = dCalls.api.find((c) => c.route === "prospects/ingest");
+  assert.ok(ingest, "应该有 ingest");
+  const ids = ingest.body.candidates.map((c) => c.item_id);
+  assert.equal(scrolls, 2, "深度 3 = 首屏 + 两次滚动");
+  // Array.from：candidates 来自 vm 沙箱，原型不是宿主的 Array.prototype，
+  // deepStrictEqual 会因此判不等，尽管内容一模一样。
+  assert.deepEqual(Array.from(ids), ["BV1aaaaaaaaa", "BV1bbbbbbbbb", "BV1ccccccccc"],
+    "三屏合并、跨屏重复按 id 去重、顺序保持先见先得");
+
+  // 滚不动就停：站点到底了，别白等剩下的轮次。
+  let stopped = 0;
+  const [d2] = deps({
+    parse: () => screens[0],
+    scrollMore: async () => { stopped += 1; return false; },
+  });
+  await R.run(d2);
+  assert.equal(stopped, 1, "第一次滚不动就该收手，不再试第三轮");
+
+  // 宿主没有滚动能力（老版本 / 单测）时必须退回单屏，而不是报错。
+  const [d3] = deps({ parse: () => screens[1] });
+  const r3 = await R.run(d3);
+  assert.ok(r3 && r3.status !== "error", "缺 scrollMore 时应优雅降级，不能抛");
+}
+
 // ---------------------------------------------------------------- 依赖桩
 function deps(over) {
   const calls = { api: [], navigated: [] };
