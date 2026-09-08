@@ -1344,6 +1344,76 @@ assert.doesNotMatch(popupSource, /post\.textContent = '标记已发'/);
   assert.equal(build({ pageHostname: "www.bilibili.com" }), null, "站点要对得上");
 }
 
+// ------------------------------------------------- 平台明确拒绝（非「发了没回执」）
+//
+// 三种码全部来自 2026-09-08 的真实运行（marine-debug.jsonl，62 条判否里的样本）。
+// 它们此前都被记成 unconfirmed —— 白占一个公开足迹，还永久烧掉这条候选，而事实是
+// 评论**根本没有发布**。
+{
+  const refusal = helperSandbox.marineBuildPublishRefusal;
+  assert.equal(typeof refusal, "function", "publish-receipt.js 要导出拒绝识别器");
+
+  // 小红书 -9119：作者只允许好友评论。内容级事实 → blocked。
+  const friendsOnly = refusal({
+    url: "https://edith.xiaohongshu.com/api/sns/web/v1/comment/post",
+    method: "POST", status: 200, ok: true,
+    body: JSON.stringify({ code: -9119, success: false, msg: "作者只允许好友评论", data: null }),
+  });
+  assert.ok(friendsOnly, "-9119 必须被识别");
+  assert.equal(friendsOnly.blocked, true, "作者限制评论对所有账号成立，应标 blocked");
+
+  // 小红书 -9131：由于对方设置，你无法发布评论。同上。
+  const disallowed = refusal({
+    url: "https://edith.xiaohongshu.com/api/sns/web/v1/comment/post",
+    method: "POST", status: 200, ok: true,
+    body: JSON.stringify({ code: -9131, success: false, msg: "由于对方设置，你无法发布评论", data: null }),
+  });
+  assert.ok(disallowed && disallowed.blocked === true, "-9131 必须被识别为 blocked");
+
+  // 抖音 3002121 且 comment=null：评论没被创建，但这是账号/内容级风控，
+  // 不等于「这条内容对所有人关闭」，所以**不能**标 blocked。
+  const douyinRefused = refusal({
+    url: "https://www.douyin.com/aweme/v1/web/comment/publish?app_name=aweme",
+    method: "POST", status: 200, ok: true,
+    body: JSON.stringify({ comment: null, log_pb: { impr_id: "x" }, status_code: 3002121 }),
+  });
+  assert.ok(douyinRefused, "抖音非零 status_code 且无 comment 必须被识别");
+  assert.equal(douyinRefused.blocked, false, "抖音风控不是内容级关闭，不该标 blocked");
+
+  // 成功的响应绝不能被当成拒绝。
+  assert.equal(
+    refusal({
+      url: "https://www.douyin.com/aweme/v1/web/comment/publish",
+      method: "POST", status: 200, ok: true,
+      body: JSON.stringify({ comment: { cid: "1" }, status_code: 0 }),
+    }),
+    null,
+    "status_code=0 是成功，不是拒绝",
+  );
+
+  // 读接口不该进这个判定 —— 实测有 6 条 /feed 被误算进「判据未通过」。
+  assert.equal(
+    refusal({
+      url: "https://edith.xiaohongshu.com/api/sns/web/v1/feed",
+      method: "POST", status: 200, ok: true,
+      body: JSON.stringify({ code: -9119, success: false, msg: "x" }),
+    }),
+    null,
+    "非发布端点即使带着拒绝码也不能被当成拒绝",
+  );
+
+  // 没见过的码一律不认 —— 猜一个「大概是拒绝」的判据，等于拿足迹去赌错误码含义。
+  assert.equal(
+    refusal({
+      url: "https://edith.xiaohongshu.com/api/sns/web/v1/comment/post",
+      method: "POST", status: 200, ok: true,
+      body: JSON.stringify({ code: -1234, success: false, msg: "某个没见过的错误" }),
+    }),
+    null,
+    "未实测过的码必须继续走保守的 unconfirmed",
+  );
+}
+
 // ---------------------------------------------------------------- 小红书回执
 //
 // 用**实测抓到的真实响应**（2026-07-28，POST /api/sns/web/v1/comment/post）钉住。

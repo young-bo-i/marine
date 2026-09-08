@@ -17,11 +17,13 @@
   const buildXhsReceipt = globalThis.marineBuildXiaohongshuPublishedReceipt;
   const buildDouyinReceipt = globalThis.marineBuildDouyinPublishedReceipt;
   const buildRecoveredReceipts = globalThis.marineBuildBilibiliRecoveredReceipts;
+  const buildRefusal = globalThis.marineBuildPublishRefusal;
   try { delete globalThis.marineBuildBilibiliPublishedReceipt; } catch (e) {}
   try { delete globalThis.marineBuildZhihuPublishedReceipt; } catch (e) {}
   try { delete globalThis.marineBuildXiaohongshuPublishedReceipt; } catch (e) {}
   try { delete globalThis.marineBuildDouyinPublishedReceipt; } catch (e) {}
   try { delete globalThis.marineBuildBilibiliRecoveredReceipts; } catch (e) {}
+  try { delete globalThis.marineBuildPublishRefusal; } catch (e) {}
   let existingBridgeState = null;
   try { existingBridgeState = globalThis[BRIDGE_STATE_KEY]; } catch (e) {}
   if (existingBridgeState && typeof existingBridgeState.signalReady === 'function') {
@@ -447,15 +449,38 @@
       return;
     }
     if (!built && isPost(value)) {
-      // 决定性的一条：POST 到达了、构造器也跑了，但判据没过。排查时唯一要问的
-      // 就是「实际路径/响应体长什么样」，所以两者都带上 —— 否则只能靠再发一条
-      // 真评论去抓包，每次都在平台上多留一条公开痕迹。
+      // 先问一句：是不是平台**明确拒绝**了？
+      //
+      // 实测里 62 条「判据未通过」有一半以上根本不是判据的问题 —— 有的是作者只
+      // 允许好友评论、有的是抖音直接回了错误码。这些评论**没有发布**，却因为拿不到
+      // 回执被记成 unconfirmed：白占一个公开足迹，还永久烧掉这条候选。
+      let refusal = null;
+      try {
+        refusal = typeof buildRefusal === 'function' ? buildRefusal({
+          url: value.url, method: value.method, status: value.status,
+          ok: value.ok, body: value.body,
+        }) : null;
+      } catch (e) {}
+      if (refusal) {
+        try {
+          if (typeof window !== 'undefined') {
+            window.marineLastPublishRefusal = Object.assign({ at: Date.now() }, refusal);
+          }
+        } catch (e) {}
+        bridgeLog('warn', '平台拒绝了这条评论：' + refusal.message,
+          JSON.stringify({ platform: refusal.platform, code: refusal.code, blocked: refusal.blocked }));
+        return;
+      }
+      // 只对**看起来像发布端点**的 POST 报噪。实测有 6 条是 /api/sns/web/v1/feed
+      // ——那是读信息流，本来就不该进这个判定，记进来只会虚增问题规模。
+      if (typeof builder === 'function') {
       bridgeLog('error', '发布 POST 已捕获，但回执判据未通过', JSON.stringify({
         url: String(value.url || '').slice(0, 200),
         status: value.status || 0,
         ok: !!value.ok,
         bodySample: String(value.body || '').slice(0, 300),
       }));
+      }
     }
     if (built) {
       const receipt = sanitize(Object.assign({}, built, {

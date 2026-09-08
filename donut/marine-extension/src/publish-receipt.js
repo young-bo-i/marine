@@ -438,6 +438,65 @@
 
   root.marineBuildBilibiliPublishedReceipt = marineBuildBilibiliPublishedReceipt;
   root.marineBuildZhihuPublishedReceipt = marineBuildZhihuPublishedReceipt;
+  /// 平台**明确拒绝**了这条评论 —— 和「发出去了但没拿到回执」是两回事。
+  ///
+  /// 2026-09-08 从真实运行里量到的三种（marine-debug.jsonl，62 条判否里的样本）：
+  ///
+  ///   小红书 code=-9119「作者只允许好友评论」   HTTP 200
+  ///   小红书 code=-9131「由于对方设置，你无法发布评论」HTTP 200
+  ///   抖音   status_code=3002121, comment=null   HTTP 200
+  ///
+  /// 这三种都不该记成 `unconfirmed`：那会保守占掉一个公开足迹、并永久烧掉这条候选，
+  /// 而事实是评论**根本没有发布**。前两种更进一步 —— 是**内容本身不允许评论**，对
+  /// 所有账号都成立，正是 `blocked` 这个状态存在的意义（它不占足迹，而且会跨设备
+  /// 共享，别的机器就不必再白跑一趟）。
+  ///
+  /// 刻意只认**已实测**的码。没见过的形状一律返回 null，继续走保守的 unconfirmed
+  /// —— 猜一个「大概是拒绝」的判据，就等于用足迹去赌平台的错误码含义。
+  function marineBuildPublishRefusal(input) {
+    input = input || {};
+    if (String(input.method || '').toUpperCase() !== 'POST') return null;
+    let endpoint;
+    try { endpoint = new URL(String(input.url || ''), 'https://example.invalid/'); }
+    catch (e) { return null; }
+
+    let payload;
+    try { payload = typeof input.body === 'string' ? JSON.parse(input.body) : input.body; }
+    catch (e) { return null; }
+    if (!payload || typeof payload !== 'object') return null;
+
+    if (XHS_HOST_RE.test(endpoint.hostname) && XHS_PUBLISH_PATH_RE.test(endpoint.pathname)) {
+      const code = Number(payload.code);
+      // -9119 / -9131：作者限制了谁能评论。内容级事实，对所有账号成立。
+      if (code === -9119 || code === -9131) {
+        return {
+          platform: 'xiaohongshu',
+          blocked: true,
+          code: code,
+          message: boundedString(payload.msg, 200) || '对方设置不允许评论',
+        };
+      }
+      return null;
+    }
+
+    if (DOUYIN_HOST_RE.test(endpoint.hostname) && DOUYIN_PUBLISH_PATH_RE.test(endpoint.pathname)) {
+      const code = Number(payload.status_code);
+      // 抖音明确回了非零 status_code 且没有 comment 对象 —— 评论没被创建。
+      // 但这是账号/内容级风控，不等于「这条内容对所有人关闭」，所以不标 blocked。
+      if (Number.isFinite(code) && code !== 0 && !payload.comment) {
+        return {
+          platform: 'douyin',
+          blocked: false,
+          code: code,
+          message: '抖音拒绝了这条评论（status_code=' + code + '）',
+        };
+      }
+      return null;
+    }
+    return null;
+  }
+
+  root.marineBuildPublishRefusal = marineBuildPublishRefusal;
   root.marineBuildXiaohongshuPublishedReceipt = marineBuildXiaohongshuPublishedReceipt;
   root.marineBuildDouyinPublishedReceipt = marineBuildDouyinPublishedReceipt;
   root.marineBuildBilibiliRecoveredReceipts = marineBuildBilibiliRecoveredReceipts;

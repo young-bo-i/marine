@@ -3780,8 +3780,69 @@
     marineProspectDouyinSaid[reason] = true;
     try {
       marineLog('warn', 'iso', '抖音评论区未打开·' + reason + (detail ? ' · ' + detail : ''));
+      marineProspectDouyinDumpScene(reason);
     } catch (e) {}
     return false;
+  }
+
+  /**
+   * 抖音评论区打不开时，把现场结构留下来。
+   *
+   * 2026-09-08 的真实运行给出了一个精确到无可辩驳的相关性：抖音 55 次
+   * 「未能定位到直评输入框」= 55 次 `/note/` 图文笔记，而 177 次 `/video/`
+   * 视频页**一次都没失败**。诊断只留下两句话（`评论图标 count=0`、
+   * `输入条不在评论列表旁边 prev=div.Ii031XNo`），不足以写出选择器。
+   *
+   * 抖音在裸浏览器里渲染不出来（实测：标题空、节点全无），所以结构只能从真实运行
+   * 里取。一次只发一份，且只在**已经确定失败**的那一刻 —— 正常路径零成本。
+   */
+  function marineProspectDouyinDumpScene(reason) {
+    const brief = function (el) {
+      if (!el || el.nodeType !== 1) return null;
+      const r = el.getBoundingClientRect();
+      return {
+        tag: el.tagName.toLowerCase(),
+        cls: String(el.className || '').slice(0, 70),
+        e2e: el.getAttribute && el.getAttribute('data-e2e') || '',
+        ph: (el.getAttribute && (el.getAttribute('placeholder')
+          || el.getAttribute('data-placeholder'))) || '',
+        w: Math.round(r.width), h: Math.round(r.height),
+        txt: String(el.textContent || '').replace(/\s+/g, '').slice(0, 24),
+      };
+    };
+    const all = function (sel, n) {
+      try { return Array.prototype.slice.call(document.querySelectorAll(sel), 0, n).map(brief); }
+      catch (e) { return []; }
+    };
+    marineLog('error', 'douyin-scene', '抖音评论区现场 · ' + reason, JSON.stringify({
+      url: location.href,
+      // 页型是这次的关键变量：/note/ 全败、/video/ 全过。
+      页型: /\/note\//.test(location.pathname) ? 'note 图文'
+        : /\/video\//.test(location.pathname) ? 'video 视频' : location.pathname.slice(0, 40),
+      // 抖音用 data-e2e 标记关键节点，类名是混淆的。先看这一层还在不在。
+      e2e清单: (function () {
+        try {
+          return Array.prototype.slice.call(document.querySelectorAll('[data-e2e]'))
+            .map(function (e) { return e.getAttribute('data-e2e'); })
+            .filter(function (v, i, a) { return v && a.indexOf(v) === i; })
+            .slice(0, 50);
+        } catch (e) { return []; }
+      })(),
+      可编辑元素: all('[contenteditable="true"],textarea,input[type="text"]', 12),
+      评论相关容器: all('[class*="comment" i],[data-e2e*="comment" i]', 16),
+      // 输入条候选：抖音常把它做成一个带提示文案的壳。
+      提示文案节点: (function () {
+        try {
+          return Array.prototype.slice.call(document.querySelectorAll('div,span,p'))
+            .filter(function (e) {
+              return MARINE_PROSPECT_DOUYIN_INPUT_HINT_RE.test(String(e.textContent || ''))
+                && String(e.textContent || '').length < 40;
+            })
+            .slice(0, 6)
+            .map(brief);
+        } catch (e) { return []; }
+      })(),
+    }));
   }
 
   // 输入条的文字和层级都改过：/note/ 实测已有 comment-list，但输入条不再是它的
@@ -5367,6 +5428,23 @@
         const now = (typeof window !== 'undefined' && window.marineLastPublishedReceipt) || null;
         if (now && now.eventId && now.eventId !== beforeId) {
           return resolve({ ok: true, eventId: now.eventId, platformCommentId: now.platformCommentId });
+        }
+        // 平台明确拒绝：不用再等满 20 秒，而且**绝不能**记成 unconfirmed。
+        //
+        // 实测（2026-09-08）：「作者只允许好友评论」「由于对方设置，你无法发布评论」
+        // 「抖音 status_code=3002121」这三种，评论都**没有发布**，却因为拿不到回执
+        // 被保守记成 unconfirmed —— 白占一个公开足迹，还永久烧掉这条候选。
+        const refused = (typeof window !== 'undefined' && window.marineLastPublishRefusal) || null;
+        if (refused && refused.at && refused.at >= pollStartedAt - 5000) {
+          marineLog('warn', 'send', '平台拒绝：' + refused.message);
+          return resolve({
+            ok: false,
+            // 没有发布 = 没有公开足迹。attempted 留 false，让台账按「未发出」处理。
+            attempted: false,
+            // 内容级拒绝（作者限制评论）对所有账号成立，用 blocked 让别的机器不必再来一趟。
+            blocked: refused.blocked === true,
+            error: refused.message,
+          });
         }
         if (Date.now() > deadline) {
           // 放弃之前先「捕获回读」一次。

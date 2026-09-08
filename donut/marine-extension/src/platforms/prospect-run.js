@@ -891,7 +891,12 @@ var marineProspectRun = marineProspectRun || {};
         // 已跨不可逆边界处理，避免未知异常把 public footprint 释放后再次发送。
         sent = { ok: false, attempted: true, error: String((e && e.message) || e) };
       }
-      const state = sent && sent.ok ? 'posted' : sent && sent.attempted ? 'unconfirmed' : 'failed';
+      // blocked 优先于其余判定：平台已经明说这条内容不接受评论，那是**内容级
+      // 事实**，对所有账号成立。记成 blocked 之后它不占公开足迹，而且会跨设备
+      // 共享，别的机器不必再为同一条内容白跑一趟。
+      const state = sent && sent.blocked === true
+        ? 'blocked'
+        : sent && sent.ok ? 'posted' : sent && sent.attempted ? 'unconfirmed' : 'failed';
       if (state === 'posted' || state === 'unconfirmed') {
         guarded = Object.assign({}, guarded, { pendingSettlement: state });
         // 即使这次写失败也继续尝试 settle；sendStarted 仍在。unconfirmed 表示点击
@@ -914,6 +919,10 @@ var marineProspectRun = marineProspectRun || {};
           ? { status: 'posted', key: handoff.key, text: outcome.text }
           : state === 'unconfirmed'
           ? { status: 'send_unconfirmed', key: handoff.key, error: sent && sent.error }
+          : state === 'blocked'
+          // 单列一个状态：外面看到 send_failed 会以为是我们没发成功，而事实是
+          // 平台明说这条内容不接受评论 —— 前者要去查代码，后者什么都不用做。
+          ? { status: 'blocked_by_platform', key: handoff.key, error: sent && sent.error }
           : { status: 'send_failed', key: handoff.key, error: sent && sent.error },
       );
     }
