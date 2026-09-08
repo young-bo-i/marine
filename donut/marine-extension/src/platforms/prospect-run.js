@@ -154,11 +154,14 @@ var marineProspectRun = marineProspectRun || {};
     // 为什么必须**边滚边解析**、而不是滚到底再抓一次：这几个站都是虚拟列表，
     // 卡片滚出视口就从 DOM 里回收掉。先滚后抓会把前面的卡片弄丢，比不滚还少。
     //
-    // 深度 3 是按预算取的：腿超时 120s，Posted 腿实测中位 37–43s、NoWork 腿 5–6s，
-    // 多两轮 × 1.2s 沉淀完全在 p90 以内。
+    // 停的条件有两个，缺一不可：滚不动了（站点到底），或者连着几轮解析不出**新**
+    // id（虚拟列表在原地回收重排，文档还在长但内容是重复的）。只看前者会把剩下的
+    // 轮次全花在 1.2 秒的空等上。
     const seenIds = new Set();
     const items = [];
+    const yields = [];
     let rounds = 0;
+    let dry = 0;
     for (let depth = 0; depth < MARINE_HARVEST_DEPTH; depth++) {
       if (depth > 0) {
         // 没有滚动能力（老宿主、单元测试）就退回单屏，行为和以前完全一致。
@@ -168,6 +171,7 @@ var marineProspectRun = marineProspectRun || {};
         if (!moved) break;
       }
       rounds += 1;
+      const before = items.length;
       const batch = deps.parse(platform, deps.pageHtml()) || [];
       for (const item of batch) {
         const id = String(item && item.id || '');
@@ -175,9 +179,15 @@ var marineProspectRun = marineProspectRun || {};
         seenIds.add(id);
         items.push(item);
       }
+      const gained = items.length - before;
+      yields.push(gained);
+      // 连续 MARINE_HARVEST_DRY_ROUNDS 轮颗粒无收就停：再滚也只是白等。
+      dry = gained > 0 ? 0 : dry + 1;
+      if (dry >= MARINE_HARVEST_DRY_ROUNDS) break;
     }
     if (typeof deps.log === 'function') {
-      deps.log('滚动采集：' + rounds + ' 轮，去重后 ' + items.length + ' 条候选');
+      deps.log('滚动采集：' + rounds + ' 轮，各轮新增 [' + yields.join(',') + ']，去重后 '
+        + items.length + ' 条候选');
     }
 
     // ---- 3. 体检 ----------------------------------------------------------
@@ -202,7 +212,13 @@ var marineProspectRun = marineProspectRun || {};
       // 分组当场退化成按回答算 —— 同一个账号立刻能领走同问题下的另一个回答。
       thread_hint: i.question_id ? String(i.question_id) : null,
     }));
-    const ingested = await deps.api('prospects/ingest', { candidates });
+    // 采集读数随 ingest 一起送上去，让它落进 **Marine.log** —— 而不是只留在
+    // marine-debug.jsonl 里（那个 4MB 封顶、还得手动去取）。「这一轮到底看了几屏、
+    // 每屏还出不出新东西」是判断要不要继续加深的唯一依据。
+    const ingested = await deps.api('prospects/ingest', {
+      candidates,
+      harvest: { platform: platform, rounds: rounds, yields: yields },
+    });
 
     // ---- 5. 领取 ----------------------------------------------------------
     const claimed = await deps.api('prospects/claim', {
@@ -259,8 +275,19 @@ var marineProspectRun = marineProspectRun || {};
   // 到的条数不够，canary 就会判 unhealthy —— 这时候把页面标记成跑过，等渲染
   // 完了也永远不会再跑。（实测：知乎自动跑零 API 调用，手动清掉标记重跑一次
   // 立刻 claimed 15 条。B 站是 SSR 所以没暴露这个问题。）
-  // 一条腿最多解析几屏。见下方「滚动加深」那段注释的预算推导。
-  const MARINE_HARVEST_DEPTH = 3;
+  // 一条腿最多解析几屏。
+  //
+  // 3 → 6：上一轮实测 `滚动采集：3 轮` —— 也就是第 2、3 轮 scrollMore() 都报告了
+  // 「页面还在长」，是这个常量把采集停住的，不是站点到底了。每多一轮的成本是
+  // MARINE_HARVEST_SETTLE_MS(1.2s)，而腿超时 120s、Posted 腿实测中位 43s，还有
+  // 很大余量。
+  const MARINE_HARVEST_DEPTH = 6;
+
+  // 连续几轮没有**新**候选就收手。
+  //
+  // 光看「页面还在长」不够：虚拟列表回收节点时文档照样变高，但解析出来全是见过的
+  // id。没有这道闸，一个不再产出新内容的页面会把剩下的轮次全花在 1.2 秒的等待上。
+  const MARINE_HARVEST_DRY_ROUNDS = 2;
 
   const TERMINAL = [
     'claimed',

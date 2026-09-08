@@ -127,20 +127,20 @@ assert.equal(R.platformOfSearchPage("not a url"), null, "坏 URL 不该抛");
   }
 }
 
-// ------------------------------------------------- 滚动加深（深度 3，按 id 取并集）
+// ------------------------------------------------- 滚动加深（深度 6，按 id 取并集）
 //
 // 供给的天花板原来就是首页一屏：整条腿只调一次 pageHtml。实测 141 条腿以
 // 「no eligible targets left for this account」结束，而台账里每条内容全舰队只
 // 允许一次终态（连 Failed 也算），池子只减不增。
 {
-  // 三屏各给一条新的，外加一条跨屏重复 —— 重复必须被吃掉。
-  const screens = [
-    [{ id: "BV1aaaaaaaaa", title: "A", open_url: "https://www.bilibili.com/video/BV1aaaaaaaaa/" }],
-    [{ id: "BV1aaaaaaaaa", title: "A", open_url: "https://www.bilibili.com/video/BV1aaaaaaaaa/" },
-     { id: "BV1bbbbbbbbb", title: "B", open_url: "https://www.bilibili.com/video/BV1bbbbbbbbb/" }],
-    [{ id: "BV1ccccccccc", title: "C", open_url: "https://www.bilibili.com/video/BV1ccccccccc/" }],
-    [{ id: "BV1ddddddddd", title: "D", open_url: "https://www.bilibili.com/video/BV1ddddddddd/" }],
-  ];
+  // 每屏一条新的 + 一条跨屏重复，一路给到第 6 屏 —— 证明深度确实是 6，
+  // 并且重复被吃掉。
+  const mk = (n) => ({
+    id: "BV1" + String(n).repeat(9),
+    title: "N" + n,
+    open_url: "https://www.bilibili.com/video/BV1" + String(n).repeat(9) + "/",
+  });
+  const screens = [[mk(1)], [mk(1), mk(2)], [mk(3)], [mk(4)], [mk(5)], [mk(6)]];
   let screen = 0;
   let scrolls = 0;
   const [d, dCalls] = deps({
@@ -151,11 +151,29 @@ assert.equal(R.platformOfSearchPage("not a url"), null, "坏 URL 不该抛");
   const ingest = dCalls.api.find((c) => c.route === "prospects/ingest");
   assert.ok(ingest, "应该有 ingest");
   const ids = ingest.body.candidates.map((c) => c.item_id);
-  assert.equal(scrolls, 2, "深度 3 = 首屏 + 两次滚动");
+  assert.equal(scrolls, 5, "深度 6 = 首屏 + 五次滚动");
   // Array.from：candidates 来自 vm 沙箱，原型不是宿主的 Array.prototype，
   // deepStrictEqual 会因此判不等，尽管内容一模一样。
-  assert.deepEqual(Array.from(ids), ["BV1aaaaaaaaa", "BV1bbbbbbbbb", "BV1ccccccccc"],
-    "三屏合并、跨屏重复按 id 去重、顺序保持先见先得");
+  assert.deepEqual(Array.from(ids),
+    ["BV1111111111", "BV1222222222", "BV1333333333", "BV1444444444", "BV1555555555", "BV1666666666"],
+    "六屏合并、跨屏重复按 id 去重、顺序保持先见先得");
+
+  // 采集读数要随 ingest 上报 —— 它是 Marine.log 里判断「要不要再加深」的唯一依据。
+  assert.equal(ingest.body.harvest.rounds, 6, "上报滚了几屏");
+  assert.equal(ingest.body.harvest.platform, "bilibili", "带上平台名 —— 零候选时它是唯一线索");
+  assert.deepEqual(Array.from(ingest.body.harvest.yields), [1, 1, 1, 1, 1, 1], "上报各屏新增");
+
+  // 产出下限：页面还在长，但解析出来全是见过的 id（虚拟列表原地回收），
+  // 连着两轮颗粒无收就收手，不把剩下的轮次花在 1.2 秒的空等上。
+  let dryScrolls = 0;
+  const [dDry, dryCalls] = deps({
+    parse: () => screens[0],
+    scrollMore: async () => { dryScrolls += 1; return true; },
+  });
+  await R.run(dDry);
+  assert.equal(dryScrolls, 2, "第 2、3 轮无新增就停，不该滚满 5 次");
+  const dryIngest = dryCalls.api.find((c) => c.route === "prospects/ingest");
+  assert.deepEqual(Array.from(dryIngest.body.harvest.yields), [1, 0, 0], "空轮也要如实上报");
 
   // 滚不动就停：站点到底了，别白等剩下的轮次。
   let stopped = 0;

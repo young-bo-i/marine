@@ -195,7 +195,17 @@ impl DebugLog {
     let kept = lines[start..].join("\n");
     if let Err(e) = fs::write(path, kept + "\n") {
       log::warn!("Could not trim the Marine debug log: {e}");
+      return;
     }
+    // 说出来。裁掉的是**页面内视角**的证据，而且恰恰是最旧的那批 —— 排查一个
+    // 几小时前的怪腿时，人翻到这个文件却发现前半段没了，必须能在 Marine.log
+    // 里看到「不是没记，是被裁了」，否则会把它误读成「扩展当时什么都没说」。
+    log::warn!(
+      "Marine debug log trimmed: 丢弃最旧的 {} 行（{} → {} 行），页面内证据的前半段已不可追",
+      start,
+      lines.len(),
+      lines.len() - start,
+    );
   }
 
   /// Newest `limit` entries, oldest first.

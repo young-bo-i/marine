@@ -1446,6 +1446,21 @@ async fn marine_login_status(
 #[derive(Debug, Deserialize, ToSchema)]
 struct MarineProspectIngestRequest {
   candidates: Vec<crate::marine::prospect::Candidate>,
+  /// 这一轮滚动采集的读数：滚了几屏、每屏新增多少。缺省 None（老扩展）。
+  #[serde(default)]
+  harvest: Option<MarineHarvestReport>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct MarineHarvestReport {
+  /// 采集时所在的平台。冗余，但不可省：下面的 `platform` 是从第一条候选里读的，
+  /// 零候选时会退化成 "?" —— 而「一条都没采到」正是最需要知道是哪个站的那次。
+  #[serde(default)]
+  platform: Option<String>,
+  #[serde(default)]
+  rounds: usize,
+  #[serde(default)]
+  yields: Vec<usize>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1513,7 +1528,7 @@ async fn marine_prospect_ready(State(_state): State<ApiServerState>) -> StatusCo
 )]
 async fn marine_ingest_prospects(
   State(_state): State<ApiServerState>,
-  Json(req): Json<MarineProspectIngestRequest>,
+  Json(mut req): Json<MarineProspectIngestRequest>,
 ) -> Result<Json<crate::marine::prospect::IngestReport>, (StatusCode, String)> {
   // 供给侧的唯一读数，此前只回给调用方、从不落盘。
   //
@@ -1526,6 +1541,12 @@ async fn marine_ingest_prospects(
     .map(|c| c.platform.clone())
     .unwrap_or_else(|| "?".to_string());
   let offered = req.candidates.len();
+  let harvest = req.harvest.take();
+  let platform = harvest
+    .as_ref()
+    .and_then(|h| h.platform.clone())
+    .filter(|p| !p.is_empty())
+    .unwrap_or(platform);
   let report =
     tokio::task::spawn_blocking(move || crate::marine::prospect::PROSPECTS.ingest(&req.candidates))
       .await
@@ -1537,10 +1558,13 @@ async fn marine_ingest_prospects(
       })?
       .map_err(prospect_error)?;
   log::info!(
-    "Prospect ingest: {platform} 提交 {offered} 条 → 新增 {} / 刷新 {} / 已知 {}",
+    "Prospect ingest: {platform} 提交 {offered} 条 → 新增 {} / 刷新 {} / 已知 {}{}",
     report.inserted,
     report.refreshed,
     report.already_known,
+    harvest
+      .map(|h| format!("（滚 {} 屏，各屏新增 {:?}）", h.rounds, h.yields))
+      .unwrap_or_default(),
   );
   Ok(Json(report))
 }

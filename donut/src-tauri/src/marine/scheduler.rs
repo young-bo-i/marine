@@ -737,8 +737,10 @@ fn append_report_error(report: &mut LegReport, error: impl Into<String>) {
 /// the plan shown at start. Explicit reports also tell the operator which work
 /// was deliberately not attempted.
 fn append_cancelled_profiles(profiles: &[ResolvedProfile], finished: &mut Vec<LegReport>) {
+  let mut legs = 0usize;
   for resolved in profiles {
     for platform in &resolved.platforms {
+      legs += 1;
       finished.push(report_for(
         &resolved.profile,
         platform,
@@ -747,6 +749,20 @@ fn append_cancelled_profiles(profiles: &[ResolvedProfile], finished: &mut Vec<Le
       ));
     }
   }
+  if legs == 0 {
+    return;
+  }
+  // 停止是人按的，但「按下去的那一刻还剩多少没跑」只有这里知道。少了这行，
+  // 周期汇总里那一堆 Cancelled 在日志上没有出处，会被当成程序自己放弃的。
+  log::info!(
+    "Discovery: 收到停止，放弃剩余 {} 个 profile 的 {legs} 条腿 —— {}",
+    profiles.len(),
+    profiles
+      .iter()
+      .map(|p| p.profile.name.as_str())
+      .collect::<Vec<_>>()
+      .join("，"),
+  );
 }
 
 /// Sleep, but notice a cancel request while doing it.
@@ -829,18 +845,46 @@ async fn run_cycles(
           .iter()
           .filter(|l| l.outcome == LegOutcome::Posted)
           .count();
+        // 「7/20」这种写法骗过人一次：分母是**计划**的腿数，而其中一部分根本没跑
+        // （profile 被租约占住、浏览器被操作员开着、没有搜索位……）。上一轮实测有
+        // 57 条腿从未执行却被算进分母，于是 0/20 看着像全线崩溃，实际是压根没开工。
+        //
+        // 现在把分母拆开：真正尝试过的有多少、没开工的有多少，再按结局逐项列出。
+        // 一行看完这一轮的钱花在哪了。
+        let never_ran = last
+          .iter()
+          .filter(|l| {
+            matches!(
+              l.outcome,
+              LegOutcome::AlreadyOpen | LegOutcome::Skipped | LegOutcome::Cancelled
+            )
+          })
+          .count();
+        let attempted = last.len().saturating_sub(never_ran);
+        let breakdown = {
+          let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+          for leg in &last {
+            *counts.entry(format!("{:?}", leg.outcome)).or_insert(0) += 1;
+          }
+          counts
+            .iter()
+            .map(|(k, n)| format!("{k}×{n}"))
+            .collect::<Vec<_>>()
+            .join("，")
+        };
         let cancelled = scheduler.cancel.load(Ordering::SeqCst);
         let total_failure = cycle_is_total_failure(&last);
         failures = next_cycle_failure_count(failures, &last, cancelled);
         if cancelled {
           log::info!(
-            "Discovery cycle {cycle} cancelled after {}s ({posted}/{} legs posted)",
+            "Discovery cycle {cycle} cancelled after {}s（发布 {posted}，尝试 {attempted}，未开工 {never_ran}，计划 {}）：{breakdown}",
             started.elapsed().as_secs(),
             last.len(),
           );
         } else if total_failure {
           log::error!(
-            "Discovery cycle {cycle} produced only failed legs ({failures}/{MAX_CONSECUTIVE_CYCLE_FAILURES})"
+            "Discovery cycle {cycle} produced only failed legs ({failures}/{MAX_CONSECUTIVE_CYCLE_FAILURES})（尝试 {attempted}，未开工 {never_ran}）：{breakdown}"
           );
           if failures >= MAX_CONSECUTIVE_CYCLE_FAILURES {
             return Err(format!(
@@ -849,7 +893,7 @@ async fn run_cycles(
           }
         } else {
           log::info!(
-            "Discovery cycle {cycle} finished in {}s ({posted}/{} legs posted); resting {} min",
+            "Discovery cycle {cycle} finished in {}s（发布 {posted}，尝试 {attempted}，未开工 {never_ran}，计划 {}）：{breakdown}；resting {} min",
             started.elapsed().as_secs(),
             last.len(),
             gap.as_secs() / 60,
@@ -959,6 +1003,13 @@ async fn run_inner(
       .map(|p| format!("{}[{}]", p.profile.name, p.platforms.join("+")))
       .collect::<Vec<_>>()
       .join("，"),
+  );
+  // 指路。排查一条腿几乎总要用到**页面内视角**那份 JSONL，而它躺在 data 目录
+  // 而不是 log 目录 —— 猜是猜不到的。把绝对路径印在每轮开头，谁拿到 Marine.log
+  // 谁就知道另一半证据在哪，不用再回来问。
+  log::info!(
+    "Discovery plan: 页面内日志 → {}",
+    crate::marine::debug_log::DEBUG_LOG.file_path().display(),
   );
 
   let mut finished: Vec<LegReport> = Vec::with_capacity(total_legs);
@@ -1107,6 +1158,14 @@ async fn run_profile_session(
     for platform in platforms {
       finished.push(base(platform, LegOutcome::Skipped, Some(reason.clone())));
     }
+    // 整批放弃必须出声。这里一次跳掉这个 profile 的**全部**平台，而在此之前一行
+    // 日志都没有 —— 于是「这个号这一轮怎么一条腿都没跑」在 Marine.log 里查不到，
+    // 而周期汇总还把它们算进分母，0/20 因此虚高。
+    log::warn!(
+      "Discovery: 跳过 profile {} 的全部 {} 个平台 —— {reason}",
+      profile.name,
+      platforms.len(),
+    );
     return !scheduler.cancel.load(Ordering::SeqCst);
   }
 
@@ -1117,6 +1176,13 @@ async fn run_profile_session(
     for platform in platforms {
       finished.push(base(platform, LegOutcome::AlreadyOpen, err.clone()));
     }
+    // 同上：操作员自己开着这个 profile 时，整批腿被记成 AlreadyOpen 却零日志。
+    log::warn!(
+      "Discovery: profile {} 的全部 {} 个平台跳过 —— 浏览器已被占用：{}",
+      profile.name,
+      platforms.len(),
+      err.clone().unwrap_or_else(|| "未知原因".to_string()),
+    );
     return !scheduler.cancel.load(Ordering::SeqCst);
   }
 
@@ -1139,6 +1205,12 @@ async fn run_profile_session(
     let leg_index = leg_base_index + platform_index + 1;
 
     if scheduler.cancel.load(Ordering::SeqCst) {
+      log::info!(
+        "Discovery: 停止到达，profile {} 剩余 {} 个平台不再开工：{}",
+        profile.name,
+        platforms.len() - platform_index,
+        platforms[platform_index..].join("+"),
+      );
       for rest in &platforms[platform_index..] {
         finished.push(base(rest, LegOutcome::Cancelled, None));
       }
@@ -1169,6 +1241,14 @@ async fn run_profile_session(
       }
       if restarts_left == 0 {
         let stopping = scheduler.cancel.load(Ordering::SeqCst);
+        // 重启额度用光是这条 profile 当轮的死因，而且它发生在 run_leg 之前 ——
+        // 没有这行，剩下那几条腿在日志里根本不存在，只在汇总的计数里冒出来。
+        log::warn!(
+          "Discovery: profile {} 的会话连丢两次，重启额度用尽，剩余 {} 个平台放弃：{}",
+          profile.name,
+          platforms.len() - platform_index,
+          platforms[platform_index..].join("+"),
+        );
         for rest in &platforms[platform_index..] {
           finished.push(base(
             rest,
@@ -1190,6 +1270,12 @@ async fn run_profile_session(
     // this iteration can cold-launch and navigate a profile *after* Stop was
     // accepted, even though the loop-top check ran earlier.
     if scheduler.cancel.load(Ordering::SeqCst) {
+      log::info!(
+        "Discovery: 停止在开工前一刻到达，profile {} 剩余 {} 个平台不再开工：{}",
+        profile.name,
+        platforms.len() - platform_index,
+        platforms[platform_index..].join("+"),
+      );
       for rest in &platforms[platform_index..] {
         finished.push(base(rest, LegOutcome::Cancelled, None));
       }
@@ -2652,6 +2738,12 @@ async fn run_leg(
   let baseline = match initial_touch_summary(&profile_id, platform).await {
     Ok(count) => count,
     Err(error) => {
+      // 这条出口在「浏览器已打开」那行日志**之前**，所以在此之前它是完全隐形的：
+      // 腿被记成 Failed，Marine.log 里却连它存在过都看不出来。
+      log::error!(
+        "Discovery leg {leg_index}/{total_legs}: {} on {platform} 读不到台账基线，未开工即结束：{error}",
+        profile.name,
+      );
       return LegExecution::healthy(LegReport {
         outcome: LegOutcome::Failed,
         error: Some(format!(
