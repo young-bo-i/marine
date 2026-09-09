@@ -1111,9 +1111,13 @@ function deps(over) {
   // 页面已经不是那条靶子了：精确拉回一次，次数先持久化；再错就明确结束。
   {
     const navigated = [];
+    // 这个用例要看落账的全部字段（key / pre_send），所以自带一个记全量的 api 桩，
+    // 而不是动 tdeps —— 别处几十条断言是按 {route,state} 的精确形状比的。
+    const bodies = [];
     const [d, calls, storage] = tdeps({
       href: "https://www.bilibili.com/video/BV_OTHER/",
       navigate: (url) => navigated.push(url),
+      api: async (route, body) => { bodies.push({ route, body }); return {}; },
     });
     const first = await R.runOnTarget(d);
     assert.equal(first.status, "handoff_redirected");
@@ -1125,7 +1129,16 @@ function deps(over) {
     assert.equal(second.status, "handoff_url_mismatch");
     assert.equal(second.redirects, 1);
     assert.deepStrictEqual([...navigated], [CLAIM.open_url], "同一交接单最多纠正一次");
-    assert.deepStrictEqual([...calls], [], "认错页面时不该乱记");
+    // 终局必须落账。只清交接单的话，台账那条永远停在 Claimed，6 小时 claim TTL
+    // 一到就被另一个号原样重新领走 —— 实测 4 个死靶子各撞了 2 次，间隔精确等于
+    // 1 个 TTL。落 failed 是安全的：这个位置在 sendStarted 闸之后，点击绝无可能
+    // 发生过，所以 pre_send 必须为 true，让它进「可回收失败」那档而不是烧掉。
+    const settles = bodies.filter((c) => c.route === "prospects/settle");
+    assert.equal(settles.length, 1, "认错页面是终局，必须恰好落账一次");
+    assert.equal(settles[0].body.state, "failed", "只能记 failed —— 绝不能记成发过了");
+    assert.equal(settles[0].body.key, CLAIM.key, "记在 claim 给的 key 上，不是当前跑偏的 URL");
+    assert.equal(settles[0].body.pre_send, true,
+      "闸前失败：走到这里 sendStarted 必然为假，这条内容还能再被别的号试");
     assert.equal(await storage.read(), null, "纠正一次仍错就是终局，不能把旧 handoff 留在 tab 上");
   }
 

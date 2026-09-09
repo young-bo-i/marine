@@ -3775,12 +3775,15 @@
   // 的「未能定位到直评输入框」—— 五种完全不同的原因长成同一个样子，只能靠猜。
   // 每种原因只报一次（轮询会调用几十次，每次都报会把日志淹掉）。
   let marineProspectDouyinSaid = Object.create(null);
+  // 最后一次「没成功」的理由。结构取证要等到真放弃的那一刻才发（见下），
+  // 那时候得知道当初卡在哪一步。
+  let marineProspectDouyinLastWhy = null;
   function marineProspectDouyinWhy(reason, detail) {
+    marineProspectDouyinLastWhy = reason + (detail ? ' · ' + detail : '');
     if (marineProspectDouyinSaid[reason]) return false;
     marineProspectDouyinSaid[reason] = true;
     try {
       marineLog('warn', 'iso', '抖音评论区未打开·' + reason + (detail ? ' · ' + detail : ''));
-      marineProspectDouyinDumpScene(reason);
     } catch (e) {}
     return false;
   }
@@ -3794,7 +3797,13 @@
    * `输入条不在评论列表旁边 prev=div.Ii031XNo`），不足以写出选择器。
    *
    * 抖音在裸浏览器里渲染不出来（实测：标题空、节点全无），所以结构只能从真实运行
-   * 里取。一次只发一份，且只在**已经确定失败**的那一刻 —— 正常路径零成本。
+   * 里取。一次只发一份，且只在**轮询真的放弃**的那一刻 —— 正常路径零成本。
+   *
+   * 时机曾经是错的，代价很具体：它原本挂在第一次「没找到」上，也就是页面加载后
+   * 约 1.5 秒、hydrate 都还没完。上一轮 35 份 /video/ 现场里有 9 份是这么来的
+   * 假警报 —— 那些页面一秒后就好了，其中 7 条最后成功发出。看这些 dump 会得出
+   * 「页面是空的」这个错误结论，而真实问题在别处。现在它回答的是唯一有意义的
+   * 那个问题：**放弃的时候**长什么样。
    */
   function marineProspectDouyinDumpScene(reason) {
     const brief = function (el) {
@@ -3830,6 +3839,30 @@
       })(),
       可编辑元素: all('[contenteditable="true"],textarea,input[type="text"]', 12),
       评论相关容器: all('[class*="comment" i],[data-e2e*="comment" i]', 16),
+      // 折叠在**哪一层**翻转。
+      //
+      // 上一轮 31 份 /note/ 现场里，评论子树整棵是 0×0，但只有 1 份偶然露出了
+      // 边界（div.DOH9VVjn 1410×891 → div.ayyuDOMc 0×0）；其余 30 份完全看不出
+      // 是哪个节点在折叠，于是「该点哪个开关」只能猜。逐层记 rect 和 display，
+      // 边界一眼可见。
+      折叠链: (function () {
+        try {
+          const out = [];
+          let el = document.querySelector('[data-e2e="comment-list"]');
+          for (let i = 0; el && i < 8; i++) {
+            let display = '?';
+            try { display = getComputedStyle(el).display; } catch (e) {}
+            out.push({
+              cls: String(el.className || '').slice(0, 50),
+              e2e: (el.getAttribute && el.getAttribute('data-e2e')) || '',
+              rect: marineProspectDouyinRect(el),
+              display: display,
+            });
+            el = el.parentElement;
+          }
+          return out;
+        } catch (e) { return []; }
+      })(),
       // 输入条候选：抖音常把它做成一个带提示文案的壳。
       提示文案节点: (function () {
         try {
@@ -3850,6 +3883,14 @@
   // 是语义壳（适配器也用同一信号确认真正的 editor），可以和一组保守提示文案一起用。
   const MARINE_PROSPECT_DOUYIN_INPUT_HINT_RE =
     /留下你的精彩评论|说点什么|发一条友善的评论|善语结善缘|平等表达|写下(?:你的)?评论|请输入评论|评论一下/;
+  // 「量得出多大」—— 折叠与展开的唯一可判据，写进日志好过写进猜测。
+  function marineProspectDouyinRect(el) {
+    try {
+      const r = el.getBoundingClientRect();
+      return Math.round(r.width) + 'x' + Math.round(r.height);
+    } catch (e) { return '?'; }
+  }
+
   const MARINE_PROSPECT_DOUYIN_INPUT_ENTRY_SELECTOR =
     '.comment-input-container,.comment-input-inner-container,[class*="comment-input" i],' +
     '[data-e2e*="comment-input" i]';
@@ -4007,9 +4048,20 @@
       //   · 视频页 `/video/…` —— 播放器右侧有评论图标 `feed-comment-icon`
       //   · 图文笔记页 `/note/…` —— 右栏是「相关推荐 | 评论(N)」两个 tab，
       //     默认停在「相关推荐」上，必须先点「评论」那个 tab 才切过去
-      // 只处理视频页的话，笔记页永远找不到输入框（实测：那条链路上
-      // `feed-comment-icon` 根本不存在）。
-      const list = document.querySelector('[data-e2e="comment-list"]');
+      // 只处理视频页的话，笔记页永远找不到输入框。
+      //
+      // 判据必须是「量得出尺寸」，不能是「在 DOM 里」。/note/ 把整棵评论子树
+      // **预渲染进 DOM 但整体折叠**：31 份现场取证里 comment-list、comment-item、
+      // .comment-input-inner-container、「全部评论」标题的 rect **全是 0×0**，
+      // 而同一份 dump 里 searchbar-input 是 515×38、feed-comment-icon 是 48×74 ——
+      // 量得出来，0 是真的 0。评论正文和评论 XHR 都已经到位，是 display 折叠，
+      // 不是懒渲染。
+      //
+      // 拿 querySelector 的真假当「抽屉开着」，下面这整段展开逻辑就被跳过：
+      // /note/ 的 31 次加载里 feed-comment-icon 一次都没被点过，11 个笔记页
+      // 11 个全失败（100%），而 /video/ 只失败 24%。
+      const listNode = document.querySelector('[data-e2e="comment-list"]');
+      const list = listNode && marineVisible(listNode) ? listNode : null;
       if (!list) {
         // 先看 tab：它可见就证明抽屉已经开着，此时再点 feed icon 反而会把抽屉
         // 关掉。文本严格匹配，避免命中评论正文里的「评论」二字。
@@ -4046,15 +4098,23 @@
           return false;   // 面板要时间渲染，下一轮轮询再往下走
         }
         // 「评论」tab。两种形态都要走这一步，判据不能是「没有图标」：
-        //   · 图文笔记页 `/note/…`：右栏是「相关推荐 | 评论(N)」，没有图标
+        //   · 图文笔记页 `/note/…`：右栏是「相关推荐 | 评论(N)」。注意图标**是有的**
+        //     （30/31 份现场取证里 feed-comment-icon 存在且可见，48×74，文本就是
+        //     评论数），这里原来写「没有图标」是错的
         //   · **精选页 `/jingxuan?modal_id=…`**：右侧抽屉是
         //     「详情 | TA的作品 | 评论 | AI抖音 | 相关推荐」，默认停在别的 tab 上，
         //     而 `feed-comment-icon` **存在**——老代码因此永远走不到这里，
         //     一轮轮点图标直到超时（实测卡满 240 秒）。
         if (!tab) {
+          // 分流两种完全不同的处境，否则下一轮又只能猜：
+          // listNode 存在 = 评论子树预渲染了但还是折叠着（点过入口也没展开）；
+          // listNode 为空 = 这页压根没有评论区。
           return marineProspectDouyinWhy(
-            '既没有评论图标也找不到「评论」tab',
-            'icon=' + (icon ? '有' : '无') + ' 已点过=' + marineProspectDouyinIconClicked,
+            listNode
+              ? '评论子树已预渲染但整体折叠，点过入口后仍未展开'
+              : '既没有评论图标也找不到「评论」tab',
+            'icon=' + (icon ? '有' : '无') + ' 已点过=' + marineProspectDouyinIconClicked +
+              ' list=' + (listNode ? marineProspectDouyinRect(listNode) : '无'),
           );
         }
         if (!marineProspectDouyinCommentTabClicked) {
@@ -4095,11 +4155,15 @@
           try { cls = String(el.className || '').replace(/\s+/g, '.').slice(0, 60); } catch (e) {}
           return String(el.tagName || '?').toLowerCase() + (cls ? '.' + cls : '');
         };
+        // listRect 是分水岭：走到这里的 list 一定是可见的（上面的闸门保证），
+        // 所以这条原因再次出现就说明抽屉确实开了、卡在选择器那一步 —— 和「抽屉
+        // 压根没开」是两个完全不同的下一步。
         return marineProspectDouyinWhy(
           '评论列表附近找不到直评输入条',
           'prev=' + shape(list && list.previousElementSibling) +
             ' next=' + shape(list && list.nextElementSibling) +
-            ' parent=' + shape(list && list.parentElement),
+            ' parent=' + shape(list && list.parentElement) +
+            ' listRect=' + marineProspectDouyinRect(list),
         );
       }
       spot.scrollIntoView({ block: 'center' });
@@ -4163,7 +4227,16 @@
           }, 400);
           return;
         }
-        if (Date.now() > deadline) return resolve(false);
+        if (Date.now() > deadline) {
+          // 放弃了才取证。理由用轮询过程中记下的最后一条，没有就说明连一次明确
+          // 的「没找到」都没走到（例如输入框始终没出现但也没触发任何出口）。
+          try {
+            if (detectPlatform() === 'douyin') {
+              marineProspectDouyinDumpScene(marineProspectDouyinLastWhy || '轮询超时·无明确出口');
+            }
+          } catch (e) {}
+          return resolve(false);
+        }
         setTimeout(attempt, 700);
       })();
     });

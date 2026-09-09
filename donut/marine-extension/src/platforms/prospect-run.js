@@ -751,15 +751,32 @@ var marineProspectRun = marineProspectRun || {};
           };
         }
       }
-      // 一次精确纠正仍不匹配就是终局。清掉交接单，避免它跨 document 留在 tab
-      // 上，之后把用户打开的每一个普通详情页都再次当成自动任务。
-      await clearHandoff(deps, handoff);
-      return {
-        status: 'handoff_url_mismatch',
-        expected: handoff.open_url,
-        got: href,
-        redirects,
-      };
+      // 一次精确纠正仍不匹配就是终局。
+      //
+      // 必须**落账**，不能只清交接单。只清的话台账那条永远停在 Claimed，6 小时
+      // claim TTL 一到就被另一个号原样重新领走，再废一条腿 —— 实测 4 个死靶子各
+      // 撞了 2 次，间隔精确等于 1 个 TTL。
+      //
+      // 记 failed 是安全的，而且这个位置能证明它「闸前失败」：上面的闸序是
+      // pendingSettlement → sendStarted → TTL → URL 校验，走到这里 sendStarted
+      // 必然为假，所以 pre_send=true，点击绝无可能发生过。它因此落进台账的
+      // 「可回收失败」那档（prospect.rs recyclable_failures），至多再试 2 次就
+      // 彻底停手，而不是每 6 小时无限回锅。
+      //
+      // settleAndClear 自己会在落账成功后清交接单，原来那条「不能把交接单跨
+      // document 留在 tab 上」的不变量不破。
+      return await settleAndClear(
+        deps,
+        handoff,
+        'failed',
+        {
+          status: 'handoff_url_mismatch',
+          key: handoff.key,
+          expected: handoff.open_url,
+          got: href,
+          redirects,
+        },
+      );
     }
 
     if (handoff.stopAfter === 'open') {

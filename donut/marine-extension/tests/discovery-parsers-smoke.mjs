@@ -164,6 +164,49 @@ function zhihuCard({ kind, id, qid, voteup, comment, classOrder = "normal" }) {
   );
 }
 
+// ---------------------------------------------------------------- douyin
+//
+// 瀑布流里混着「认得出来、但根本评不了」的卡：直播、合集、广告、课程。它们的
+// id 不是 aweme_id（直播是 room_id、合集是 mix_id），拼成 /video/<id> 抖音解不出
+// 内容 —— 实测直接画 error-page，然后平台自己把 URL 换成 /jingxuan?modal_id=<别的
+// 视频>，靶子校验判 mismatch，整条腿废掉。20 小时线上日志里这是 13 次尝试 / 9 个 id。
+//
+// 准入门槛（有 @作者，或时长+数字）拦不住它们：直播卡有 @主播名。
+{
+  const dyCard = ({ id, badge, author = "某某", title = "标题", count = "1.2万", duration = "01:23" }) => `
+    <div id="waterfall_item_${id}">
+      <div>${badge ? `<span>${badge}</span>` : ""}<span>${duration}</span><span>${count}</span>
+      <span>${title}</span><span>@</span><span>${author}</span></div>
+    </div>`;
+
+  const html = [
+    dyCard({ id: "7683132411806223631", badge: "视频" }),
+    dyCard({ id: "7683132411806223632", badge: null }),
+    dyCard({ id: "7683132411806223633", badge: "图文" }),
+    dyCard({ id: "7683132411806223634", badge: "直播" }),
+    dyCard({ id: "7683132411806223635", badge: "合集" }),
+    dyCard({ id: "7683132411806223636", badge: "广告" }),
+    dyCard({ id: "7683132411806223637", badge: "课程" }),
+  ].join("");
+
+  const got = hostArray(D.douyin.parse(html));
+  const ids = got.map((c) => c.id);
+  assert.deepStrictEqual(
+    ids,
+    ["7683132411806223631", "7683132411806223632", "7683132411806223633"],
+    "只有视频/无标记/图文能留下；直播·合集·广告·课程必须整条丢掉",
+  );
+  assert.deepStrictEqual(
+    got.map((c) => c.open_url),
+    [
+      "https://www.douyin.com/video/7683132411806223631",
+      "https://www.douyin.com/video/7683132411806223632",
+      "https://www.douyin.com/note/7683132411806223633",
+    ],
+    "只有「图文」走 /note/，其余走 /video/",
+  );
+}
+
 // ---------------------------------------------------------------- canary
 {
   const { check } = D.canary;

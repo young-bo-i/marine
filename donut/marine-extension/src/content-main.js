@@ -492,6 +492,44 @@
       if (kind) {
         const pageContext = pageContextSnapshot();
         mlog('net', kind + ' xhr ⇢ ' + shortUrl(url));
+
+        // 请求级失败此前完全不可观测：只挂了 load，而 error / abort / timeout
+        // 一律无声。代价是一整类故障看不见 —— 实测有一个账号的抖音 publish 发出
+        // 10 次、拿回 0 次响应，另外六个账号请求数恒等于响应数；日志里唯一的痕迹
+        // 是上层 20 秒后猜的一句「可能被风控拦截」，猜错了也无从发现。
+        //
+        // 这几个监听器**只观测、不投递**：不碰 post()、不碰 postPublishedCandidate()，
+        // 因此不可能凭空造出一张回执。回执的定义不变 —— 仍然只认「平台返回了能解析
+        // 出 comment id 的响应体」。HTTP 200 + 空 body 不是回执。
+        let marineDelivered = false;
+        const marineSnapshot = function () {
+          let rs = '?', st = '?', rt = '?', len = '?';
+          try { if (xhrReadyStateGet) rs = string(nativeNumber(call(xhrReadyStateGet, xhr))); } catch (e) {}
+          try { if (xhrStatusGet) st = string(nativeNumber(call(xhrStatusGet, xhr))); } catch (e) {}
+          try { if (xhrResponseTypeGet) rt = string(call(xhrResponseTypeGet, xhr) || '(text)'); } catch (e) {}
+          try {
+            if (xhrResponseTextGet) len = string(string(call(xhrResponseTextGet, xhr) || '').length);
+          } catch (e) {}
+          return 'readyState=' + rs + ' status=' + st + ' responseType=' + rt + ' len=' + len;
+        };
+        ['error', 'abort', 'timeout'].forEach(function (ev) {
+          call(eventTargetAddEventListener, xhr, [ev, function () {
+            try {
+              marineDelivered = true;   // 已经有明确结论了，别再让 loadend 补一条
+              mlog('warn', kind + ' xhr ✗ ' + ev + ' ⇢ ' + shortUrl(url), marineSnapshot());
+            } catch (e) {}
+          }, false]);
+        });
+        // 兜底：请求结束了，但上面的 load 分支什么都没投递出去（空 body、
+        // 非 text/json 的 responseType、或者读响应时抛了）。这一条把「平台没回」
+        // 和「平台回了但我们没解析」彻底分开。
+        call(eventTargetAddEventListener, xhr, ['loadend', function () {
+          try {
+            if (marineDelivered) return;
+            mlog('warn', kind + ' xhr ⇢ 结束但无可用响应体 · ' + shortUrl(url), marineSnapshot());
+          } catch (e) {}
+        }, false]);
+
         call(eventTargetAddEventListener, xhr, ['load', function () {
           try {
             if (xhrReadyStateGet && nativeNumber(call(xhrReadyStateGet, xhr)) !== 4) return;
@@ -514,6 +552,7 @@
             try {
               if (xhrGetResponseHeader) ct = string(call(xhrGetResponseHeader, xhr, ['content-type']) || '');
             } catch (e) {}
+            marineDelivered = true;
             post({ url: capturedUrl(responseUrl || url), body, ct, kind, method, status, ok });
             if (kind === 'comment' && responseUrl && publishableBody) postPublishedCandidate({
               url: responseUrl,

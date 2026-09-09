@@ -698,6 +698,19 @@ var marineDiscovery = marineDiscovery || {};
     const COUNT_RE = /^[0-9]+(\.[0-9]+)?\s*(万|亿|w|W|k|K)?$/;
     const DATE_RE = /^·?\s*(\d{4}年)?\d{1,2}月\d{1,2}日$|^·?\s*\d+(天|小时|分钟|秒)前$|^·?\s*(刚刚|昨天|前天)/;
     const TYPE_BADGES = new Set(['图文', '直播', '合集', '广告', '视频', '课程']);
+    // 认得出来、但**评不了**的卡。
+    //
+    // 它们的 id 不是 aweme_id —— 直播是 room_id、合集是 mix_id、广告和课程是推广位
+    // id —— 拼成 /video/<id> 抖音的 web 路由表根本解不出内容。实测（20 小时线上日志）：
+    // 页面立刻画出 data-e2e="error-page" 的空壳，约 9–11 秒后平台自己把 URL 换成
+    // /jingxuan?modal_id=<另一条无关视频>，靶子校验判 handoff_url_mismatch，这条腿废掉。
+    //
+    // 代价是 13 次尝试 / 9 个 id。识别签名很干净：9 个死 id 里 7 个的内嵌发布时刻
+    // （aweme id >> 32 ≈ unix 秒）落在整点 ±2 分钟内 —— 直播整点开播 —— 而 52 个
+    // 成功的 /video/ 靶子只有 7 个落在那里。
+    //
+    // 下面那道准入门槛（有 @作者，或时长+数字）拦不住它们：直播卡有 @主播名。
+    const NON_COMMENTABLE_BADGES = new Set(['直播', '合集', '广告', '课程']);
     // 混在瀑布流里、但**不是**可评论内容的卡（它们也占一个 waterfall_item_<假 id>）
     const NON_CONTENT_HEADINGS = new Set(['相关搜索', '大家都在搜', '相关推荐', '相关话题', '猜你想搜']);
 
@@ -754,6 +767,9 @@ var marineDiscovery = marineDiscovery || {};
         // 「可评论内容」的最低证据：有 @作者，或者同时有时长+数字（视频卡）。
         // 达不到就不是一条能直评的内容（推荐词卡 / 商品卡 / 空壳），丢弃。
         if (!author && !(duration && countRaw)) continue;
+        // 卡片种类：只有「图文」和「视频/无标记」能直评。别的认出来就丢，
+        // 见 NON_COMMENTABLE_BADGES 那段的实测。
+        if (badge && NON_COMMENTABLE_BADGES.has(badge)) continue;
 
         const kind = badge === '图文' ? 'note' : 'video';
         const metrics = emptyMetrics();

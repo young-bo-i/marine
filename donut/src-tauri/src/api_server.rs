@@ -1609,6 +1609,8 @@ async fn marine_claim_prospect(
   if let Some(v) = req.session_url_max_age_secs {
     opts.session_url_max_age_secs = v;
   }
+  let platform = req.platform.clone();
+  let profile_id = req.profile_id.clone();
   let claimed = tokio::task::spawn_blocking(move || {
     PROSPECTS.claim_next(&req.profile_id, &req.platform, &opts)
   })
@@ -1620,6 +1622,26 @@ async fn marine_claim_prospect(
     )
   })?
   .map_err(prospect_error)?;
+
+  // 台账发出去的是**哪一条**，此前一行日志都没有。
+  //
+  // 后果是 Marine.log 单独无法定位任何一条腿：它记得下这条腿失败了，却记不下它
+  // 在哪个 URL 上失败的 —— 上一轮排查「同一个死靶子被反复重领」只能靠扩展侧那份
+  // 4MB 封顶、还得手动去取的 JSONL 拼出来。一次领取一行，成本可以忽略。
+  match claimed.as_ref() {
+    Some(record) => log::info!(
+      "Prospect claim: {platform} → {} 领到 {}（{}）{}",
+      profile_id,
+      record.key,
+      record.open_url,
+      if record.title.trim().is_empty() {
+        String::new()
+      } else {
+        format!("「{}」", record.title.trim())
+      },
+    ),
+    None => log::info!("Prospect claim: {platform} → {profile_id} 无可领取的目标"),
+  }
 
   // `null` rather than an error: "nothing left for you" is a normal outcome the
   // caller branches on, not a failure. (A 204 would be tidier HTTP, but this
